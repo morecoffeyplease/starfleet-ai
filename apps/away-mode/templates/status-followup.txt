@@ -1,0 +1,5 @@
+Follow-up for {REPORT_ID}, {LANE}: {MISSING_OR_OVERDUE}.
+If already reported, do not repeat it.
+Otherwise reply to original request {ORIGINAL_MESSAGE_ID} with the report or a revised absolute-time ETA and the reporting blocker.
+Keep the same fixed window, {WINDOW_START} to {WINDOW_END} ({TIMEZONE}).
+The coordinator is waiting for complete coverage; this does not authorize new product work, tests or forced interruption.

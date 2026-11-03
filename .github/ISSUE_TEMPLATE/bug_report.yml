@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible problem in a Starfleet component.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report suspected vulnerabilities through the private route in SECURITY.md.
+        All issues are public, so remove credentials, private messages, and unrelated project data.
+  - type: input
+    id: component
+    attributes:
+      label: Component and installed revision
+      placeholder: Component name and version, tag, or commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include your operating system, CMUX build, harness, and relevant CLI versions.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest repeatable user path and use synthetic data where possible.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Actual behavior
+      description: Separate saved configuration, attempted delivery, and observed receipt.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence
+      description: Include useful errors or screenshots and state what remains unverified.

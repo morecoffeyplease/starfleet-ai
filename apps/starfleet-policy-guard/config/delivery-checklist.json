@@ -1,0 +1,12 @@
+{
+  "approval_authority": {
+    "label": "user",
+    "accepted_channels": ["direct-user", "configured-contact-route"]
+  },
+  "checks": [
+    {"id": "design-fidelity", "enabled": true, "instruction": "Conduct design-fidelity-audit before reporting design work; show coverage, fidelity, every property finding and outstanding gap, plus explicit approval from the configured human authority for every requested deviation."},
+    {"id": "main-awareness", "enabled": true, "instruction": "Review relevant target-branch changes and existing solutions before adding a new fix; record what matters for this PR."},
+    {"id": "merge-conflicts", "enabled": true, "instruction": "Check merge conflicts against the PR target snapshot; being behind the target alone is allowed."},
+    {"id": "local-verification", "enabled": true, "instruction": "Record successful canonical local verification or an explicit successful nothing-affected verdict for unchanged source and verification inputs."}
+  ]
+}

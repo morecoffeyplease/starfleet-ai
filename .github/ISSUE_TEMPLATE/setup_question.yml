@@ -1,0 +1,30 @@
+name: Setup question
+description: Ask about installation or a supported configuration.
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        All issues are public.
+        Remove credentials, private messages, webhook URLs, and unrelated project data.
+  - type: input
+    id: component
+    attributes:
+      label: Component and installed revision
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and guide followed
+      description: Include your operating system, CMUX build, harness, and setup instructions used.
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Where you need help
+      description: Include the exact command and a redacted error, without secrets or private links.
+    validations:
+      required: true

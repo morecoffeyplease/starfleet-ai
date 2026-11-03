@@ -1,0 +1,26 @@
+{
+  "pr_url": "https://github.com/owner/repo/pull/123",
+  "base_ref": "origin/main",
+  "design-fidelity": {
+    "revision": "<candidate commit from delivery snapshot>",
+    "applicable": false,
+    "reason": "<why no designs were involved>"
+  },
+  "main-awareness": {
+    "revision": "<candidate commit>",
+    "base_head": "<base_head from delivery snapshot>",
+    "relevant_changes": "<relevant target changes and their effect on this PR>",
+    "existing_solutions": "<existing fixes or reusable solutions considered, or what was checked and none found>",
+    "evidence": {"path": "main-assessment.md", "sha256": "<file hash>"}
+  },
+  "local-verification": {
+    "revision": "<exact verified commit>",
+    "command": ["python3", "scripts/verify.py"],
+    "command_source": {"path": "/path/to/repo/README.md", "sha256": "<file hash>"},
+    "exit_code": 0,
+    "outcome": "passed",
+    "evidence": {"path": "verification.log", "sha256": "<file hash>"},
+    "inputs": [],
+    "input_scope": "<tracked verification inputs, external inputs listed above, environment and limitations>"
+  }
+}

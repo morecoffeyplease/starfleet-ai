@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+# starfleet-pattern-buffer-launcher:v1
+"""Start Pattern Buffer from its installed alias or this source checkout."""
+import importlib.util
+from pathlib import Path
+import sys
+
+
+RUNTIME_DIR = None
+here = Path(RUNTIME_DIR).expanduser() if RUNTIME_DIR else Path(__file__).resolve().parent
+for name in ("pattern_buffer.py", "pattern_buffer_codex.py", "pattern_buffer_claude.py"):
+    script = here / name
+    if script.is_file():
+        break
+else:
+    raise SystemExit("Pattern Buffer CLI is missing beside this launcher; reinstall the app.")
+
+spec = importlib.util.spec_from_file_location("pattern_buffer_launcher_core", script)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"Could not load Pattern Buffer CLI: {script}")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+raise SystemExit(module.main())

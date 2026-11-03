@@ -1,0 +1,56 @@
+{
+  "app": "starfleet-policy-guard",
+  "status": "fixture-prototype-not-installed",
+  "version": 6,
+  "counting": {
+    "unit": "product-fix-round",
+    "description": "One accepted batch of product fixes prompted by review or audit findings, including the coordinator's own review, or by a branch-caused failure, regardless of reviewer, dispatch, or commit count.",
+    "registration_point": "When qualifying findings are accepted into a fix batch, before its first implementation edit or dispatch.",
+    "mixed_batch_rule": "Count the batch once if any item qualifies; excluded work in the same batch does not cancel the obligation.",
+    "verdict_rule": "A not-ready verdict alone does not increment the count; rejected or duplicate findings and findings requiring no product change do not create another round.",
+    "retry_rule": "Retries of the same registered batch reuse its round identity.",
+    "failure_source_rule": "A branch-caused product failure can qualify whether discovered locally, in CI, or in merge-queue proof. Calling the work proof repair does not exclude a product fix.",
+    "excluded": [
+      "clean review or confirmation-only recheck",
+      "rebase conflict resolution",
+      "confirmed flake repair",
+      "changes solely to the proof harness, including merge-queue proof repairs, without a qualifying product fix"
+    ]
+  },
+  "zoom_out": {
+    "first_required_round": 3,
+    "repeat": "every-subsequent-fix-round",
+    "scope": "affected-work-item",
+    "instruction_template": "Fix round {N} on PR #{pr}. This many rounds of fixes can be an indication that we're moving in the wrong direction. Accordingly, this stop requires a zoom-out before any further edit, dispatch or push. Please do the following for your PR:\n\n1. Purpose. Quote the PR's purpose from its body or tracker row, not from your summary or memory.\n2. Inventory. List every mechanism added since round 1 (helper, guard, retry, timeout, fixture, cache path, test machinery), with its line count and the round that added it.\n3. For each one, answer in one line: does the PR's purpose need it, or does it exist only to make an earlier fix work? What breaks if it's deleted?\n4. Evidence check. Separate what you observed from what you concluded. If a runtime failure drives this round, rerun it alone and compare against main before fixing anything. If a source-review finding drives it, quote the finding, cite the relevant code path, and state what supports it and what remains unproven. Do not invent a reproduction or present reviewer agreement as proof.\n5. Simpler design. Name the simplest design that meets the purpose, and why you're not using it, or switch to it.\n6. Decision: keep, delete, revert, split out or simplify. Anything not serving the purpose leaves this PR.\n7. Record it before acting: update the PR body to \"Fix rounds: {N} (zoom-out done <date>: <decision>)\", then the tracker row.\n\nIf the decision adds scope, adds a new mechanism, or creates a split-out PR, stop and ask the configured human authority, with the purpose and inventory. The configured human authority makes the project decision. Explain the user problem, the proposed change, why it is needed, the simpler alternative, and the tradeoff or decision in plain language understandable by a PM. Explain technical terms when needed, and connect each relevant mechanism to its effect on users or delivery. Make the question answerable without requiring the configured human authority to inspect code."
+  },
+  "approval_authority": {
+    "label": "user"
+  },
+  "exceptions": {
+    "require_explicit_human_authorization": true,
+    "peer_relay_alone_is_authorization": false
+  },
+  "commit_metadata": {
+    "required_for_new_fix_commits": true,
+    "trailer": "Starfleet-Fix-Round: {N}",
+    "batch_rule": "Every commit in the same registered fix batch carries the same round number; commit count does not increment the fix-round count.",
+    "inventory_provenance": "Trace mechanism introduction through the round-labelled commit diffs.",
+    "history_rewrite_rule": "Preserve the mechanism-to-round mapping in the durable work-item record before squashing or otherwise discarding the round-labelled history; a list of round numbers alone is insufficient.",
+    "historical_unknown_rule": "Use unknown for an originating round only when historical evidence is unavailable; do not guess."
+  },
+  "pr_start": {
+    "require_draft_pr_before_implementation": true,
+    "identity": "GitHub host, repository, and PR number",
+    "intent": "Open a draft before product implementation so every review and fix round has a PR number.",
+    "bootstrap": "Prefer a zero-product-change kickoff commit; confirm that GitHub and the repository hooks accept the bootstrap during the pilot. Do not silently start untracked implementation if creation fails.",
+    "bootstrap_counts_as_fix_round": false,
+    "purpose": {
+      "required": true,
+      "placement": "First substantive content in the PR body, before implementation details.",
+      "instruction": "State the concrete user problem this PR solves or how it benefits users. For engineering-only work, state the actual engineering or operational benefit and its connection to users where applicable; do not invent a user-facing claim.",
+      "authoritative_for_zoom_out": true
+    },
+    "opening_body_template": "{user_problem_or_benefit}\n\nFix rounds: 0",
+    "missing_pr_rule": "Allow only the bounded branch/PR bootstrap and investigation needed to open the draft; no product implementation or fix rounds until the PR is bound."
+  }
+}

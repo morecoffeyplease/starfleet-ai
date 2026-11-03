@@ -1,0 +1,1791 @@
+#!/usr/bin/env python3
+"""Pattern Buffer restores approved worktree context for Claude and Codex."""
+import argparse
+import datetime
+from dataclasses import asdict
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from urllib.parse import quote, urlsplit
+
+ROLES = ("implementer", "orchestrator")
+LIMIT = 8192
+FILE_LIMIT = 32768
+HOOK_INPUT_LIMIT = 1024 * 1024
+TASK_LIMIT = 16384
+INJECTION_LIMIT = 24576
+DISPATCH_ENV = "STARFLEET_CONTEXT_DISPATCH"
+REPO_PROFILE_LIMIT = 32768
+
+
+class DispatchFailure(ValueError):
+    """A known dispatched session must not silently lose its recovery context."""
+
+
+class RequiredContextFailure(ValueError):
+    """A session enrolled for isolated context must never inherit the default."""
+
+    def __init__(self, message, path, enrollment_id=None):
+        super().__init__(message)
+        self.path = Path(path)
+        self.enrollment_id = enrollment_id
+
+
+_AUXILIARY = {}
+_RUNTIME_FINGERPRINT = None
+
+
+def auxiliary_source(name, script=None):
+    script = Path(script or __file__).resolve()
+    return script.with_name(("pattern_buffer" if script.name == "pattern_buffer.py" else script.stem)
+                            + "_" + name + ".py")
+
+
+def auxiliary(name):
+    if name not in _AUXILIARY:
+        path = auxiliary_source(name)
+        spec = importlib.util.spec_from_file_location("starfleet_pb_" + name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _AUXILIARY[name] = module
+    return _AUXILIARY[name]
+
+
+def session_binding(root, gitdir, harness, session, agent=""):
+    if agent or not session:
+        return None
+    return auxiliary("sessions").lookup(root, gitdir, harness, session)
+
+
+def record_event(root, event, harness=None, session=None, enrollment_id=None,
+                 result=None, correlation_id=None, details=None):
+    """Observability must not suppress an otherwise valid recovery."""
+    try:
+        global _RUNTIME_FINGERPRINT
+        if _RUNTIME_FINGERPRINT is None:
+            _RUNTIME_FINGERPRINT = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        details = {**(details or {}), "runtime_fingerprint": _RUNTIME_FINGERPRINT}
+        report = auxiliary("reliability").emit(
+            root, event, harness=harness, session=session, enrollment_id=enrollment_id,
+            result=result, correlation_id=correlation_id, details=details)
+        if isinstance(report, dict) and report.get("error"):
+            print("pattern-buffer telemetry: " + str(report["error"]), file=sys.stderr)
+    except Exception as error:
+        print("pattern-buffer telemetry unavailable: " + type(error).__name__, file=sys.stderr)
+
+
+def idle_receipt_report(root, since):
+    """Read only this worktree's existing Beacon receipts without copying continuation bodies."""
+    path = Path.home() / ".local/state/starfleet-ai/hailing-frequencies/receipts.sqlite3"
+    if not path.is_file() or any(p.is_symlink() for p in (path, *path.parents)):
+        return {"state": "unknown", "reason": "Hailing receipt history is unavailable", "receipts": []}
+    try:
+        start = datetime.datetime.fromisoformat(since.replace("Z", "+00:00")).timestamp()
+        with sqlite3.connect("file:" + quote(str(path)) + "?mode=ro", uri=True, timeout=1) as database:
+            rows = database.execute(
+                "SELECT o.id,o.timer_id,o.status,o.attempted_at,o.received_at,t.harness,t.session "
+                "FROM timer_occurrences o JOIN timers t ON t.id=o.timer_id "
+                "WHERE t.canonical_worktree=? AND t.replacement_key=? "
+                "AND (o.attempted_at>=? OR o.received_at>=?) ORDER BY o.due_at DESC LIMIT 1001",
+                (str(root), "pattern-buffer-checkpoint-idle", start, start)).fetchall()
+        counts = {}
+        receipts = []
+        for row in rows[:1000]:
+            counts[row[2]] = counts.get(row[2], 0) + 1
+            receipts.append(dict(zip(("occurrence_id", "timer_id", "status", "attempted_at", "received_at",
+                                      "harness", "session"), row)))
+        return {"state": "observed", "counts": counts, "truncated": len(rows) > 1000,
+                "receipts": receipts,
+                "receipt_note": "An explicit exact-owner CLI receipt is not model comprehension or task completion."}
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        return {"state": "unknown", "reason": "Hailing receipt history could not be read", "receipts": []}
+
+
+TEMPLATE = """# shared
+- Worktree: <WORKTREE>
+- Mission: <MISSION>
+- Roadmap: <TRACKER>
+- Assigned items: <AUTHORIZED_ITEM_REFERENCES>
+
+**Scope**
+- If the mission, authoritative tracker or authorized assignment is missing or unclear, ask the user to establish it.
+- Never invent values, infer new scope or treat placeholders as approval.
+- If no tracker or assignment applies, record the user's explicit agreement.
+- Stay within the user's authorized scope.
+
+**Agents**
+- Before launching any agent, read the saved active profile in Model Preferences and resolve its configured reviewers.
+- A pilot preference or old startup summary doesn't prove the active selection or reviewer count.
+- Launch only configured reviewer slots.
+- Advanced-review permission doesn't authorize an extra reviewer, another provider or a shared profile switch.
+
+**Agent communication** (concise but accurate)
+- Lead with what changed and any action needed.
+- Batch nonurgent updates unless that delays dependent work.
+- Reply only with answers, needed questions, decisions or meaningful updates; otherwise use the supported receipt ack (means received, not completed).
+- Link accessible evidence; don't repeat detailed logs.
+- Send blockers, approval requests and key handoffs promptly.
+
+After processing this message, confirm to the user you received the re-injection and whether you're updating the mission and/or tracker.
+
+**Test failures and claims about systems**
+- Every explanation is a hypothesis until it survives an attempt to disprove it.
+- Before you name a cause or a fix option, or state what CI, a config or a tool does, write down at least one competing explanation and the observation that would tell them apart.
+- Check that observation on the failing run AND a passing control: the base branch, main, or an earlier green run of the same check.
+- Use evidence already on disk first: result files, timestamps, receipts, logs, and the config and source themselves.
+- Ask for a new run only when disk cannot answer.
+- Look for the check that could prove you wrong, not the one that agrees.
+- A mechanism that fits is not a cause.
+- Agreement is not evidence: not from another agent, a reviewer, a coordinating tool or service, or your own earlier message.
+- When config says one thing and behavior shows another, that contradiction is the finding.
+- Report it; do not explain it away.
+- Facts about tools and CI come from reading them now, not from memory.
+- Never offer a fix option built on an unverified cause.
+- Do not implement or dispatch a fix based on an unverified cause; diagnostic investigation is allowed.
+- When reporting, separate what you observed from what you concluded, and mark every unchecked claim "unverified".
+- When you find you were wrong, say so first and plainly, then correct it.
+
+# implementer
+- Ask your parent orchestrator for more agents (incl. research and review) unless this task explicitly delegates that authority; delegation still follows current Model Preferences role choices, reviewer count and advanced-review permission.
+- Reproduce reported bugs before editing code.
+- Verify completed changes through the user's path.
+
+# orchestrator
+**Before resuming, do this now:**
+1. Re-read the mission, roadmap/tracker and current PRs’ issues IN FULL; reconcile actual checkout, PR heads/states, active work, evidence and human holds, don’t rely on assumptions; then update only this lane's tracker sections where facts changed.
+   Re-pull before editing; coordinate with other tracker owners.
+2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
+
+**Takeover:** reconcile inherited PR identities, fix counts, round-specific zoom-out evidence and human holds before more product fixes; write a fresh assessment for the next repair round; confirm mission and roadmap still apply; verify successor tool bindings and actual context delivery before dispatching work.
+
+**Always**
+- Preserve unknowns and missing evidence as gaps; don't rewrite unchanged status or infer new authority.
+- Track ownership, dependencies and completion evidence.
+  Delegated ≠ completed.
+
+**Pattern Buffer checkpoints:** if enrolled, maintain the registered private note after meaningful changes; read/reconcile it on recovery. Path, Git hygiene and controls: apps/pattern-buffer/docs/checkpoints.md
+"""
+
+
+def git(cwd, *args):
+    result = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
+                            text=True, timeout=3)
+    if result.returncode:
+        raise ValueError("working directory is not a Git worktree")
+    return result.stdout.strip()
+
+
+def checkout(cwd):
+    root = Path(git(cwd, "rev-parse", "--show-toplevel")).resolve()
+    gitdir = Path(git(root, "rev-parse", "--absolute-git-dir")).resolve()
+    return root, gitdir
+
+
+def bounded(path, limit):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"expected a regular, non-symlink file: {path}")
+    with path.open("rb") as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"file exceeds {limit} bytes: {path}")
+    return data.decode("utf-8")
+
+
+def atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".pending-")
+    try:
+        if path.exists():
+            os.fchmod(fd, path.stat().st_mode & 0o777)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def load(root, gitdir):
+    folder = root / ".context-injector"
+    if folder.is_symlink():
+        raise ValueError("context directory must not be a symlink")
+    config = json.loads(bounded(gitdir / "context-injector" / "config.json", FILE_LIMIT))
+    if not isinstance(config, dict) or config.get("version") != 1 or config.get("root") != str(root):
+        raise ValueError("checkout registration changed; initialize this worktree again")
+    if config.get("default_role") not in (None, *ROLES):
+        raise ValueError("invalid default role")
+    profile = config.get("repo_profile")
+    if profile is not None and not isinstance(profile, (str, dict)):
+        raise ValueError("invalid repository profile registration")
+    if not isinstance(config.get("enabled", True), bool):
+        raise ValueError("invalid enabled state")
+    owner = config.get("context_owner")
+    if owner is not None:
+        owner_root, owner_gitdir = validate_owner(root, owner)
+        owner_config = json.loads(bounded(owner_gitdir / "context-injector/config.json", FILE_LIMIT))
+        if not isinstance(owner_config, dict) or owner_config.get("context_owner"):
+            raise ValueError("context owners must be directly initialized worktrees")
+        load(owner_root, owner_gitdir)
+        return config, owner_root / ".context-injector/context.md"
+    return config, folder / "context.md"
+
+
+def validate_owner(root, owner):
+    if not isinstance(owner, dict) or not isinstance(owner.get("root"), str):
+        raise ValueError("invalid context owner")
+    owner_root, owner_gitdir = checkout(owner["root"])
+    if str(owner_gitdir) != owner.get("gitdir") or owner_root == root:
+        raise ValueError("context owner identity changed")
+    if git(root, "rev-parse", "--path-format=absolute", "--git-common-dir") != git(
+            owner_root, "rev-parse", "--path-format=absolute", "--git-common-dir"):
+        raise ValueError("context owner must belong to the same Git repository")
+    return owner_root, owner_gitdir
+
+
+def enabled(config):
+    if not config.get("enabled", True):
+        return False
+    if config.get("context_owner"):
+        owner_root, owner_gitdir = checkout(config["context_owner"]["root"])
+        owner_config, _ = load(owner_root, owner_gitdir)
+        return owner_config.get("enabled", True)
+    return True
+
+
+def resolved_repo_profile(root, config):
+    owner = config.get("context_owner")
+    if owner is None:
+        return profile_name(config.get("repo_profile"))
+    owner_root, owner_gitdir = validate_owner(root, owner)
+    owner_config, _ = load(owner_root, owner_gitdir)
+    return profile_name(owner_config.get("repo_profile"))
+
+
+def profile_name(profile):
+    if isinstance(profile, dict):
+        return profile.get("name")
+    return "legacy profile" if isinstance(profile, str) else None
+
+
+def compose_template(fragment=None):
+    if fragment is None:
+        return TEMPLATE
+    if not isinstance(fragment, str) or not fragment.strip():
+        raise ValueError("repository profile fragment must be nonempty text")
+    marker = "\n# implementer\n"
+    if TEMPLATE.count(marker) != 1:
+        raise ValueError("default template cannot accept a repository profile")
+    return TEMPLATE.replace(marker, "\n" + fragment.rstrip() + marker, 1)
+
+
+def origin_parts(url):
+    if not isinstance(url, str) or not url or "\\n" in url or "\\r" in url:
+        raise ValueError("repository profile origin must be one HTTPS or SSH URL")
+    if url.casefold().startswith("git@"):
+        address, separator, path = url.partition(":")
+        username, at, host = address.partition("@")
+        if not separator or not at or username.casefold() != "git" or not host:
+            raise ValueError("repository profile origin must use HTTPS or git SSH")
+        if "?" in path or "#" in path:
+            raise ValueError("repository profile origin cannot include a query or fragment")
+    else:
+        try:
+            parts = urlsplit(url)
+            if (parts.scheme == "https" and parts.hostname and parts.username is None
+                    and parts.password is None and parts.port in (None, 443)):
+                pass
+            elif (parts.scheme == "ssh" and parts.hostname and parts.username == "git"
+                  and parts.password is None and parts.port in (None, 22)):
+                pass
+            else:
+                raise ValueError("repository profile origin must use HTTPS or git SSH")
+            if parts.query or parts.fragment:
+                raise ValueError("repository profile origin cannot include a query or fragment")
+            host, path = parts.hostname, parts.path
+        except ValueError as error:
+            raise ValueError("invalid repository profile origin URL") from error
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not host or not path or any(part in ("", ".", "..") for part in path.split("/")):
+        raise ValueError("repository profile origin must identify a repository")
+    return host.casefold(), path.casefold()
+
+
+def _origin_matches(actual, expected):
+    try:
+        return origin_parts(actual) == origin_parts(expected)
+    except ValueError:
+        return False
+
+
+def read_repo_profile(path):
+    profile_path = Path(path).expanduser().absolute()
+    if profile_path.is_symlink() or not profile_path.is_file():
+        raise ValueError("repository profile must be a regular, non-symlink JSON file")
+    raw = bounded(profile_path, REPO_PROFILE_LIMIT).encode("utf-8")
+    try:
+        profile = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("repository profile must contain valid UTF-8 JSON") from error
+    if (not isinstance(profile, dict) or profile.get("schema_version") != 1
+            or set(profile) != {"schema_version", "name", "origin", "fragment"}
+            or not isinstance(profile.get("name"), str) or not profile["name"].strip()
+            or not isinstance(profile.get("fragment"), str) or not profile["fragment"].strip()):
+        raise ValueError("repository profile needs schema_version 1, name, origin and nonempty fragment fields")
+    origin_parts(profile["origin"])
+    return profile, {"name": profile["name"], "path": str(profile_path),
+                     "sha256": hashlib.sha256(raw).hexdigest(), "origin": profile["origin"]}
+
+
+def verify_repo_profile_origin(root, profile):
+    try:
+        result = subprocess.run(["git", "-C", str(root), "config", "--get-all", "remote.origin.url"],
+                                capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("could not verify the repository profile's origin remote") from error
+    urls = result.stdout.splitlines()
+    if result.returncode or len(urls) != 1 or not _origin_matches(urls[0].strip(), profile["origin"]):
+        raise ValueError(f"repository profile {profile['name']!r} is bound to {profile['origin']!r}; origin must match exactly")
+
+
+def load_registered_profile(root, descriptor):
+    if isinstance(descriptor, str):
+        return None
+    if not isinstance(descriptor, dict):
+        return None
+    profile, current = read_repo_profile(descriptor.get("path", ""))
+    if current != descriptor:
+        raise ValueError("repository profile changed since registration; review and initialize it again")
+    verify_repo_profile_origin(root, profile)
+    return profile
+
+
+@contextmanager
+def locked(path):
+    """Serialize only CLI mutations, including read/modify/write cycles."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a", encoding="utf-8") as handle:
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError(f"another Pattern Buffer command holds {path}")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def settings_path(harness, explicit=None):
+    if explicit:
+        return Path(explicit).expanduser().absolute()
+    if harness == "codex":
+        return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "hooks.json"
+    return Path.home() / ".claude" / "settings.json"
+
+
+def marker(harness):
+    return f" # starfleet-context-injector:{harness}:v1"
+
+
+def checkpoint_source(script=None):
+    script = Path(script or __file__).resolve()
+    return script.with_name("pattern_buffer_checkpoint.py" if script.name == "pattern_buffer.py"
+                            else script.stem + "_checkpoint.py")
+
+
+def guide_source(script=None):
+    return Path(script or __file__).resolve().with_name("guide.md")
+
+
+def checkpoints():
+    path = checkpoint_source()
+    spec = importlib.util.spec_from_file_location("starfleet_checkpoint", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def enrollment_source(script=None):
+    script = Path(script or __file__).resolve()
+    return script.with_name("pattern_buffer_enrollment.py" if script.name == "pattern_buffer.py"
+                            else script.stem + "_enrollment.py")
+
+
+def self_enroll(root, gitdir, args):
+    spec = importlib.util.spec_from_file_location("starfleet_enrollment", enrollment_source())
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.enroll(sys.modules[__name__], checkpoints(), root, gitdir, args)
+
+
+def hook_config(harness, script=None, with_checkpoints=True):
+    command = shlex.join([sys.executable, str(script or Path(__file__).resolve()),
+                          "hook", "--harness", harness]) + marker(harness)
+    handler = {"type": "command", "command": command, "timeout": 5}
+    if harness == "codex":
+        # Full output is strictly bounded in render, including the exact task brief.
+        handler["additionalContextLimit"] = 0
+    result = {"hooks": {"SessionStart": [{
+        "matcher": "startup|resume|compact|fork|clear", "hooks": [handler]}]}}
+    if with_checkpoints:
+        for event in ("PreCompact", "PostToolUse", "UserPromptSubmit"):
+            extra_handler = dict(handler)
+            if event == "PreCompact":
+                extra_handler.pop("additionalContextLimit", None)
+            result["hooks"][event] = [{"hooks": [extra_handler]}]
+    return result
+
+
+def read_settings(path):
+    # Preserve unrelated settings, but never rewrite malformed settings.
+    if not path.exists() and not path.is_symlink():
+        return {}
+    data = json.loads(bounded(path, 1024 * 1024))
+    if not isinstance(data, dict) or not isinstance(data.get("hooks", {}), dict):
+        raise ValueError("settings and hooks must be JSON objects")
+    for event in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit"):
+        groups = data.get("hooks", {}).get(event, [])
+        if not isinstance(groups, list):
+            raise ValueError(f"{event} must be an array")
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                raise ValueError(f"each {event} group must contain a hooks array")
+            if any(not isinstance(handler, dict) for handler in group["hooks"]):
+                raise ValueError("hook handlers must be objects")
+    return data
+
+
+def owned(handler, harness):
+    command = handler.get("command")
+    return (handler.get("type") == "command" and isinstance(command, str)
+            and command.endswith(marker(harness)))
+
+
+def configure_hooks(args):
+    path = settings_path(args.harness, args.settings)
+    with locked(path.with_name(path.name + ".context-injector.lock")):
+        data = read_settings(path)
+        before = json.dumps(data, sort_keys=True)
+        hooks = data.get("hooks", {})
+        hooks = dict(hooks)
+        for event in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit"):
+            groups = []
+            for group in hooks.get(event, []):
+                handlers = [item for item in group["hooks"] if not owned(item, args.harness)]
+                if len(handlers) == len(group["hooks"]):
+                    groups.append(group)
+                elif handlers:
+                    groups.append({**group, "hooks": handlers})
+            if groups:
+                hooks[event] = groups
+            else:
+                hooks.pop(event, None)
+        runtime = None
+        if args.command == "install":
+            base = Path(args.runtime_dir).expanduser().absolute() if args.runtime_dir else (
+                Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+                / "starfleet-ai" / "context-injector")
+            runtime = base / f"context_injector_{args.harness}.py"
+            canonical_runtime = base / "pattern_buffer.py"
+            harness_alias = base / f"pattern_buffer_{args.harness}.py"
+            runtime_launcher = base / "pattern-buffer"
+            bin_directory = (Path(args.bin_dir).expanduser().absolute() if args.bin_dir else
+                             (Path.home() / ".local/bin" if not args.runtime_dir else base))
+            launcher = bin_directory / "pattern-buffer"
+            if any(path.is_symlink() for path in
+                   (runtime, canonical_runtime, harness_alias, runtime_launcher, launcher, base, bin_directory)):
+                raise ValueError("runtime path must not be a symlink")
+            source = bounded(Path(__file__).resolve(), 256 * 1024)
+            guide = bounded(guide_source(), FILE_LIMIT)
+            launcher_template = bounded(Path(__file__).resolve().with_name("pattern-buffer.template"), FILE_LIMIT)
+            runtime_binding = "RUNTIME_DIR = None"
+            if launcher_template.count(runtime_binding) != 1:
+                raise ValueError("Pattern Buffer launcher template is malformed")
+            launcher_source = launcher_template.replace(runtime_binding, f"RUNTIME_DIR = {str(base)!r}")
+            for launcher_path in {runtime_launcher, launcher}:
+                if not launcher_path.exists():
+                    continue
+                existing_launcher = bounded(launcher_path, FILE_LIMIT)
+                if "starfleet-pattern-buffer-launcher:v1" not in existing_launcher:
+                    raise ValueError(f"refusing to replace an unowned launcher: {launcher_path}")
+            for event, additions in hook_config(args.harness, runtime, args.checkpoints)["hooks"].items():
+                hooks.setdefault(event, []).extend(additions)
+        if hooks:
+            data["hooks"] = hooks
+        else:
+            data.pop("hooks", None)
+        # Carry the exact prior status-line configuration inside the owned command.
+        # This avoids a second global registry and preserves unrelated display options.
+        if args.harness == "claude":
+            prior = data.get("statusLine")
+            command = prior.get("command", "") if isinstance(prior, dict) else ""
+            status_marker = " # starfleet-context-statusline:v1"
+            if command.endswith(status_marker):
+                argv = shlex.split(command, comments=True)
+                if len(argv) != 5 or argv[2:4] != ["statusline", "--delegate-json"]:
+                    raise ValueError("owned status line is malformed; restore its backup before reinstalling")
+                prior = json.loads(argv[4])
+            if runtime and args.checkpoints:
+                if prior is not None and (not isinstance(prior, dict) or prior.get("type") != "command"
+                                          or not isinstance(prior.get("command"), str)):
+                    raise ValueError("checkpoint status line requires an existing command status line or no status line")
+                data["statusLine"] = {**(prior or {}), "type": "command", "command": shlex.join([
+                    sys.executable, str(runtime), "statusline", "--delegate-json", json.dumps(prior)]) + status_marker}
+            elif command.endswith(status_marker):
+                if prior is None:
+                    data.pop("statusLine", None)
+                else:
+                    data["statusLine"] = prior
+        changed = json.dumps(data, sort_keys=True) != before
+        if changed and path.exists():
+            backup = path.with_name(path.name + f".context-injector-backup-{uuid.uuid4().hex}")
+            atomic(backup, bounded(path, 1024 * 1024))
+            print(f"Backup: {backup}")
+        if runtime is not None:
+            for installed_script in (runtime, canonical_runtime, harness_alias):
+                for name in ("sessions", "reliability"):
+                    atomic(auxiliary_source(name, installed_script), bounded(auxiliary_source(name), 256 * 1024))
+            atomic(enrollment_source(runtime), bounded(enrollment_source(), 256 * 1024))
+            atomic(checkpoint_source(runtime), bounded(checkpoint_source(), 256 * 1024))
+            atomic(guide_source(runtime), guide)
+            atomic(runtime, source)
+            atomic(enrollment_source(canonical_runtime), bounded(enrollment_source(), 256 * 1024))
+            atomic(checkpoint_source(canonical_runtime), bounded(checkpoint_source(), 256 * 1024))
+            atomic(guide_source(canonical_runtime), guide)
+            atomic(canonical_runtime, source)
+            atomic(enrollment_source(harness_alias), bounded(enrollment_source(), 256 * 1024))
+            atomic(checkpoint_source(harness_alias), bounded(checkpoint_source(), 256 * 1024))
+            atomic(guide_source(harness_alias), guide)
+            atomic(harness_alias, source)
+            atomic(base / "pattern-buffer.template", launcher_template)
+            for launcher_path in {runtime_launcher, launcher}:
+                if not launcher_path.exists() or bounded(launcher_path, FILE_LIMIT) != launcher_source:
+                    atomic(launcher_path, launcher_source)
+                os.chmod(launcher_path, 0o755)
+        if changed:
+            atomic(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        print(f"{args.command}: {path} ({'updated' if changed else 'unchanged'})")
+        if runtime:
+            print(f"Runtime: {runtime}")
+            print("Restart or resume the harness; review hook trust where required. Delivery is not verified.")
+        else:
+            print("Worktree context, assignments, backups, and runtime copies were retained.")
+
+
+def sections(path):
+    return sections_text(bounded(path, FILE_LIMIT))
+
+
+def sections_text(text):
+    result = {}
+    current = None
+    for line in text.splitlines():
+        if line.startswith("```") or line.startswith("~~~"):
+            raise ValueError("pilot format does not support fenced code blocks")
+        if line.startswith("# "):
+            current = line[2:].strip()
+            if not result and current != "shared":
+                raise ValueError("context must begin with # shared")
+            if current not in ("shared", *ROLES) or current in result:
+                raise ValueError("use each exact heading once: # shared, # implementer, # orchestrator")
+            result[current] = []
+        elif current is not None:
+            result[current].append(line)
+        elif line.strip():
+            raise ValueError("context must begin with # shared")
+    if "shared" not in result:
+        raise ValueError("missing # shared section")
+    return {key: "\n".join(value).strip() for key, value in result.items()}
+
+
+def state_path(gitdir, harness, session, agent=""):
+    if not isinstance(session, str) or not session or len(session) > 512:
+        raise ValueError("a nonempty session ID is required (maximum 512 characters)")
+    if not isinstance(agent, str) or len(agent) > 512:
+        raise ValueError("invalid agent ID")
+    key = hashlib.sha256(json.dumps([harness, session, agent]).encode()).hexdigest()
+    return gitdir / "context-injector" / "sessions" / f"{key}.json"
+
+
+def resolve_role(root, gitdir, config, harness, session, agent="", forced_role=None):
+    role = forced_role
+    origin = "preview override" if role else "unassigned"
+    saved = {}
+    enrolled = session_binding(root, gitdir, harness, session, agent)
+    if enrolled is not None:
+        if enrolled.state != "active":
+            raise RequiredContextFailure("This enrollment binding is " + enrolled.state,
+                                         enrolled.path, enrolled.enrollment_id)
+        return forced_role or enrolled.role, "session enrollment", {"enrollment_id": enrolled.enrollment_id,
+                                                     "context_file": str(enrolled.path)}
+    path = state_path(gitdir, harness, session, agent)
+    if not role and path.exists():
+        saved = json.loads(bounded(path, FILE_LIMIT))
+        if not isinstance(saved, dict):
+            raise ValueError("invalid session registration")
+        role = saved.get("role")
+        if role not in ROLES or saved.get("root") != str(root):
+            raise ValueError("invalid session registration")
+        origin = "session assignment"
+    # Children never inherit the worktree's primary-session default.
+    if not role and not agent:
+        role = config.get("default_role")
+        if role:
+            origin = "worktree default"
+    return role, origin, saved
+
+
+def task_path(gitdir, task_id):
+    if not isinstance(task_id, str) or len(task_id) != 32 or any(
+            character not in "0123456789abcdef" for character in task_id):
+        raise ValueError("invalid task ID")
+    return gitdir / "context-injector/tasks" / task_id / "task.json"
+
+
+def read_task(root, gitdir, task_id):
+    path = task_path(gitdir, task_id)
+    data = json.loads(bounded(path, FILE_LIMIT))
+    if (not isinstance(data, dict) or data.get("root") != str(root)
+            or data.get("gitdir") != str(gitdir)
+            or data.get("harness") not in ("claude", "codex")
+            or data.get("status") not in ("pending", "active", "finished")):
+        raise ValueError("invalid task registration")
+    digest = data.get("brief_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("invalid task brief digest")
+    brief = bounded(path.parent / f"{digest}.txt", TASK_LIMIT)
+    if hashlib.sha256(brief.encode()).hexdigest() != digest:
+        raise ValueError("task brief changed outside update-task")
+    return data, brief
+
+
+def snapshot_brief(path, brief):
+    if not brief.strip():
+        raise ValueError("task brief must not be empty")
+    digest = hashlib.sha256(brief.encode()).hexdigest()
+    snapshot = path.parent / f"{digest}.txt"
+    if not snapshot.exists():
+        atomic(snapshot, brief)
+    return digest
+
+
+def write_dispatch_receipt(path, root, gitdir, task_id):
+    data, _ = read_task(root, gitdir, task_id)
+    receipt = {"version": 1, "task_id": task_id, "owner_worktree": data["owner"]["root"],
+               "worktree": data["root"], "harness": data["harness"],
+               "session_id": data["session_id"], "brief_sha256": data["brief_sha256"],
+               "created_at": data["created_at"], "status": data["status"],
+               "receipt_type": "immutable_dispatch_snapshot",
+               "note": "Immutable snapshot written before launch, not live task state; use task_status_command for current metadata.",
+               "task_status_command": shlex.join([sys.executable, str(Path(__file__).resolve()),
+                                                  "--cwd", str(root), "task-status", "--task-id", task_id])}
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".receipt-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(receipt, handle, indent=2)
+            handle.write("\n")
+        # Publish a complete receipt without replacing any existing file or symlink.
+        os.link(temporary, path)
+    finally:
+        os.unlink(temporary)
+    return receipt
+
+
+def list_owner_tasks(owner_cwd, status=None):
+    owner_root, owner_gitdir = checkout(owner_cwd)
+    config, _ = load(owner_root, owner_gitdir)
+    if config.get("context_owner"):
+        raise ValueError("select the directly initialized owner worktree")
+    owner = {"root": str(owner_root), "gitdir": str(owner_gitdir)}
+    tasks, errors = [], []
+    common = Path(git(owner_root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    linked = common / "worktrees"
+    gitdirs = [common, *sorted(linked.iterdir())] if linked.is_dir() else [common]
+    for gitdir in gitdirs:
+        for path in sorted((gitdir / "context-injector/tasks").glob("*/task.json")):
+            try:
+                # Inspect identity before reading a different lane's brief snapshot.
+                metadata = json.loads(bounded(path, FILE_LIMIT))
+                if not isinstance(metadata, dict):
+                    raise ValueError("invalid task registration")
+                if metadata.get("owner") != owner:
+                    continue
+                root, actual_gitdir = checkout(metadata["root"])
+                if actual_gitdir != gitdir.resolve():
+                    raise ValueError("task worktree identity changed")
+                data, _ = read_task(root, gitdir, path.parent.name)
+                if not isinstance(data.get("created_at"), (int, float)):
+                    raise ValueError("invalid task creation time")
+                if status is None or data["status"] == status:
+                    tasks.append({"task_id": path.parent.name, **data})
+            except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+                errors.append({"gitdir": str(gitdir), "task_id": path.parent.name,
+                               "error": str(error)})
+    tasks.sort(key=lambda task: (task["created_at"], task["task_id"]))
+    return {"owner_worktree": str(owner_root), "tasks": tasks, "errors": errors}
+
+
+def prepare_dispatch(root, gitdir, args):
+    owner_root, owner_gitdir = checkout(args.owner_worktree)
+    owner_config, source = load(owner_root, owner_gitdir)
+    if owner_config.get("context_owner") or not enabled(owner_config):
+        raise ValueError("owner must be a directly initialized, enabled worktree")
+    session_files = owner_root / ".context-injector" / "sessions"
+    kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").lower()
+    parent_harness = "claude" if kind in ("claude", "claudeteams") else "codex" if kind == "codex" else None
+    parent_session = os.environ.get("CLAUDE_CODE_SESSION_ID" if parent_harness == "claude" else "CODEX_THREAD_ID")
+    parent = session_binding(owner_root, owner_gitdir, parent_harness, parent_session) if parent_harness else None
+    if parent is not None or session_files.exists() or session_files.is_symlink():
+        if (parent is None or parent.state != "active" or parent.file_status != "valid" or
+                parent.source_sha256 != hashlib.sha256(bounded(source, FILE_LIMIT).encode()).hexdigest()):
+            raise ValueError("dispatch cannot substitute a worktree default for a session-specific parent mission; "
+                             "use a dedicated --owner-worktree containing the parent's approved standing context")
+    owner = {"root": str(owner_root), "gitdir": str(owner_gitdir)}
+    if owner_root != root:
+        validate_owner(root, owner)
+    content = sections(source)
+    if "implementer" not in content:
+        raise ValueError("owner is missing # implementer")
+    brief = bounded(Path(args.task_file).expanduser().absolute(), TASK_LIMIT)
+    if not brief.strip():
+        raise ValueError("task brief must not be empty")
+    if len((content["shared"] + content["implementer"]).encode()) > LIMIT:
+        raise ValueError("selected owner context is too large")
+    config_path = gitdir / "context-injector/config.json"
+    with locked(config_path.with_suffix(".lock")):
+        if config_path.exists():
+            config, _ = load(root, gitdir)
+            expected_owner = owner if owner_root != root else None
+            if config.get("context_owner") != expected_owner or not enabled(config):
+                raise ValueError("target is disabled or enrolled to another context source")
+        else:
+            config = {"version": 1, "root": str(root), "enabled": True,
+                      "default_role": None, "context_owner": owner}
+            atomic(config_path, json.dumps(config, indent=2))
+        task_id = uuid.uuid4().hex
+        path = task_path(gitdir, task_id)
+        digest = snapshot_brief(path, brief)
+        data = {"root": str(root), "gitdir": str(gitdir), "harness": args.harness,
+                "owner": owner, "created_at": time.time(), "status": "pending",
+                "session_id": None, "brief_sha256": digest}
+        atomic(path, json.dumps(data, indent=2))
+    return task_id
+
+
+def bind_dispatch(root, gitdir, harness, session, task_id):
+    path = task_path(gitdir, task_id)
+    binding = state_path(gitdir, harness, session)
+    with locked(binding.with_suffix(".lock")), locked(path.with_suffix(".lock")):
+        data, _ = read_task(root, gitdir, task_id)
+        if data["harness"] != harness or data["status"] == "finished":
+            raise ValueError("dispatch is finished or belongs to another harness")
+        if data["session_id"] not in (None, session):
+            raise ValueError("dispatch already belongs to another session; inherited tokens cannot enroll children")
+        if data["session_id"] is None and time.time() - data["created_at"] > 600:
+            raise ValueError("unclaimed dispatch expired; prepare a fresh dispatch")
+        if binding.exists():
+            previous = json.loads(bounded(binding, FILE_LIMIT))
+            if not isinstance(previous, dict) or previous.get("task_id") != task_id:
+                raise ValueError("session already has another assignment")
+        data.update(status="active", session_id=session)
+        atomic(path, json.dumps(data, indent=2))
+        atomic(binding, json.dumps({"root": str(root), "role": "implementer", "task_id": task_id}))
+
+
+def dispatch_command(root, args):
+    command = list(args.argv)
+    if command[:1] == ["--"]:
+        command.pop(0)
+    if not command:
+        raise ValueError("dispatch needs a harness command after --")
+    if Path(command[0]).name != args.harness:
+        raise ValueError("dispatch command must directly invoke the selected harness")
+    if args.harness == "codex":
+        if command[1:2] != ["exec"] or command[-1:] != ["-"]:
+            raise ValueError("use codex exec FLAGS -; the task file supplies stdin")
+        if any(value in command[2:] for value in ("resume", "fork", "review", "--worktree", "--ignore-user-config")):
+            raise ValueError("dispatch starts a fresh session in the specified worktree")
+        # Preserve the PATH shim while preventing client/server environment separation.
+        command.insert(1, "--no-daemon")
+    elif not any(flag in command for flag in ("-p", "--print")):
+        raise ValueError("use claude -p FLAGS with its prompt supplied on stdin")
+    elif any(value in command for value in ("--resume", "-r", "--continue", "-c", "--fork-session",
+                                           "--worktree", "-w", "--bare", "--safe-mode")):
+        raise ValueError("dispatch requires a fresh Claude session with hooks enabled")
+    for i, value in enumerate(command):
+        if value == "--input-format" and (i + 1 == len(command) or command[i + 1] != "text"):
+            raise ValueError("dispatch supplies a plain-text task on stdin")
+        if value.startswith("--input-format=") and value != "--input-format=text":
+            raise ValueError("dispatch supplies a plain-text task on stdin")
+        if value in ("-C", "--cd"):
+            if i + 1 >= len(command) or checkout(command[i + 1])[0] != root:
+                raise ValueError("command working directory does not match --cwd")
+            command[i + 1] = str(root)
+        elif value.startswith("--cd="):
+            if checkout(value.split("=", 1)[1])[0] != root:
+                raise ValueError("command working directory does not match --cwd")
+            command[i] = "--cd=" + str(root)
+        elif value.startswith("-C") and value != "-C":
+            raise ValueError("use a separate -C DIR argument so its worktree can be validated")
+    executable = shutil.which(command[0])
+    if not executable:
+        raise ValueError("harness executable not found on PATH")
+    return executable, command
+
+
+def check_dispatch_hook(harness, explicit=None):
+    data = read_settings(settings_path(harness, explicit))
+    handlers = [handler for group in data.get("hooks", {}).get("SessionStart", [])
+                for handler in group["hooks"] if owned(handler, harness)]
+    if len(handlers) != 1:
+        raise ValueError("dispatch requires exactly one installed Pattern Buffer hook")
+    if harness == "codex" and handlers[0].get("additionalContextLimit") != 0:
+        raise ValueError("reinstall the Codex hook to enable bounded, untruncated task replay")
+    argv = shlex.split(handlers[0]["command"], comments=True)
+    if len(argv) != 5 or argv[2:] != ["hook", "--harness", harness]:
+        raise ValueError("installed hook command is not recognized; reinstall")
+    if bounded(Path(argv[1]), 256 * 1024) != bounded(Path(__file__).resolve(), 256 * 1024):
+        raise ValueError("installed hook runtime differs from this CLI; reinstall before dispatch")
+    if bounded(checkpoint_source(argv[1]), 256 * 1024) != bounded(checkpoint_source(), 256 * 1024):
+        raise ValueError("installed checkpoint support differs from this CLI; reinstall before dispatch")
+    if bounded(enrollment_source(argv[1]), 256 * 1024) != bounded(enrollment_source(), 256 * 1024):
+        raise ValueError("installed enrollment support differs from this CLI; reinstall before dispatch")
+
+
+def check_handoff_interpreter(harness, explicit=None):
+    data = read_settings(settings_path(harness, explicit))
+    handlers = [handler for group in data.get("hooks", {}).get("SessionStart", [])
+                for handler in group["hooks"] if owned(handler, harness)]
+    if len(handlers) != 1:
+        raise ValueError("expected exactly one installed Pattern Buffer hook")
+    argv = shlex.split(handlers[0]["command"], comments=True)
+    interpreter = argv[0] if argv else ""
+    executable = shutil.which(interpreter)
+    if not executable or not os.access(executable, os.X_OK):
+        raise ValueError(f"hook interpreter is not available and executable on the current PATH: {interpreter or '(empty)'}")
+    return executable
+
+
+def handoff_report(root, gitdir, config_path, harness, session, explicit_settings=None):
+    registered = config_path.exists()
+    config = None
+    source = root / ".context-injector/context.md"
+    registration_error = None
+    if registered:
+        try:
+            config, source = load(root, gitdir)
+            binding = session_binding(root, gitdir, harness, session)
+            if binding is not None:
+                source = Path(binding.path)
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+            registration_error = str(error)
+    else:
+        registration_error = "No Pattern Buffer registration exists for this worktree."
+
+    checks = {
+        "registration": {
+            "ok": config is not None,
+            "detail": ("Registration is valid." if config is not None else
+                       f"Registration is unavailable: {registration_error}"),
+        },
+    }
+    if config is None:
+        checks["enabled"] = {
+            "ok": False,
+            "detail": "Cannot resolve enabled state without a valid registration.",
+        }
+        resolved_role = {"role": None, "source": None}
+        checks["resolved_role"] = {
+            "ok": False,
+            **resolved_role,
+            "detail": f"Cannot resolve role: {registration_error}",
+        }
+        context_budgets = {
+            role: {"ok": False, "detail": f"Cannot validate context: {registration_error}"}
+            for role in ROLES
+        }
+        checks["context"] = {
+            "ok": False,
+            "detail": f"Context cannot be checked: {registration_error}",
+            "budgets": context_budgets,
+        }
+    else:
+        try:
+            is_enabled = enabled(config)
+            checks["enabled"] = {
+                "ok": is_enabled,
+                "detail": ("Worktree and context owner are enabled." if is_enabled else
+                           "Worktree or its context owner is disabled."),
+            }
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+            checks["enabled"] = {"ok": False, "detail": f"Enabled state is invalid: {error}"}
+
+        try:
+            role, origin, _ = resolve_role(root, gitdir, config, harness, session)
+            resolved_role = {"role": role, "source": origin}
+            checks["resolved_role"] = {
+                "ok": role == "orchestrator",
+                **resolved_role,
+                "detail": (f"Resolved role is orchestrator from {origin}." if role == "orchestrator" else
+                           f"Resolved role is {role or 'unassigned'} from {origin}; expected orchestrator."),
+            }
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+            resolved_role = {"role": None, "source": None}
+            checks["resolved_role"] = {
+                "ok": False,
+                **resolved_role,
+                "detail": f"Cannot resolve role: {error}",
+            }
+
+        context_budgets = {}
+        for role in ROLES:
+            try:
+                text = render(root, harness, session, forced_role=role)
+                used = len(text.encode("utf-8"))
+                context_budgets[role] = {
+                    "ok": True,
+                    "bytes_used": used,
+                    "limit_bytes": LIMIT,
+                    "remaining_bytes": LIMIT - used,
+                    "detail": f"{role} context fits its byte budget.",
+                }
+            except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+                context_budgets[role] = {"ok": False, "detail": str(error)}
+        context_ok = all(result["ok"] for result in context_budgets.values())
+        context_errors = [f"{role}: {result['detail']}" for role, result in context_budgets.items()
+                          if not result["ok"]]
+        checks["context"] = {
+            "ok": context_ok,
+            "detail": ("Both role sections are valid and fit their byte budgets." if context_ok else
+                       "Context validation failed: " + "; ".join(context_errors)),
+            "budgets": context_budgets,
+        }
+
+    settings = settings_path(harness, explicit_settings)
+    try:
+        check_dispatch_hook(harness, explicit_settings)
+        check_handoff_interpreter(harness, explicit_settings)
+        checks["hook_runtime"] = {
+            "ok": True,
+            "detail": "One owned hook matches this CLI, and its interpreter is executable on the current PATH.",
+        }
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+        checks["hook_runtime"] = {"ok": False, "detail": f"Local hook/runtime preflight failed: {error}"}
+
+    configuration_ready = all(check["ok"] for check in checks.values())
+    delivery_note = (
+        "Model reception is not recorded by Pattern Buffer; legacy delivery_verified=false does not mean reception failed."
+    )
+    return {
+        "target_worktree": str(root),
+        "harness": harness,
+        "session": session,
+        "registered": registered,
+        "resolved_role": resolved_role,
+        "settings_file": str(settings),
+        "checks": checks,
+        "configuration_ready": configuration_ready,
+        "delivery_state": "not_tracked",
+        "delivery_note": delivery_note,
+        "notes": [
+            "The actual harness cwd must match target_worktree.",
+            "Actual model reception is still a manual observation; this command cannot probe it.",
+            "Hook trust and runtime delivery remain unverified.",
+            "This check is read-only and does not enroll, assign, install, repair, or dispatch.",
+        ],
+    }
+
+
+def render(cwd, harness, session, agent="", forced_role=None):
+    root, gitdir = checkout(cwd)
+    config, source = load(root, gitdir)
+    enrolled = session_binding(root, gitdir, harness, session, agent)
+    if enrolled is not None:
+        if enrolled.state != "active":
+            raise RequiredContextFailure("This enrollment binding is " + enrolled.state,
+                                         enrolled.path, enrolled.enrollment_id)
+        source = Path(enrolled.path)
+    role, origin, saved = resolve_role(root, gitdir, config, harness, session, agent, forced_role)
+    try:
+        raw = bounded(source, FILE_LIMIT)
+        if enrolled is not None and (enrolled.file_status != "valid" or
+                hashlib.sha256(raw.encode()).hexdigest() != enrolled.source_sha256):
+            raise ValueError("registered context file is missing, unsafe, or changed outside reviewed publication")
+        content = sections_text(raw)
+        text = render_standing(root, source, harness, session, agent, role, origin, content)
+    except (OSError, ValueError, UnicodeError) as error:
+        if enrolled is not None:
+            raise RequiredContextFailure(str(error), source, enrolled.enrollment_id) from error
+        raise
+    if saved.get("task_id"):
+        if role != "implementer" or agent:
+            raise ValueError("task bindings require a primary implementer session")
+        task_id = saved["task_id"]
+        data, brief = read_task(root, gitdir, task_id)
+        expected_owner = config.get("context_owner") or {"root": str(root), "gitdir": str(gitdir)}
+        if data["owner"] != expected_owner or data["session_id"] != session or data["harness"] != harness:
+            raise ValueError("task/session/context-owner binding changed")
+        if data["status"] == "finished":
+            text += f"\n\nTask {task_id} is finished. No task is restored; await a new assignment."
+        else:
+            text += (f"\n\n# Active task {task_id}\nTask brief SHA-256: {data['brief_sha256']}\n"
+                     "Repeat of the dispatched assignment, subject to later user direction; this does not reset progress.\n\n" + brief)
+    if len(text.encode()) > INJECTION_LIMIT:
+        raise ValueError("combined reminder and task exceed the 24 KiB injection limit")
+    return text
+
+
+def render_standing(root, source, harness, session, agent, role, origin, content):
+    if role and role not in content:
+        raise ValueError(f"missing section for assigned role: {role}")
+    selected = content["shared"]
+    if role:
+        selected += "\n\n" + content[role]
+    text = (f"pattern-buffer | role: {role or 'unassigned'} | source: {origin}\n"
+            f"Session: {harness}/{session}" + (f" | agent: {agent}" if agent else "") + "\n"
+            f"Worktree: {root}\nContext file: {source}\n"
+            "These reminders do not expand authorization. Follow current user direction.\n")
+    if not role:
+        text += "Role is unassigned; only shared context is included.\n"
+    text += "\n" + selected
+    if len(text.encode("utf-8")) > LIMIT:
+        raise ValueError(f"{role or 'unassigned'} context uses {len(text.encode('utf-8'))} / {LIMIT} bytes "
+                         f"({len(text.encode('utf-8')) - LIMIT} over); shorten the file")
+    return text
+
+
+def context_validator(root, harness, session):
+    def validate(text, destination, role):
+        if len(text.encode()) > FILE_LIMIT:
+            raise ValueError(f"standing context source exceeds {FILE_LIMIT} bytes")
+        content = sections_text(text)
+        for selected in ROLES:
+            render_standing(root, destination, harness, session, "", selected,
+                            "session enrollment", content)
+        return True
+    return validate
+
+
+def ensure_session_ignore(root, gitdir):
+    relative = ".context-injector/sessions"
+    if git(root, "ls-files", "--", relative):
+        raise ValueError("session context directory is tracked; move tracked files before enrolling")
+    common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    exclude = common / "info" / "exclude"
+    lock = exclude.with_name("exclude.context-injector.lock")
+    helper = checkpoints()
+    helper._ensure_directory_chain(exclude.parent)
+    helper._check_path(exclude, missing_ok=True)
+    helper._check_path(lock, missing_ok=True)
+    with locked(lock):
+        existing = bounded(exclude, 1024 * 1024) if exclude.exists() else ""
+        rule = "/.context-injector/sessions/"
+        if rule not in existing.splitlines():
+            atomic(exclude, existing + ("" if not existing or existing.endswith("\n") else "\n") + rule + "\n")
+
+
+def binding_report(binding):
+    return asdict(binding) if binding is not None else None
+
+
+def require_own_session(harness, session):
+    variable = "CLAUDE_CODE_SESSION_ID" if harness == "claude" else "CODEX_THREAD_ID"
+    if os.environ.get(variable, "").lower() != session.lower():
+        raise ValueError("Run this ownership operation from the exact outgoing or incoming native session")
+    kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").lower()
+    if kind not in ({"claude", "claudeteams"} if harness == "claude" else {"codex"}):
+        raise ValueError("Native caller harness is unavailable or does not match")
+
+
+def clear_owned_idle_timers(root, helper):
+    """Reconcile only this native owner's Pattern Buffer idle timers, including orphaned receipts."""
+    launcher = Path.home() / ".local/bin/hailing-frequencies"
+    command = [str(launcher), "temporal", "list"]
+    code, output, timeout, oversized = helper._bounded_attention_process(command, b"", output_limit=256 * 1024)
+    if code or timeout or oversized:
+        raise ValueError("cannot confirm outgoing idle timers; inspect temporal-beacon list from this exact owner")
+    report = json.loads(output)
+    if not isinstance(report, dict) or not isinstance(report.get("timers"), list):
+        raise ValueError("outgoing timer listing was not confirmed")
+    for timer in report["timers"]:
+        if (timer.get("replacement_key") != "pattern-buffer-checkpoint-idle" or
+                timer.get("canonical_worktree") != str(root) or timer.get("status") != "active"):
+            continue
+        code, output, timeout, oversized = helper._bounded_attention_process(
+            [str(launcher), "temporal", "cancel", timer["id"]], b"")
+        if code or timeout or oversized or json.loads(output).get("status") not in ("canceled", "completed", "expired"):
+            raise ValueError("outgoing idle-timer cancellation remains unresolved; no ownership transfer was made")
+
+
+def session_command(root, gitdir, args):
+    store = auxiliary("sessions")
+    load(root, gitdir)
+    if args.command == "enrollment-status":
+        return binding_report(store.status(root, gitdir, args.harness, args.session))
+    if args.command in ("session-enroll", "assign"):
+        if getattr(args, "agent", ""):
+            raise ValueError("session context enrollment requires a primary session")
+        old_path = state_path(gitdir, args.harness, args.session)
+        if old_path.exists() and json.loads(bounded(old_path, FILE_LIMIT)).get("task_id"):
+            raise ValueError("a dispatched task cannot be replaced by a session enrollment")
+        ensure_session_ignore(root, gitdir)
+        binding = store.enroll(root, gitdir, args.harness, args.session,
+                               args.context_file, args.role, context_validator(root, args.harness, args.session),
+                               reviewed_update=args.reviewed_update, evidence=args.evidence)
+    elif args.command == "enrollment-release":
+        require_own_session(args.harness, args.session)
+        previous = store.lookup(root, gitdir, args.harness, args.session)
+        if previous is None or previous.enrollment_id != args.enrollment_id:
+            raise ValueError("outgoing enrollment does not match this exact session")
+        helper = checkpoints()
+        state_path_ = helper._state_path(gitdir, args.harness, args.session)
+        if state_path_.exists() and previous.state == "active":
+            from types import SimpleNamespace
+            _, prior = helper._load_state(sys.modules[__name__], root, gitdir, args.harness, args.session)
+            result = helper.handle_cli(sys.modules[__name__], root, gitdir, SimpleNamespace(
+                command="checkpoint-config", harness=args.harness, session=args.session,
+                reminders="off", enabled="off", idle_warning_minutes=0 if args.harness == "claude" else None,
+                compact_at=None, lead_points=None))
+            timer = result.get("idle_timer") or {}
+            if timer.get("status") in ("armed", "uncertain", "cancel_unconfirmed"):
+                raise ValueError("outgoing checkpoint disabled, but idle-timer cancellation is unresolved; preserve its identity")
+            if args.harness == "claude" and (prior.get("idle_warning_minutes") or prior.get("idle_timer")):
+                clear_owned_idle_timers(root, helper)
+        binding = store.release(root, gitdir, args.enrollment_id, args.harness, args.session,
+                                args.next_harness, args.next_session, args.evidence, timers_safe=True)
+    elif args.command == "enrollment-adopt":
+        require_own_session(args.harness, args.session)
+        helper = checkpoints()
+        # Review is explicit; do not silently adopt an old owner's checkpoint state or authority.
+        if args.role == "orchestrator":
+            if not args.checkpoint_file:
+                raise ValueError("orchestrator adoption requires a fresh reviewed --checkpoint-file")
+            text = helper._note_body(bounded(Path(args.checkpoint_file).expanduser().absolute(), helper.NOTE_LIMIT))
+            helper._validate_note(text)
+        ensure_session_ignore(root, gitdir)
+        binding = store.adopt(root, gitdir, args.enrollment_id, args.harness, args.session,
+                              args.context_file, args.role, args.evidence,
+                              context_validator(root, args.harness, args.session))
+        # Successor checkpoints are initialized through their normal exact-owner enrollment,
+        # not by copying the predecessor's private metadata or timers.
+        record_event(root, "enrollment." + args.command, args.harness, args.session,
+                     binding.enrollment_id, binding.state)
+        return {"enrollment": binding_report(binding), "reviewed_checkpoint_file": args.checkpoint_file,
+                "checkpoint_setup_required": args.role == "orchestrator",
+                "next_command": (shlex.join(["pattern-buffer", "--cwd", str(root), "checkpoint-enroll",
+                    "--harness", args.harness, "--session", args.session, "--file", args.checkpoint_file])
+                    if args.role == "orchestrator" else shlex.join(["pattern-buffer", "--cwd", str(root),
+                        "preview", "--harness", args.harness, "--session", args.session])),
+                "authority_note": "Adoption preserves existing authority only; reception is unverified."}
+    record_event(root, "enrollment." + args.command, args.harness, args.session,
+                 binding.enrollment_id, binding.state)
+    return binding_report(binding)
+
+
+def required_context_alarm(root, gitdir, harness, session, error):
+    message = ("STOP: This exact session has no active, valid standing-context binding. "
+               "Pause product work and all other substantive work. Preserve running jobs, human holds, and evidence. "
+               "Do not use memory, another session's file, the worktree default, or inferred authority.\n"
+               "Use enrollment-status for this exact harness and session to diagnose the binding. "
+               "You may perform only already-authorized supported enrollment recovery needed to restore this exact binding. "
+               "If status confirms this session is the named pending successor of an approved release, use enrollment-adopt "
+               "with that existing enrollment ID, the already-reviewed successor context, and the release evidence. "
+               "Then follow any required fresh checkpoint setup command and validate the binding. "
+               "For an active binding with a changed or invalid file, use session-enroll --reviewed-update only with an "
+               "already user-approved source and evidence. These steps restore the binding only. Do no product work "
+               "until validation succeeds, and do not create a new mission or authority.\n"
+               "For any unexpected missing or invalid state, missing approval or reviewed input, or failed recovery, "
+               "notify the context owner through the configured contact workflow.\n"
+               f"Session: {harness}/{session}\nExpected file: {error.path}\nFailure: {str(error)[:512]}")
+    key = hashlib.sha256(json.dumps([harness, session]).encode()).hexdigest()
+    path = gitdir / "context-injector" / "context-alarms" / (key + ".json")
+    event_key = None
+    try:
+        checkpoints()._ensure_directory_chain(path.parent)
+        checkpoints()._check_path(path, missing_ok=True)
+        checkpoints()._check_path(path.with_suffix(".lock"), missing_ok=True)
+        with locked(path.with_suffix(".lock")):
+            saved = json.loads(bounded(path, FILE_LIMIT)) if path.exists() else {}
+            if not saved.get("active"):
+                event_key = str(uuid.uuid4())
+                # Durable intent precedes external submission; an interrupted attempt is never replayed.
+                atomic(path, json.dumps({"active": True, "event_key": event_key,
+                                         "outcome": "pending", "expected_file": str(error.path)}))
+                record_event(root, "context.missing_alarm", harness, session, error.enrollment_id,
+                             "emitted", event_key, {"error_code": "required_context_unavailable"})
+                result = checkpoints()._attention_once(harness, session, event_key, message)
+                atomic(path, json.dumps({"active": True, "event_key": event_key,
+                                         "outcome": result, "expected_file": str(error.path)}))
+                record_event(root, "delivery." + {
+                    "submitted": "submitted", "held": "held", "uncertain": "uncertain"
+                }.get(result.get("outcome"), "refused"), harness, session, error.enrollment_id,
+                             result.get("outcome"), event_key)
+    except Exception as alarm_error:
+        # No durable intent means no stronger attempt. The hook alarm still reaches stdout.
+        print("pattern-buffer context alarm attention unavailable: " + type(alarm_error).__name__, file=sys.stderr)
+    return message
+
+
+def check_required_context(root, gitdir, harness, session, agent=""):
+    if agent or not session:
+        return None
+    try:
+        binding = session_binding(root, gitdir, harness, session)
+        if binding is None:
+            return None
+        render(root, harness, session)
+    except (OSError, ValueError, UnicodeError) as error:
+        if not isinstance(error, RequiredContextFailure):
+            error = RequiredContextFailure(str(error), root / ".context-injector" / "sessions")
+        return required_context_alarm(root, gitdir, harness, session, error)
+    key = hashlib.sha256(json.dumps([harness, session]).encode()).hexdigest()
+    path = gitdir / "context-injector" / "context-alarms" / (key + ".json")
+    if path.exists():
+        try:
+            with locked(path.with_suffix(".lock")):
+                previous = json.loads(bounded(path, FILE_LIMIT))
+                if previous.get("active"):
+                    atomic(path, json.dumps({**previous, "active": False}))
+                    record_event(root, "context.recovered", harness, session, binding.enrollment_id,
+                                 "validated", previous.get("event_key"))
+        except (OSError, ValueError):
+            print("pattern-buffer could not record context-alarm recovery", file=sys.stderr)
+    return None
+
+
+def hook(harness):
+    raw = sys.stdin.buffer.read(HOOK_INPUT_LIMIT + 1)
+    if len(raw) > HOOK_INPUT_LIMIT:
+        raise ValueError("hook input too large")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("hook input must be an object")
+    event = payload.get("hook_event_name")
+    if event not in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit"):
+        return
+    if event == "SessionStart" and payload.get("source") not in ("startup", "resume", "compact", "fork", "clear"):
+        return
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        raise ValueError("hook cwd must be an absolute path")
+    try:
+        root, gitdir = checkout(cwd)
+    except ValueError:
+        if event != "SessionStart":
+            return  # Standard pressure hooks are inert outside Git worktrees too.
+        raise
+    if not (gitdir / "context-injector" / "config.json").exists():
+        return  # This checkout has not opted in.
+    config, _ = load(root, gitdir)
+    if enabled(config):
+        alarm = check_required_context(root, gitdir, harness, payload.get("session_id"),
+                                       payload.get("agent_id") or "")
+        if alarm:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
+                                                       "additionalContext": alarm}}, ensure_ascii=False), flush=True)
+            return
+    if event != "SessionStart":
+        extra = checkpoint_event(root, gitdir, harness, payload)
+        if extra:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
+                                                      "additionalContext": extra}}, ensure_ascii=False))
+        return
+    token = os.environ.get(DISPATCH_ENV)
+    binding = state_path(gitdir, harness, payload.get("session_id"), payload.get("agent_id") or "")
+    saved = json.loads(bounded(binding, FILE_LIMIT)) if binding.exists() else {}
+    dispatched = bool(token or isinstance(saved, dict) and saved.get("task_id"))
+    try:
+        config, _ = load(root, gitdir)
+        if not enabled(config):
+            return
+        if token and payload.get("source") == "startup":
+            if payload.get("agent_id"):
+                raise ValueError("dispatch cannot enroll a nested agent")
+            bind_dispatch(root, gitdir, harness, payload.get("session_id"), token)
+        text = render(root, harness, payload.get("session_id"), payload.get("agent_id") or "")
+        extra = checkpoint_event(root, gitdir, harness, payload)
+        if extra:
+            text += "\n\n" + extra
+        if len(text.encode()) > INJECTION_LIMIT:
+            raise ValueError("combined reminder, checkpoint pointer and task exceed the 24 KiB injection limit")
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+        record_event(root, "standing.injection_failed", harness, payload.get("session_id"),
+                     result="failed", details={"error_code": type(error).__name__})
+        if dispatched:
+            raise DispatchFailure(str(error)) from error
+        raise
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                              "additionalContext": text}}, ensure_ascii=False), flush=True)
+    binding = session_binding(root, gitdir, harness, payload.get("session_id"), payload.get("agent_id") or "")
+    record_event(root, "standing.injection_emitted", harness, payload.get("session_id"),
+                 binding.enrollment_id if binding else None, "emitted", details={
+                     "trigger": payload.get("source"), "bytes": len(text.encode()),
+                     "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                     "source": "session" if binding else "default"})
+
+
+def checkpoint_event(root, gitdir, harness, payload):
+    if not (gitdir / "context-injector/checkpoints").exists():
+        return ""
+    try:
+        return checkpoints().event(sys.modules[__name__], root, gitdir, harness, payload)
+    except (OSError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError) as error:
+        # Checkpoint failure must not suppress the standing reminder or task replay.
+        print(f"pattern-buffer checkpoint: {error}", file=sys.stderr)
+        if payload.get("hook_event_name") == "SessionStart":
+            return "Checkpoint unavailable. Reconstruct current state from live evidence; preserve existing jobs and human holds."
+        return ""
+
+
+def statusline(delegate_json):
+    raw = sys.stdin.buffer.read(1024 * 1024 + 1)
+    payload = {}
+    try:
+        payload = json.loads(raw) if len(raw) <= 1024 * 1024 else {}
+        if isinstance(payload, dict):
+            checkpoints().statusline(sys.modules[__name__], "claude", payload)
+    except (OSError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError):
+        pass  # The original display must keep working when telemetry is unavailable.
+    delegate = json.loads(delegate_json)
+    if delegate:
+        return subprocess.run(delegate["command"], shell=True, input=raw).returncode
+    used = payload.get("context_window", {}).get("used_percentage") if isinstance(payload, dict) else None
+    print(f"Context: {used}%" if used is not None else "Context: unavailable")
+    return 0
+
+
+def compaction_settings(args):
+    if not 5 < args.compact_at <= 100:
+        raise ValueError("Claude auto-compaction percentage must be greater than 5 and at most 100")
+    path = settings_path("claude", args.settings)
+    with locked(path.with_name(path.name + ".context-injector.lock")):
+        data = read_settings(path)
+        env = data.get("env", {})
+        if not isinstance(env, dict):
+            raise ValueError("Claude settings env must be an object")
+        if path.exists():
+            atomic(path.with_name(path.name + f".context-injector-backup-{uuid.uuid4().hex}"), bounded(path, 1024 * 1024))
+        data["env"] = {**env, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": str(args.compact_at)}
+        atomic(path, json.dumps(data, indent=2) + "\n")
+    print(json.dumps({"settings_file": str(path), "saved_auto_compact_percent": args.compact_at,
+                      "default_reminder_percent": args.compact_at - 5,
+                      "note": "Saved configuration only. Existing sessions may retain earlier environment values; restart/resume and verify the actual session before relying on it. No session was changed or restarted."}, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cwd", default=os.getcwd(), help="worktree or a directory inside it")
+    sub = parser.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init", help="opt this worktree in; never installs hooks")
+    init.add_argument("--default-role", choices=ROLES)
+    init.add_argument("--repo-profile-file",
+                      help="select an external JSON profile bound to this checkout's exact origin")
+    cmd = sub.add_parser("dispatch", help="enroll an implementer worktree and launch its task on stdin")
+    cmd.add_argument("--owner-worktree", required=True)
+    cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+    cmd.add_argument("--task-file", required=True)
+    cmd.add_argument("--settings", help="settings JSON used for hook-runtime preflight")
+    cmd.add_argument("--prepare-only", action="store_true", help="create a dispatch ticket without launching a process")
+    cmd.add_argument("--receipt-file", help="write an exclusive immutable JSON dispatch snapshot with a live task lookup command")
+    cmd.add_argument("argv", nargs=argparse.REMAINDER)
+    cmd = sub.add_parser("tasks", help="list this owner's tasks across registered Git worktrees; not proof of success")
+    cmd.add_argument("--owner-worktree", help="directly initialized owner; defaults to --cwd")
+    cmd.add_argument("--status", choices=("pending", "active", "finished"))
+    for name in ("update-task", "finish-task", "task-status"):
+        cmd = sub.add_parser(name)
+        cmd.add_argument("--task-id", required=True)
+        if name == "update-task":
+            cmd.add_argument("--task-file", required=True)
+    for name in ("enable", "disable"):
+        sub.add_parser(name, help=f"{name} future injections for this worktree")
+    status = sub.add_parser("status", help="report registration, enabled state, and optional hook presence")
+    status.add_argument("--harness", choices=("claude", "codex"))
+    status.add_argument("--session", help="report the exact session's selected standing context")
+    status.add_argument("--settings", help="inspect an explicit settings JSON file")
+    handoff = sub.add_parser("handoff-check", help="read-only local configuration check for an orchestrator successor")
+    handoff.add_argument("--harness", choices=("claude", "codex"), required=True)
+    handoff.add_argument("--session", required=True)
+    handoff.add_argument("--settings", help="inspect an explicit settings JSON file")
+    for name in ("install", "uninstall"):
+        cmd = sub.add_parser(name, help=f"{name} only this app's owned user-level hook")
+        cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+        cmd.add_argument("--settings", help="override the user-level settings JSON path")
+        if name == "install":
+            cmd.add_argument("--runtime-dir", help="override the stable installed runtime directory")
+            cmd.add_argument("--bin-dir", help="install the pattern-buffer launcher here; defaults to ~/.local/bin for standard installs and the runtime directory for custom --runtime-dir installs")
+            mode = cmd.add_mutually_exclusive_group()
+            mode.add_argument("--checkpoints", action="store_true", default=True,
+                              help="include the standard checkpoint hooks (default; does not enroll sessions)")
+            mode.add_argument("--no-checkpoints", action="store_false", dest="checkpoints",
+                              help="explicit recovery-only installation without pressure hooks or Claude telemetry")
+    for name in ("assign", "preview"):
+        cmd = sub.add_parser(name)
+        cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+        cmd.add_argument("--session", required=True)
+        cmd.add_argument("--agent", default="")
+        cmd.add_argument("--role", choices=ROLES, required=name == "assign")
+        if name == "assign":
+            cmd.add_argument("--context-file", help="reviewed input copied to this exact session's private named file")
+            cmd.add_argument("--reviewed-update", action="store_true")
+            cmd.add_argument("--evidence", help="brief reference for the explicit reviewed update")
+    enrollment_help = {
+        "session-enroll": "validate and publish reviewed standing context for one exact session",
+        "enrollment-status": "inspect the exact binding and required file; not proof of model receipt",
+        "enrollment-release": "release from the outgoing native owner to an explicitly named successor",
+        "enrollment-adopt": "adopt from the named native successor using reviewed handoff inputs",
+    }
+    for name, description in enrollment_help.items():
+        cmd = sub.add_parser(name, help=description, description=description)
+        cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+        cmd.add_argument("--session", required=True)
+        if name in ("session-enroll", "enrollment-adopt"):
+            cmd.add_argument("--context-file", "--file", required=True,
+                             help="reviewed standing source; separate from the current-state checkpoint")
+            cmd.add_argument("--role", choices=ROLES, default="orchestrator")
+        if name == "session-enroll":
+            cmd.add_argument("--reviewed-update", action="store_true",
+                             help="replace or restore this owner's approved source; requires --evidence")
+        if name in ("enrollment-release", "enrollment-adopt"):
+            cmd.add_argument("--enrollment-id", required=True)
+            cmd.add_argument("--evidence", required=True, help="existing authority/handoff evidence reference")
+        elif name == "session-enroll":
+            cmd.add_argument("--evidence")
+        if name == "enrollment-release":
+            cmd.add_argument("--next-harness", choices=("claude", "codex"), required=True)
+            cmd.add_argument("--next-session", required=True)
+        if name == "enrollment-adopt":
+            cmd.add_argument("--checkpoint-file", help="fresh reviewed incoming note; required for orchestrators")
+    cmd = sub.add_parser("reliability", help="summarize bounded local lifecycle events, not model comprehension")
+    cmd.add_argument("--since", default="7d", help="report window, for example 7d or 24h (default: 7d)")
+    cmd.add_argument("--json", action="store_true", dest="json_output",
+                     help="print structured bounded evidence, with receipt and coverage limits")
+    cmd = sub.add_parser("reliability-config", help="configure owned telemetry retention and size limits")
+    cmd.add_argument("--retention-days", type=int, help="owned telemetry age limit (default: 30 days)")
+    cmd.add_argument("--max-bytes", type=int, help="per-worktree owned telemetry cap (default: 20971520 bytes)")
+    for name in ("validate", "doctor"):
+        cmd = sub.add_parser(name, help="lint both roles and report byte budgets; not delivery or hook trust")
+        cmd.add_argument("--harness", choices=("claude", "codex"), default="codex")
+        cmd.add_argument("--session", default="validation", help="session identity to include in the budget")
+        cmd.add_argument("--agent", default="")
+    cmd = sub.add_parser("hook")
+    cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+    cmd = sub.add_parser("hook-config", help="print configuration to merge manually")
+    cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+    mode = cmd.add_mutually_exclusive_group()
+    mode.add_argument("--checkpoints", action="store_true", default=True)
+    mode.add_argument("--no-checkpoints", action="store_false", dest="checkpoints")
+    guide = sub.add_parser("guide", help="print the operational guide without reading worktree state")
+    guide.add_argument("--print", action="store_true", dest="print_guide",
+                       help="print the guide (the default when using this command)")
+    cmd = sub.add_parser("checkpoint-enroll", help="self-service briefing, note adoption and hook preparation; no separate human approval")
+    cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+    cmd.add_argument("--session", help="defaults to this harness's inherited native session ID")
+    cmd.add_argument("--compact-at", type=float, help="confirmed percentage when native runtime detection is unavailable")
+    cmd.add_argument("--lead-points", type=float, default=5)
+    cmd.add_argument("--file", help="reviewed private note; omit to show the take-stock briefing without changes")
+    cmd.add_argument("--settings", help="explicit harness settings JSON; defaults to user-level settings")
+    cmd.add_argument("--runtime-dir", help="explicit installed runtime directory")
+    cmd.add_argument("--prepare-restart", action="store_true", help="prepare removal of legacy native hook copies without changing an existing checkpoint")
+    for name in ("checkpoint-init", "checkpoint-config", "checkpoint-save", "checkpoint-status", "checkpoint-read"):
+        cmd = sub.add_parser(name, help="manage a private orchestrator checkpoint; see docs/checkpoints.md")
+        cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+        cmd.add_argument("--session", required=True, help="exact native orchestrator session ID")
+        if name in ("checkpoint-init", "checkpoint-config"):
+            cmd.add_argument("--compact-at", type=float, help="operator-confirmed compaction percentage on this harness's usage scale")
+            cmd.add_argument("--lead-points", type=float, default=5 if name == "checkpoint-init" else None)
+        if name == "checkpoint-init":
+            cmd.add_argument("--path", help="reuse an explicitly owned, durable private checkpoint file")
+        if name == "checkpoint-config":
+            cmd.add_argument("--reminders", choices=("on", "off"))
+            cmd.add_argument("--enabled", choices=("on", "off"))
+            cmd.add_argument("--idle-warning-minutes", type=float,
+                             help="Claude idle warning delay, default 50; 0 disables future arming")
+        if name == "checkpoint-save":
+            cmd.add_argument("--file", required=True, help="reviewed Markdown input; no automatic summarization")
+    cmd = sub.add_parser("statusline", help=argparse.SUPPRESS)
+    cmd.add_argument("--delegate-json", default="null")
+    cmd = sub.add_parser("compaction-settings", help="save Claude's auto-compaction percentage without restarting sessions")
+    cmd.add_argument("--compact-at", required=True, type=float)
+    cmd.add_argument("--settings", help="Claude settings JSON; defaults to user settings")
+    args = parser.parse_args()
+    try:
+        if args.command == "guide":
+            sys.stdout.write(bounded(guide_source(), FILE_LIMIT))
+            return 0
+        if args.command == "hook":
+            hook(args.harness)
+            return 0
+        if args.command == "hook-config":
+            print(json.dumps(hook_config(args.harness, with_checkpoints=args.checkpoints), indent=2))
+            return 0
+        if args.command == "statusline":
+            return statusline(args.delegate_json)
+        if args.command == "compaction-settings":
+            compaction_settings(args)
+            return 0
+        if args.command in ("install", "uninstall"):
+            configure_hooks(args)
+            return 0
+        root, gitdir = checkout(args.cwd)
+        config_path = gitdir / "context-injector" / "config.json"
+        if args.command == "reliability":
+            report = auxiliary("reliability").report(root, since=args.since)
+            if report.get("ok"):
+                report["idle_timer_receipts"] = idle_receipt_report(root, report["since"])
+            if args.json_output or not report.get("ok"):
+                print(json.dumps(report, indent=2, default=str))
+            else:
+                summary = report["summary"]
+                print(f"Pattern Buffer reliability: {root}; since {report['since']}")
+                print("Observed lifecycle events: " + str(summary.get("event_count", 0)))
+                for name, count in sorted(summary.get("by_event", {}).items()):
+                    print(f"  {name}: {count}")
+                print("History coverage: " + json.dumps(report.get("coverage", {}), sort_keys=True))
+                gaps = sorted({item["code"] for item in report.get("unknowns", [])})
+                print("Unknowns: " + (", ".join(gaps) if gaps else "none reported"))
+                idle = report["idle_timer_receipts"]
+                print("Hailing idle receipts: " + json.dumps({key: value for key, value in idle.items()
+                                                             if key != "receipts"}, sort_keys=True))
+                print("Emission and submission do not prove model receipt, note accuracy, or task completion.")
+            return 0 if report.get("ok") else 1
+        elif args.command == "reliability-config":
+            values = {key: value for key, value in {
+                "retention_days": args.retention_days, "max_bytes": args.max_bytes}.items() if value is not None}
+            result = auxiliary("reliability").configure(root, **values)
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("ok") else 1
+        elif args.command.startswith("enrollment-") or args.command == "session-enroll" or (
+                args.command == "assign" and args.context_file):
+            print(json.dumps(session_command(root, gitdir, args), indent=2, default=str))
+        elif args.command == "checkpoint-enroll":
+            print(json.dumps(self_enroll(root, gitdir, args), indent=2))
+        elif args.command.startswith("checkpoint-"):
+            print(json.dumps(checkpoints().handle_cli(sys.modules[__name__], root, gitdir, args), indent=2))
+        elif args.command == "dispatch":
+            receipt = Path(args.receipt_file).expanduser().absolute() if args.receipt_file else None
+            if receipt and (receipt.exists() or receipt.is_symlink()):
+                raise ValueError("receipt file already exists; use a unique path for each dispatch")
+            if not args.prepare_only:
+                executable, command = dispatch_command(root, args)
+                check_dispatch_hook(args.harness, args.settings)
+            task_id = prepare_dispatch(root, gitdir, args)
+            if receipt:
+                saved_receipt = write_dispatch_receipt(receipt, root, gitdir, task_id)
+                print(f"Pattern Buffer receipt {receipt}: immutable dispatch snapshot, not live task state.\n"
+                      f"Current task state: {saved_receipt['task_status_command']}", file=sys.stderr, flush=True)
+            if args.prepare_only:
+                print(json.dumps({"task_id": task_id, "environment": {DISPATCH_ENV: task_id}}))
+            else:
+                _, brief = read_task(root, gitdir, task_id)
+                # Preflight complete context size before the harness can do work.
+                render(root, args.harness, "dispatch-validation", forced_role="implementer")
+                print(f"Pattern Buffer dispatch {task_id}; task retained for explicit update/finish.", file=sys.stderr, flush=True)
+                snapshot = task_path(gitdir, task_id).parent / f"{hashlib.sha256(brief.encode()).hexdigest()}.txt"
+                with snapshot.open("rb") as handle:
+                    os.dup2(handle.fileno(), 0)
+                os.chdir(root)
+                os.execvpe(executable, command, {**os.environ, DISPATCH_ENV: task_id})
+        elif args.command == "tasks":
+            result = list_owner_tasks(args.owner_worktree or root, args.status)
+            print(json.dumps(result, indent=2))
+            return 1 if result["errors"] else 0
+        elif args.command in ("update-task", "finish-task", "task-status"):
+            path = task_path(gitdir, args.task_id)
+            if not path.exists() and not path.is_symlink():
+                raise ValueError(
+                    f"task {args.task_id} was not found in this worktree: {root}. "
+                    "Use the receipt's worktree or run tasks from the registered owner to find the child worktree, "
+                    f"then retry your existing command with --cwd CHILD_WORKTREE before {args.command}, keeping its other arguments")
+            with locked(path.with_suffix(".lock")):
+                data, _ = read_task(root, gitdir, args.task_id)
+                if args.command == "update-task":
+                    if data["status"] == "finished":
+                        raise ValueError("finished tasks cannot be revived; dispatch a new assignment")
+                    brief = bounded(Path(args.task_file).expanduser().absolute(), TASK_LIMIT)
+                    data["brief_sha256"] = snapshot_brief(path, brief)
+                    data["updated_at"] = time.time()
+                elif args.command == "finish-task":
+                    data["status"] = "finished"
+                    data["finished_at"] = time.time()
+                if args.command != "task-status":
+                    atomic(path, json.dumps(data, indent=2))
+            result = {"task_id": args.task_id, **data}
+            if args.command == "update-task":
+                result.update(
+                    delivery_state="pending_recovery",
+                    delivery_note="Saved for the next eligible recovery hook; this does not interrupt current work or confirm model reception.",
+                    urgent_change_guide="apps/pattern-buffer/docs/implementer-dispatch.md#urgent-scope-changes")
+            print(json.dumps(result, indent=2))
+        elif args.command == "status":
+            if args.settings and not args.harness:
+                raise ValueError("--settings requires --harness")
+            registered = config_path.exists()
+            config, source = load(root, gitdir) if registered else ({}, root / ".context-injector/context.md")
+            result = {"worktree": str(root), "registered": registered,
+                      "enabled": registered and enabled(config),
+                      "default_role": config.get("default_role"), "context_file": str(source),
+                      "context_owner": config.get("context_owner"),
+                      "repo_profile": resolved_repo_profile(root, config) if registered else None,
+                      "delivery_state": "not_tracked",
+                      "delivery_note": (
+                          "Model reception is not recorded by Pattern Buffer; "
+                          "legacy delivery_verified=false does not mean reception failed."),
+                      "delivery_verified": False}
+            if args.harness:
+                settings = settings_path(args.harness, args.settings)
+                data = read_settings(settings)
+                result.update(settings_file=str(settings), owned_hook_handlers=sum(
+                    owned(handler, args.harness)
+                    for group in data.get("hooks", {}).get("SessionStart", [])
+                    for handler in group["hooks"]))
+            if args.session:
+                if not args.harness:
+                    raise ValueError("--session requires --harness")
+                binding = session_binding(root, gitdir, args.harness, args.session)
+                result.update(session=args.session, enrollment=binding_report(binding),
+                              context_file=str(binding.path) if binding else str(source),
+                              context_required=binding is not None)
+            print(json.dumps(result, indent=2))
+        elif args.command == "handoff-check":
+            result = handoff_report(root, gitdir, config_path, args.harness, args.session, args.settings)
+            print(json.dumps(result, indent=2))
+            return 0 if result["configuration_ready"] else 1
+        elif args.command in ("enable", "disable"):
+            with locked(config_path.with_suffix(".lock")):
+                config, source = load(root, gitdir)
+                if args.command == "enable":
+                    # Reject invalid reminders before opting back in.
+                    sections(source)
+                    render(root, "codex", "enable-validation")
+                config["enabled"] = args.command == "enable"
+                atomic(config_path, json.dumps(config, indent=2))
+            print(f"{args.command}d: {root}. Applies to future hook events only.")
+        elif args.command == "init":
+            folder = root / ".context-injector"
+            if folder.is_symlink():
+                raise ValueError("context directory must not be a symlink")
+            source = folder / "context.md"
+            previous = load(root, gitdir)[0] if config_path.exists() else {}
+            if previous.get("context_owner"):
+                raise ValueError("dispatch-enrolled worktree uses its owner's context; do not initialize a local copy")
+            requested_profile = None
+            if args.repo_profile_file is not None:
+                profile, requested_profile = read_repo_profile(args.repo_profile_file)
+                verify_repo_profile_origin(root, profile)
+            with locked(config_path.with_suffix(".lock")):
+                previous = load(root, gitdir)[0] if config_path.exists() else {}
+                if previous.get("context_owner"):
+                    raise ValueError("dispatch-enrolled worktree uses its owner's context; do not initialize a local copy")
+                saved_profile = previous.get("repo_profile")
+                if requested_profile is not None and isinstance(saved_profile, dict) and requested_profile != saved_profile:
+                    raise ValueError("a different repository profile is already registered; existing contexts are not migrated")
+                selected_profile = requested_profile or saved_profile
+                source_existed = source.exists() or source.is_symlink()
+                profile = profile if requested_profile is not None else (
+                    load_registered_profile(root, selected_profile)
+                    if selected_profile is not None and not source_existed else None)
+                if source.is_symlink():
+                    raise ValueError(f"expected a regular, non-symlink file: {source}")
+                if not source.exists():
+                    folder.mkdir(exist_ok=True)
+                    try:
+                        with source.open("x", encoding="utf-8") as handle:
+                            handle.write(compose_template(profile.get("fragment") if profile else None))
+                    except FileExistsError:
+                        source_existed = True
+                sections(source)
+                updated = {**previous, "version": 1, "root": str(root),
+                           "default_role": args.default_role if args.default_role is not None
+                           else previous.get("default_role"),
+                           "enabled": previous.get("enabled", True)}
+                if selected_profile is not None:
+                    updated["repo_profile"] = selected_profile
+                else:
+                    updated.pop("repo_profile", None)
+                atomic(config_path, json.dumps(updated, indent=2))
+            if selected_profile and args.repo_profile_file and source_existed and not saved_profile:
+                print(f"Initialized {root}; existing context preserved. Profile {selected_profile} recorded, but its controls were not applied to existing text. Review and adopt {folder / 'context.md'} explicitly. No hooks installed.")
+            elif isinstance(selected_profile, dict):
+                print(f"Initialized {root}; repository profile: {selected_profile['name']}. Edit {source}. No hooks installed.")
+            elif isinstance(selected_profile, str):
+                print(f"Initialized {root}; legacy repository profile registration retained. Edit {source}. No hooks installed.")
+            else:
+                print(f"Initialized {root}; edit {source}. No hooks installed.")
+        elif args.command == "assign":
+            load(root, gitdir)
+            if session_binding(root, gitdir, args.harness, args.session, args.agent) is not None:
+                raise ValueError("session has isolated standing context; use session-enroll --reviewed-update")
+            path = state_path(gitdir, args.harness, args.session, args.agent)
+            if path.exists():
+                previous = json.loads(bounded(path, FILE_LIMIT))
+                if not isinstance(previous, dict):
+                    raise ValueError("invalid session registration")
+                if previous.get("task_id"):
+                    raise ValueError("session has a dispatched task; use update-task or finish-task instead")
+            # Validate the selected content before replacing an assignment.
+            render(root, args.harness, args.session, args.agent, args.role)
+            path = state_path(gitdir, args.harness, args.session, args.agent)
+            atomic(path, json.dumps({"root": str(root), "role": args.role}))
+            print(f"Assigned {args.harness} session {args.session} to {args.role}.")
+        elif args.command == "preview":
+            print(render(root, args.harness, args.session, args.agent, args.role))
+        else:
+            config, source = load(root, gitdir)
+            enrolled = session_binding(root, gitdir, args.harness, args.session, args.agent)
+            if enrolled is not None:
+                source = Path(enrolled.path)
+            sections(source)
+            failures = []
+            for role in ROLES:
+                try:
+                    text = render(root, args.harness, args.session, args.agent, role)
+                    used = len(text.encode("utf-8"))
+                    print(f"{role}: {used} / {LIMIT} bytes; {LIMIT - used} remaining")
+                    if used >= LIMIT * 0.8:
+                        print(f"WARNING: {role} context is at least 80% of its byte budget; "
+                              "leave room for longer session/worktree headers", file=sys.stderr)
+                except ValueError as error:
+                    failures.append(str(error))
+            if failures:
+                raise ValueError("; ".join(failures))
+            print(f"Context valid: {source}; default role: {config.get('default_role') or 'unassigned'}")
+            if args.command == "doctor":
+                print("Local data checked only. Hook installation, trust, delivery, and subagents are NOT verified.")
+        return 0
+    except (OSError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError) as error:
+        print(f"pattern-buffer: {error}", file=sys.stderr)
+        if args.command == "hook" and (os.environ.get(DISPATCH_ENV) or isinstance(error, DispatchFailure)):
+            print(json.dumps({"continue": False, "stopReason": "Pattern Buffer dispatch failed: " + str(error)}))
+        # Hook failures are advisory. Never block the user's session.
+        return 0 if args.command == "hook" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

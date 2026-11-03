@@ -1,0 +1,42 @@
+{
+  "applicable": true,
+  "revision": "<immutable audited commit SHA>",
+  "skill": "design-fidelity-audit",
+  "design_reference": "<authoritative approved design version and location>",
+  "design": {"path": "design.html", "sha256": "<hash>"},
+  "audit": {"path": "fidelity-audit.md", "sha256": "<hash>"},
+  "coverage": "FULL",
+  "fidelity": "DRIFT",
+  "assessed_scope": "<regions, states, properties and comparable viewports>",
+  "not_assessable": [],
+  "unresolved": [],
+  "authority_map": [{
+    "region_state": "<module and state>",
+    "reference": "<authoritative region or annotation>",
+    "properties_specified": "<properties the reference governs>",
+    "properties_open": "<unspecified properties, or explicit none>"
+  }],
+  "findings": [{
+    "id": "F1",
+    "region_state": "<module and state>",
+    "property": "<one assessed property>",
+    "reference_says": "<what the authoritative property specifies>",
+    "implementation_shows": "<what the rendered implementation shows>",
+    "verdict": "DRIFT",
+    "reference_evidence": {"path": "reference.png", "sha256": "<hash>"},
+    "implementation_evidence": {"path": "implementation.png", "sha256": "<hash>"},
+    "deviation_id": "D1"
+  }],
+  "deviations": [{
+    "id": "D1",
+    "description": "<requested deviation and user impact>",
+    "approval": {
+      "by": "user",
+      "decision": "approved",
+      "channel": "direct-user",
+      "source": "<conversation and message ID>",
+      "quote": "<the user's explicit approval for D1>",
+      "evidence": {"path": "user-approval.txt", "sha256": "<hash>"}
+    }
+  }]
+}

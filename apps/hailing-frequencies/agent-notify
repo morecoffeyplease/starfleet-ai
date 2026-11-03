@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+# agent-notify - let CLI agents (Claude Code, Codex) contact a configured user
+# through a Discord forum channel, one forum post per ask.
+#
+#   agent-notify open  --urgency urgent|normal|fyi --title "..." [--issue N] [--body "..."] [--delivery auto|discord]
+#   agent-notify reply <post> [--body "..."] [--ping] [--agent NAME]
+#   agent-notify wait  <post> [--timeout SECONDS]
+#   agent-notify watch <post> [--max-wait SECONDS] [--queue CODEX_THREAD]
+#   agent-notify listen <post>    (Codex in CMUX; exits 4 if auto-wake is unavailable)
+#   agent-notify close <post> [--body "..."] [--agent NAME]
+#   agent-notify doctor
+#   agent-notify guide --print
+#
+# <post> is the id (or discord.com URL) printed by `open`. Body is read from
+# stdin when --body is omitted and stdin is not a terminal.
+#
+# `open` builds the subject line itself, so --title is only the decision or
+# the reason for the contact:
+#   [Claude] example-repo/feature-branch #42 Formatting differs: which version should ship?
+# The agent kind is detected (Claude, Codex, else Agent; override with --kind),
+# repo and worktree come from git, and --issue N looks the title up with `gh`
+# (pass --issue-title when `gh` cannot see it).
+#
+# Posting goes through the channel webhook, so each message carries the
+# agent's own name. Closing a post and reading replies need the bot token,
+# because a webhook cannot edit tags, archive a post, or read messages.
+#
+# Config lives outside any repo in ~/.config/agent-notify/env (mode 600):
+#   DISCORD_WEBHOOK_URL=...   required
+#   DISCORD_BOT_TOKEN=...     required for open (tag ids), wait, close, doctor
+#   DISCORD_USER_ID=...       optional; defaults to the server owner
+# `doctor` checks all of it and caches tag ids in ~/.config/agent-notify/cache.json.
+set -euo pipefail
+umask 077
+
+if [[ "${1:-}" == "guide" ]]; then
+  if [[ $# -eq 1 || ( $# -eq 2 && "${2:-}" == "--print" ) ]]; then
+    guide_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    cat "$guide_dir/agent-notify-guide.md"
+    exit 0
+  fi
+  echo "agent-notify: usage: agent-notify guide --print" >&2
+  exit 64
+fi
+
+CONF_DIR="${AGENT_NOTIFY_HOME:-$HOME/.config/agent-notify}"
+ENV_FILE="$CONF_DIR/env"
+CACHE="$CONF_DIR/cache.json"
+STATE_DIR="$CONF_DIR/state"
+API="https://discord.com/api/v10"
+UA="DiscordBot (https://github.com/morecoffeyplease/starfleet-ai, 1.0)"
+MAX_BODY=1900
+
+die() { echo "agent-notify: $*" >&2; exit 1; }
+
+[ -f "$ENV_FILE" ] || die "missing $ENV_FILE"
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+[ -n "${DISCORD_WEBHOOK_URL:-}" ] || die "DISCORD_WEBHOOK_URL is not set in $ENV_FILE"
+
+need_bot() {
+  [ -n "${DISCORD_BOT_TOKEN:-}" ] || die "DISCORD_BOT_TOKEN is not set in $ENV_FILE ($1 needs the bot)"
+}
+
+# http METHOD URL [JSON] - prints the response body, fails loudly on non-2xx.
+# Adds bot auth for api URLs; webhook URLs carry their own token.
+http() {
+  local method="$1" url="$2" data="${3:-}" out code
+  local args=(-sS -X "$method" -H "User-Agent: $UA" -w $'\n%{http_code}')
+  case "$url" in "$API"/*) args+=(-H "Authorization: Bot $DISCORD_BOT_TOKEN") ;; esac
+  [ -n "$data" ] && args+=(-H "Content-Type: application/json" --data "$data")
+  out="$(curl "${args[@]}" "$url")" || die "network error calling Discord"
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  case "$code" in
+    2*) printf '%s' "$out" ;;
+    *) die "Discord returned HTTP $code: $(printf '%s' "$out" | jq -r '.message // .' 2>/dev/null | head -c 300)" ;;
+  esac
+}
+
+post_id() {
+  local raw="${1:-}"
+  [ -n "$raw" ] || die "missing <post> id"
+  raw="${raw%/}"; raw="${raw##*/}"
+  [[ "$raw" =~ ^[0-9]+$ ]] || die "not a post id: $1"
+  printf '%s' "$raw"
+}
+
+agent_kind() {
+  if [ -n "${AGENT_NOTIFY_KIND:-}" ]; then printf '%s' "$AGENT_NOTIFY_KIND"
+  elif [ -n "${CLAUDECODE:-}" ]; then printf 'Claude'
+  elif env | grep -q '^CODEX_'; then printf 'Codex'
+  else printf 'Agent'; fi
+}
+
+# where_label - "repo", or "repo/worktree" when the session is in a linked
+# worktree. Outside git it is the current directory name.
+where_label() {
+  local top common repo
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || { basename "$PWD"; return; }
+  common="$(cd "$top" && cd "$(git rev-parse --git-common-dir)" && pwd)"
+  repo="$(basename "$(dirname "$common")")"
+  if [ "$(basename "$top")" = "$repo" ]; then printf '%s' "$repo"
+  else printf '%s/%s' "$repo" "$(basename "$top")"; fi
+}
+
+agent_name() {
+  if [ -n "${AGENT_NOTIFY_AGENT:-}" ]; then printf '%s' "$AGENT_NOTIFY_AGENT"; return; fi
+  printf '%s - %s' "$(agent_kind)" "$(where_label)" | cut -c1-80
+}
+
+# subject KIND WHERE ISSUE ISSUE_TITLE TITLE
+#   [Claude] example-repo/feature-branch #42 Formatting differs: which version should ship?
+# Discord caps a post title at 100 characters, so the issue title is the part
+# that gets shortened or dropped; the full one is always in the body header.
+subject() {
+  local kind="$1" where="$2" issue="$3" ititle="$4" title="$5" prefix room
+  prefix="[$kind] $where"
+  if [ -n "$issue" ]; then
+    prefix="$prefix #$issue"
+    room=$(( 100 - ${#prefix} - ${#title} - 3 ))
+    if [ -n "$ititle" ] && [ "$room" -ge 12 ]; then
+      [ "${#ititle}" -le "$room" ] || ititle="${ititle:0:$((room - 3))}..."
+      prefix="$prefix $ititle"
+    fi
+  fi
+  printf '%s: %s' "$prefix" "$title" | cut -c1-100
+}
+
+read_body() {
+  local body="$1" limit="${2:-$MAX_BODY}"
+  if [ -z "$body" ] && [ ! -t 0 ]; then body="$(cat)"; fi
+  # A body passed as --body "a\n\nb" arrives with literal backslash-n and no
+  # real newlines; Discord would show the \n. Expand it and say so.
+  if [[ "$body" == *'\n'* && "$body" != *$'\n'* ]]; then
+    local nl=$'\n'
+    body="${body//\\n/$nl}"
+    printf '%s\n' 'agent-notify: expanded literal \n in body; pass the body on stdin with a heredoc instead' >&2
+  fi
+  if [ "$limit" -gt 0 ] && [ "${#body}" -gt "$limit" ]; then
+    body="${body:0:$limit}"$'\n''[truncated]'
+  fi
+  printf '%s' "$body"
+}
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+}
+
+# Software-managed Discord ownership is optional until the local canary is active.
+# Its worker persists replies and wakes the exact owner without a per-post watch.
+discord_watch_bin() {
+  local bin="${AGENT_NOTIFY_DISCORD_WATCH_BIN:-discord-watch}"
+  command -v "$bin" 2>/dev/null
+}
+
+managed_thread() {
+  local bin result
+  bin="$(discord_watch_bin)" || return 1
+  result="$("$bin" managed "$1" 2>/dev/null)" || return 1
+  if ! jq -e '.worker_health.ready_for_wakes == true' <<<"$result" >/dev/null 2>&1; then
+    echo "agent-notify: thread $1 is registered, but an active sending worker is not confirmed; check discord-watch status" >&2
+  fi
+  return 0
+}
+
+register_thread() {
+  local bin
+  bin="$(discord_watch_bin)" || return 0
+  if ! "$bin" register "$1" >/dev/null; then
+    echo "agent-notify: software-managed wake registration failed for $1; keep the legacy listener until the owner resolves it" >&2
+  fi
+}
+
+managed_wait() {
+  local id="$1" timeout="$2" bin deadline status
+  bin="$(discord_watch_bin)" || return 1
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    if "$bin" receive --thread "$id"; then return 0; else status=$?; fi
+    [ "$status" = 3 ] || return "$status"
+    [ "$(date +%s)" -lt "$deadline" ] || return 3
+    sleep 10
+  done
+}
+
+PRESENCE_CONTEXT=""
+PRESENCE_MODE="unknown"
+PRESENCE_ERROR=""
+
+# Load and validate the exact CMUX location before using a back-mode route.
+# away-mode is read-only and does not need agent-notify credentials.
+load_presence_context() {
+  local workspace_id="${CMUX_WORKSPACE_ID:-}" surface_id="${CMUX_SURFACE_ID:-}"
+  local away_mode raw
+  PRESENCE_CONTEXT=""
+  PRESENCE_MODE="unknown"
+  PRESENCE_ERROR=""
+  if [ -z "$workspace_id" ] || [ -z "$surface_id" ]; then
+    PRESENCE_ERROR="CMUX workspace or surface identity is missing"
+    return 1
+  fi
+  away_mode="${AWAY_MODE_BIN:-$(command -v away-mode 2>/dev/null || true)}"
+  if [ -z "$away_mode" ]; then
+    PRESENCE_ERROR="away-mode is not on PATH"
+    return 1
+  fi
+  if ! raw="$("$away_mode" notification-context --workspace "$workspace_id" --surface "$surface_id" 2>/dev/null)"; then
+    PRESENCE_ERROR="away-mode notification-context failed"
+    return 1
+  fi
+  if ! jq -e --arg workspace_id "$workspace_id" --arg surface_id "$surface_id" '
+    (.mode == "away" or .mode == "back") and
+    (.workspace | type == "string" and length > 0) and
+    (.window | type == "string" and length > 0) and
+    (.workspace_id | type == "string") and
+    (.surface_id | type == "string") and
+    ((.workspace_id | ascii_downcase) == ($workspace_id | ascii_downcase)) and
+    ((.surface_id | ascii_downcase) == ($surface_id | ascii_downcase))
+  ' <<<"$raw" >/dev/null 2>&1; then
+    PRESENCE_ERROR="away-mode returned incomplete or mismatched CMUX context"
+    return 1
+  fi
+  PRESENCE_MODE="$(jq -r .mode <<<"$raw")"
+  PRESENCE_CONTEXT="$(jq -c '{workspace, window, workspace_id, surface_id}' <<<"$raw")"
+}
+
+save_post_metadata() {
+  local id="$1" delivery="$2" mode="$3" kind="$4" where="$5"
+  local issue="$6" issue_title="$7" title="$8" body="$9" context="${10}"
+  local path tmp
+  ensure_state_dir || return 1
+  path="$STATE_DIR/$id.post.json"
+  tmp="$(mktemp "$STATE_DIR/.post.XXXXXX")" || return 1
+  if ! jq -n \
+    --arg post_id "$id" --arg delivery "$delivery" --arg mode "$mode" \
+    --arg kind "$kind" --arg where "$where" --arg issue "$issue" \
+    --arg issue_title "$issue_title" --arg title "$title" --arg body "$body" \
+    --argjson location "${context:-null}" \
+    '{schema_version: 1, post_id: $post_id, delivery: $delivery, mode: $mode,
+      kind: $kind, where: $where, issue: $issue, issue_title: $issue_title,
+      title: $title, body: $body, location: $location}' >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+}
+
+print_attention_context() {
+  local title="$1" issue="$2" issue_title="$3" body="$4" context="$5"
+  local workspace window workspace_id surface_id
+  workspace="$(jq -r '.workspace' <<<"$context")"
+  window="$(jq -r '.window' <<<"$context")"
+  workspace_id="$(jq -r '.workspace_id' <<<"$context")"
+  surface_id="$(jq -r '.surface_id' <<<"$context")"
+  printf '%s\n' 'agent-notify: this is an attention notice, not the full ask. Continue in the owning CMUX chat, paste the context below there, and resolve the request in that chat.' >&2
+  printf 'Owning CMUX location: workspace "%s" (%s), window/surface "%s" (%s).\n' \
+    "$workspace" "$workspace_id" "$window" "$surface_id" >&2
+  printf 'Full ask for the owning chat:\nTitle: %s\n' "$title" >&2
+  [ -z "$issue" ] || printf 'Issue: #%s%s\n' "$issue" "${issue_title:+ $issue_title}" >&2
+  printf 'Body:\n%s\n' "$body" >&2
+}
+
+post_metadata() {
+  local id="$1" path
+  path="$STATE_DIR/$id.post.json"
+  [ -f "$path" ] || return 1
+  jq -c . "$path"
+}
+
+refresh_cache() {
+  need_bot "tag lookup"
+  local hook channel guild chan owner
+  hook="$(http GET "$DISCORD_WEBHOOK_URL")"
+  channel="$(jq -r .channel_id <<<"$hook")"
+  guild="$(jq -r .guild_id <<<"$hook")"
+  chan="$(http GET "$API/channels/$channel")"
+  owner="${DISCORD_USER_ID:-$(http GET "$API/guilds/$guild" | jq -r .owner_id)}"
+  jq -n --arg channel "$channel" --arg guild "$guild" --arg user "$owner" \
+    --argjson tags "$(jq '[.available_tags[] | {key: (.name | ascii_downcase), value: .id}] | from_entries' <<<"$chan")" \
+    '{channel: $channel, guild: $guild, user: $user, tags: $tags}' > "$CACHE"
+  chmod 600 "$CACHE"
+}
+
+cached() {
+  [ -f "$CACHE" ] || refresh_cache
+  local v; v="$(jq -r "$1 // empty" "$CACHE")"
+  [ -n "$v" ] || { refresh_cache; v="$(jq -r "$1 // empty" "$CACHE")"; }
+  [ -n "$v" ] || die "could not resolve $1; run: agent-notify doctor"
+  printf '%s' "$v"
+}
+
+cmd_open() {
+  local urgency="normal" title="" body="" agent="" kind="" issue="" ititle="" where header
+  local delivery="auto" route="discord" mode="unknown" original_title original_body context="" remote_title
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --urgency) urgency="$2"; shift 2 ;;
+      --title) title="$2"; shift 2 ;;
+      --issue) issue="${2#\#}"; shift 2 ;;
+      --issue-title) ititle="$2"; shift 2 ;;
+      --kind) kind="$2"; shift 2 ;;
+      --body) body="$2"; shift 2 ;;
+      --agent) agent="$2"; shift 2 ;;
+      --delivery) delivery="$2"; shift 2 ;;
+      *) die "open: unknown argument $1" ;;
+    esac
+  done
+  case "$urgency" in urgent|normal|fyi) ;; *) die "--urgency must be urgent, normal, or fyi" ;; esac
+  case "$delivery" in auto|discord) ;; *) die "--delivery must be auto or discord" ;; esac
+  [ -n "$title" ] || die "open: --title is required"
+  [ -z "$issue" ] || [[ "$issue" =~ ^[0-9]+$ ]] || die "open: --issue must be a number"
+  body="$(read_body "$body" 0)"
+  [ -n "$body" ] || body="$title"
+  original_title="$title"
+  original_body="$body"
+  [ -n "$kind" ] || kind="$(agent_kind)"
+  where="$(where_label)"
+  [ -n "$agent" ] || agent="$(printf '%s - %s' "$kind" "$where" | cut -c1-80)"
+
+  if [ "$delivery" = "auto" ]; then
+    if load_presence_context; then
+      mode="$PRESENCE_MODE"
+      context="$PRESENCE_CONTEXT"
+      if [ "$mode" = "back" ]; then
+        route="attention"
+      fi
+    else
+      echo "agent-notify: presence context unavailable ($PRESENCE_ERROR); sending the full ask to Discord" >&2
+    fi
+  else
+    mode="discord"
+  fi
+
+  if [ "$route" = "discord" ] && [ -n "$issue" ] && [ -z "$ititle" ]; then
+    ititle="$(gh issue view "$issue" --json title --jq .title 2>/dev/null || true)"
+  fi
+  header="-# $kind | $where"
+  if [ "$route" = "attention" ]; then
+    remote_title="$(subject "$kind" "$where" "" "" "Needs attention in CMUX")"
+    body="Your attention is needed in CMUX.
+Workspace: $(jq -r '.workspace' <<<"$context")
+Window: $(jq -r '.window' <<<"$context")
+Please open that chat."
+    title="$remote_title"
+  else
+    body="$(read_body "$original_body")"
+    [ -z "$issue" ] || header="$header | #$issue${ititle:+ $ititle}"
+    title="$(subject "$kind" "$where" "$issue" "$ititle" "$title")"
+  fi
+
+  local user flags=0 payload res id guild
+  user="$(cached .user)"
+  # Questions (urgent, normal) mention the configured user. FYI posts
+  # are sent silently and carry no mention.
+  if [ "$urgency" = "fyi" ]; then flags=4096; else body="<@$user> $body"; fi
+  body="$header"$'\n'"$body"
+  payload="$(jq -n --arg name "$title" --arg content "$body" --arg agent "$agent" \
+    --arg open "$(cached .tags.open)" --arg urg "$(cached ".tags.$urgency")" \
+    --arg user "$user" --argjson flags "$flags" \
+    '{thread_name: $name, content: $content, username: $agent, flags: $flags,
+      applied_tags: [$open, $urg], allowed_mentions: {users: [$user]}}')"
+  res="$(http POST "$DISCORD_WEBHOOK_URL?wait=true" "$payload")"
+  id="$(jq -r .channel_id <<<"$res")"
+  if ! save_post_metadata "$id" "$route" "$mode" "$kind" "$where" \
+      "$issue" "$ititle" "$original_title" "$original_body" "$context"; then
+    echo "agent-notify: could not save private routing metadata for post $id" >&2
+    if [ "$route" = "attention" ]; then
+      echo "agent-notify: continue in the owning CMUX chat; do not use agent-notify reply for this post because its route could not be preserved" >&2
+    fi
+  fi
+  register_thread "$id"
+  printf '%s\n' "$id"
+  if guild="$(cached .guild 2>/dev/null)"; then
+    echo "https://discord.com/channels/$guild/$id" >&2
+  else
+    echo "agent-notify: post created, but its Discord link could not be resolved" >&2
+  fi
+  if [ "$route" = "attention" ]; then
+    print_attention_context "$original_title" "$issue" "$ititle" "$original_body" "$context"
+  fi
+}
+
+cmd_reply() {
+  local id body="" agent="" ping=0 user payload meta delivery location workspace window workspace_id surface_id
+  id="$(post_id "${1:-}")"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body) body="$2"; shift 2 ;;
+      --agent) agent="$2"; shift 2 ;;
+      --ping) ping=1; shift ;;
+      *) die "reply: unknown argument $1" ;;
+    esac
+  done
+  body="$(read_body "$body")"
+  [ -n "$body" ] || die "reply: empty body"
+  if meta="$(post_metadata "$id" 2>/dev/null)"; then
+    delivery="$(jq -r '.delivery // "discord"' <<<"$meta")"
+    if [ "$delivery" = "attention" ]; then
+      location="$(jq -c '.location // {}' <<<"$meta")"
+      workspace="$(jq -r '.workspace // "unknown"' <<<"$location")"
+      window="$(jq -r '.window // "unknown"' <<<"$location")"
+      workspace_id="$(jq -r '.workspace_id // "unknown"' <<<"$location")"
+      surface_id="$(jq -r '.surface_id // "unknown"' <<<"$location")"
+      printf '%s\n' 'agent-notify: this post is owned by its original CMUX chat. Continue there and do not send this reply to Discord.' >&2
+      printf 'Owning CMUX location: workspace "%s" (%s), window/surface "%s" (%s).\nReply to share in that chat:\n%s\n' \
+        "$workspace" "$workspace_id" "$window" "$surface_id" "$body" >&2
+      return 0
+    fi
+  fi
+  [ -n "$agent" ] || agent="$(agent_name)"
+  user="$(cached .user)"
+  [ "$ping" = 1 ] && body="<@$user> $body"
+  payload="$(jq -n --arg content "$body" --arg agent "$agent" --arg user "$user" \
+    '{content: $content, username: $agent, allowed_mentions: {users: [$user]}}')"
+  http POST "$DISCORD_WEBHOOK_URL?wait=true&thread_id=$id" "$payload" >/dev/null
+}
+
+# Prints replies written by people (not bots or webhooks) since the last call,
+# one "author: text" block each. Exits 3 if none arrive before the timeout.
+cmd_wait() {
+  need_bot wait
+  local id timeout=540 cursor_file cursor msgs deadline
+  id="$(post_id "${1:-}")"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout="$2"; shift 2 ;;
+      *) die "wait: unknown argument $1" ;;
+    esac
+  done
+  if managed_thread "$id"; then
+    managed_wait "$id" "$timeout"
+    return $?
+  fi
+  ensure_state_dir
+  cursor_file="$STATE_DIR/$id"
+  cursor="$(cat "$cursor_file" 2>/dev/null || echo "$id")"
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    # explicit exit: watch calls this inside `if`, where set -e is off
+    msgs="$(http GET "$API/channels/$id/messages?after=$cursor&limit=100")" || exit 1
+    if [ "$(jq 'length' <<<"$msgs")" -gt 0 ]; then
+      jq -r 'max_by(.id | tonumber) | .id' <<<"$msgs" > "$cursor_file"
+      cursor="$(cat "$cursor_file")"
+      if [ "$(jq '[.[] | select((.author.bot // false) | not) | select(.webhook_id == null)] | length' <<<"$msgs")" -gt 0 ]; then
+        jq -r --arg thread "$id" 'sort_by([(.id | length), .id]) | .[] | select((.author.bot // false) | not) | select(.webhook_id == null)
+               | "[discord:\($thread):\(.id)] \(.author.global_name // .author.username): \(.content)"' <<<"$msgs"
+        return 0
+      fi
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || { echo "agent-notify: no reply within ${timeout}s" >&2; exit 3; }
+    sleep 10
+  done
+}
+
+# Blocks until a person replies, however long that takes (up to --max-wait),
+# by repeating wait. Prints the reply. With --queue THREAD it also hands the
+# reply to that Codex session with `codex queue`, which wakes an idle TUI.
+cmd_watch() {
+  local id max=14400 queue="" codex="codex" deadline out status
+  id="$(post_id "${1:-}")"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --max-wait) max="$2"; shift 2 ;;
+      --queue) queue="$2"; shift 2 ;;
+      --codex) codex="$2"; shift 2 ;;
+      *) die "watch: unknown argument $1" ;;
+    esac
+  done
+  register_thread "$id"
+  if managed_thread "$id"; then
+    echo "agent-notify: thread $id has software-managed guarded wakes; this per-thread watch is unnecessary" >&2
+    return 0
+  fi
+  deadline=$(( $(date +%s) + max ))
+  while :; do
+    if out="$(cmd_wait "$id" 2>/dev/null)"; then break; else status=$?; fi
+    [ "$status" = 3 ] || die "watch: wait failed with exit $status; run: agent-notify doctor"
+    [ "$(date +%s)" -lt "$deadline" ] || { echo "agent-notify: no reply within ${max}s" >&2; exit 3; }
+  done
+  printf '%s\n' "$out"
+  [ -z "$queue" ] || "$codex" queue --thread "$queue" --message "$out"
+}
+
+# Codex in CMUX: starts `watch --queue` in a background CMUX tab that closes
+# itself after delivering. Codex kills children of its own tool calls, so the
+# watcher must belong to CMUX. Exits 4 when this session cannot do that.
+cmd_listen() {
+  local id self codex cmux why="" watcher
+  id="$(post_id "${1:-}")"
+  register_thread "$id"
+  if managed_thread "$id"; then
+    echo "agent-notify: thread $id has software-managed guarded wakes; no listener tab is needed" >&2
+    return 0
+  fi
+  # Skip CMUX's own codex shim: `codex queue` through it fails with
+  # "cannot queue through an embedded app server".
+  cmux="$(command -v cmux || true)"
+  codex="$(which -a codex 2>/dev/null | grep -v '/cmux-cli-shims/' | head -1 || true)"
+  if [ -z "${CODEX_THREAD_ID:-}" ]; then why="not a Codex session (no CODEX_THREAD_ID)"
+  elif [ -z "${CMUX_WORKSPACE_ID:-}" ] || [ -z "$cmux" ]; then
+    why="this shell has no CMUX context (needs a CMUX tab and -s workspace-write with network_access=true)"
+  elif [ -z "$codex" ]; then why="codex is not on PATH"
+  fi
+  if [ -n "$why" ]; then echo "agent-notify: auto-wake unavailable: $why" >&2; exit 4; fi
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  watcher="$(printf '%q ' "$self" watch "$id" --queue "$CODEX_THREAD_ID" --codex "$codex");"
+  watcher+=" $(printf '%q' "$cmux")"' close-surface --surface "$CMUX_SURFACE_ID" --workspace "$CMUX_WORKSPACE_ID" --force'
+  if ! "$cmux" new-surface --type terminal --workspace "$CMUX_WORKSPACE_ID" --focus false --command "$watcher" >/dev/null; then
+    echo "agent-notify: auto-wake unavailable: CMUX refused the watcher tab (sandbox)" >&2; exit 4
+  fi
+  echo "agent-notify: listening on $id; a reply arrives as your next turn" >&2
+}
+
+cmd_close() {
+  need_bot close
+  local id body="" agent="" open closed tags
+  id="$(post_id "${1:-}")"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body) body="$2"; shift 2 ;;
+      --agent) agent="$2"; shift 2 ;;
+      *) die "close: unknown argument $1" ;;
+    esac
+  done
+  body="$(read_body "$body")"
+  if [ -n "$body" ]; then
+    if [ -n "$agent" ]; then cmd_reply "$id" --body "$body" --agent "$agent"; else cmd_reply "$id" --body "$body"; fi
+  fi
+  open="$(cached .tags.open)"; closed="$(cached .tags.closed)"
+  tags="$(http GET "$API/channels/$id" | jq -c --arg open "$open" --arg closed "$closed" \
+    '[(.applied_tags // [])[] | select(. != $open and . != $closed)] + [$closed]')"
+  http PATCH "$API/channels/$id" "$(jq -n --argjson tags "$tags" '{applied_tags: $tags, archived: true}')" >/dev/null
+  local managed_bin
+  if managed_bin="$(discord_watch_bin)" && "$managed_bin" managed "$id" >/dev/null 2>&1; then
+    if ! "$managed_bin" close "$id" >/dev/null; then
+      echo "agent-notify: Discord post archived, but local ownership cleanup failed for $id; run discord-watch status" >&2
+    fi
+  fi
+  rm -f "$STATE_DIR/$id" "$STATE_DIR/$id.post.json"
+}
+
+cmd_doctor() {
+  local missing=0 name
+  echo "webhook: $(http GET "$DISCORD_WEBHOOK_URL" | jq -r '"ok (\(.name))"')"
+  if [ -z "${DISCORD_BOT_TOKEN:-}" ]; then
+    echo "bot: DISCORD_BOT_TOKEN is not set in $ENV_FILE; open, wait, and close will not work"
+    exit 1
+  fi
+  echo "bot: $(http GET "$API/users/@me" | jq -r '"ok (\(.username))"')"
+  refresh_cache
+  for name in open closed urgent normal fyi; do
+    if [ -n "$(jq -r ".tags.$name // empty" "$CACHE")" ]; then echo "tag $name: ok"
+    else echo "tag $name: MISSING in the forum channel"; missing=1; fi
+  done
+  echo "configured user: $(http GET "$API/users/$(jq -r .user "$CACHE")" | jq -r '.global_name // .username')"
+  [ "$missing" = 0 ] || exit 1
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  open) cmd_open "$@" ;;
+  reply) cmd_reply "$@" ;;
+  wait) cmd_wait "$@" ;;
+  watch) cmd_watch "$@" ;;
+  listen) cmd_listen "$@" ;;
+  close) cmd_close "$@" ;;
+  doctor) cmd_doctor ;;
+  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 64 ;;
+esac

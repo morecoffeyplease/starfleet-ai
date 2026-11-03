@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "name": "Example repository controls",
+  "origin": "https://github.com/OWNER/REPOSITORY.git",
+  "fragment": "# Repository controls\n- Add reviewed repository-specific instructions here.\n- Keep the fragment within the authority granted by the user."
+}

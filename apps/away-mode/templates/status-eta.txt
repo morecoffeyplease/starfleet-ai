@@ -1,0 +1,3 @@
+Report {REPORT_ID}, {LANE}: detailed report ETA {ETA} ({TIMEZONE}).
+Preparation remaining: {REMAINING_PREPARATION}.
+Reporting blocker or timing uncertainty: {REPORTING_BLOCKER_OR_NONE}.

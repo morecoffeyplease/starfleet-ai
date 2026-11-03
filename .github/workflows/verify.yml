@@ -1,0 +1,160 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python verification (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run all Python component checks
+        run: python3 scripts/verify.py --python-only
+
+
+  markup:
+    name: Starfleet Markup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Install locked dependencies
+        working-directory: apps/starfleet-markup
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run source and unit verification
+        working-directory: apps/starfleet-markup
+        run: npm run verify
+      - name: Install Chromium and Linux libraries
+        working-directory: apps/starfleet-markup
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+      - name: Run browser verification
+        working-directory: apps/starfleet-markup
+        env:
+          STARFLEET_MARKUP_EVIDENCE: ${{ runner.temp }}/starfleet-markup-evidence
+        run: npm run verify:browser
+
+  source-scan:
+    name: Source scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:b109bc5f8f76a38196a3e413704fc5b9e3c32360bce4e4b603bd6f45b3721dbb
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check tracked source whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          empty_tree="$(git hash-object -w -t tree --stdin </dev/null)"
+          git diff --check "$empty_tree" HEAD
+      - name: Verify scanner with a synthetic positive control
+        shell: bash
+        run: |
+          set -euo pipefail
+          control_dir="$(mktemp -d)"
+          trap 'rm -rf "$control_dir"' EXIT
+          python3 - "$control_dir/control.env" <<'PY'
+          from pathlib import Path
+          import hashlib
+          import sys
+
+          Path(sys.argv[1]).write_text(
+              'api_key = "' + hashlib.sha256(b'Nonfunctional scanner control').hexdigest() + '"\n',
+              encoding="utf-8",
+          )
+          PY
+          git -C "$control_dir" init -q
+          git -C "$control_dir" config user.name "Synthetic scanner control"
+          git -C "$control_dir" config user.email "control@example.invalid"
+          git -C "$control_dir" add control.env
+          git -C "$control_dir" commit -qm "synthetic positive control"
+          scan_log="$control_dir/scanner.log"
+          scan_status=0
+          docker run --rm --network none \
+            --volume "$control_dir:/repo" \
+            --workdir /repo \
+            "$GITLEAKS_IMAGE" \
+            git --redact=100 --no-banner --exit-code 1 \
+            --report-format json --report-path /repo/report.json . \
+            >"$scan_log" 2>&1 || scan_status=$?
+          if [ "$scan_status" -ne 1 ]; then
+            cat "$scan_log"
+            echo "The source scanner did not flag its synthetic positive control." >&2
+            exit 1
+          fi
+          python3 - "$control_dir/report.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          findings = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if len(findings) != 1 or findings[0].get("RuleID") != "generic-api-key":
+              raise SystemExit("The source scanner returned an unexpected positive-control result.")
+          print("The source scanner detected one synthetic generic-api-key control.")
+          PY
+      - name: Scan checked-out source and all Git refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          scan_log="$RUNNER_TEMP/gitleaks-source.log"
+          scan_status=0
+          docker run --rm --network none \
+            --volume "$GITHUB_WORKSPACE:/repo:ro" \
+            --workdir /repo \
+            "$GITLEAKS_IMAGE" \
+            git --log-opts=--all --redact=100 --no-banner --exit-code 1 --verbose . \
+            >"$scan_log" 2>&1 || scan_status=$?
+          cat "$scan_log"
+          if [ "$scan_status" -ne 0 ]; then
+            exit "$scan_status"
+          fi
+          if ! grep -Eq '[1-9][0-9]* commits scanned\.' "$scan_log"; then
+            echo "The source scanner did not report scanning any Git commits." >&2
+            exit 1
+          fi

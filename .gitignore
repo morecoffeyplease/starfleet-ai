@@ -1,0 +1,8 @@
+.DS_Store
+.lavish/
+.context-injector/
+__pycache__/
+*.py[cod]
+**/node_modules/
+.coverage
+.pytest_cache/

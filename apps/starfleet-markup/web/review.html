@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="markup-key" content="__KEY__" />
+    <meta name="review-id" content="__REVIEW__" />
+    <title>Starfleet Markup</title>
+    <link rel="stylesheet" href="/review.css" />
+    <script src="/review.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="Starfleet Markup, back to top"
+        ><span class="brand-icon" aria-hidden="true">S</span>Starfleet
+        <strong>Markup</strong></a
+      >
+      <div class="status-wrap">
+        <span id="status" role="status">Opening review...</span
+        ><button id="retry-wake" hidden>Retry notification</button
+        ><button id="send" class="primary" disabled>Send to Agent</button>
+      </div>
+    </header>
+    <main id="top" class="workspace">
+      <section class="intro">
+        <div>
+          <p class="eyebrow">YOUR REVIEW SPACE</p>
+          <h1 id="title">Document review</h1>
+          <p class="subtitle" id="hint">
+            Click a paragraph or select text to leave a comment.
+          </p>
+        </div>
+        <a class="comment-count" href="#comments-heading"
+          ><strong id="count">0</strong><span>comments ↓</span></a
+        >
+      </section>
+      <section
+        class="review-surface"
+        aria-label="Document review"
+        data-loading
+        aria-busy="true"
+      >
+        <div class="toolbar">
+          <div class="history">
+            <label
+              >Version
+              <select
+                id="version"
+                aria-label="Document version"
+              ></select></label
+            ><label
+              >Round
+              <select id="round" aria-label="Review round"></select
+            ></label>
+          </div>
+          <fieldset class="mode">
+            <legend class="sr-only">Document interaction mode</legend>
+            <label><input type="radio" name="mode" value="click" />Click</label
+            ><label
+              ><input
+                type="radio"
+                name="mode"
+                value="comment"
+                checked
+              />Comment</label
+            >
+          </fieldset>
+        </div>
+        <div id="banner" class="banner" hidden></div>
+        <p id="document-loading" role="status">Preparing your document...</p>
+        <iframe
+          id="document"
+          title="Document to review"
+          sandbox="allow-scripts"
+          referrerpolicy="no-referrer"
+        ></iframe>
+      </section>
+      <section class="comments" aria-labelledby="comments-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">ALL IN ONE PLACE</p>
+            <h2 id="comments-heading" tabindex="-1">Your comments</h2>
+          </div>
+          <button id="new-round" hidden>Start another round</button>
+        </div>
+        <div id="comment-list"></div>
+      </section>
+      <footer>
+        Your draft saves automatically on this Mac. Feedback reaches your agent
+        when you send it.
+      </footer>
+    </main>
+    <dialog id="editor" aria-labelledby="editor-heading">
+      <form id="comment-form">
+        <div class="dialog-heading">
+          <h2 id="editor-heading">Leave a comment</h2>
+          <button
+            type="button"
+            id="close-editor"
+            class="icon-button"
+            aria-label="Close comment editor"
+          >
+            ×
+          </button>
+        </div>
+        <blockquote id="target-quote"></blockquote>
+        <label class="field-label" for="comment-text">Your feedback</label
+        ><textarea
+          id="comment-text"
+          rows="5"
+          maxlength="10000"
+          placeholder="What would you like to change or discuss?"
+          required
+        ></textarea>
+        <fieldset class="intent">
+          <legend>What would you like next? <span>Optional</span></legend>
+          <label
+            ><input type="radio" name="intent" value="" checked />No
+            preference</label
+          >
+          <label
+            ><input type="radio" name="intent" value="discuss" />Discuss in
+            chat</label
+          >
+          <label
+            ><input type="radio" name="intent" value="revise" />New version of
+            document</label
+          >
+        </fieldset>
+        <p id="editor-error" class="error" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="button" id="delete-comment" class="danger" hidden>
+            Delete comment</button
+          ><span></span><button type="button" id="cancel-editor">Cancel</button
+          ><button type="submit" class="primary" id="save-comment">
+            Save comment
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <div id="error" role="alert" class="global-error" hidden></div>
+  </body>
+</html>

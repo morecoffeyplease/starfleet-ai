@@ -1,0 +1,11 @@
+Status request {REPORT_ID} for {LANE}, requested by the user.
+Fixed window: {WINDOW_START} to {WINDOW_END} ({TIMEZONE}).
+Send the report now if ready; otherwise reply in this thread with an absolute-time ETA within two minutes of reading this request.
+Provide a detailed source report the officer can retain for follow-ups; the 300-500 word brief target does not apply to your report.
+Cover overall roadmap progress and biggest bottlenecks; before/current estimated completion percentage ranges for the roadmap and active issue plus percentage points accomplished in this fixed window (unknown if baseline unavailable; explain scope/estimate revisions), with scope, basis, remaining work and confidence; recent surprises and implications; whether another agent/worktree would help, its concrete task, expected benefit, dependencies and coordination/resource cost.
+Include decisions needing the user with impact/recommendation; active PR or issue, window progress, current state and next step; blockers, unblocker and whether other work can continue; evidence references and known gaps.
+Finish with EVERY roadmap issue in planned execution order, one issue per bullet on its own line with a half-sentence status.
+Separate parked issues with reasons and unknown priorities; list each issue exactly once and name the roadmap source and any incomplete coverage.
+Use existing evidence; distinguish implemented, verified, reviewed, merged and deployed.
+Label percentages as rough estimates or ranges, not verified metrics; state unknown when scope cannot be established.
+Reporting only; this request grants no new work or agent-launch authority, and a receipt-only reply is not a report.

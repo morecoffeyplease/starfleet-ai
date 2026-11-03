@@ -1,0 +1,28 @@
+name: Feature request
+description: Explain a user problem and the outcome you need.
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Who is affected and what are they trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround and alternatives
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Integration or compatibility needs
+      description: Include relevant CMUX, harness, operating system, or Discord requirements.

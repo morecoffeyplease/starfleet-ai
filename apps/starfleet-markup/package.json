@@ -1,0 +1,24 @@
+{
+  "name": "@starfleet-ai/markup",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "starfleet-markup": "bin/starfleet-markup.mjs"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "verify:browser": "node tests/browser.mjs",
+    "verify": "node --check bin/starfleet-markup.mjs && node --check lib/server.mjs && node --check web/review.js && node --check web/bridge.js && node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "marked": "^18.1.2",
+    "sanitize-html": "^2.18.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.64.1"
+  }
+}

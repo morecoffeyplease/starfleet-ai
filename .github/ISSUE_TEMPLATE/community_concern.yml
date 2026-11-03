@@ -1,0 +1,24 @@
+name: Community concern
+description: Report a community or conduct concern to project maintainers.
+labels:
+  - conduct
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue form is public, and every issue in this repository is public.
+        Do not include private messages, personal information, credentials, or details you are not willing to share publicly.
+        For abusive GitHub content, use the content menu and choose Report content.
+        For a suspected security vulnerability, use the private route in SECURITY.md.
+  - type: textarea
+    id: concern
+    attributes:
+      label: Concern
+      description: Describe the public conduct concern without sharing private information.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Public context
+      description: Link to public repository content if it helps explain the concern.
