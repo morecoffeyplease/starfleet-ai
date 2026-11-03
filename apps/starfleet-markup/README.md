@@ -299,7 +299,8 @@ Browser acceptance must additionally drive paragraph, text, image, and interacti
 Use only disposable state directories for automated checks.
 
 Run the repeatable browser acceptance suite with `npm run verify:browser` from this component directory.
-On macOS it uses the installed Google Chrome; set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to override the browser path.
+The browser checks use the Chromium version installed for the locked Playwright dependency.
+Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to test an explicitly selected browser executable.
 On Linux, first run `npx playwright install --with-deps chromium` to install the test browser.
 The suite creates its synthetic documents, state, screenshots, and JSON acceptance evidence outside Git and prints their location.
 Set `STARFLEET_MARKUP_EVIDENCE` to an explicit outside-Git directory to retain a known evidence location.

@@ -26,46 +26,70 @@ PYTHON_CHECKS = (
 def run(label, command, cwd=ROOT, env=None):
     print(f"== {label} ==", flush=True)
     result = subprocess.run(command, cwd=cwd, env=env)
-    if result.returncode:
-        raise SystemExit(result.returncode)
+    return result.returncode
 
 
 def verify_python():
+    failures = []
     for label, arguments in PYTHON_CHECKS:
-        run(label, [sys.executable, *arguments])
+        code = run(label, [sys.executable, *arguments])
+        if code:
+            failures.append((label, code))
+    return failures
 
 
 def verify_markup():
     node = shutil.which("node")
     npm = shutil.which("npm")
     if not node or not npm:
-        raise SystemExit("Starfleet Markup verification requires Node.js 22 or newer and npm.")
-    version = subprocess.run([node, "--version"], check=True, capture_output=True, text=True).stdout.strip()
+        print("Starfleet Markup verification requires Node.js 22 or newer and npm.", file=sys.stderr)
+        return [("Starfleet Markup prerequisites", 1)]
+    version_result = subprocess.run([node, "--version"], capture_output=True, text=True)
+    if version_result.returncode:
+        if version_result.stderr:
+            print(version_result.stderr, file=sys.stderr, end="")
+        return [("Check Node.js version", version_result.returncode)]
+    version = version_result.stdout.strip()
     try:
         major = int(version.lstrip("v").split(".", 1)[0])
     except ValueError:
-        raise SystemExit(f"Could not parse Node.js version: {version}") from None
+        print(f"Could not parse Node.js version: {version}", file=sys.stderr)
+        return [("Check Node.js version", 1)]
     if major < 22:
-        raise SystemExit(f"Starfleet Markup requires Node.js 22 or newer, found {version}.")
+        print(f"Starfleet Markup requires Node.js 22 or newer, found {version}.", file=sys.stderr)
+        return [("Check Node.js version", 1)]
 
-    run("Install locked Starfleet Markup dependencies", [
+    label = "Install locked Starfleet Markup dependencies"
+    code = run(label, [
         npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"
     ], cwd=MARKUP)
+    if code:
+        return [(label, code)]
 
     with tempfile.TemporaryDirectory(prefix="starfleet-markup-verify-") as temporary:
         temp = Path(temporary)
         environment = os.environ.copy()
         environment["PLAYWRIGHT_BROWSERS_PATH"] = str(temp / "browsers")
         environment["STARFLEET_MARKUP_EVIDENCE"] = str(temp / "evidence")
-        run("Starfleet Markup source and unit verification", [
+        label = "Starfleet Markup source and unit verification"
+        code = run(label, [
             npm, "run", "verify"
         ], cwd=MARKUP, env=environment)
-        run("Install temporary Chromium browser", [
+        if code:
+            return [(label, code)]
+        label = "Install temporary Chromium browser"
+        code = run(label, [
             str(MARKUP / "node_modules" / ".bin" / "playwright"), "install", "chromium"
         ], cwd=MARKUP, env=environment)
-        run("Starfleet Markup browser verification", [
+        if code:
+            return [(label, code)]
+        label = "Starfleet Markup browser verification"
+        code = run(label, [
             npm, "run", "verify:browser"
         ], cwd=MARKUP, env=environment)
+        if code:
+            return [(label, code)]
+    return []
 
 
 def main():
@@ -77,10 +101,16 @@ def main():
     )
     args = parser.parse_args()
 
-    verify_python()
+    failures = verify_python()
     if not args.python_only:
-        verify_markup()
+        failures.extend(verify_markup())
+    if failures:
+        print("\nVerification failures:", file=sys.stderr)
+        for label, code in failures:
+            print(f"- {label}: exit {code}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

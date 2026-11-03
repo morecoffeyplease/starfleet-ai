@@ -1,5 +1,6 @@
 """Exercise installation through the real command using isolated user directories."""
 import json
+import os
 from pathlib import Path
 import shutil
 import stat
@@ -29,6 +30,30 @@ class InstallTest(unittest.TestCase):
         self.claude = self.root / "claude.json"
         self.codex = self.root / "codex.json"
         self.command = self.bin / "model-preferences"
+        self.cmux_bin = self.root / "cmux-bin"
+        self.cmux_bin.mkdir()
+        self.cmux = self.cmux_bin / "cmux"
+        self.cmux.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--json\" ] && [ \"$2\" = \"current\" ]; then\n"
+            "  printf '%s\\n' '{\"items\":[],\"truncated\":false}'\n"
+            "  exit 0\n"
+            "fi\n"
+            "printf 'Unexpected CMUX fixture command: %s\\n' \"$*\" >&2\n"
+            "exit 2\n"
+        )
+        self.cmux.chmod(0o755)
+        for name in ("home", "xdg-config", "xdg-cache", "xdg-state"):
+            (self.root / name).mkdir()
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("CMUX_")}
+        self.env.update({
+            "HOME": str(self.root / "home"),
+            "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
+            "XDG_CACHE_HOME": str(self.root / "xdg-cache"),
+            "XDG_STATE_HOME": str(self.root / "xdg-state"),
+            "TMPDIR": str(self.root),
+            "PATH": str(self.cmux_bin) + os.pathsep + self.env.get("PATH", os.defpath),
+        })
 
     def install(self, *extra, ok=True):
         argv = [sys.executable, str(self.source / "install.py")]
@@ -36,13 +61,14 @@ class InstallTest(unittest.TestCase):
                            ("config-dir", self.config), ("state-dir", self.state),
                            ("claude-settings", self.claude), ("codex-settings", self.codex)):
             argv.extend(["--" + key, str(value)])
-        result = subprocess.run([*argv, *extra], capture_output=True, text=True, timeout=20)
+        result = subprocess.run([*argv, *extra], capture_output=True, text=True, timeout=20, env=self.env)
         self.assertEqual(result.returncode == 0, ok, result.stderr)
         return json.loads(result.stdout) if ok else result.stderr
 
     def run_command(self, *args, stdin=None):
-        result = subprocess.run([str(self.command), *args], input=stdin, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run([str(self.command), *args], input=stdin, capture_output=True, text=True,
+                                timeout=10, env=self.env)
+        self.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         return json.loads(result.stdout)
 
     def active(self):
@@ -61,7 +87,8 @@ class InstallTest(unittest.TestCase):
             command = json.loads(path.read_text())["hooks"][event][0]["hooks"][0]["command"]
             result = subprocess.run(command, shell=True, input=json.dumps({
                 "session_id": "startup-" + harness, "hook_event_name": event,
-                "source": "startup", "cwd": str(self.root)}), text=True, capture_output=True, timeout=10)
+                "source": "startup", "cwd": str(self.root)}), text=True, capture_output=True,
+                timeout=10, env=self.env)
             self.assertEqual(result.returncode, 0, result.stderr)
             context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
             self.assertIn("active profile Claude-Codex", context)

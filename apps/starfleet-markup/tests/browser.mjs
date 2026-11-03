@@ -27,11 +27,7 @@ const command = async (...args) =>
   );
 const browser = await chromium.launch({
   headless: true,
-  executablePath:
-    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ||
-    (process.platform === "darwin"
-      ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-      : undefined),
+  executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
 });
 const context = await browser.newContext({
   viewport: { width: 1280, height: 900 },
@@ -175,6 +171,7 @@ try {
   );
 
   await doc.locator("img").click();
+  await page.locator("#editor[open]").waitFor();
   assert.equal(
     await page.locator("#target-quote").textContent(),
     "Sample illustration",
@@ -205,10 +202,15 @@ try {
   await second.goto(created.url);
   await second.bringToFront();
   await second.locator('.review-surface[aria-busy="false"]').waitFor();
-  await second.frameLocator("#document").locator("h2").click();
+  // Keyboard activation keeps this scenario focused on concurrent edits.
+  await second.frameLocator("#document").locator("h2").focus();
+  await second.frameLocator("#document").locator("h2").press("Enter");
+  await second.locator("#editor[open]").waitFor();
   await second.locator("#comment-text").fill("Stale tab comment");
   await page.bringToFront();
-  await doc.locator("h2").click();
+  await doc.locator("h2").focus();
+  await doc.locator("h2").press("Enter");
+  await page.locator("#editor[open]").waitFor();
   await page.locator("#comment-text").fill("The current heading comment.");
   await page.locator("#save-comment").click();
   await page.waitForFunction(
