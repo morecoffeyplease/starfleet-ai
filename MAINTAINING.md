@@ -12,12 +12,14 @@ python3 scripts/verify.py
 ```
 
 GitHub-hosted CI is the routine verification path.
-Require all four Python matrix results: **Python verification (ubuntu-latest, Python 3.10)**, **Python verification (ubuntu-latest, Python 3.14)**, **Python verification (macos-latest, Python 3.10)**, and **Python verification (macos-latest, Python 3.14)**.
+Require all four Python matrix results: **Python verification (ubuntu-latest, Python 3.10)**, **Python verification (ubuntu-latest, Python 3.14)**, **Python verification (macos-15-intel, Python 3.10)**, and **Python verification (macos-15-intel, Python 3.14)**.
 Also require **Starfleet Markup** and **Source scan**.
 The `verify` workflow runs for every pull request and push to `main` without path filters, so unaffected components still produce their required check results.
 Do not make a check required until the workflow is enabled and its exact status name has been observed on a candidate run.
 
 Keep the workflow read-only, pinned to full action commit SHAs, limited to GitHub-hosted runners, and free of live service credentials.
+The routine macOS matrix uses the explicit `macos-15-intel` pool, so a floating label cannot change its CPU architecture.
+Native Apple Silicon receipt and service pilots remain separate from synthetic hosted verification.
 The source scan uses the official Gitleaks v8.30.1 Linux image pinned by digest.
 It runs a synthetic nonfunctional `generic-api-key` positive control, then scans the checked-out source and all Git refs with the default rules.
 No custom ignore rules or broad allowlists are added.

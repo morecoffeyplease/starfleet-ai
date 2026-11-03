@@ -28,9 +28,9 @@ jobs:
             python: "3.10"
           - os: ubuntu-latest
             python: "3.14"
-          - os: macos-latest
+          - os: macos-15-intel
             python: "3.10"
-          - os: macos-latest
+          - os: macos-15-intel
             python: "3.14"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
