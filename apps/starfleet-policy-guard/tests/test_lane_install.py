@@ -178,6 +178,67 @@ class LaneInstallTest(unittest.TestCase):
         self.adapter = Path(plan['adapter'])
         return plan
 
+    def assert_runtime_is_sealed(self, runtime):
+        self.assertEqual(runtime.stat().st_mode & 0o777, 0o555)
+        for path in runtime.rglob('*'):
+            expected = 0o555 if path.is_dir() else 0o444
+            self.assertEqual(path.stat().st_mode & 0o777, expected, str(path))
+
+    def test_runtime_publish_recovery_and_immutable_modes(self):
+        store = lane_runtime.session_store
+        plan = store.runtime_plan(APP)
+        runtime = Path(store.install_runtime(APP, plan))
+        self.assertEqual(runtime, Path(plan['path']))
+        self.assert_runtime_is_sealed(runtime)
+
+        directories = [runtime, *(path for path in runtime.rglob('*') if path.is_dir())]
+        for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+            os.chmod(directory, 0o700)
+        missing = runtime / 'README.md'
+        missing.unlink()
+
+        repaired = Path(store.install_runtime(APP, plan))
+        self.assertEqual(repaired, runtime)
+        self.assertTrue(missing.is_file())
+        self.assertEqual(store._digest(missing.read_bytes()), plan['files']['README.md'])
+        self.assert_runtime_is_sealed(runtime)
+
+        os.chmod(runtime, 0o700)
+        with self.assertRaisesRegex(ValueError, 'runtime permissions changed'):
+            store.install_runtime(APP, plan)
+        os.chmod(runtime, 0o555)
+
+    def test_runtime_seal_failure_removes_only_new_runtime(self):
+        store = lane_runtime.session_store
+        existing_plan = store.runtime_plan(APP)
+        existing = Path(store.install_runtime(APP, existing_plan))
+        existing_stat = existing.stat()
+
+        source = self.base / 'runtime variant'
+        shutil.copytree(APP, source, ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo'))
+        with (source / 'guide.md').open('a') as stream:
+            stream.write('\nSeal failure fixture.\n')
+        plan = store.runtime_plan(source)
+        target = Path(plan['path'])
+        self.assertNotEqual(target, existing)
+        self.assertFalse(target.exists())
+
+        original_chmod = os.chmod
+
+        def fail_final_seal(path, mode, *args, **kwargs):
+            if Path(path) == target and mode == 0o555:
+                raise OSError('fixture final seal failure')
+            return original_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(store.os, 'chmod', side_effect=fail_final_seal):
+            with self.assertRaisesRegex(OSError, 'fixture final seal failure'):
+                store.install_runtime(source, plan)
+
+        self.assertFalse(os.path.lexists(target))
+        after = existing.stat()
+        self.assertEqual((after.st_dev, after.st_ino), (existing_stat.st_dev, existing_stat.st_ino))
+        self.assert_runtime_is_sealed(existing)
+
     def record(self):
         return json.loads(self.call('record', '--evidence', self.packet, '--format', 'json').stdout)
 

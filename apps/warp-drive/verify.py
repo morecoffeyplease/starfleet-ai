@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent
@@ -76,12 +77,78 @@ def test_guide_and_install(temp):
               f"{command} help omitted its passive diagnostic guidance")
 
     share, bin_dir, installed_state = temp / "share", temp / "bin", temp / "installed-state"
-    subprocess.run([sys.executable, str(ROOT / "install.py"), "--share-dir", str(share),
-                    "--bin-dir", str(bin_dir)], text=True, capture_output=True, check=True)
-    result = subprocess.run([str(bin_dir / "warp-drive"), "--state-dir", str(installed_state),
-                             "guide", "--print"], cwd=temp, text=True, capture_output=True, check=True)
+    install_command = [sys.executable, str(ROOT / "install.py"), "--share-dir", str(share),
+                       "--bin-dir", str(bin_dir)]
+    installed = subprocess.run(install_command, text=True, capture_output=True)
+    check(installed.returncode == 0,
+          f"installer CLI failed: {install_command}\n{installed.stdout}\n{installed.stderr}")
+    runtimes = list((share / "runtimes").iterdir())
+    check(len(runtimes) == 1, "installer did not publish one content-addressed runtime")
+    runtime = runtimes[0]
+    check(stat.S_IMODE(runtime.stat().st_mode) == 0o555,
+          "installed runtime directory did not retain its read-only mode")
+    for name in ("warp_drive.py", "host.py", "policy.py", "guide.md"):
+        check(stat.S_IMODE((runtime / name).stat().st_mode) == 0o444,
+              f"installed runtime file {name} did not retain its read-only mode")
+    guide_command = [str(bin_dir / "warp-drive"), "--state-dir", str(installed_state),
+                     "guide", "--print"]
+    result = subprocess.run(guide_command, cwd=temp, text=True, capture_output=True)
+    check(result.returncode == 0,
+          f"installed guide CLI failed: {guide_command}\n{result.stdout}\n{result.stderr}")
     check(result.stdout == (ROOT / "guide.md").read_text(), "installed guide differs from source")
     check(not installed_state.exists(), "installed guide --print created state")
+
+
+def test_install_removes_new_runtime_after_seal_failure(temp):
+    spec = importlib.util.spec_from_file_location("warp_verify_install", ROOT / "install.py")
+    installer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(installer)
+    share, bin_dir = temp / "seal-failure-share", temp / "seal-failure-bin"
+    runtime = share / "runtimes" / installer.digest_source(ROOT)
+    chmod = os.chmod
+    rmtree = shutil.rmtree
+
+    def fail_runtime_seal(path, mode):
+        if Path(path) == runtime and mode == 0o555:
+            raise PermissionError("fixture runtime seal failure")
+        chmod(path, mode)
+
+    with patch.object(installer.os, "chmod", side_effect=fail_runtime_seal):
+        try:
+            installer.install(ROOT, share, bin_dir)
+        except PermissionError as exc:
+            check("fixture runtime seal failure" in str(exc), "unexpected runtime seal error")
+        else:
+            raise AssertionError("installer unexpectedly sealed the fixture runtime")
+    check(not runtime.exists(), "installer left a partial runtime after sealing failed")
+    check(not list(runtime.parent.glob(".warp-drive-*")), "installer left a staging runtime after sealing failed")
+
+    def fail_runtime_cleanup(path):
+        if Path(path) == runtime:
+            raise PermissionError("fixture runtime cleanup failure")
+        rmtree(path)
+
+    with patch.object(installer.os, "chmod", side_effect=fail_runtime_seal), \
+            patch.object(installer.shutil, "rmtree", side_effect=fail_runtime_cleanup):
+        try:
+            installer.install(ROOT, share, bin_dir)
+        except RuntimeError as exc:
+            check("cleanup also failed" in str(exc), "runtime cleanup failure was not reported")
+        else:
+            raise AssertionError("installer did not report cleanup failure")
+    check(runtime.is_dir(), "fixture cleanup failure did not preserve its candidate for inspection")
+    mode_before_retry = stat.S_IMODE(runtime.stat().st_mode)
+    files_before_retry = {name: (runtime / name).read_bytes() for name in installer.FILES}
+    try:
+        installer.install(ROOT, share, bin_dir)
+    except RuntimeError as exc:
+        check("Existing runtime is not sealed" in str(exc), "unsealed runtime retry had an unexpected refusal")
+    else:
+        raise AssertionError("installer reused an unsealed runtime")
+    check(stat.S_IMODE(runtime.stat().st_mode) == mode_before_retry,
+          "refusing an unsealed runtime changed its mode")
+    check({name: (runtime / name).read_bytes() for name in installer.FILES} == files_before_retry,
+          "refusing an unsealed runtime changed its contents")
 
 
 def test_product_command_inherits_caller_umask(temp):
@@ -2279,6 +2346,7 @@ def main():
         os.environ["WARP_DRIVE_HAILING_STATE"] = str(temp / "unconfigured-hailing-state")
         try:
             test_guide_and_install(temp)
+            test_install_removes_new_runtime_after_seal_failure(temp)
             test_product_command_inherits_caller_umask(temp)
             test_policy_fixtures()
             test_scheduler_refreshes_policy_version(temp)

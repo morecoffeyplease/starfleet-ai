@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 import time
 
@@ -262,9 +263,85 @@ def runtime_plan(source_root):
     return {'version': version, 'path': str(runtime_root() / version), 'files': rows}
 
 
+def _runtime_entries(path):
+    path = Path(path)
+    directories = []
+    files = []
+    for item in path.rglob('*'):
+        mode = item.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            raise ValueError('Installed Policy Guard runtime contains a symlink; preserve it and inspect its fingerprint')
+        if stat.S_ISDIR(mode):
+            directories.append(item)
+        else:
+            files.append(item)
+    return directories, files
+
+
+def _seal_runtime(path):
+    path = Path(path)
+    directories, files = _runtime_entries(path)
+    for item in files:
+        os.chmod(item, 0o444)
+    for item in sorted(directories, key=lambda value: len(value.parts), reverse=True):
+        os.chmod(item, 0o555)
+    os.chmod(path, 0o555)
+
+
+def _require_sealed_runtime(path):
+    path = Path(path)
+    root_mode = path.lstat().st_mode
+    if not stat.S_ISDIR(root_mode) or root_mode & 0o777 != 0o555:
+        raise ValueError('Installed Policy Guard runtime permissions changed; preserve it and inspect its fingerprint')
+    directories, files = _runtime_entries(path)
+    for item in directories:
+        if item.lstat().st_mode & 0o777 != 0o555:
+            raise ValueError('Installed Policy Guard runtime permissions changed; preserve it and inspect its fingerprint')
+    for item in files:
+        if item.lstat().st_mode & 0o777 != 0o444:
+            raise ValueError('Installed Policy Guard runtime permissions changed; preserve it and inspect its fingerprint')
+
+
+def _remove_new_runtime(path, identity):
+    path = Path(path)
+    try:
+        root = path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISDIR(root.st_mode) or (root.st_dev, root.st_ino) != identity:
+        return False
+    for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+        for name in files:
+            item = Path(current) / name
+            try:
+                if stat.S_ISREG(item.lstat().st_mode):
+                    os.chmod(item, 0o600)
+            except OSError:
+                pass
+        for name in directories:
+            item = Path(current) / name
+            try:
+                if stat.S_ISDIR(item.lstat().st_mode):
+                    os.chmod(item, 0o700)
+            except OSError:
+                pass
+    try:
+        root = path.lstat()
+        if not stat.S_ISDIR(root.st_mode) or (root.st_dev, root.st_ino) != identity:
+            return False
+        os.chmod(path, 0o700)
+        shutil.rmtree(path)
+    except OSError:
+        return False
+    return not os.path.lexists(path)
+
+
 def _install_runtime_locked(source_root, plan=None):
     plan = plan or runtime_plan(source_root)
     target = Path(plan['path'])
+    _refuse_symlinked_path(target)
     if target.exists():
         missing = []
         for relative, expected in plan['files'].items():
@@ -276,6 +353,7 @@ def _install_runtime_locked(source_root, plan=None):
             if _digest(path.read_bytes()) != expected:
                 raise ValueError('Installed Policy Guard runtime version was modified; preserve it and inspect its fingerprint')
         if not missing:
+            _require_sealed_runtime(target)
             return target
         directories = [target, *(path for path in target.rglob('*') if path.is_dir())]
         for directory in directories:
@@ -300,9 +378,7 @@ def _install_runtime_locked(source_root, plan=None):
                     if os.path.exists(temporary):
                         os.unlink(temporary)
         finally:
-            directories = [target, *(path for path in target.rglob('*') if path.is_dir())]
-            for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
-                os.chmod(directory, 0o555)
+            _seal_runtime(target)
         return target
     _private_mkdir(runtime_root())
     temporary = Path(tempfile.mkdtemp(prefix='.runtime-', dir=runtime_root()))
@@ -316,9 +392,8 @@ def _install_runtime_locked(source_root, plan=None):
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(data)
             os.chmod(destination, 0o444)
-        for directory in sorted((p for p in temporary.rglob('*') if p.is_dir()), reverse=True):
-            os.chmod(directory, 0o555)
-        os.chmod(temporary, 0o555)
+        temporary_stat = temporary.stat()
+        identity = (temporary_stat.st_dev, temporary_stat.st_ino)
         try:
             os.replace(temporary, target)
         except OSError:
@@ -326,6 +401,12 @@ def _install_runtime_locked(source_root, plan=None):
                 raise
             shutil.rmtree(temporary, ignore_errors=True)
             return _install_runtime_locked(source_root, plan)
+        try:
+            _seal_runtime(target)
+        except BaseException as error:
+            if not _remove_new_runtime(target, identity) and isinstance(error, Exception):
+                raise RuntimeError('New Policy Guard runtime could not be sealed or safely removed; preserve it and inspect its permissions') from error
+            raise
     finally:
         if temporary.exists():
             for path in temporary.rglob('*'):

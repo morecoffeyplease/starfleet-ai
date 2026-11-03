@@ -142,8 +142,9 @@ class AwayTest(unittest.TestCase):
         text = self.call("render", rid)
         self.assertIn("0 of 1", text)
         self.assertIn("No response yet", text)
-        self.assertNotIn(str(child), text)
-        self.assertIn(str(child), self.call("render", rid, "--details"))
+        self.assertNotIn(am.cell(child), text)
+        details = self.call("render", rid, "--details")
+        self.assertIn(f"No enrolled agent for worktree: {am.cell(child)}", details)
         self.assertIn("blockers are unknown", text)
 
     def test_concurrent_returns_make_one_report(self):

@@ -2,10 +2,12 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('away_install', SOURCE / 'apps/away-mode/install.py')
@@ -47,6 +49,10 @@ class InstallTests(unittest.TestCase):
                 f"installer CLI failed: {install_command!r}\n"
                 f"stdout:\n{installed.stdout}\nstderr:\n{installed.stderr}",
             )
+            runtime = root / "share/runtimes" / installer.digest_source(source)
+            self.assertEqual(stat.S_IMODE(runtime.stat().st_mode), 0o555)
+            for name in installer.FILES:
+                self.assertEqual(stat.S_IMODE((runtime / name).stat().st_mode), 0o444)
             launcher = root / "bin/away-mode"
             self.assertTrue(launcher.is_file())
             shutil.rmtree(source)
@@ -83,6 +89,44 @@ class InstallTests(unittest.TestCase):
             self.assertIn('no personal-name defaults', run.stdout)
             self.assertFalse((root / 'state').exists())
             self.assertFalse((root / 'home').exists())
+
+    def test_seal_failure_removes_new_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            share, bin_dir = root / "share", root / "bin"
+            runtime = share / "runtimes" / installer.digest_source(SOURCE)
+            chmod = os.chmod
+            rmtree = shutil.rmtree
+
+            def fail_runtime_seal(path, mode):
+                if Path(path) == runtime and mode == 0o555:
+                    raise PermissionError("fixture runtime seal failure")
+                chmod(path, mode)
+
+            with patch.object(installer.os, "chmod", side_effect=fail_runtime_seal):
+                with self.assertRaisesRegex(PermissionError, "fixture runtime seal failure"):
+                    installer.install(SOURCE, share, bin_dir)
+
+            self.assertFalse(runtime.exists())
+            self.assertEqual(list(runtime.parent.glob(".away-mode-*")), [])
+
+            def fail_runtime_cleanup(path):
+                if Path(path) == runtime:
+                    raise PermissionError("fixture runtime cleanup failure")
+                rmtree(path)
+
+            with patch.object(installer.os, "chmod", side_effect=fail_runtime_seal), \
+                    patch.object(installer.shutil, "rmtree", side_effect=fail_runtime_cleanup):
+                with self.assertRaisesRegex(RuntimeError, "cleanup also failed"):
+                    installer.install(SOURCE, share, bin_dir)
+
+            self.assertTrue(runtime.is_dir())
+            mode_before_retry = stat.S_IMODE(runtime.stat().st_mode)
+            files_before_retry = {name: (runtime / name).read_bytes() for name in installer.FILES}
+            with self.assertRaisesRegex(RuntimeError, "Existing runtime is not sealed"):
+                installer.install(SOURCE, share, bin_dir)
+            self.assertEqual(stat.S_IMODE(runtime.stat().st_mode), mode_before_retry)
+            self.assertEqual({name: (runtime / name).read_bytes() for name in installer.FILES}, files_before_retry)
 
     def test_unowned_launcher_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:

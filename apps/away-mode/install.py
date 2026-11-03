@@ -42,13 +42,26 @@ def install(source, share_dir, bin_dir):
                 (staging / name).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source / name, staging / name)
                 os.chmod(staging / name, 0o444)
-            os.chmod(staging, 0o555)
             os.replace(staging, runtime)
+            try:
+                os.chmod(runtime, 0o555)
+            except OSError as seal_error:
+                try:
+                    os.chmod(runtime, 0o700)
+                    shutil.rmtree(runtime)
+                except OSError as cleanup_error:
+                    raise RuntimeError(
+                        f"Could not seal new runtime {runtime}: {seal_error}; "
+                        f"cleanup also failed: {cleanup_error}"
+                    ) from seal_error
+                raise
         finally:
             if staging.exists():
                 os.chmod(staging, 0o700)
                 shutil.rmtree(staging)
     else:
+        if runtime.stat().st_mode & 0o777 != 0o555:
+            raise RuntimeError(f"Existing runtime is not sealed: {runtime}")
         for name in FILES:
             if (runtime / name).read_bytes() != (source / name).read_bytes():
                 raise RuntimeError(f"Immutable runtime digest collision: {runtime}")

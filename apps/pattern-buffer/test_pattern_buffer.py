@@ -24,7 +24,8 @@ class PatternBufferTests(unittest.TestCase):
         self.root = Path(self.temp.name) / "repo"
         self.root.mkdir()
         self.git("init", "-q")
-        self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        self.git("-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                 "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                  "commit", "--allow-empty", "-qm", "Initial")
 
     def git(self, *args):
@@ -38,7 +39,8 @@ class PatternBufferTests(unittest.TestCase):
     def create_repo(self, root):
         root.mkdir(parents=True)
         self.git_at(root, "init", "-q")
-        self.git_at(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        self.git_at(root, "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                    "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                     "commit", "--allow-empty", "-qm", "Initial")
 
     def registration(self, root=None):
