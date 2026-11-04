@@ -1,6 +1,6 @@
 # Qwen operating guide
 
-This guide describes a manual, bounded workflow for Codex or Claude orchestrators supervising Qwen implementers in OpenCode.
+This guide describes a bounded workflow for Codex or Claude orchestrators supervising Qwen implementers in OpenCode.
 It also describes the separate evidence required before a Qwen orchestrator can coordinate implementers.
 
 Every Qwen run uses a visible OpenCode tab or pane in the existing CMUX workspace assigned to that same task.
@@ -13,14 +13,24 @@ It does not add a Starfleet adapter, launch command, permission boundary or nati
 
 ## Current support and evidence boundary
 
-### Starfleet source limits
+### Source support and native qualification
 
-The maintained Starfleet sources currently support Claude, Codex and Muse model records, while Pattern Buffer dispatch supports Claude and Codex.
-Those sources contain no native OpenCode or Qwen adapter.
-Pattern Buffer task replay and compaction recovery for OpenCode are planned and unverified, so relay the current task and essential context directly in the visible OpenCode session.
+This candidate includes opt-in OpenCode adapters; it does not enable them in existing installations or activate a Qwen profile.
+Keep source implementation, simulated verification and observed native behavior separate when selecting a workflow.
+The [acceptance observations](opencode-qwen-acceptance.md) record the tested runtime configuration and remaining gaps.
 
-The saved-startup check recorded for the current controlled trial covered Codex only, with the implementer choice set to gpt-6-luna at xhigh.
-That record establishes no Qwen startup, implementer or orchestrator qualification.
+| Component | Candidate source behavior | Observed native boundary |
+| --- | --- | --- |
+| Model Preferences | Exact local provider/model/max preflight and initial implementer/researcher dispatch into a new tab in the existing workspace | Real read-only preflight passed; managed launch and continuation need separate native qualification |
+| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks | Initial shared/implementer/task delivery, updated task in completed compaction and pre-provider failure refusal passed; resumed implementation and model-visible finish remain unverified |
+| Hailing Frequencies and Discord Watch | Exact OpenCode ownership and guarded API delivery, including Temporal continuation integration | Automatic delivery remains held while the tested native composer state is unknown; configured enrollment is not wake reception |
+| Agent Notify | OpenCode identity labeling and owning-thread integration | Native Qwen-origin conversation and reply reception need qualification |
+| Warp-drive and Away Mode | OpenCode ownership handling in source | Native Qwen job completion and away-context reception need qualification |
+| Qwen-only orchestration | Opt-in model profile records | A profile is not orchestration proof; fresh parent startup, actual child delegation, acceptance reporting and escalation remain separate trials |
+
+The active shared profile remains independent of these opt-in examples.
+Check the saved profile against each session's intended profile before launch, and do not globally activate a trial preference.
+The observed Codex startup and Luna delegation do not establish Qwen orchestrator qualification.
 
 ### Operator guidance
 
@@ -296,6 +306,6 @@ If a decision needs human approval, leave the decision pending and record the ho
 ## Starfleet references
 
 [Model Preferences](../apps/model-preferences/README.md) describes exact model choices and the limits of saved profiles.
-[Pattern Buffer](../apps/pattern-buffer/README.md) describes current task replay and dispatch support for Claude and Codex.
+[Pattern Buffer](../apps/pattern-buffer/README.md) and its [OpenCode guide](../apps/pattern-buffer/docs/opencode.md) describe explicit context installation and exact task binding.
 [Implementer dispatch](../apps/pattern-buffer/docs/implementer-dispatch.md) describes receipt and completion evidence boundaries.
 [Warp-drive](../apps/warp-drive/README.md) describes local CPU reservation controls when those are part of an authorized workflow.

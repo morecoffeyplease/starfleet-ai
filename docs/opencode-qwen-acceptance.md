@@ -22,6 +22,14 @@ Seventeen synthetic adapter tests also passed independently on candidate `7de919
 The native check establishes compatibility of these read-only routes and response shapes for the tested configuration.
 It does not independently authenticate the caller-supplied CMUX association or prove a safe message-send state.
 
+## Model Preferences preflight
+
+Candidate `2dda6cc` passed the component verifier with 90 tests, including synthetic OpenCode API and CMUX boundary tests.
+A separate real read-only preflight against the owned OpenCode 2.2.5 server confirmed the authenticated API identity, exact local provider and model, the `max` variant and a 32,768-token output allowance.
+That check did not create a session, launch a model or qualify managed dispatch.
+Native CMUX returns uppercase UUID strings while the initial launcher normalized expected UUIDs to lowercase.
+The current native-binding comparison needs semantic UUID normalization before a managed launch can be qualified; case differences must not weaken exact ownership checks.
+
 ## Maximum-thinking startup and instruction reception
 
 An interactive OpenCode startup prompt requested one allowed fixture read and two known markers.
