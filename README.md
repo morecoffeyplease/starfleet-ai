@@ -25,7 +25,8 @@ The repository does not promise publication to npm, PyPI, Homebrew, or another p
 Each component has its own setup, supported platforms, verification command, and limits.
 Start with the component README and its printable guide when available.
 Installation is opt-in, and components do not start workers or change hooks merely because the source is present.
-The [Qwen operating guide](docs/qwen-operating-guide.md) documents the manual OpenCode workflow and its current qualification limits.
+The [OpenCode and local Qwen setup guide](docs/opencode-qwen-setup.md) records the prerequisites, isolated configuration and current qualification limits.
+The [Qwen operating guide](docs/qwen-operating-guide.md) covers task framing, supervision, evidence, secrets and escalation for orchestrators and implementers.
 
 ## Prerequisites
 
