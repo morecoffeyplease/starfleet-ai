@@ -83,7 +83,8 @@ class FakeAPIState:
         self.pending_inbox = []
         self.pending_permissions = []
         self.pending_forms = []
-        self.prompt_delivery_mode = "queue"
+        self.prompt_delivery = "queue"
+        self.omit_prompt_delivery = False
         self.delay_info = False
         self.delay_create = False
         self.large_info = False
@@ -214,12 +215,13 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
                 return
         if self.path == f"/api/session/{SESSION}/prompt":
             self.state.sent_prompts.append(payload)
-            return self.respond(200, {"data": {"id": f"msg_user{len(self.state.sent_prompts)}",
-                                                "sessionID": SESSION, "type": "user", "time": {},
-                                                "payload": {},
-                                                "delivery": {"mode": (self.state.prompt_delivery_mode
-                                                                          if payload.get("delivery") == "queue"
-                                                                          else "steer")}}})
+            data = {"id": f"msg_user{len(self.state.sent_prompts)}", "sessionID": SESSION,
+                    "type": "user", "time": {}, "payload": {},
+                    "delivery": (self.state.prompt_delivery if payload.get("delivery") == "queue"
+                                 else "steer")}
+            if self.state.omit_prompt_delivery:
+                data.pop("delivery")
+            return self.respond(200, {"data": data})
         return self.respond(404)
 
     def do_PUT(self):
@@ -445,7 +447,8 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.state.pending_permissions = []
         self.state.pending_forms = []
         self.state.sent_prompts = []
-        self.state.prompt_delivery_mode = "queue"
+        self.state.prompt_delivery = "queue"
+        self.state.omit_prompt_delivery = False
         if delivery_policy is not None:
             manifest = json.loads(self.manifest.read_text())
             manifest["delivery_policy"] = delivery_policy
@@ -692,7 +695,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
     def test_api_sidechannel_continuation_wrong_queue_admission_is_uncertain_and_not_replayed(self):
         app, _launch, args, current, hook_path, cmux = self.continuation_fixture(
             guard_state="draft", guard_blocks_typing=False, delivery_policy="api_sidechannel")
-        self.state.prompt_delivery_mode = "steer"
+        self.state.prompt_delivery = "steer"
         with patch.object(app, "current", return_value=current), \
                 patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
                 patch.object(mp, "run_json", side_effect=cmux), \
@@ -708,6 +711,28 @@ class OpenCodeDispatchTest(unittest.TestCase):
                 self.assertRaisesRegex(mp.PreferenceError, "uncertain admission"):
             mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
         self.assertEqual(len(self.state.sent_prompts), 1)
+
+    def test_api_sidechannel_admission_rejects_object_steer_and_missing_delivery(self):
+        manifest = json.loads(self.manifest.read_text())
+        manifest["delivery_policy"] = "api_sidechannel"
+        self.manifest.write_text(json.dumps(manifest)); self.manifest.chmod(0o600)
+        connection = dispatch.load_connection(self.manifest)
+        cases = (("steer", False, "prompt_queue_admission_unconfirmed"),
+                 ({"mode": "queue"}, False, "prompt_queue_admission_unconfirmed"),
+                 ("queue", True, "prompt_response_unconfirmed"))
+        for index, (delivery, omit, code) in enumerate(cases):
+            with self.subTest(delivery=delivery, omit=omit):
+                self.state.prompt_delivery = delivery
+                self.state.omit_prompt_delivery = omit
+                with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+                    dispatch.send_prompt(connection, session_id=SESSION,
+                                         text=f"Synthetic delivery-shape case {index}.")
+                self.assertEqual(raised.exception.code, code)
+        self.assertEqual(self.state.sent_prompts, [
+            {"text": "Synthetic delivery-shape case 0.", "delivery": "queue", "resume": True},
+            {"text": "Synthetic delivery-shape case 1.", "delivery": "queue", "resume": True},
+            {"text": "Synthetic delivery-shape case 2.", "delivery": "queue", "resume": True},
+        ])
 
     def test_opencode_resume_rejects_a_changed_delivery_policy(self):
         app, _launch, args, _current, _hook_path, _cmux = self.continuation_fixture()

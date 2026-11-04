@@ -1122,8 +1122,7 @@ def send_prompt(connection: Connection, *, session_id: str, text: str) -> dict:
             or not all(key in data for key in ("time", "payload", "delivery"))):
         raise OpenCodeDispatchError("prompt_response_unconfirmed")
     if connection.delivery_policy == "api_sidechannel":
-        delivery = data.get("delivery")
-        if not isinstance(delivery, dict) or delivery.get("mode") != "queue":
+        if data.get("delivery") != "queue":
             raise OpenCodeDispatchError("prompt_queue_admission_unconfirmed")
     return {"message_id": message_id, "session_id": session_id,
             "admission": "confirmed", "transport": "opencode_api"}

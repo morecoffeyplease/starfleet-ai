@@ -33,7 +33,7 @@ class FakeOpenCodeServer:
         self.post_delay = 0
         self.post_response = {"data": {"id": "msg_HailingFixture1", "sessionID": SESSION,
                                        "time": {"created": 1}, "type": "user",
-                                       "payload": {"parts": []}, "delivery": {"mode": "direct"}}}
+                                       "payload": {"parts": []}, "delivery": "steer"}}
         self.posts = []
         self.gets = []
         self.password = PASSWORD
@@ -324,7 +324,7 @@ class OpenCodeDeliveryTests(unittest.TestCase):
 
     def test_api_sidechannel_queues_while_composer_state_is_unknown_or_draft(self):
         self.enroll_api_sidechannel()
-        self.server.post_response["data"]["delivery"] = {"mode": "queue"}
+        self.server.post_response["data"]["delivery"] = "queue"
 
         cases = (("unknown", "idle"), ("draft", "idle"))
         for index, (state, lifecycle) in enumerate(cases):
@@ -343,22 +343,27 @@ class OpenCodeDeliveryTests(unittest.TestCase):
     def test_api_sidechannel_queue_mismatch_and_timeout_are_uncertain_without_replay(self):
         self.enroll_api_sidechannel()
         self.guard["state"] = "unknown"
-        self.server.post_response["data"]["delivery"] = {"mode": "direct"}
+        for index, wrong_delivery in enumerate(("steer", {"mode": "queue"}, None)):
+            with self.subTest(delivery=wrong_delivery):
+                if wrong_delivery is None:
+                    self.server.post_response["data"].pop("delivery", None)
+                else:
+                    self.server.post_response["data"]["delivery"] = wrong_delivery
+                key = f"api-queue-mismatch-{index}"
+                mismatch = self.attention_once(key=key)
+                self.assertEqual((mismatch["outcome"], mismatch["attempted"]), ("uncertain", True))
+                mismatch_row = self.app.prior_attention_intent(self.target, key)
+                self.assertEqual(mismatch_row[1:3], ("uncertain", 1))
+                self.assertEqual(self.attention_once(key=key), mismatch)
+                self.assertEqual(len(self.server.posts), index + 1)
+                self.server.post_response["data"]["delivery"] = "queue"
 
-        mismatch = self.attention_once(key="api-queue-mismatch")
-        self.assertEqual((mismatch["outcome"], mismatch["attempted"]), ("uncertain", True))
-        mismatch_row = self.app.prior_attention_intent(self.target, "api-queue-mismatch")
-        self.assertEqual(mismatch_row[1:3], ("uncertain", 1))
-        self.assertEqual(self.attention_once(key="api-queue-mismatch"), mismatch)
-        self.assertEqual(len(self.server.posts), 1)
-
-        self.server.post_response["data"]["delivery"] = {"mode": "queue"}
         self.server.post_delay = 0.2
         with patch.object(hf, "OPENCODE_HTTP_TIMEOUT", 0.05):
             timeout = self.attention_once(key="api-queue-timeout")
             self.assertEqual((timeout["outcome"], timeout["attempted"]), ("uncertain", True))
             self.assertEqual(self.attention_once(key="api-queue-timeout"), timeout)
-        self.assertEqual(len(self.server.posts), 2)
+        self.assertEqual(len(self.server.posts), 4)
 
     def test_api_sidechannel_keeps_api_receiving_and_human_input_holds(self):
         self.enroll_api_sidechannel()

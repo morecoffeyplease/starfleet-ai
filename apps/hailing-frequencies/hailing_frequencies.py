@@ -249,8 +249,7 @@ def opencode_prompt(target, password, prompt):
             require(all(key in data for key in ("time", "payload", "delivery")),
                     "OpenCode prompt response was not confirmed")
             if policy == OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY:
-                delivery = data.get("delivery")
-                require(isinstance(delivery, dict) and delivery.get("mode") == "queue",
+                require(data.get("delivery") == "queue",
                         "OpenCode queue admission was not confirmed")
     except (UnicodeError, ValueError) as error:
         raise ValueError(str(error) or "OpenCode prompt response was not confirmed") from None
