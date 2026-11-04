@@ -1,6 +1,7 @@
 """Synthetic OpenCode API and CMUX boundary tests for Model Preferences."""
 
 import base64
+import hashlib
 import http.server
 import importlib.util
 import json
@@ -15,6 +16,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 import uuid
 
 SCRIPT = Path(__file__).resolve().parents[1] / "opencode_dispatch.py"
@@ -26,6 +28,7 @@ from test_preferences import mp
 
 
 CANARY = "synthetic-password-canary-never-output"
+CMUX_CANARY = "synthetic-cmux-capability-canary-never-output"
 SESSION = "ses_synthetic123"
 PROVIDER = "trial-local"
 MODEL = "qwen3.6:35b"
@@ -49,8 +52,14 @@ class FakeAPIState:
         self.variant_settings = {"reasoningEffort": "max"}
         self.session_directory = str(root)
         self.session_model = {"providerID": PROVIDER, "id": MODEL, "variant": "max"}
+        self.session_parent_id = None
         self.session_metadata = {}
         self.environment = None
+        self.messages = []
+        self.message_reads = 0
+        self.delay_startup_messages = False
+        self.pending_startup_prompt = None
+        self.sent_prompts = []
         self.active_sessions = {}
         self.pending_permissions = []
         self.pending_forms = []
@@ -60,9 +69,17 @@ class FakeAPIState:
         self.wrong_create_id = False
 
     def session(self, session_id=SESSION):
-        return {"id": session_id, "location": {"directory": self.session_directory},
+        return {"id": session_id, "parentID": self.session_parent_id,
+                "location": {"directory": self.session_directory},
                 "model": self.session_model, "metadata": self.session_metadata,
                 "time": {"created": 1, "updated": 1, "archived": None}}
+
+    def startup_messages(self, prompt):
+        return [{"id": "msg_startupUser123", "type": "user", "text": prompt,
+                 "time": {"created": 10}},
+                {"id": "msg_startupAssistant123", "type": "assistant", "agent": "build",
+                 "model": {"providerID": PROVIDER, "id": MODEL, "variant": "max"},
+                 "time": {"created": 11, "completed": 12}, "finish": "stop", "content": []}]
 
 
 class FakeHandler(http.server.BaseHTTPRequestHandler):
@@ -128,6 +145,24 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
             return self.respond(200, {"data": self.state.pending_permissions})
         if self.path == f"/api/session/{SESSION}/form":
             return self.respond(200, {"data": self.state.pending_forms})
+        if self.path.split("?", 1)[0] == f"/api/session/{SESSION}/message":
+            self.state.message_reads += 1
+            if self.state.delay_startup_messages and self.state.message_reads >= 2 and not self.state.messages:
+                self.state.messages = self.state.startup_messages(self.state.pending_startup_prompt)
+            query = parse_qs(urlsplit(self.path).query)
+            if "cursor" in query:
+                messages = []
+            else:
+                messages = self.state.messages
+                if query.get("type") == ["user"]:
+                    messages = [row for row in messages if row.get("type") == "user"]
+                if query.get("order") == ["desc"]:
+                    messages = list(reversed(messages))
+                if "limit" in query:
+                    messages = messages[:int(query["limit"][0])]
+            cursor = ({"previous": "fixture-previous", "next": "fixture-next"} if messages
+                      else {"previous": None, "next": None})
+            return self.respond(200, {"data": messages, "cursor": cursor})
         return self.respond(404)
 
     def do_POST(self):
@@ -141,6 +176,7 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
             location = payload.get("location", {})
             self.state.session_directory = location.get("directory", "")
             self.state.session_model = payload.get("model")
+            self.state.session_parent_id = payload.get("parentID")
             self.state.session_metadata = payload.get("metadata", {})
             if self.state.delay_create:
                 time.sleep(2.2)
@@ -148,6 +184,11 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
                 return self.respond(200, {"data": self.state.session(session_id)})
             except OSError:
                 return
+        if self.path == f"/api/session/{SESSION}/prompt":
+            self.state.sent_prompts.append(payload)
+            return self.respond(200, {"data": {"id": f"msg_user{len(self.state.sent_prompts)}",
+                                                "sessionID": SESSION, "type": "user", "time": {},
+                                                "payload": {}, "delivery": {}}})
         return self.respond(404)
 
     def do_PUT(self):
@@ -188,6 +229,69 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.choice = {"harness": "opencode", "provider_id": PROVIDER, "model": MODEL,
                        "effort": "max", "selection": "a" * 64}
 
+    def continuation_fixture(self, *, native_state="idle", guard_state="empty", wrong_surface=False):
+        self.state.active_sessions = {}
+        self.state.pending_permissions = []
+        self.state.pending_forms = []
+        self.state.sent_prompts = []
+        fixture_id = uuid.uuid4().hex
+        config_dir, state_dir = self.root / ("resume-config-" + fixture_id), self.root / ("resume-state-" + fixture_id)
+        config = mp.example_config()
+        config["active"] = "Qwen-only"
+        mp.write(config_dir / "profiles.json", config)
+        app = mp.App(config_dir, state_dir)
+        worktree = self.root / ("resume-worktree-" + uuid.uuid4().hex)
+        worktree.mkdir()
+        subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+        connection = dispatch.load_connection(self.manifest)
+        choice = mp.resolve(mp.selection(config), "implementer", None)
+        launch_id = uuid.uuid4().hex
+        original = b"Original bounded task."
+        task_digest = hashlib.sha256(original).hexdigest()
+        created = dispatch.create_session(connection, directory=str(worktree), choice=choice,
+                                          launch_id=launch_id, task_digest=task_digest,
+                                          parent_task_id=connection.parent_task_id)
+        workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+        launch = {"id": launch_id, "choice": choice, "cwd": str(worktree), "created_at": "fixture",
+                  "status": "running", "native_session": SESSION, "parent_task_id": connection.parent_task_id,
+                  "task_id": connection.parent_task_id, "task_digest": task_digest,
+                  "api_origin": connection.api_origin, "api_contract": "opencode-v2.2.5-model-preflight-1",
+                  "expected_server_pid": connection.expected_server_pid,
+                  "session_directory": created["directory"], "worktree_directory": str(worktree),
+                  "cmux_workspace_uuid": workspace, "cmux_surface_uuid": surface,
+                  "native_started_at": 123.0, "execution_result": "turn_idle", "slot": None,
+                  "context_injector": None, "opencode_parent_session_id": None}
+        app.save_state(f"launches/{launch_id}", launch)
+        hook_path = self.root / ("resume-hook-" + uuid.uuid4().hex + ".json")
+        dispatch.write_private_json(hook_path, {"sessions": {SESSION: {
+            "workspaceId": workspace, "surfaceId": surface, "startedAt": 123.0,
+            "agentLifecycle": "idle", "cwd": str(worktree)}}})
+        visible_surface = str(uuid.uuid4()) if wrong_surface else surface
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                   "items": [{"lifecycle": "running", "placement": {"kind": "local"},
+                              "freshness": {"state": "current"},
+                              "projections": [{"workspace_id": workspace, "panel_id": visible_surface}],
+                              "agents": [{"kind": "opencode", "session_id": SESSION,
+                                          "state": native_state}]}]}
+
+        def cmux(argv, stdin=None):
+            method = argv[argv.index("rpc") + 1]
+            params = json.loads(argv[-1])
+            if method == "surface.input_state":
+                return {"surface_id": params["surface_id"], "workspace_id": workspace,
+                        "agent": True, "terminal": True, "state": guard_state,
+                        "blocks_typing": guard_state != "empty", "waiting_on_human": False,
+                        "lifecycle": "idle"}
+            if method == "agent.message.settings":
+                return {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+            raise AssertionError(method)
+
+        args = SimpleNamespace(launch=launch_id, task_file=str(self.root / "followup.txt"),
+                               opencode_manifest=str(self.manifest), review_plan=None, approval=None,
+                               review_authorization=None)
+        Path(args.task_file).write_bytes(b"Continue with one distinct synthetic task.")
+        return app, launch, args, current, hook_path, cmux
+
     def test_preflight_and_create_use_exact_model_without_prompt_or_permission_calls(self):
         proof = dispatch.preflight(self.manifest, self.choice)
         self.assertEqual(proof.server_pid, 4242)
@@ -209,11 +313,540 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(payload["parent_task_id"], "task-parent-fixture")
         dispatch.set_session_environment(connection, SESSION, workspace_uuid=str(uuid.uuid4()),
                                          surface_uuid=str(uuid.uuid4()), launch_id=launch_id,
-                                         cmux_socket_path="/private/tmp/cmux.sock")
+                                         cmux_socket_path="/private/tmp/cmux.sock",
+                                         cmux_socket_capability=CMUX_CANARY,
+                                         model_preferences_manifest=str(self.manifest),
+                                         task_id="task-child-fixture")
         self.assertEqual(self.state.calls[-1][0:2], ("PUT", f"/api/session/{SESSION}/environment"))
         self.assertIn("OPENCODE_SESSION_ID", self.state.environment["variables"])
+        self.assertEqual(self.state.environment["variables"]["CMUX_SOCKET_CAPABILITY"], CMUX_CANARY)
+        self.assertEqual(self.state.environment["variables"]["MODEL_PREFERENCES_TASK_ID"], "task-child-fixture")
         self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
         self.assertNotIn(CANARY, repr(connection))
+
+    def test_child_session_keeps_native_parent_session_separate_from_parent_task(self):
+        connection = dispatch.load_connection(self.manifest)
+        parent_session = "ses_parentFixture123"
+        created = dispatch.create_session(connection, directory=str(self.root), choice=self.choice,
+                                          launch_id="d" * 32, task_digest="e" * 64,
+                                          parent_task_id=connection.parent_task_id,
+                                          parent_session_id=parent_session)
+        self.assertEqual(created["parent_session_id"], parent_session)
+        self.assertEqual(self.state.session_metadata["starfleet.model-preferences"]["parent_task_id"],
+                         "task-parent-fixture")
+        self.assertEqual(self.state.session_metadata["starfleet.model-preferences"]["parent_session_id"],
+                         parent_session)
+        self.assertEqual(self.state.session_parent_id, parent_session)
+        self.assertNotEqual(created["parent_session_id"], connection.parent_task_id)
+        self.state.session_parent_id = "ses_differentParent123"
+        with self.assertRaisesRegex(dispatch.OpenCodeDispatchError, "created_session_parent_session_mismatch"):
+            dispatch.verify_session(connection, SESSION, expected_directory=str(self.root), choice=self.choice,
+                                    launch_id="d" * 32, task_digest="e" * 64,
+                                    parent_task_id=connection.parent_task_id,
+                                    parent_session_id=parent_session)
+
+    def test_startup_message_proof_requires_exact_prompt_and_completed_configured_model(self):
+        connection = dispatch.load_connection(self.manifest)
+        prompt = "Exact synthetic startup prompt"
+        prompt_digest = hashlib.sha256(prompt.encode()).hexdigest()
+        self.state.messages = self.state.startup_messages(prompt)
+        observation = dispatch.startup_turn_observation(
+            connection, session_id=SESSION, prompt_sha256=prompt_digest,
+            provider_id=PROVIDER, model_id=MODEL)
+        self.assertEqual(observation["state"], "complete")
+        self.assertEqual(observation["user_message_id"], "msg_startupUser123")
+        self.assertNotIn(prompt, json.dumps(observation))
+        pages = [urlsplit(path).query for method, path, _ in self.state.calls
+                 if method == "GET" and urlsplit(path).path == f"/api/session/{SESSION}/message"]
+        self.assertEqual(len(pages), 2)
+        first_query, terminal_query = (parse_qs(page) for page in pages)
+        self.assertEqual(first_query, {"limit": ["100"], "order": ["asc"]})
+        self.assertEqual(set(terminal_query), {"limit", "cursor"})
+        self.assertEqual(terminal_query["limit"], ["100"])
+        self.assertTrue(dispatch.latest_user_message_matches(
+            connection, session_id=SESSION, message_id="msg_startupUser123", text_sha256=prompt_digest))
+        assistant = next(row for row in self.state.messages if row.get("type") == "assistant")
+        assistant["model"]["variant"] = "default"
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.startup_turn_observation(
+                connection, session_id=SESSION, prompt_sha256=prompt_digest,
+                provider_id=PROVIDER, model_id=MODEL)
+        self.assertEqual(raised.exception.code, "startup_assistant_model_mismatch")
+        assistant["model"].pop("variant")
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.startup_turn_observation(
+                connection, session_id=SESSION, prompt_sha256=prompt_digest,
+                provider_id=PROVIDER, model_id=MODEL)
+        self.assertEqual(raised.exception.code, "startup_assistant_model_mismatch")
+        assistant["model"]["variant"] = "max"
+        self.state.messages[0]["text"] = "different prompt"
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.startup_turn_observation(
+                connection, session_id=SESSION, prompt_sha256=prompt_digest,
+                provider_id=PROVIDER, model_id=MODEL)
+        self.assertEqual(raised.exception.code, "startup_prompt_identity_mismatch")
+
+    def test_capability_handoff_rejects_missing_or_unbounded_values(self):
+        connection = dispatch.load_connection(self.manifest)
+        for value in (None, "", "  padded", "bad\nvalue", "x" * 4097):
+            with self.subTest(value=repr(value)[:16]), self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+                dispatch.set_session_environment(connection, SESSION, workspace_uuid=str(uuid.uuid4()),
+                                                surface_uuid=str(uuid.uuid4()), launch_id="a" * 32,
+                                                cmux_socket_path=None, cmux_socket_capability=value)
+            self.assertEqual(raised.exception.code, "cmux_socket_capability_unavailable")
+        self.assertFalse(any(method == "PUT" for method, _, _ in self.state.calls))
+
+    def test_opencode_continuation_requires_native_empty_composer_and_persists_intent_before_send(self):
+        app, launch, args, current, hook_path, cmux = self.continuation_fixture()
+        original_send = dispatch.send_prompt
+
+        def send_after_intent(connection, *, session_id, text):
+            intent = app.state(f"continuations/{SESSION}", None)
+            self.assertEqual(intent["status"], "send_intent")
+            self.assertEqual(intent["session"], SESSION)
+            self.assertNotIn(text, json.dumps(intent))
+            return original_send(connection, session_id=session_id, text=text)
+
+        with patch.object(app, "current", return_value=current), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                patch.object(mp, "run_json", side_effect=cmux), \
+                patch.object(mp.opencode_dispatch, "send_prompt", side_effect=send_after_intent):
+            result = mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
+        self.assertEqual(result["status"], "submitted")
+        self.assertEqual(result["session"], SESSION)
+        self.assertEqual(len(self.state.sent_prompts), 1)
+        saved = app.state(f"continuations/{SESSION}", None)
+        self.assertEqual(saved["status"], "submitted")
+        self.assertEqual(saved["message_id"], result["message_id"])
+        self.assertNotIn("Continue with one distinct synthetic task.", json.dumps(saved))
+
+    def test_opencode_continuation_holds_busy_draft_unknown_and_wrong_surface_without_sending(self):
+        cases = (("busy", {"active": {SESSION: {"type": "running"}}}, "empty", False,
+                  "session_guard_session_busy"),
+                 ("permission", {"permission": [{"id": "permission-fixture"}]}, "empty", False,
+                  "session_guard_pending_permissions"),
+                 ("form", {"form": [{"id": "form-fixture"}]}, "empty", False,
+                  "session_guard_pending_forms"),
+                 ("draft", {}, "draft", False, "native_composer_not_empty"),
+                 ("unknown", {}, "unknown", False, "native_composer_not_empty"),
+                 ("wrong_surface", {}, "empty", True, "native_session_visible_on_other_surface"))
+        for name, api_state, guard_state, wrong_surface, expected in cases:
+            with self.subTest(name=name):
+                app, launch, args, current, hook_path, _ = self.continuation_fixture(
+                    guard_state=guard_state, wrong_surface=wrong_surface)
+                self.state.active_sessions = api_state.get("active", {})
+                self.state.pending_permissions = api_state.get("permission", [])
+                self.state.pending_forms = api_state.get("form", [])
+
+                def cmux(argv, stdin=None):
+                    method = argv[argv.index("rpc") + 1]
+                    params = json.loads(argv[-1])
+                    if method == "surface.input_state":
+                        return {"surface_id": params["surface_id"],
+                                "workspace_id": launch["cmux_workspace_uuid"],
+                                "agent": True, "terminal": True, "state": guard_state,
+                                "blocks_typing": guard_state != "empty", "waiting_on_human": False,
+                                "lifecycle": "idle"}
+                    return {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+
+                with patch.object(app, "current", return_value=current), \
+                        patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                        patch.object(mp, "run_json", side_effect=cmux), \
+                        self.assertRaisesRegex(mp.PreferenceError, expected):
+                    mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
+                self.assertEqual(self.state.sent_prompts, [])
+
+    def test_uncertain_opencode_prompt_send_blocks_retry(self):
+        app, launch, args, current, hook_path, cmux = self.continuation_fixture()
+        calls = []
+
+        def uncertain_send(*args, **kwargs):
+            calls.append(1)
+            raise mp.opencode_dispatch.OpenCodeDispatchError("http_timeout")
+
+        with patch.object(app, "current", return_value=current), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                patch.object(mp, "run_json", side_effect=cmux), \
+                patch.object(mp.opencode_dispatch, "send_prompt", side_effect=uncertain_send), \
+                self.assertRaisesRegex(mp.PreferenceError, "admission is uncertain"):
+            mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
+        self.assertEqual(app.state(f"continuations/{SESSION}", None)["status"], "uncertain")
+        with patch.object(app, "current", return_value=current), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                patch.object(mp, "run_json", side_effect=cmux), \
+                patch.object(mp.opencode_dispatch, "send_prompt", side_effect=uncertain_send), \
+                self.assertRaisesRegex(mp.PreferenceError, "uncertain admission"):
+            mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
+        self.assertEqual(len(calls), 1)
+
+    def test_fresh_qwen_only_orchestrator_gets_exact_pattern_buffer_assignment(self):
+        config_dir, state_dir = self.root / "orch-config", self.root / "orch-state"
+        config = mp.example_config(); config["active"] = "Qwen-only"
+        mp.validate(config); mp.write(config_dir / "profiles.json", config)
+        app = mp.App(config_dir, state_dir)
+        worktree = self.root / "orch-worktree"; worktree.mkdir()
+        subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+        task_file = self.root / "orch-task.txt"; task_file.write_text("Coordinate this synthetic task.")
+        pb_script = self.root / "pattern_buffer.py"; pb_script.write_text("# synthetic PB boundary\n")
+        choice = mp.resolve(mp.selection(config), "orchestrator", None)
+        assignment_sha = "a" * 64
+        context = {"status": "context", "harness": "opencode", "session_id": SESSION,
+                   "worktree": str(worktree), "text": "pattern-buffer | role: orchestrator | fixture",
+                   "assignment_sha256": assignment_sha}
+        app.run_command = lambda argv, stdin=None: "assigned"
+        app.run_json = lambda argv, stdin=None: context if "context" in argv else {
+            "truncated": False, "owner_availability": {"agent_sessions": "available"},
+            "items": [{"lifecycle": "idle", "placement": {"kind": "local"},
+                       "freshness": {"state": "current"},
+                       "projections": [{"workspace_id": workspace, "panel_id": opened_surface}],
+                       "agents": [{"kind": "opencode", "session_id": SESSION, "state": "idle"}]}]}
+
+        workspace, caller_surface, pane, opened_surface = (
+            str(uuid.uuid4()), str(uuid.uuid4()), "pane-fixture", str(uuid.uuid4()))
+        hook_path = self.root / "orch-hook.json"
+        prompt_seen = {}
+
+        def cmux(argv, stdin=None):
+            if "identify" in argv:
+                return {"caller": {"workspace_id": workspace, "surface_id": caller_surface}}
+            if "tree" in argv:
+                return {"windows": [{"workspaces": [{"id": workspace, "panes": [
+                    {"id": pane, "surfaces": [{"id": caller_surface}]}]}]}]}
+            if "new-surface" in argv:
+                child = shlex.split(argv[argv.index("--command") + 1])
+                def get(flag): return child[child.index("--" + flag) + 1]
+                prompt_text = Path(get("prompt-file")).read_text()
+                prompt_seen["text"] = prompt_text
+                self.state.messages = self.state.startup_messages(prompt_text)
+                dispatch.write_private_json(get("handshake-file"), {
+                    "launch_id": get("launch-id"), "session_id": get("session"),
+                    "workspace_uuid": workspace, "surface_uuid": opened_surface,
+                    "cmux_socket_path": None, "cmux_socket_capability": CMUX_CANARY})
+                dispatch.write_private_json(hook_path, {"sessions": {SESSION: {
+                    "workspaceId": workspace, "surfaceId": opened_surface, "startedAt": 456.0,
+                    "agentLifecycle": "idle", "cwd": str(worktree)}}})
+                return {"workspace_id": workspace, "surface_id": opened_surface}
+            if "current" in argv:
+                return {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                        "items": [{"lifecycle": "idle", "placement": {"kind": "local"},
+                                   "freshness": {"state": "current"},
+                                   "projections": [{"workspace_id": workspace, "panel_id": opened_surface}],
+                                   "agents": [{"kind": "opencode", "session_id": SESSION, "state": "idle"}]}]}
+            if "rpc" in argv:
+                method = argv[argv.index("rpc") + 1]
+                params = json.loads(argv[-1])
+                if method == "surface.input_state":
+                    return {"surface_id": params["surface_id"], "workspace_id": workspace,
+                            "agent": True, "terminal": True, "state": "empty", "blocks_typing": False,
+                            "waiting_on_human": False, "lifecycle": "idle"}
+                return {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+            raise AssertionError(argv)
+
+        args = SimpleNamespace(role="orchestrator", opencode_manifest=str(self.manifest),
+                               context_injector=str(pb_script), owner_worktree=None, receipt_file=None,
+                               task_file=str(task_file), slot=None)
+        with patch.object(mp, "run_json", side_effect=cmux), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"):
+            result = mp.dispatch_opencode(app, args, config, choice, worktree, task_file.read_bytes())
+        saved = app.state(f"launches/{result['launch']}", None)
+        self.assertEqual(result["session"], SESSION)
+        self.assertEqual(saved["choice"]["role"], "orchestrator")
+        self.assertEqual(saved["pattern_buffer_assignment_sha256"], assignment_sha)
+        self.assertEqual(saved["task_id"], "task-parent-fixture")
+        self.assertIsNone(saved["opencode_parent_session_id"])
+        self.assertIn("fresh Qwen-only orchestrator", prompt_seen["text"])
+        self.assertEqual(self.state.environment["variables"]["MODEL_PREFERENCES_TASK_ID"],
+                         "task-parent-fixture")
+        self.assertEqual(self.state.environment["variables"]["MODEL_PREFERENCES_PATTERN_BUFFER"],
+                         str(pb_script))
+        self.assertNotIn(CMUX_CANARY, json.dumps(saved))
+
+    def test_active_parent_proof_keeps_task_session_and_pb_assignment_distinct(self):
+        config_dir, state_dir = self.root / "parent-config", self.root / "parent-state"
+        config = mp.example_config(); config["active"] = "Qwen-only"
+        mp.write(config_dir / "profiles.json", config)
+        app = mp.App(config_dir, state_dir)
+        worktree = self.root / "parent-worktree"; worktree.mkdir()
+        subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+        pb_script = self.root / "parent-pattern-buffer.py"; pb_script.write_text("# fixture\n")
+        choice = mp.resolve(mp.selection(config), "orchestrator", None)
+        connection = dispatch.load_connection(self.manifest)
+        launch_id, task_digest = "a" * 32, "b" * 64
+        dispatch.create_session(connection, directory=str(worktree), choice=choice,
+                                 launch_id=launch_id, task_digest=task_digest,
+                                 parent_task_id=connection.parent_task_id)
+        workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+        prompt = "Active exact parent task."
+        prompt_digest = hashlib.sha256(prompt.encode()).hexdigest()
+        self.state.messages = [{"id": "msg_parentUser123", "type": "user", "text": prompt,
+                                "time": {"created": 10}}]
+        assignment_sha = "c" * 64
+        launch = {"id": launch_id, "choice": choice, "cwd": str(worktree),
+                  "status": "running", "native_session": SESSION,
+                  "parent_task_id": connection.parent_task_id, "task_id": connection.parent_task_id,
+                  "task_digest": task_digest, "startup_prompt_sha256": prompt_digest,
+                  "startup_turn": {"state": "running", "user_message_id": "msg_parentUser123"},
+                  "api_origin": connection.api_origin, "expected_server_pid": connection.expected_server_pid,
+                  "session_directory": str(worktree), "worktree_directory": str(worktree),
+                  "cmux_workspace_uuid": workspace, "cmux_surface_uuid": surface,
+                  "context_injector": {"script": str(pb_script), "role": "orchestrator", "session_id": SESSION},
+                  "pattern_buffer_assignment_sha256": assignment_sha, "opencode_parent_session_id": None,
+                  "created_at": "fixture"}
+        app.save_state(f"launches/{launch_id}", launch)
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                   "items": [{"lifecycle": "running", "placement": {"kind": "local"},
+                              "freshness": {"state": "current"},
+                              "projections": [{"workspace_id": workspace, "panel_id": surface}],
+                              "agents": [{"kind": "opencode", "session_id": SESSION, "state": "working"}]}]}
+        context = {"status": "context", "harness": "opencode", "session_id": SESSION,
+                   "worktree": str(worktree), "text": "pattern-buffer | role: orchestrator | fixture",
+                   "assignment_sha256": assignment_sha}
+        app.current = lambda: current
+        app.run_json = lambda argv, stdin=None: context
+        environ = {"CMUX_AGENT_LAUNCH_KIND": "opencode", "OPENCODE_SESSION_ID": SESSION,
+                   "CMUX_SURFACE_ID": surface, "CMUX_WORKSPACE_ID": workspace}
+        with patch.dict(os.environ, environ):
+            parent = mp.opencode_parent_caller(
+                app, connection, worktree,
+                {"surface_uuid": surface, "workspace_uuid": workspace})
+        self.assertEqual(parent["session_id"], SESSION)
+        self.assertEqual(parent["task_id"], "task-parent-fixture")
+        self.assertNotEqual(parent["task_id"], parent["session_id"])
+        self.assertEqual(parent["assignment_sha256"], assignment_sha)
+        for interaction, attribute in (("permission", "pending_permissions"), ("form", "pending_forms")):
+            with self.subTest(interaction=interaction):
+                setattr(self.state, attribute, [{"id": f"{interaction}-fixture"}])
+                with patch.dict(os.environ, environ), self.assertRaisesRegex(mp.PreferenceError, "pending_"):
+                    mp.opencode_parent_caller(
+                        app, connection, worktree,
+                        {"surface_uuid": surface, "workspace_uuid": workspace})
+                setattr(self.state, attribute, [])
+        self.state.pending_permissions = {"unsupported": True}
+        with patch.dict(os.environ, environ), self.assertRaisesRegex(mp.PreferenceError, "permission_state_unavailable"):
+            mp.opencode_parent_caller(
+                app, connection, worktree,
+                {"surface_uuid": surface, "workspace_uuid": workspace})
+        self.state.pending_permissions = []
+        self.state.pid = 5252
+        with patch.dict(os.environ, environ), self.assertRaisesRegex(mp.PreferenceError, "opencode_server_pid_mismatch"):
+            mp.opencode_parent_caller(
+                app, connection, worktree,
+                {"surface_uuid": surface, "workspace_uuid": workspace})
+        self.state.pid = 4242
+        current["items"][0]["agents"][0]["state"] = "idle"
+        with patch.dict(os.environ, environ), self.assertRaisesRegex(mp.PreferenceError, "currently executing"):
+            mp.opencode_parent_caller(
+                app, connection, worktree,
+                {"surface_uuid": surface, "workspace_uuid": workspace})
+
+    def test_dispatch_qwen_parent_to_distinct_child_worktree(self):
+        config_dir, state_dir = self.root / "child-dispatch-config", self.root / "child-dispatch-state"
+        config = mp.example_config(); config["active"] = "Qwen-only"
+        mp.write(config_dir / "profiles.json", config)
+        app = mp.App(config_dir, state_dir)
+        owner = self.root / "owner-worktree"; owner.mkdir()
+        child = self.root / "child-worktree"; child.mkdir()
+        for worktree in (owner, child):
+            subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+        pb_script = self.root / "child-pattern-buffer.py"; pb_script.write_text("# fixture\n")
+        task_file = self.root / "child-task.txt"; task_file.write_text("Implement one bounded child task.")
+        receipt_file = self.root / "child-receipt.json"
+        parent_choice = mp.resolve(mp.selection(config), "orchestrator", None)
+        child_choice = mp.resolve(mp.selection(config), "implementer", None)
+        connection = dispatch.load_connection(self.manifest)
+        parent_id, parent_digest = "a" * 32, "b" * 64
+        dispatch.create_session(connection, directory=str(owner), choice=parent_choice,
+                                 launch_id=parent_id, task_digest=parent_digest,
+                                 parent_task_id=connection.parent_task_id)
+        workspace, caller_surface = str(uuid.uuid4()), str(uuid.uuid4())
+        child_surface, child_session = str(uuid.uuid4()), "ses_childFixture456"
+        parent_prompt = "Dispatch one bounded child during this exact first task."
+        parent_prompt_digest = hashlib.sha256(parent_prompt.encode()).hexdigest()
+        self.state.messages = [{"id": "msg_parentChildTask123", "type": "user", "text": parent_prompt,
+                                "time": {"created": 10}}]
+        assignment_sha = "c" * 64
+        app.save_state(f"launches/{parent_id}", {
+            "id": parent_id, "choice": parent_choice, "cwd": str(owner),
+            "status": "running", "native_session": SESSION,
+            "parent_task_id": connection.parent_task_id, "task_id": connection.parent_task_id,
+            "task_digest": parent_digest, "startup_prompt_sha256": parent_prompt_digest,
+            "startup_turn": {"state": "running", "user_message_id": "msg_parentChildTask123"},
+            "api_origin": connection.api_origin, "expected_server_pid": connection.expected_server_pid,
+            "session_directory": str(owner), "worktree_directory": str(owner),
+            "cmux_workspace_uuid": workspace, "cmux_surface_uuid": caller_surface,
+            "context_injector": {"script": str(pb_script), "role": "orchestrator", "session_id": SESSION},
+            "pattern_buffer_assignment_sha256": assignment_sha, "opencode_parent_session_id": None,
+            "created_at": "fixture"})
+        parent_context = {"status": "context", "harness": "opencode", "session_id": SESSION,
+                          "worktree": str(owner), "text": "pattern-buffer | role: orchestrator | fixture",
+                          "assignment_sha256": assignment_sha}
+        child_assignment_sha = "d" * 64
+        child_context = {"status": "context", "harness": "opencode", "session_id": child_session,
+                         "worktree": str(child), "text": "pattern-buffer | role: implementer | fixture",
+                         "assignment_sha256": child_assignment_sha}
+        child_ticket = "e" * 32
+        expected_parent = {"harness": "opencode", "session_id": SESSION,
+                           "task_id": connection.parent_task_id, "role": "orchestrator",
+                           "owner_worktree": str(owner),
+                           "owner_gitdir": mp.git(owner, "rev-parse", "--absolute-git-dir").decode().strip(),
+                           "surface_id": caller_surface.upper(), "workspace_id": workspace.upper(),
+                           "assignment_sha256": assignment_sha}
+        current_child = False
+        hook_path = self.root / "child-hook-store.json"
+        pb_actions = []
+        create_requests = []
+
+        def current_for(session, surface, state):
+            return {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                    "items": [{"lifecycle": "running" if state == "working" else "idle",
+                               "placement": {"kind": "local"}, "freshness": {"state": "current"},
+                               "projections": [{"workspace_id": workspace, "panel_id": surface}],
+                               "agents": [{"kind": "opencode", "session_id": session, "state": state}]}]}
+
+        def fake_create(conn, *, directory, choice, launch_id, task_digest, parent_task_id,
+                        parent_session_id=None):
+            create_requests.append({"directory": directory, "parent_session_id": parent_session_id,
+                                    "parent_task_id": parent_task_id, "choice": choice})
+            return {"session_id": child_session, "directory": str(child),
+                    "parent_session_id": parent_session_id,
+                    "model": {"provider_id": choice["provider_id"], "id": choice["model"], "variant": "max"}}
+
+        def fake_cmux(argv, stdin=None):
+            nonlocal current_child
+            if argv[0] == sys.executable and argv[1] == str(pb_script):
+                action = next(item for item in ("prepare-dispatch", "bind-dispatch", "context") if item in argv)
+                pb_actions.append(action)
+                if action == "context":
+                    return parent_context if SESSION in argv else child_context
+                if action == "prepare-dispatch":
+                    receipt_path = Path(argv[argv.index("--receipt-file") + 1])
+                    receipt_path.write_text(json.dumps({"task_id": child_ticket, "harness": "opencode",
+                        "role": "implementer", "status": "pending", "session_id": None,
+                        "worktree": str(child), "owner_worktree": str(owner),
+                        "brief_sha256": hashlib.sha256(task_file.read_bytes()).hexdigest(),
+                        "parent": expected_parent}))
+                    self.assertEqual(argv[argv.index("--cwd") + 1], str(child))
+                    self.assertEqual(argv[argv.index("--owner-worktree") + 1], str(owner))
+                    return {"status": "pending", "harness": "opencode", "role": "implementer",
+                            "task_id": child_ticket, "parent": expected_parent}
+                if action == "bind-dispatch":
+                    return {"status": "active", "task_id": child_ticket, "session_id": child_session,
+                            "harness": "opencode", "role": "implementer"}
+            if "identify" in argv:
+                return {"caller": {"workspace_id": workspace, "surface_id": caller_surface}}
+            if "tree" in argv:
+                return {"windows": [{"workspaces": [{"id": workspace, "panes": [
+                    {"id": "pane-child-dispatch", "surfaces": [{"id": caller_surface}]}]}]}]}
+            if "new-surface" in argv:
+                child_command = shlex.split(argv[argv.index("--command") + 1])
+                def get(flag): return child_command[child_command.index("--" + flag) + 1]
+                prompt_text = Path(get("prompt-file")).read_text()
+                self.assertEqual(get("session"), child_session)
+                self.assertEqual(get("directory"), str(child))
+                dispatch.write_private_json(get("handshake-file"), {
+                    "launch_id": get("launch-id"), "session_id": child_session,
+                    "workspace_uuid": workspace, "surface_uuid": child_surface,
+                    "cmux_socket_path": None, "cmux_socket_capability": CMUX_CANARY})
+                dispatch.write_private_json(hook_path, {"sessions": {child_session: {
+                    "workspaceId": workspace, "surfaceId": child_surface, "startedAt": 987.0,
+                    "agentLifecycle": "idle", "cwd": str(child)}}})
+                current_child = True
+                return {"workspace_id": workspace, "surface_id": child_surface}
+            if "current" in argv:
+                return current_for(child_session, child_surface, "idle") if current_child else current_for(
+                    SESSION, caller_surface, "working")
+            if "rpc" in argv:
+                method = argv[argv.index("rpc") + 1]
+                params = json.loads(argv[-1])
+                if method == "surface.input_state":
+                    return {"surface_id": params["surface_id"], "workspace_id": workspace,
+                            "agent": True, "terminal": True, "state": "empty", "blocks_typing": False,
+                            "waiting_on_human": False, "lifecycle": "idle"}
+                if method == "agent.message.settings":
+                    return {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+            raise AssertionError(f"Unexpected fake dispatch call: {argv}")
+
+        def startup_observation(conn, *, session_id, prompt_sha256, provider_id, model_id):
+            self.assertEqual(session_id, child_session)
+            return {"state": "complete", "user_message_id": "msg_childUser123",
+                    "assistant_message_id": "msg_childAssistant123", "finish": "stop"}
+
+        def child_identity(conn, *, session_id, session_directory, worktree_directory,
+                           workspace_uuid, surface_uuid, parent_task_id):
+            self.assertEqual(session_id, child_session)
+            self.assertEqual(session_directory, str(child))
+            self.assertEqual(worktree_directory, str(child))
+            return {"opencode_session_id": child_session, "opencode_parent_session_id": SESSION,
+                    "worktree_directory": str(child), "cmux_workspace_uuid": workspace,
+                    "cmux_surface_uuid": child_surface, "parent_task_id": parent_task_id}
+
+        args = SimpleNamespace(role="implementer", opencode_manifest=str(self.manifest),
+                               context_injector=str(pb_script), owner_worktree=str(owner),
+                               receipt_file=str(receipt_file), task_file=str(task_file), slot=None)
+        with patch.dict(os.environ, {"CMUX_AGENT_LAUNCH_KIND": "opencode", "OPENCODE_SESSION_ID": SESSION,
+                                     "CMUX_SURFACE_ID": caller_surface, "CMUX_WORKSPACE_ID": workspace}), \
+                patch.object(mp, "run_json", side_effect=fake_cmux), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"), \
+                patch.object(mp.opencode_dispatch, "create_session", side_effect=fake_create), \
+                patch.object(mp.opencode_dispatch, "startup_turn_observation", side_effect=startup_observation), \
+                patch.object(mp.opencode_dispatch, "inspect_session", side_effect=child_identity), \
+                patch.object(mp.opencode_dispatch, "set_session_environment", wraps=mp.opencode_dispatch.set_session_environment):
+            result = mp.dispatch_opencode(app, args, config, child_choice, child, task_file.read_bytes())
+        launch = app.state(f"launches/{result['launch']}", None)
+        self.assertEqual(result["session"], child_session)
+        self.assertEqual(create_requests[0]["directory"], str(child))
+        self.assertEqual(create_requests[0]["parent_session_id"], SESSION)
+        self.assertEqual(launch["opencode_parent_session_id"], SESSION)
+        self.assertEqual(launch["pattern_buffer_task_id"], child_ticket)
+        self.assertEqual(launch["pattern_buffer_owner_worktree"], str(owner))
+        self.assertEqual(launch["worktree_directory"], str(child))
+        self.assertEqual(pb_actions, ["context", "prepare-dispatch", "context", "bind-dispatch", "context"])
+        self.assertNotIn(CMUX_CANARY, json.dumps(launch))
+
+    def test_pattern_buffer_child_receipt_binds_parent_session_and_task_separately(self):
+        owner = self.root / "pb-owner"; owner.mkdir()
+        child = self.root / "pb-child"; child.mkdir()
+        script = self.root / "pb-contract.py"; script.write_text("# synthetic PB boundary\n")
+        task_file = self.root / "pb-child-task.txt"; task_file.write_text("Bounded child task.")
+        receipt_path = self.root / "pb-receipt.json"
+        workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+        parent = {"session_id": "ses_parentFixture123", "task_id": "parent-task-ref",
+                  "owner_worktree": str(owner), "owner_gitdir": str(owner / ".git"),
+                  "workspace_uuid": workspace, "surface_uuid": surface,
+                  "assignment_sha256": "d" * 64, "launch_id": "a" * 32}
+        args = SimpleNamespace(context_injector=str(script), owner_worktree=str(owner),
+                               receipt_file=str(receipt_path), role="implementer",
+                               task_file=str(task_file))
+        task_digest = hashlib.sha256(task_file.read_bytes()).hexdigest()
+        child_ticket = "e" * 32
+        expected_parent = {"harness": "opencode", "session_id": parent["session_id"],
+                           "task_id": parent["task_id"], "role": "orchestrator",
+                           "owner_worktree": parent["owner_worktree"],
+                           "owner_gitdir": parent["owner_gitdir"],
+                           "surface_id": surface.upper(), "workspace_id": workspace.upper(),
+                           "assignment_sha256": parent["assignment_sha256"]}
+
+        class FakeApp:
+            def run_json(self, argv, stdin=None):
+                self.argv = argv
+                receipt = {"task_id": child_ticket, "harness": "opencode", "role": "implementer",
+                           "status": "pending", "session_id": None, "worktree": str(child),
+                           "owner_worktree": str(owner), "brief_sha256": task_digest,
+                           "parent": expected_parent}
+                Path(argv[argv.index("--receipt-file") + 1]).write_text(json.dumps(receipt))
+                return {"status": "pending", "harness": "opencode", "role": "implementer",
+                        "task_id": child_ticket, "parent": expected_parent}
+
+        fake = FakeApp()
+        adapter = mp.prepare_opencode_pattern_buffer(fake, args, child, task_digest, parent)
+        self.assertEqual(adapter["task_id"], child_ticket)
+        self.assertNotEqual(adapter["task_id"], parent["task_id"])
+        self.assertIn("--parent-task-id", fake.argv)
+        self.assertEqual(fake.argv[fake.argv.index("--parent-task-id") + 1], parent["task_id"])
+        self.assertEqual(adapter["parent"]["session_id"], parent["session_id"])
+        self.assertEqual(adapter["parent"]["task_id"], parent["task_id"])
 
     def test_tui_child_targets_only_the_verified_session_and_keeps_password_out_of_argv(self):
         connection = dispatch.load_connection(self.manifest)
@@ -244,7 +877,8 @@ class OpenCodeDispatchTest(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0)
             raise AssertionError(f"Unexpected child command: {argv}")
 
-        with patch.object(dispatch.subprocess, "run", side_effect=fake_run):
+        with patch.dict(os.environ, {"CMUX_SOCKET_CAPABILITY": CMUX_CANARY}), \
+                patch.object(dispatch.subprocess, "run", side_effect=fake_run):
             result = dispatch.tui_child(str(self.manifest), SESSION, str(self.root), str(prompt_file),
                                         PROVIDER, MODEL, launch_id, self.choice["selection"], task_digest,
                                         str(handshake_file), str(release_file), str(self.root / "abort.json"),
@@ -256,8 +890,11 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--prompt") + 1], prompt)
         self.assertNotIn(CANARY, argv)
         self.assertEqual(observed["env"]["OPENCODE_SERVER_PASSWORD"], CANARY)
+        self.assertEqual(observed["env"]["CMUX_SOCKET_CAPABILITY"], CMUX_CANARY)
         self.assertNotIn("OPENCODE_PASSWORD", observed["env"])
-        self.assertEqual(dispatch.read_private_json(handshake_file)["surface_uuid"], surface)
+        handshake = dispatch.read_private_json(handshake_file)
+        self.assertEqual(handshake["surface_uuid"], surface)
+        self.assertEqual(handshake["cmux_socket_capability"], CMUX_CANARY)
 
     def test_ambiguous_session_create_timeout_is_uncertain_and_blocks_retry(self):
         config_dir, state_dir = self.root / "timeout-config", self.root / "timeout-state"
@@ -384,15 +1021,18 @@ class OpenCodeDispatchTest(unittest.TestCase):
 
     def test_native_binding_requires_one_exact_surface_known_state_and_fresh_projection(self):
         workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-        item = {"lifecycle": "running", "freshness": {"state": "current"},
+        item = {"lifecycle": "running", "placement": {"kind": "local"},
+                "freshness": {"state": "current"},
                 "projections": [{"workspace_id": workspace, "panel_id": surface}],
                 "agents": [{"kind": "opencode", "session_id": SESSION, "state": "idle"}]}
-        current = {"truncated": False, "items": [item]}
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                   "items": [item]}
         binding = dispatch.require_native_dispatch_binding(expected_workspace=workspace,
                                                            expected_surface=surface,
                                                            expected_session=SESSION, current=current)
         self.assertEqual(binding["surface_uuid"], surface)
-        uppercase = {"truncated": False, "items": [{**item, "projections": [
+        uppercase = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                     "items": [{**item, "projections": [
             {"workspace_id": workspace.upper(), "panel_id": surface.upper()}]}]}
         uppercase_binding = dispatch.require_native_dispatch_binding(expected_workspace=workspace,
                                                                      expected_surface=surface,
@@ -400,16 +1040,21 @@ class OpenCodeDispatchTest(unittest.TestCase):
                                                                      current=uppercase)
         self.assertEqual(uppercase_binding["workspace_uuid"], workspace)
         self.assertEqual(uppercase_binding["surface_uuid"], surface)
-        for altered, code in (({"truncated": True, "items": [item]}, "native_binding_observation_unknown"),
-                              ({"truncated": False, "items": [{**item, "projections": [
+        for altered, code in (({"truncated": True, "owner_availability": {"agent_sessions": "available"},
+                                "items": [item]}, "native_binding_observation_unknown"),
+                              ({"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                                "items": [{**item, "projections": [
                                   {"workspace_id": "not-a-uuid", "panel_id": surface}]}]},
                                "native_binding_observation_unknown"),
-                              ({"truncated": False, "items": [{**item, "projections": [
+                              ({"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                                "items": [{**item, "projections": [
                                   {"workspace_id": workspace, "panel_id": str(uuid.uuid4())}]}]},
                                "native_session_visible_on_other_surface"),
-                              ({"truncated": False, "items": [{**item, "freshness": {"state": "stale"}}]},
+                              ({"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                                "items": [{**item, "freshness": {"state": "stale"}}]},
                                "native_session_observation_stale"),
-                              ({"truncated": False, "items": [{**item, "agents": [
+                              ({"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                                "items": [{**item, "agents": [
                                   {"kind": "opencode", "session_id": SESSION, "state": "unknown"}]}]},
                                "native_session_state_unknown")):
             with self.subTest(code=code), self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
@@ -430,7 +1075,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "response_too_large")
         self.assertNotIn(CANARY, str(raised.exception))
 
-    def test_initial_dispatch_creates_exact_session_scoped_env_and_accepts_idle_identity_with_composer_hold(self):
+    def test_initial_dispatch_waits_for_delayed_prompt_admission_before_accepting_idle_state(self):
         config_dir, state_dir = self.root / "config", self.root / "state"
         config = mp.example_config()
         config["active"] = "Qwen-only"
@@ -447,6 +1092,8 @@ class OpenCodeDispatchTest(unittest.TestCase):
         workspace, caller_surface, pane = str(uuid.uuid4()), str(uuid.uuid4()), "pane-fixture"
         opened_surface = str(uuid.uuid4())
         current_surface = opened_surface
+        hook_path = self.root / "hook-sessions.json"
+        self.state.delay_startup_messages = True
 
         def cmux(argv, stdin=None):
             nonlocal current_surface
@@ -459,27 +1106,48 @@ class OpenCodeDispatchTest(unittest.TestCase):
                 child_command = shlex.split(argv[argv.index("--command") + 1])
                 self.assertNotIn(CANARY, argv[-1])
                 def get(flag): return child_command[child_command.index("--" + flag) + 1]
+                prompt_text = Path(get("prompt-file")).read_text()
+                self.state.pending_startup_prompt = prompt_text
+                if not self.state.delay_startup_messages:
+                    self.state.messages = self.state.startup_messages(prompt_text)
                 dispatch.write_private_json(get("handshake-file"), {
                     "launch_id": get("launch-id"), "session_id": get("session"),
                     "workspace_uuid": workspace, "surface_uuid": opened_surface,
-                    "cmux_socket_path": None})
+                    "cmux_socket_path": None, "cmux_socket_capability": CMUX_CANARY})
+                dispatch.write_private_json(hook_path, {"sessions": {SESSION: {
+                    "workspaceId": workspace, "surfaceId": opened_surface, "startedAt": 123.0,
+                    "agentLifecycle": "idle", "cwd": str(repo)}}})
                 return {"workspace_id": workspace, "surface_id": opened_surface}
             if "current" in argv:
-                return {"truncated": False, "items": [{"lifecycle": "idle", "freshness": {"state": "current"},
+                return {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                    "items": [{"lifecycle": "idle", "placement": {"kind": "local"},
+                    "freshness": {"state": "current"},
                     "projections": [{"workspace_id": workspace, "panel_id": current_surface}],
-                    "agents": [{"kind": "opencode", "session_id": SESSION, "state": "unknown"}]}]}
+                    "agents": [{"kind": "opencode", "session_id": SESSION, "state": "idle"}]}]}
+            if "rpc" in argv:
+                method = argv[argv.index("rpc") + 1]
+                params = json.loads(argv[-1])
+                if method == "surface.input_state":
+                    return {"surface_id": params["surface_id"], "workspace_id": workspace,
+                            "agent": True, "terminal": True, "state": "empty", "blocks_typing": False,
+                            "waiting_on_human": False, "lifecycle": "idle"}
+                if method == "agent.message.settings":
+                    return {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
             raise AssertionError(f"Unexpected CMUX request: {argv}")
 
         args = SimpleNamespace(role="implementer", opencode_manifest=str(self.manifest), context_injector=None,
                                owner_worktree=None, receipt_file=None, task_file=str(task_file), slot=None)
         with patch.object(mp, "run_json", side_effect=cmux), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
                 patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"):
             result = mp.dispatch_opencode(app, args, config, choice, repo, brief)
         launch = app.state(f"launches/{result['launch']}", None)
         self.assertEqual(result["session"], SESSION)
         self.assertEqual(result["cmux_surface_uuid"], opened_surface)
         self.assertEqual(result["execution_result"], "turn_idle")
-        self.assertEqual(result["delivery_readiness"], "held")
+        self.assertEqual(result["delivery_readiness"], "ready")
+        self.assertEqual(launch["native_started_at"], 123.0)
+        self.assertEqual(self.state.message_reads, 3)
         self.assertEqual(launch["native_session"], SESSION)
         self.assertEqual(launch["parent_task_id"], "task-parent-fixture")
         self.assertEqual(launch["expected_server_pid"], 4242)
@@ -487,8 +1155,13 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(launch["cmux_surface_uuid"], opened_surface)
         self.assertEqual(self.state.environment["variables"]["CMUX_AGENT_LAUNCH_KIND"], "opencode")
         self.assertEqual(self.state.environment["variables"]["OPENCODE_SESSION_ID"], SESSION)
+        self.assertEqual(self.state.environment["variables"]["CMUX_SOCKET_CAPABILITY"], CMUX_CANARY)
+        self.assertFalse(any(path.name.endswith(".handshake.json") for path in
+                             (state_dir / "opencode-launches").glob("*")))
         self.assertNotIn(CANARY, json.dumps(launch))
+        self.assertNotIn(CMUX_CANARY, json.dumps(launch))
         self.assertNotIn(CANARY, json.dumps(self.state.environment))
+        self.assertNotIn(CMUX_CANARY, json.dumps(launch))
         self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
 
     def test_initial_dispatch_wrong_surface_is_uncertain_and_never_falls_back(self):
@@ -516,10 +1189,13 @@ class OpenCodeDispatchTest(unittest.TestCase):
                 def get(flag): return child[child.index("--" + flag) + 1]
                 dispatch.write_private_json(get("handshake-file"), {
                     "launch_id": get("launch-id"), "session_id": get("session"),
-                    "workspace_uuid": workspace, "surface_uuid": opened_surface, "cmux_socket_path": None})
+                    "workspace_uuid": workspace, "surface_uuid": opened_surface, "cmux_socket_path": None,
+                    "cmux_socket_capability": CMUX_CANARY})
                 return {"workspace_id": workspace, "surface_id": opened_surface}
             if "current" in argv:
-                return {"truncated": False, "items": [{"lifecycle": "idle", "freshness": {"state": "current"},
+                return {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                    "items": [{"lifecycle": "idle", "placement": {"kind": "local"},
+                    "freshness": {"state": "current"},
                     "projections": [{"workspace_id": workspace, "panel_id": wrong_surface}],
                     "agents": [{"kind": "opencode", "session_id": SESSION, "state": "unknown"}]}]}
             raise AssertionError(f"Unexpected CMUX request: {argv}")

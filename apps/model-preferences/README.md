@@ -119,11 +119,38 @@ The helper checks the authenticated API version, server PID, exact provider and 
 It creates the session through the API, records the returned native `ses_` ID, and verifies the session directory and selected model before opening an interactive TUI with its initial prompt.
 When Pattern Buffer dispatch is requested, its immutable task snapshot is prepared and bound to that exact native session before the initial prompt is released.
 The child TUI obtains its CMUX workspace and surface UUIDs from its own `cmux identify` result, and a private launch barrier requires those UUIDs to match the exact newly opened surface before the session-scoped CMUX environment is set and the initial prompt is released.
-The initial execution can be recorded as idle only after current native projection maps the exact session to that exact surface and API inspection reports no active turn, pending permissions or pending forms.
-Delivery readiness remains held because the inspected native interface does not expose a supported composer-draft guard.
-Wrong or ambiguous surfaces, timeouts and uncertain sends remain unresolved and block retry until inspected.
+The child transfers its own native `CMUX_SOCKET_CAPABILITY` through that mode-0600 handshake, and Model Preferences writes it only into the exact OpenCode session environment.
+The capability is never written to launch records, receipts, command arguments or diagnostics.
+The initial task is recorded only after the exact startup prompt appears in the exact session message history, a matching assistant turn is complete, the native session is idle, and API inspection reports no active turn, pending permissions or pending forms.
+The bounded pinned-2.2.5 history reader follows opaque cursors to an empty end page, because nonempty response cursors are navigation anchors rather than evidence of additional pages.
+This records an observed completed turn, not semantic task success.
+If CMUX current, hook-generation or empty-composer proof is unavailable, the completed turn remains recorded while managed continuation stays held.
+Wrong or ambiguous surfaces, timeouts, unsupported schemas and uncertain sends remain unresolved and block retry until inspected.
 Titles and working directories alone never establish a native session identity.
 
-Managed OpenCode continuation, wake, resume and successor-orchestrator handoff are not supported by this slice and remain held.
-OpenCode API inspection does not expose unsent composer contents or a stable process-start identifier, and those gaps prevent a safe managed continuation contract.
-The server and TUI must already be running in the intended environment, and this command never starts or configures a global OpenCode service.
+Start a fresh Qwen-only orchestrator with its own Pattern Buffer orchestrator assignment.
+
+    model-preferences --config-dir /private/config --state-dir /private/state dispatch --role orchestrator --cwd /absolute/path/to/owner-worktree --task-file /absolute/path/to/task.md --pattern-buffer /absolute/path/to/pattern_buffer.py --opencode-manifest /private/opencode-connection.json
+
+This opens a new visible TUI in the current CMUX workspace after creating and verifying the exact API session.
+It does not replace an existing orchestrator or mutate the active profile.
+The orchestrator may prepare a bounded implementer child in a separate Git worktree with `--pattern-buffer`, the exact owner worktree and a unique immutable receipt.
+Child dispatch requires the exact currently executing OpenCode orchestrator session, its current CMUX surface and workspace, its active admitted task, and the matching Pattern Buffer `{root, role}` assignment digest.
+The API child `parentID` stores that verified native parent `ses_` ID separately from the explicit parent task reference and the new child Pattern Buffer ticket.
+Codex-Qwen keeps Codex Sol medium orchestration and uses local Qwen only for configured implementation and research roles.
+Qwen-only uses local Qwen for orchestration, implementation and research, with external Codex Sol high reviews.
+Every review launch still requires fresh explicit operator authorization.
+
+Continue a recorded OpenCode session with a new bounded task only when the exact server, session model, worktree, native session, hook generation and CMUX placement still match.
+
+    model-preferences --config-dir /private/config --state-dir /private/state resume LAUNCH_ID --task-file /absolute/path/to/follow-up.md --opencode-manifest /private/opencode-connection.json
+
+Before one API prompt is sent, the exact native composer must report empty, native receiving must be enabled, CMUX current and hook records must match the recorded session generation, and OpenCode API inspection must report idle with no pending permissions or forms.
+The helper persists a send intent before the API request.
+If the response is uncertain, the exact session is held against automatic retry.
+An accepted prompt records submission only; later model output is not inferred.
+Human drafts, busy or unknown states, changed worktrees, stale or ambiguous surfaces, unsupported versions and uncertain API responses all hold without sending.
+
+The OpenCode API server must already be running on the exact loopback origin with its private connection manifest and password file.
+Dispatch itself opens the interactive TUI in a new CMUX surface and never starts or configures a global OpenCode service.
+OpenCode 2.2.5 exposes no stable server-startup identifier, so a reused PID at the same loopback origin remains a binding limitation.
