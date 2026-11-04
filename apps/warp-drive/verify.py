@@ -2442,6 +2442,104 @@ sys.exit(int(os.environ.get('FAKE_ENGINEER_EXIT', '0')))
           "incident send pass failed" in stderr.getvalue(),
           "send-path errors stopped the scheduler pass instead of being reported and isolated")
 
+
+def test_opencode_native_owner_identity(temp):
+    state = temp / "opencode-owner-state"
+    worktree = temp / "opencode-owner-worktree"
+    worktree.mkdir()
+    run_cli(state, "init")
+    first = {"harness": "opencode", "session": "ses_AaZ9", "surface": uuid_text()}
+    second = {"harness": "opencode", "session": "ses_NeWCase7", "surface": uuid_text()}
+    canonical = warp_drive.canonical_owner(first["harness"], first["session"], first["surface"].lower())
+    check(canonical["session"] == "ses_AaZ9" and canonical["surface"] == first["surface"],
+          "OpenCode native session case was changed or surface UUID stopped canonicalizing")
+    for invalid in ("ses_", "SES_AaZ9", uuid_text(), "ses_bad-value"):
+        try:
+            warp_drive.canonical_owner("opencode", invalid, first["surface"])
+        except warp_drive.WarpError:
+            pass
+        else:
+            raise AssertionError(f"invalid OpenCode session namespace was accepted: {invalid}")
+
+    submitted = parse_json(run_cli(state, "submit", "--key", "opencode-exact-owner", *owner_args(first),
+        "--size", "light", "--family", "verify-opencode", "--workers", "1", "--expected-runtime", "30",
+        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass"))
+    request_id = submitted["request_id"]
+    duplicate = parse_json(run_cli(state, "submit", "--key", "opencode-exact-owner", *owner_args(first),
+        "--size", "light", "--family", "verify-opencode", "--workers", "1", "--expected-runtime", "30",
+        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass"))
+    check(duplicate["request_id"] == request_id,
+          "identical OpenCode request key did not deduplicate to the original reservation")
+    altered_case = dict(first, session="ses_aaz9")
+    changed_owner = run_cli(state, "submit", "--key", "opencode-exact-owner", *owner_args(altered_case),
+        "--size", "light", "--family", "verify-opencode", "--workers", "1", "--expected-runtime", "30",
+        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass", ok=False)
+    check(changed_owner.returncode != 0,
+          "case-changed OpenCode owner reused the original stable request key")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            warp_drive.attach_helper(db, request_id, first, str(uuid.uuid4()))
+    admitted = run_fixture_pass(state, 0.05)
+    check(admitted["granted"] == request_id,
+          "exact OpenCode owner reservation was not admitted by the existing fixture host policy")
+    run_cli(state, "attach", request_id, *owner_args(first), timeout=20)
+    check(parse_json(run_cli(state, "inspect", request_id))["reservation"]["state"] == "finished",
+          "exact OpenCode owner could not attach and finish the harmless reserved command")
+    hailing_dir = temp / "opencode-hailing"
+    hailing_dir.mkdir()
+    target = {"label": "native-opencode", "harness": "opencode", "session": first["session"],
+              "surface": first["surface"], "workspace": uuid_text(), "started_at": 1.0, "cutoff": 1.0}
+    (hailing_dir / "config.json").write_text(json.dumps({"version": 1, "targets": [target]}))
+    route_log = temp / "opencode-route.jsonl"
+    fake_cmux = temp / "opencode-cmux"
+    fake_cmux.write_text("""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['WARP_DRIVE_ROUTE_LOG'], 'a') as stream:
+    stream.write(json.dumps({'argv': sys.argv[1:], 'surface': os.environ.get('CMUX_SURFACE_ID')}) + '\\n')
+""")
+    fake_cmux.chmod(0o755)
+    scheduler_surface = uuid_text()
+    scheduler_env = {"WARP_DRIVE_HAILING_STATE": str(hailing_dir), "WARP_DRIVE_CMUX": str(fake_cmux),
+                     "WARP_DRIVE_ROUTE_LOG": str(route_log), "CMUX_SURFACE_ID": scheduler_surface}
+    original_hailing_state = warp_drive.hailing_state_dir
+    warp_drive.hailing_state_dir = lambda: hailing_dir
+    try:
+        targets = warp_drive.read_hailing_targets()
+        check(len(targets) == 1 and warp_drive.hailing_target_for_owner(first, targets) == target,
+              "native OpenCode Hailing target did not preserve exact owner correlation")
+        check(warp_drive.hailing_target_for_owner(dict(first, session="ses_aaz9"), targets) is None,
+              "Hailing owner correlation ignored case-sensitive OpenCode session identity")
+        with contextlib.closing(warp_drive.connect(state)) as db:
+            row = warp_drive.current_request(db, request_id)
+            route = warp_drive.completion_route_info(row, targets)
+            check(route["status"] == "enrolled" and route["owner"]["session"] == "ses_AaZ9",
+                  "finished request lost exact OpenCode Hailing route")
+        rejected = run_cli(state, "transfer", request_id, *owner_args(second), "--from-session", "ses_aaz9",
+                           "--reason", "must preserve exact OpenCode owner", ok=False)
+        check(rejected.returncode != 0, "transfer accepted a case-changed prior OpenCode owner")
+        transferred = parse_json(run_cli(state, "transfer", request_id, *owner_args(second),
+            "--from-session", first["session"], "--reason", "exact native OpenCode handoff"))
+        check(transferred["to"]["session"] == "ses_NeWCase7",
+              "transfer changed or rejected exact OpenCode native session case")
+        with contextlib.closing(warp_drive.connect(state)) as db:
+            row = warp_drive.current_request(db, request_id)
+            route = warp_drive.completion_route_info(row, targets)
+            check(route["status"] == "missing_exact_hailing_route" and
+                  route["owner"]["session"] == "ses_NeWCase7",
+                  "transferred owner borrowed the previous owner's exact Hailing route")
+        run_cli(state, "scheduler", "--once", "--send", env=scheduler_env)
+        check(not route_log.exists(), "completion was routed to the previous OpenCode owner after transfer")
+        new_target = {**target, **second, "workspace": uuid_text()}
+        (hailing_dir / "config.json").write_text(json.dumps({"version": 1, "targets": [new_target]}))
+        run_cli(state, "scheduler", "--once", "--send", env=scheduler_env)
+        run_cli(state, "scheduler", "--once", "--send", env=scheduler_env)
+        messages = [json.loads(line) for line in route_log.read_text().splitlines()]
+        check(len(messages) == 1 and messages[0]["argv"][0:3] == ["agent", "message", second["surface"]] and
+              messages[0]["surface"] == scheduler_surface and request_id in messages[0]["argv"][3],
+              "completion was not deduplicated and routed through fake native CMUX to the exact new owner")
+    finally:
+        warp_drive.hailing_state_dir = original_hailing_state
+
 def main():
     with tempfile.TemporaryDirectory(prefix="warp-drive-verify-") as directory:
         temp = Path(directory)
@@ -2472,6 +2570,7 @@ def main():
             test_completion_backlog_connection_bound(temp)
             test_notification_send_pacing(temp)
             test_engineer_unavailable_retry_and_send_error_isolation(temp)
+            test_opencode_native_owner_identity(temp)
         finally:
             if previous_hailing_state is None:
                 os.environ.pop("WARP_DRIVE_HAILING_STATE", None)

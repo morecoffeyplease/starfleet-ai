@@ -23,6 +23,12 @@ Reuse a request ID only to retry that same intent.
 Set or update phrase configuration with `away-mode phrase-config --away 'Exact away phrase' --back 'Exact available phrase'`; this command does not transition presence or send messages.
 Read `away-mode context` to inspect current state and exact next steps.
 
+An OpenCode owner can use `away-mode opencode-context` to read the same presence context with its exact enrolled lane identity.
+The command requires a scoped `CMUX_AGENT_LAUNCH_KIND=opencode`, exact case-preserved native `OPENCODE_SESSION_ID`, and exact `CMUX_WORKSPACE_ID` and `CMUX_SURFACE_ID` UUIDs.
+It checks the current CMUX caller and fresh native CMUX inventory for the same active enrolled OpenCode owner before returning context.
+The command only reads state and does not install an OpenCode hook or change presence.
+Use ordinary `context` for operator inspection outside an enrolled OpenCode owner.
+
 ## Enrollment and reporting
 
 An enrolled lane binds one exact workspace, surface, native session, harness and worktree.
