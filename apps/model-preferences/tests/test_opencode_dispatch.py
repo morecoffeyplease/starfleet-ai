@@ -392,7 +392,18 @@ class OpenCodeDispatchTest(unittest.TestCase):
                                                            expected_surface=surface,
                                                            expected_session=SESSION, current=current)
         self.assertEqual(binding["surface_uuid"], surface)
+        uppercase = {"truncated": False, "items": [{**item, "projections": [
+            {"workspace_id": workspace.upper(), "panel_id": surface.upper()}]}]}
+        uppercase_binding = dispatch.require_native_dispatch_binding(expected_workspace=workspace,
+                                                                     expected_surface=surface,
+                                                                     expected_session=SESSION,
+                                                                     current=uppercase)
+        self.assertEqual(uppercase_binding["workspace_uuid"], workspace)
+        self.assertEqual(uppercase_binding["surface_uuid"], surface)
         for altered, code in (({"truncated": True, "items": [item]}, "native_binding_observation_unknown"),
+                              ({"truncated": False, "items": [{**item, "projections": [
+                                  {"workspace_id": "not-a-uuid", "panel_id": surface}]}]},
+                               "native_binding_observation_unknown"),
                               ({"truncated": False, "items": [{**item, "projections": [
                                   {"workspace_id": workspace, "panel_id": str(uuid.uuid4())}]}]},
                                "native_session_visible_on_other_surface"),

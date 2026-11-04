@@ -589,6 +589,11 @@ def require_native_dispatch_binding(*, expected_workspace: str, expected_surface
     """Accept only one exact native OpenCode session binding in its created surface."""
     if not all(isinstance(value, str) and value for value in (expected_workspace, expected_surface, expected_session)):
         raise OpenCodeDispatchError("native_binding_expectations_required")
+    try:
+        expected_workspace = str(uuid.UUID(expected_workspace))
+        expected_surface = str(uuid.UUID(expected_surface))
+    except (ValueError, AttributeError):
+        raise OpenCodeDispatchError("native_binding_expectations_required") from None
     if not isinstance(current, dict) or current.get("truncated") is not False or not isinstance(current.get("items"), list):
         raise OpenCodeDispatchError("native_binding_observation_unknown")
     matches, conflicts = [], []
@@ -613,8 +618,13 @@ def require_native_dispatch_binding(*, expected_workspace: str, expected_surface
             for projection in projections:
                 if not isinstance(projection, dict):
                     raise OpenCodeDispatchError("native_binding_observation_unknown")
-                match = {"workspace_uuid": projection.get("workspace_id"),
-                         "surface_uuid": projection.get("panel_id"), "session_id": expected_session,
+                try:
+                    workspace_uuid = str(uuid.UUID(projection.get("workspace_id")))
+                    surface_uuid = str(uuid.UUID(projection.get("panel_id")))
+                except (ValueError, TypeError, AttributeError):
+                    raise OpenCodeDispatchError("native_binding_observation_unknown") from None
+                match = {"workspace_uuid": workspace_uuid,
+                         "surface_uuid": surface_uuid, "session_id": expected_session,
                          "state": agent.get("state"), "lifecycle": lifecycle,
                          "input_state": agent.get("input_state"), "freshness": freshness.get("state")}
                 conflicts.append(match)
