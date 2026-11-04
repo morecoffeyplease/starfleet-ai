@@ -940,6 +940,14 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
     handshake_file = app.state_dir / "opencode-launches" / f"{launch_id}.handshake.json"
     release_file = app.state_dir / "opencode-launches" / f"{launch_id}.release.json"
     abort_file = app.state_dir / "opencode-launches" / f"{launch_id}.abort.json"
+    child_descriptor_file = app.state_dir / "opencode-launches" / f"{launch_id}.child.json"
+    helper = Path(__file__).resolve().with_name("opencode_dispatch.py")
+    try:
+        child_xdg_environment = opencode_dispatch.caller_private_xdg_environment()
+        child_command = opencode_dispatch.tui_child_command(
+            helper, child_descriptor_file.resolve(), sys.executable)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"OpenCode launch preparation held: {exc.code}.") from None
     launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
               "context_injector": adapter, "slot": args.slot, "task_digest": task_digest,
               "status": "session_create_pending", "api_contract": evidence.api_contract,
@@ -1004,21 +1012,35 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
             launch["pattern_buffer_assignment_sha256"] = assignment_sha256
             update_opencode_launch(app, launch)
 
-        helper = Path(__file__).resolve().with_name("opencode_dispatch.py")
-        child = [sys.executable, str(helper), "tui-child", "--manifest", str(Path(args.opencode_manifest).expanduser().resolve()),
-                 "--session", session, "--directory", str(cwd), "--prompt-file", str(prompt_file),
-                 "--provider-id", choice["provider_id"], "--model-id", choice["model"],
-                 "--launch-id", launch_id, "--selection", choice["selection"], "--task-digest", task_digest,
-                 "--handshake-file", str(handshake_file), "--release-file", str(release_file),
-                 "--abort-file", str(abort_file), "--binary", binary]
+        child_descriptor = {
+            "schema_version": opencode_dispatch.TUI_CHILD_DESCRIPTOR_SCHEMA,
+            "manifest_path": str(Path(args.opencode_manifest).expanduser().resolve()),
+            "session_id": session,
+            "directory": str(cwd),
+            "prompt_file": str(prompt_file.resolve()),
+            "provider_id": choice["provider_id"],
+            "model_id": choice["model"],
+            "launch_id": launch_id,
+            "selection": choice["selection"],
+            "task_digest": task_digest,
+            "xdg_environment": child_xdg_environment,
+            "handshake_file": str(handshake_file.resolve()),
+            "release_file": str(release_file.resolve()),
+            "abort_file": str(abort_file.resolve()),
+            "binary": binary,
+        }
         if opencode_parent:
-            child.extend(["--parent-session-id", opencode_parent["session_id"]])
+            child_descriptor["parent_session_id"] = opencode_parent["session_id"]
+        try:
+            opencode_dispatch.write_tui_child_descriptor(child_descriptor_file, child_descriptor)
+        except opencode_dispatch.OpenCodeDispatchError as exc:
+            raise PreferenceError(f"OpenCode launch preparation held: {exc.code}.") from None
         launch["status"] = "surface_opening"
         update_opencode_launch(app, launch)
         surface_opened = True
         opened = run_json(["cmux", "--json", "--id-format", "uuids", "new-surface", "--type", "terminal",
                            "--workspace", destination["workspace_uuid"], "--pane", destination["pane_id"],
-                           "--working-directory", str(cwd), "--focus", "false", "--command", shlex.join(child)])
+                           "--working-directory", str(cwd), "--focus", "false", "--command", child_command])
         surface = cmux_uuid(opened.get("surface_id"), "new surface")
         workspace = cmux_uuid(opened.get("workspace_id", destination["workspace_uuid"]), "new workspace")
         require(workspace.lower() == destination["workspace_uuid"].lower(),

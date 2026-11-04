@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import stat
 import subprocess
@@ -31,10 +32,13 @@ HTTP_TIMEOUT_SECONDS = 2.0
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024
 MAX_PASSWORD_BYTES = 4096
+MAX_TUI_CHILD_COMMAND_BYTES = 512
+TUI_CHILD_DESCRIPTOR_SCHEMA = 1
 _BASIC_USER = "opencode"
 _MODEL_ID = re.compile(r"^[A-Za-z0-9_.:+/-]{1,200}$")
 _MESSAGE_ID = re.compile(r"^msg_[A-Za-z0-9]+$")
 _ACTIVE_LIFECYCLES = ("running", "idle", "backgroundWorkPending")
+_PRIVATE_XDG_KEYS = frozenset(("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"))
 
 
 class OpenCodeDispatchError(ValueError):
@@ -710,11 +714,108 @@ def write_private_json(path: str | Path, value: dict) -> None:
     write_private_snapshot(path, json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
 
+_TUI_CHILD_DESCRIPTOR_FIELDS = {
+    "schema_version", "manifest_path", "session_id", "directory", "prompt_file",
+    "provider_id", "model_id", "launch_id", "selection", "task_digest",
+    "handshake_file", "release_file", "abort_file", "binary",
+}
+
+
+def validate_tui_child_xdg_environment(value: object) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or set(value) - _PRIVATE_XDG_KEYS:
+        raise OpenCodeDispatchError("invalid_child_xdg_environment")
+    result = {}
+    for key, path_value in value.items():
+        if (not isinstance(path_value, str) or not path_value
+                or any(ord(char) < 32 or ord(char) == 127 for char in path_value)
+                or not Path(path_value).is_absolute()):
+            raise OpenCodeDispatchError("invalid_child_xdg_environment")
+        try:
+            if len(path_value.encode("utf-8")) > 4096:
+                raise OpenCodeDispatchError("invalid_child_xdg_environment")
+        except UnicodeError:
+            raise OpenCodeDispatchError("invalid_child_xdg_environment") from None
+        result[key] = path_value
+    return result
+
+
+def caller_private_xdg_environment(source: dict[str, str] | None = None) -> dict[str, str]:
+    source = os.environ if source is None else source
+    values = {key: source[key] for key in _PRIVATE_XDG_KEYS if key in source}
+    return validate_tui_child_xdg_environment(values)
+
+
+def validate_tui_child_descriptor(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise OpenCodeDispatchError("invalid_child_descriptor_schema")
+    fields = set(value)
+    optional = {"parent_session_id", "xdg_environment"}
+    if (not _TUI_CHILD_DESCRIPTOR_FIELDS <= fields or fields - _TUI_CHILD_DESCRIPTOR_FIELDS - optional):
+        raise OpenCodeDispatchError("unsupported_child_descriptor_schema")
+    if type(value.get("schema_version")) is not int or value["schema_version"] != TUI_CHILD_DESCRIPTOR_SCHEMA:
+        raise OpenCodeDispatchError("unsupported_child_descriptor_version")
+    for key in _TUI_CHILD_DESCRIPTOR_FIELDS - {"schema_version"}:
+        item = value.get(key)
+        if (not isinstance(item, str) or not item or len(item.encode("utf-8")) > 4096
+                or any(ord(char) < 32 for char in item)):
+            raise OpenCodeDispatchError("invalid_child_descriptor_schema")
+    for key in ("manifest_path", "directory", "prompt_file", "handshake_file", "release_file",
+                "abort_file", "binary"):
+        if not Path(value[key]).is_absolute():
+            raise OpenCodeDispatchError("invalid_child_descriptor_schema")
+    if (not re.fullmatch(r"ses_[A-Za-z0-9]+", value["session_id"])
+            or not re.fullmatch(r"[0-9a-f]{32}", value["launch_id"])
+            or not re.fullmatch(r"[0-9a-f]{64}", value["selection"])
+            or not re.fullmatch(r"[0-9a-f]{64}", value["task_digest"])
+            or not _MODEL_ID.fullmatch(value["provider_id"])
+            or not _MODEL_ID.fullmatch(value["model_id"])):
+        raise OpenCodeDispatchError("invalid_child_descriptor_identity")
+    if "parent_session_id" in value and (
+            not isinstance(value["parent_session_id"], str)
+            or not re.fullmatch(r"ses_[A-Za-z0-9]+", value["parent_session_id"])):
+        raise OpenCodeDispatchError("invalid_child_descriptor_identity")
+    if "xdg_environment" in value:
+        validate_tui_child_xdg_environment(value["xdg_environment"])
+    return value
+
+
+def read_tui_child_descriptor(path: str | Path) -> dict:
+    try:
+        return validate_tui_child_descriptor(read_private_json(path, MAX_MANIFEST_BYTES))
+    except OpenCodeDispatchError as exc:
+        if exc.code == "private_json_file_invalid":
+            raise OpenCodeDispatchError("private_child_descriptor_required") from None
+        raise
+
+
+def write_tui_child_descriptor(path: str | Path, value: dict) -> None:
+    validate_tui_child_descriptor(value)
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_MANIFEST_BYTES:
+        raise OpenCodeDispatchError("child_descriptor_too_large")
+    write_private_snapshot(path, encoded)
+
+
+def tui_child_command(helper: str | Path, descriptor: str | Path,
+                      python: str | Path | None = None) -> str:
+    argv = [str(python or sys.executable), str(helper), "tui-child", "--launch-file", str(descriptor)]
+    if any(any(ord(char) < 32 or ord(char) == 127 for char in item) for item in argv):
+        raise OpenCodeDispatchError("invalid_tui_child_command")
+    command = shlex.join(argv)
+    if len(command.encode("utf-8")) > MAX_TUI_CHILD_COMMAND_BYTES:
+        raise OpenCodeDispatchError("cmux_startup_command_too_long")
+    return command
+
+
 def tui_child(manifest_path: str, session_id: str, directory: str, prompt_file: str,
               provider_id: str, model_id: str, launch_id: str, selection: str, task_digest: str,
               handshake_file: str, release_file: str, abort_file: str, binary: str,
-              parent_session_id: str | None = None) -> int:
+              parent_session_id: str | None = None,
+              xdg_environment: dict[str, str] | None = None) -> int:
     """Open a fresh, exact API-created session in an interactive TUI surface."""
+    xdg_environment = validate_tui_child_xdg_environment(xdg_environment)
     connection = load_connection(manifest_path)
     choice = {"harness": "opencode", "provider_id": provider_id, "model": model_id, "effort": "max",
               "selection": selection}
@@ -764,6 +865,7 @@ def tui_child(manifest_path: str, session_id: str, directory: str, prompt_file: 
     env = dict(os.environ)
     env.pop("OPENCODE_PASSWORD", None)
     env["OPENCODE_SERVER_PASSWORD"] = connection.password
+    env.update(xdg_environment)
     argv = [binary, directory, "--server", connection.api_origin, "--session", session_id, "--prompt", prompt]
     return subprocess.run(argv, cwd=directory, env=env).returncode
 
@@ -976,6 +1078,24 @@ def main(argv: list[str] | None = None) -> int:
     if not args or args.pop(0) != "tui-child":
         return 2
     import argparse
+    if args and args[0] == "--launch-file":
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--launch-file", required=True)
+        try:
+            values = parser.parse_args(args)
+            descriptor = read_tui_child_descriptor(values.launch_file)
+            return tui_child(descriptor["manifest_path"], descriptor["session_id"],
+                             descriptor["directory"], descriptor["prompt_file"],
+                             descriptor["provider_id"], descriptor["model_id"],
+                             descriptor["launch_id"], descriptor["selection"],
+                             descriptor["task_digest"], descriptor["handshake_file"],
+                             descriptor["release_file"], descriptor["abort_file"],
+                             descriptor["binary"], descriptor.get("parent_session_id"),
+                             descriptor.get("xdg_environment", {}))
+        except (OpenCodeDispatchError, OSError, ValueError, TypeError) as error:
+            code = error.code if isinstance(error, OpenCodeDispatchError) else "child_launch_failed"
+            print(f"model-preferences OpenCode child: {code}", file=sys.stderr)
+            return 1
     parser = argparse.ArgumentParser(add_help=False)
     for name in ("manifest", "session", "directory", "prompt-file", "provider-id", "model-id",
                  "launch-id", "selection", "task-digest", "handshake-file", "release-file", "abort-file", "binary"):

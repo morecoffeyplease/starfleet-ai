@@ -1,9 +1,11 @@
 """Synthetic OpenCode API and CMUX boundary tests for Model Preferences."""
 
 import base64
+import contextlib
 import hashlib
 import http.server
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -32,6 +34,20 @@ CMUX_CANARY = "synthetic-cmux-capability-canary-never-output"
 SESSION = "ses_synthetic123"
 PROVIDER = "trial-local"
 MODEL = "qwen3.6:35b"
+
+
+def child_value(argv, flag):
+    if "--launch-file" not in argv:
+        return argv[argv.index("--" + flag) + 1]
+    descriptor = dispatch.read_tui_child_descriptor(argv[argv.index("--launch-file") + 1])
+    keys = {
+        "manifest": "manifest_path", "session": "session_id", "directory": "directory",
+        "prompt-file": "prompt_file", "provider-id": "provider_id", "model-id": "model_id",
+        "launch-id": "launch_id", "selection": "selection", "task-digest": "task_digest",
+        "handshake-file": "handshake_file", "release-file": "release_file",
+        "abort-file": "abort_file", "binary": "binary", "parent-session-id": "parent_session_id",
+    }
+    return descriptor[keys[flag]]
 
 
 class FakeAPIState:
@@ -236,6 +252,185 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.manifest.chmod(0o600)
         self.choice = {"harness": "opencode", "provider_id": PROVIDER, "model": MODEL,
                        "effort": "max", "selection": "a" * 64}
+
+    def tui_descriptor(self):
+        return {
+            "schema_version": dispatch.TUI_CHILD_DESCRIPTOR_SCHEMA,
+            "manifest_path": str(self.manifest), "session_id": SESSION,
+            "directory": str(self.root), "prompt_file": str(self.root / "prompt"),
+            "provider_id": PROVIDER, "model_id": MODEL, "launch_id": "d" * 32,
+            "selection": "a" * 64, "task_digest": "e" * 64,
+            "xdg_environment": {
+                "XDG_CONFIG_HOME": str(self.root / "private-config"),
+                "XDG_DATA_HOME": str(self.root / "private-data"),
+                "XDG_STATE_HOME": str(self.root / "private-state"),
+                "XDG_CACHE_HOME": str(self.root / "private-cache"),
+            },
+            "handshake_file": str(self.root / "handshake.json"),
+            "release_file": str(self.root / "release.json"),
+            "abort_file": str(self.root / "abort.json"),
+            "binary": "/fixture/bin/opencode",
+        }
+
+    def test_private_tui_launch_descriptor_reaches_child_cli(self):
+        descriptor_path = self.root / "launch.child.json"
+        descriptor = self.tui_descriptor()
+        dispatch.write_tui_child_descriptor(descriptor_path, descriptor)
+        seen = []
+        with patch.object(dispatch, "tui_child", side_effect=lambda *args: seen.append(args) or 7):
+            result = dispatch.main(["tui-child", "--launch-file", str(descriptor_path)])
+        self.assertEqual(result, 7)
+        self.assertEqual(seen, [(
+            descriptor["manifest_path"], descriptor["session_id"], descriptor["directory"],
+            descriptor["prompt_file"], descriptor["provider_id"], descriptor["model_id"],
+            descriptor["launch_id"], descriptor["selection"], descriptor["task_digest"],
+            descriptor["handshake_file"], descriptor["release_file"], descriptor["abort_file"],
+            descriptor["binary"], None, descriptor["xdg_environment"],
+        )])
+        raw = descriptor_path.read_text()
+        self.assertNotIn(CANARY, raw)
+        self.assertNotIn(CMUX_CANARY, raw)
+        self.assertEqual(descriptor_path.stat().st_mode & 0o777, 0o600)
+
+    def test_tui_launch_descriptor_rejects_malformed_public_symlink_and_unknown_schema(self):
+        cases = []
+        malformed = self.root / "malformed.child.json"
+        malformed.write_text("{")
+        malformed.chmod(0o600)
+        cases.append(("malformed", malformed))
+        public = self.root / "public.child.json"
+        dispatch.write_tui_child_descriptor(public, self.tui_descriptor())
+        public.chmod(0o644)
+        cases.append(("public", public))
+        target = self.root / "target.child.json"
+        dispatch.write_tui_child_descriptor(target, self.tui_descriptor())
+        symlink = self.root / "symlink.child.json"
+        symlink.symlink_to(target)
+        cases.append(("symlink", symlink))
+        unknown = self.root / "unknown.child.json"
+        unsupported = self.tui_descriptor(); unsupported["extra"] = "ignored?"
+        dispatch.write_private_json(unknown, unsupported)
+        cases.append(("unknown", unknown))
+        secret_env = self.root / "secret-env.child.json"
+        invalid_env_key = self.tui_descriptor()
+        invalid_env_key["xdg_environment"] = {"CMUX_SOCKET_CAPABILITY": CMUX_CANARY}
+        dispatch.write_private_json(secret_env, invalid_env_key)
+        cases.append(("secret_env_key", secret_env))
+        bad_path = self.root / "bad-xdg-path.child.json"
+        invalid_path = self.tui_descriptor()
+        invalid_path["xdg_environment"] = {"XDG_STATE_HOME": "relative/state"}
+        dispatch.write_private_json(bad_path, invalid_path)
+        cases.append(("bad_xdg_path", bad_path))
+        wrong_session = self.root / "wrong-session.child.json"
+        invalid_session = self.tui_descriptor(); invalid_session["session_id"] = "session-from-title"
+        dispatch.write_private_json(wrong_session, invalid_session)
+        cases.append(("wrong_session", wrong_session))
+        wrong_launch = self.root / "wrong-launch.child.json"
+        invalid_launch = self.tui_descriptor(); invalid_launch["launch_id"] = "not-a-launch-id"
+        dispatch.write_private_json(wrong_launch, invalid_launch)
+        cases.append(("wrong_launch", wrong_launch))
+        for name, path in cases:
+            with self.subTest(name=name), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with patch.object(dispatch, "tui_child") as child:
+                    self.assertEqual(dispatch.main(["tui-child", "--launch-file", str(path)]), 1)
+                    child.assert_not_called()
+                self.assertNotIn(CANARY, stderr.getvalue())
+                self.assertNotIn(CMUX_CANARY, stderr.getvalue())
+
+    def test_tui_startup_command_is_short_quoted_and_bounded(self):
+        helper = self.root / "opencode_dispatch.py"
+        descriptor = self.root / "launch.child.json"
+        command = dispatch.tui_child_command(helper, descriptor, sys.executable)
+        self.assertLessEqual(len(command.encode("utf-8")), dispatch.MAX_TUI_CHILD_COMMAND_BYTES)
+        self.assertEqual(shlex.split(command), [sys.executable, str(helper), "tui-child",
+                                                "--launch-file", str(descriptor)])
+        with self.assertRaisesRegex(dispatch.OpenCodeDispatchError, "cmux_startup_command_too_long"):
+            dispatch.tui_child_command(helper, self.root / ("x" * 600), sys.executable)
+
+    def test_caller_private_xdg_environment_copies_only_the_four_explicit_paths(self):
+        paths = {key: str(self.root / key.lower()) for key in (
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")}
+        source = {**paths, "HOME": str(self.root / "home"), "PATH": "/private/bin",
+                  "CMUX_SOCKET_CAPABILITY": CMUX_CANARY, "OPENCODE_SERVER_PASSWORD": CANARY}
+        self.assertEqual(dispatch.caller_private_xdg_environment(source), paths)
+        self.assertEqual(dispatch.caller_private_xdg_environment({}), {})
+
+    def test_legacy_direct_tui_child_cli_remains_supported(self):
+        descriptor = self.tui_descriptor()
+        args = ["tui-child"]
+        for name, key in (
+                ("manifest", "manifest_path"), ("session", "session_id"),
+                ("directory", "directory"), ("prompt-file", "prompt_file"),
+                ("provider-id", "provider_id"), ("model-id", "model_id"),
+                ("launch-id", "launch_id"), ("selection", "selection"),
+                ("task-digest", "task_digest"), ("handshake-file", "handshake_file"),
+                ("release-file", "release_file"), ("abort-file", "abort_file"),
+                ("binary", "binary")):
+            args.extend(["--" + name, descriptor[key]])
+        seen = []
+        with patch.object(dispatch, "tui_child", side_effect=lambda *values: seen.append(values) or 8):
+            self.assertEqual(dispatch.main(args), 8)
+        self.assertEqual(len(seen[0]), 14)
+        self.assertIsNone(seen[0][-1])
+
+    def test_overlong_child_descriptor_path_refuses_before_session_creation(self):
+        config_dir = self.root / "long-config"
+        config = mp.example_config(); config["active"] = "Codex-Qwen"
+        mp.write(config_dir / "profiles.json", config)
+        long_state_dir = self.root / ("s" * 180) / ("t" * 180)
+        app = mp.App(config_dir, long_state_dir)
+        worktree = self.root / "long-worktree"; worktree.mkdir()
+        subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+        task_file = self.root / "long-task.txt"; task_file.write_text("A bounded synthetic task.")
+        choice = mp.resolve(mp.selection(config), "implementer", None)
+        args = SimpleNamespace(role="implementer", opencode_manifest=str(self.manifest), context_injector=None,
+                               owner_worktree=None, receipt_file=None, task_file=str(task_file), slot=None)
+        workspace, surface, pane = str(uuid.uuid4()), str(uuid.uuid4()), "pane-fixture"
+
+        def cmux(argv, stdin=None):
+            if "identify" in argv:
+                return {"caller": {"workspace_id": workspace, "surface_id": surface}}
+            if "tree" in argv:
+                return {"windows": [{"workspaces": [{"id": workspace, "panes": [
+                    {"id": pane, "surfaces": [{"id": surface}]}]}]}]}
+            raise AssertionError(argv)
+
+        with patch.object(mp, "run_json", side_effect=cmux), \
+                patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"), \
+                patch.object(mp.opencode_dispatch, "create_session") as create_session, \
+                self.assertRaisesRegex(mp.PreferenceError, "cmux_startup_command_too_long"):
+            mp.dispatch_opencode(app, args, config, choice, worktree, task_file.read_bytes())
+        create_session.assert_not_called()
+        self.assertFalse(long_state_dir.exists())
+
+    def test_invalid_caller_xdg_path_refuses_before_session_creation(self):
+        config_dir = self.root / "xdg-config"
+        config = mp.example_config(); config["active"] = "Codex-Qwen"
+        mp.write(config_dir / "profiles.json", config)
+        app = mp.App(config_dir, self.root / "xdg-state")
+        worktree = self.root / "xdg-worktree"; worktree.mkdir()
+        subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+        task_file = self.root / "xdg-task.txt"; task_file.write_text("A bounded synthetic task.")
+        choice = mp.resolve(mp.selection(config), "implementer", None)
+        args = SimpleNamespace(role="implementer", opencode_manifest=str(self.manifest), context_injector=None,
+                               owner_worktree=None, receipt_file=None, task_file=str(task_file), slot=None)
+        workspace, surface, pane = str(uuid.uuid4()), str(uuid.uuid4()), "pane-fixture"
+
+        def cmux(argv, stdin=None):
+            if "identify" in argv:
+                return {"caller": {"workspace_id": workspace, "surface_id": surface}}
+            if "tree" in argv:
+                return {"windows": [{"workspaces": [{"id": workspace, "panes": [
+                    {"id": pane, "surfaces": [{"id": surface}]}]}]}]}
+            raise AssertionError(argv)
+
+        with patch.dict(os.environ, {"XDG_STATE_HOME": "relative/state"}), \
+                patch.object(mp, "run_json", side_effect=cmux), \
+                patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"), \
+                patch.object(mp.opencode_dispatch, "create_session") as create_session, \
+                self.assertRaisesRegex(mp.PreferenceError, "invalid_child_xdg_environment"):
+            mp.dispatch_opencode(app, args, config, choice, worktree, task_file.read_bytes())
+        create_session.assert_not_called()
 
     def continuation_fixture(self, *, native_state="idle", guard_state="empty", wrong_surface=False):
         self.state.active_sessions = {}
@@ -560,7 +755,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
                     {"id": pane, "surfaces": [{"id": caller_surface}]}]}]}]}
             if "new-surface" in argv:
                 child = shlex.split(argv[argv.index("--command") + 1])
-                def get(flag): return child[child.index("--" + flag) + 1]
+                def get(flag): return child_value(child, flag)
                 prompt_text = Path(get("prompt-file")).read_text()
                 prompt_seen["text"] = prompt_text
                 self.state.messages = self.state.startup_messages(prompt_text)
@@ -788,7 +983,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
                     {"id": "pane-child-dispatch", "surfaces": [{"id": caller_surface}]}]}]}]}
             if "new-surface" in argv:
                 child_command = shlex.split(argv[argv.index("--command") + 1])
-                def get(flag): return child_command[child_command.index("--" + flag) + 1]
+                def get(flag): return child_value(child_command, flag)
                 prompt_text = Path(get("prompt-file")).read_text()
                 self.assertEqual(get("session"), child_session)
                 self.assertEqual(get("directory"), str(child))
@@ -1037,12 +1232,13 @@ class OpenCodeDispatchTest(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0)
             raise AssertionError(f"Unexpected child command: {argv}")
 
+        xdg_paths = self.tui_descriptor()["xdg_environment"]
         with patch.dict(os.environ, {"CMUX_SOCKET_CAPABILITY": CMUX_CANARY}), \
                 patch.object(dispatch.subprocess, "run", side_effect=fake_run):
             result = dispatch.tui_child(str(self.manifest), SESSION, str(self.root), str(prompt_file),
                                         PROVIDER, MODEL, launch_id, self.choice["selection"], task_digest,
                                         str(handshake_file), str(release_file), str(self.root / "abort.json"),
-                                        "/fixture/bin/opencode")
+                                        "/fixture/bin/opencode", None, xdg_paths)
         self.assertEqual(result, 0)
         self.assertEqual(observed["cwd"], str(self.root))
         argv = observed["argv"]
@@ -1052,6 +1248,8 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(observed["env"]["OPENCODE_SERVER_PASSWORD"], CANARY)
         self.assertEqual(observed["env"]["CMUX_SOCKET_CAPABILITY"], CMUX_CANARY)
         self.assertNotIn("OPENCODE_PASSWORD", observed["env"])
+        for key, value in xdg_paths.items():
+            self.assertEqual(observed["env"][key], value)
         handshake = dispatch.read_private_json(handshake_file)
         self.assertEqual(handshake["surface_uuid"], surface)
         self.assertEqual(handshake["cmux_socket_capability"], CMUX_CANARY)
@@ -1266,7 +1464,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
             if "new-surface" in argv:
                 child_command = shlex.split(argv[argv.index("--command") + 1])
                 self.assertNotIn(CANARY, argv[-1])
-                def get(flag): return child_command[child_command.index("--" + flag) + 1]
+                def get(flag): return child_value(child_command, flag)
                 prompt_text = Path(get("prompt-file")).read_text()
                 self.state.pending_startup_prompt = prompt_text
                 if not self.state.delay_startup_messages:
@@ -1347,7 +1545,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
                     {"id": pane, "surfaces": [{"id": caller_surface}]}]}]}]}
             if "new-surface" in argv:
                 child = shlex.split(argv[argv.index("--command") + 1])
-                def get(flag): return child[child.index("--" + flag) + 1]
+                def get(flag): return child_value(child, flag)
                 dispatch.write_private_json(get("handshake-file"), {
                     "launch_id": get("launch-id"), "session_id": get("session"),
                     "workspace_uuid": workspace, "surface_uuid": opened_surface, "cmux_socket_path": None,
