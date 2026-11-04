@@ -62,7 +62,9 @@ The HTTP timeout applies to each blocking socket operation, not a total deadline
 
 No OpenCode executable or installed source bundle was available in the assigned worktree environment.
 The schema contract was checked against official source tagged v2.2.5 and is gated to the exact reported version.
-The native OpenCode 2.2.5 routes and behavior have not been exercised here.
+The read-only routes were subsequently exercised against an owned OpenCode 2.2.5 session; exact process, session, directory, inactive state and empty permission/form lists matched.
+This does not qualify launch ownership, native composer state or delivery.
+See the [native acceptance observations](../../docs/opencode-qwen-acceptance.md).
 Any server version other than 2.2.5 remains unsupported until its schema is reviewed and tested separately.
 
 ## Focused synthetic verification

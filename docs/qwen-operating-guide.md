@@ -247,8 +247,9 @@ Keep Codex-supervised Qwen implementer observations separate from Qwen-only orch
 Use one row per observed run and include the candidate identity and the actual role.
 Do not infer a benchmark, stable cadence, general security property or qualification from one synthetic run.
 
-No completed Qwen-role trial result is recorded in this guide yet.
-The table below is an evidence template and intentionally contains no measured trial claims.
+The [native acceptance observations](opencode-qwen-acceptance.md) record a completed maximum-thinking read trial and the ownership/composer gaps it exposed.
+They do not qualify automatic delivery, Pattern Buffer recovery or Qwen-only orchestration.
+The table below remains a template for subsequent role-specific trials.
 
 | Configuration and role | Task | Observation | Consequence | Limits | Resulting guidance |
 | --- | --- | --- | --- | --- | --- |
