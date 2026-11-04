@@ -274,8 +274,10 @@ def worktree_identity(db, path):
         return row["id"]
     next_pos = db.execute("SELECT COALESCE(MAX(order_position),-1)+1 FROM worktrees").fetchone()[0]
     identifier = str(uuid.uuid4())
-    db.execute("INSERT INTO worktrees(id,path,device,inode,order_position,created_at) VALUES (?,?,?,?,?,?)",
-               (identifier, str(resolved), st.st_dev, st.st_ino, next_pos, now()))
+    current_round = max(1, int(get_setting(db, "current_round") or 1))
+    db.execute("INSERT INTO worktrees(id,path,device,inode,order_position,served_round,created_at) VALUES (?,?,?,?,?,?,?)",
+               (identifier, str(resolved), st.st_dev, st.st_ino, next_pos,
+                current_round - 1, now()))
     event(db, "worktree_registered", None, worktree_id=identifier, path=str(resolved),
           identity_version=WORKTREE_IDENTITY_VERSION)
     return identifier
@@ -588,8 +590,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                              "credit": waiting_credit(row, at),
                              "sequence": row["sequence"],
                              "position": row["order_position"]})
-    request_rows.sort(key=lambda x: (-int(x["boosted"]), x["position"], -x["credit"],
-                                     x["sequence"], x["row"]["id"]))
+    request_rows.sort(key=policy.request_order_key)
     light_ready = any(row["size"] == "light" for row in ready)
     active_heavy_cores = sum(policy.estimated_cores(job["size"], job["workers"], target_cores)
                              for job in active if job["size"] == "heavy")
@@ -617,9 +618,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
     if continuing_protection:
         target_id = protected_target["id"]
         request_rows.sort(key=lambda item: (0 if item["row"]["id"] == target_id else 1,
-                                            -int(item["boosted"]), item["position"],
-                                            -item["credit"], item["sequence"],
-                                            item["row"]["id"]))
+                                            *policy.request_order_key(item)))
     granted = None
     decision_log = []
     def try_grant(items):
@@ -725,9 +724,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
         light_items = [{"row": row, "boosted": bool(row["priority"]),
                         "credit": waiting_credit(row, at), "sequence": row["sequence"],
                         "position": row["order_position"]} for row in light_backfill]
-        light_items.sort(key=lambda item: (-int(item["boosted"]), item["position"],
-                                           -item["credit"], item["sequence"],
-                                           item["row"]["id"]))
+        light_items.sort(key=policy.request_order_key)
         granted = try_grant(light_items)
     if (granted is None and protected_target is None and request_rows and
             any(row["served_round"] >= current_round for row in ready)):
@@ -739,9 +736,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
         backfill = [{"row": row, "boosted": bool(row["priority"]),
                      "credit": waiting_credit(row, at), "sequence": row["sequence"],
                      "position": row["order_position"]} for row in eligible]
-        backfill.sort(key=lambda item: (-int(item["boosted"]), item["position"],
-                                        -item["credit"], item["sequence"],
-                                        item["row"]["id"]))
+        backfill.sort(key=policy.request_order_key)
         granted = try_grant(backfill)
     headroom_available = False
     if fresh and mean_busy is not None and pressure in (None, "normal"):
@@ -915,6 +910,16 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
         active_worktree_ids={job["worktree_id"] for job in active},
         active_aged_escape_count=active_aged_escape_count)
     protected_target_id = protected_target["id"] if protected_target else None
+
+    def diagnostic_order_key(row):
+        return policy.request_order_key({"row": row, "boosted": bool(row["priority"]),
+            "credit": waiting_credit(row, at), "sequence": row["sequence"],
+            "position": row["order_position"]})
+
+    ordered_ready = sorted(ready, key=diagnostic_order_key)
+    if continuing_protection:
+        ordered_ready.sort(key=lambda row: (0 if row["id"] == protected_target_id else 1,
+                                            diagnostic_order_key(row)))
     protected_wait_reason = None
     if protected_target is not None:
         if not fresh or mean_busy is None:
@@ -928,11 +933,12 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
     worktree_turns = {}
     candidates = []
     last_heavy_grant = get_setting(db, "last_heavy_grant")
-    for row in ready:
+    for row in ordered_ready:
         worktree_turn = worktree_turns.setdefault(row["worktree_id"], {
             "worktree_id": row["worktree_id"],
             "manual_order_position": row["order_position"],
             "served_round": row["served_round"],
+            "ordering_served_round": policy.ordering_served_round(row["served_round"]),
             "eligible_request_ids": [],
             "eligible_this_selection_round": row["served_round"] < selection_round})
         worktree_turn["eligible_request_ids"].append(row["id"])
@@ -993,6 +999,7 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
                            "selected_protected_target": row["id"] == protected_target_id,
                            "manual_order_position": row["order_position"],
                            "served_round": row["served_round"],
+                           "ordering_served_round": policy.ordering_served_round(row["served_round"]),
                            "eligible_this_selection_round": row["served_round"] < selection_round,
                            "priority": row["priority"],
                            "waiting_credit_seconds": round(waiting_credit(row, at), 1)})
@@ -1021,6 +1028,7 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
         "round_context": {
             "current_round": current_round,
             "selection_round_if_scheduler_runs_now": selection_round,
+            "ordering": "boosted requests, oldest served round, manual order, waiting credit, sequence, request ID",
             "would_advance_before_selection": bool(ready and not has_unserved),
             "worktrees": list(worktree_turns.values()),
             "note": "This reflects the initial selection round; a capacity skip may advance the round later in a scheduler pass."},

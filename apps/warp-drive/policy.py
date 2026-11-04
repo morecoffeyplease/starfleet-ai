@@ -1,6 +1,6 @@
 """Deterministic worktree-round and CPU admission policy."""
 
-POLICY_VERSION = "warp-drive-admission-v5"
+POLICY_VERSION = "warp-drive-admission-v6"
 MAX_ACTIVE_AGED_ESCAPES = 2
 
 
@@ -11,6 +11,35 @@ def estimated_cores(size, workers, target_cores, light_ready=False):
     if size == "heavy" and light_ready:
         estimate = min(estimate, max(0.01, target_cores - min(1.0, target_cores / 2)))
     return estimate
+
+
+def ordering_served_round(served_round):
+    """Return the persisted service round used for ordering.
+
+    Existing never-served rows retain round zero until their first service.
+    Newly registered worktrees initialize their stored value to current-1.
+    """
+    return int(served_round)
+
+
+def request_order_key(item):
+    """Order a request by boost, missed worktree turns, manual order, then request details."""
+    row = item["row"] if isinstance(item, dict) and "row" in item else item
+
+    def value(source, key, default=None):
+        try:
+            return source[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+
+    boosted = value(item, "boosted", value(row, "priority", 0))
+    served_round = value(row, "served_round", 0)
+    position = value(item, "position", value(row, "order_position", 0))
+    credit = value(item, "credit", value(row, "credit", 0))
+    sequence = value(item, "sequence", value(row, "sequence", 0))
+    identifier = value(row, "id", value(item, "id", ""))
+    return (-int(bool(boosted)), ordering_served_round(served_round),
+            int(position), -float(credit), int(sequence), str(identifier))
 
 
 def choose_worktree(rows):
@@ -27,8 +56,7 @@ def choose_worktree(rows):
         for row in rows:
             row["round"] = current_round
         available = rows
-    available.sort(key=lambda row: (-int(row["boosted"]), row["order_position"],
-                                    -row["credit"], row["sequence"], row["id"]))
+    available.sort(key=request_order_key)
     return available[0]
 
 

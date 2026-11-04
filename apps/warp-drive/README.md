@@ -25,10 +25,13 @@ Unsupported accounting, spawn failures, and owner reconciliation retain explicit
 
 Each waiting request needs an attached helper with a fresh heartbeat.
 The scheduler grants one request per eligible worktree per persisted round and advances after a capacity skip so an unfit request does not pin the round.
+Among eligible unserved worktrees, explicit boosts come first, followed by the least recently served round and manual order, with waiting credit, request sequence and request ID breaking remaining ties.
+New worktrees start one round behind the current round so they can take a turn immediately; existing never-served rows retain round zero as a finite first-service debt until they are served.
 Manual ordering has a revision, and authorized boosts are one bounded level within the worktree's normal turn.
 Light work bypasses heavy startup pacing and can use reserved headroom.
 A fitting request gets its ordinary worktree turn even when an aged large request is waiting.
 After other currently serviceable worktrees have received their turns, one deterministically selected heavy request that has waited at least 120 seconds can protect its worktree from fitting heavy backfill when releasing active managed work can restore its existing escape threshold.
+Protected aged-target selection and retention continue to use earned waiting credit and the existing protected-turn rules.
 The scheduler does not protect a worktree already receiving active service, and held, canceled, or stale requests stop being protection targets automatically.
 During a protected turn, conflicting heavy backfill is withheld and at most one light backfill may be active at a time.
 After managed work drains, the target can stay protected while a fresh low current sample waits for the existing recent CPU mean to settle; replacement light work pauses during that short observation gap.

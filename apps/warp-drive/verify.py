@@ -415,8 +415,106 @@ def test_scheduler_refreshes_policy_version(temp):
     historical = next(data for kind, data in events if kind == "historical_grant")
     latest_grant = next(data for kind, data in reversed(events) if kind == "granted")
     check(historical["policy_version"] == "warp-drive-admission-v1" and
-          latest_grant["policy_version"] == "warp-drive-admission-v5",
+          latest_grant["policy_version"] == "warp-drive-admission-v6",
           "policy label refresh rewrote history or emitted the wrong current event version")
+
+
+def test_missed_turn_ordering(temp):
+    current_round = 8
+    tie_rows = [
+        {"id": "newer-earlier-position", "served_round": 6,
+         "order_position": 1, "boosted": False, "credit": 7, "sequence": 1},
+        {"id": "oldest-missed", "served_round": 3,
+         "order_position": 4, "boosted": False, "credit": 7, "sequence": 2},
+        {"id": "explicit-boost", "served_round": 7,
+         "order_position": 99, "boosted": True, "credit": 0, "sequence": 3},
+        {"id": "legacy-never-served", "served_round": 0,
+         "order_position": 2, "boosted": False, "credit": 20, "sequence": 4},
+        {"id": "new-join", "served_round": 7,
+         "order_position": 3, "boosted": False, "credit": 20, "sequence": 5},
+        {"id": "credit-breaks-tie", "served_round": 7,
+         "order_position": 4, "boosted": False, "credit": 21, "sequence": 8},
+        {"id": "sequence-breaks-tie", "served_round": 7,
+         "order_position": 4, "boosted": False, "credit": 20, "sequence": 6},
+        {"id": "id-breaks-tie-b", "served_round": 7,
+         "order_position": 4, "boosted": False, "credit": 20, "sequence": 7},
+        {"id": "id-breaks-tie-a", "served_round": 7,
+         "order_position": 4, "boosted": False, "credit": 20, "sequence": 7},
+    ]
+    ordered_ids = [row["id"] for row in sorted(
+        tie_rows, key=policy.request_order_key)]
+    check(ordered_ids == ["explicit-boost", "legacy-never-served", "oldest-missed",
+                          "newer-earlier-position", "new-join", "credit-breaks-tie",
+                          "sequence-breaks-tie", "id-breaks-tie-a", "id-breaks-tie-b"],
+          f"policy ordering lost boost, missed-round, manual-order or deterministic tie behavior: {ordered_ids}")
+    check(policy.ordering_served_round(0) == 0,
+          "a legacy never-served worktree lost its finite first-service debt")
+
+    join_state = temp / "missed-turn-new-join-state"
+    run_cli(join_state, "init")
+    join_path = temp / "missed-turn-new-join-worktree"
+    join_path.mkdir()
+    with contextlib.closing(warp_drive.connect(join_state)) as db:
+        with warp_drive.immediate_transaction(db):
+            warp_drive.set_setting(db, "current_round", 4)
+            joined_id = warp_drive.worktree_identity(db, join_path)
+        joined = db.execute("SELECT served_round FROM worktrees WHERE id=?", (joined_id,)).fetchone()
+        check(joined["served_round"] == 3,
+              "a new worktree did not join immediately before the persisted current round")
+
+    state = temp / "missed-turn-order-state"
+    run_cli(state, "init")
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    target_path = temp / "missed-turn-oldest-waiter"
+    target_path.mkdir()
+    peer_paths = [temp / f"missed-turn-newer-peer-{index}" for index in range(3)]
+    for path in peer_paths:
+        path.mkdir()
+    target_id = submit_and_attach(state, owner, "missed-turn-oldest-waiter", target_path,
+                                 "heavy", 4)
+    peer_ids = [submit_and_attach(state, owner, f"missed-turn-peer-{index}", path,
+                                  "heavy", 4)
+                for index, path in enumerate(peer_paths)]
+    peer_service_rounds = [4, 5, 7]
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            warp_drive.set_setting(db, "current_round", current_round)
+            db.execute("UPDATE worktrees SET order_position=4,served_round=2 "
+                       "WHERE id=(SELECT worktree_id FROM reservations WHERE id=?)", (target_id,))
+            for index, (request_id, served_round) in enumerate(
+                    zip(peer_ids, peer_service_rounds), start=1):
+                db.execute("UPDATE worktrees SET order_position=?,served_round=? "
+                           "WHERE id=(SELECT worktree_id FROM reservations WHERE id=?)",
+                           (index, served_round, request_id))
+            db.execute("UPDATE reservations SET credit_seconds=150,credit_started_at=NULL "
+                       "WHERE id IN (" + ",".join("?" for _ in [target_id, *peer_ids]) + ")",
+                       [target_id, *peer_ids])
+        waiting = db.execute("""SELECT r.id,r.priority,r.credit_seconds,r.sequence,
+            w.order_position,w.served_round FROM reservations r JOIN worktrees w ON w.id=r.worktree_id
+            WHERE r.state='waiting' ORDER BY w.order_position,r.sequence""").fetchall()
+        old_order = sorted(waiting, key=lambda row: (-int(bool(row["priority"])),
+            row["order_position"], -row["credit_seconds"], row["sequence"], row["id"]))
+        check([row["id"] for row in old_order[:3]] == peer_ids and
+              old_order[3]["id"] == target_id and
+              all(row["order_position"] < 4 and row["served_round"] > 2
+                  for row in waiting if row["id"] in peer_ids),
+              "fixture no longer shows earlier-position peers overtaking under the prior order")
+        before = warp_drive.status_data(db)["admission"]["candidates"]
+        check(before[0]["request_id"] == target_id and
+              before[0]["ordering_served_round"] == 2,
+              "diagnostics did not put the oldest missed service first")
+
+    result = run_fixture_pass(state, 0.20, cpus=8)
+    check(result["granted"] == target_id,
+          "the oldest continuously eligible worktree did not receive equivalent available headroom")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        granted = db.execute("SELECT served_round FROM worktrees WHERE id=(SELECT worktree_id "
+                             "FROM reservations WHERE id=?)", (target_id,)).fetchone()
+        grant_event = db.execute("SELECT data_json FROM events WHERE reservation_id=? "
+                                 "AND kind='granted' ORDER BY id DESC LIMIT 1", (target_id,)).fetchone()
+        check(granted["served_round"] == current_round and
+              json.loads(grant_event["data_json"])["policy_version"] == "warp-drive-admission-v6",
+              "grant did not preserve the current round or identify the revised measured policy")
 
 
 def test_scheduler_startup_pacing_and_escape_limit(temp):
@@ -1393,7 +1491,7 @@ def test_scheduler_fair_aged_worktree_and_idle_signal(temp):
     check(light_release["granted"] == light_target,
           "a finished light job did not yield its measured headroom to the aged oversized request")
 
-    # Multiple aged requests select one oldest target and progress in turn.
+    # Protected-target choice keeps its earned-credit ordering ahead of generic service-round order.
     multiple_state = temp / "multiple-aged-targets-state"
     run_cli(multiple_state, "init")
     old_path, next_path, active_path = [temp / name for name in
@@ -1409,6 +1507,11 @@ def test_scheduler_fair_aged_worktree_and_idle_signal(temp):
     sample_at = time.time()
     with contextlib.closing(warp_drive.connect(multiple_state)) as db:
         with warp_drive.immediate_transaction(db):
+            warp_drive.set_setting(db, "current_round", 10)
+            db.execute("UPDATE worktrees SET served_round=5 WHERE id=(SELECT worktree_id FROM reservations WHERE id=?)",
+                       (old_id,))
+            db.execute("UPDATE worktrees SET served_round=3 WHERE id=(SELECT worktree_id FROM reservations WHERE id=?)",
+                       (next_id,))
             db.execute("UPDATE reservations SET credit_seconds=300,credit_started_at=NULL WHERE id=?",
                        (old_id,))
             db.execute("UPDATE reservations SET credit_seconds=180,credit_started_at=NULL WHERE id=?",
@@ -1417,7 +1520,7 @@ def test_scheduler_fair_aged_worktree_and_idle_signal(temp):
                        (sample_at-30, sample_at-20, active_id))
     blocked = run_fixture_pass(multiple_state, 0.50, cpus=18)
     check(blocked["granted"] is None and blocked["protected_target_id"] == old_id,
-          "multiple aged waiters did not select one deterministic oldest target")
+          "protected-target selection stopped honoring earned credit when service rounds differ")
     with contextlib.closing(warp_drive.connect(multiple_state)) as db:
         with warp_drive.immediate_transaction(db):
             db.execute("UPDATE reservations SET state='finished',outcome='succeeded',exit_code=0,lease_active=0,ended_at=? WHERE id=?",
@@ -2350,6 +2453,7 @@ def main():
             test_product_command_inherits_caller_umask(temp)
             test_policy_fixtures()
             test_scheduler_refreshes_policy_version(temp)
+            test_missed_turn_ordering(temp)
             test_scheduler_startup_pacing_and_escape_limit(temp)
             test_active_escape_preserves_fitting_progress(temp)
             test_claim_and_cancel_launch_interleavings(temp)
