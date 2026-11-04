@@ -57,6 +57,11 @@ Never put those credentials in command-line arguments, task cards, shared contex
 Keep hosted providers and external integrations disabled for a local-only task.
 If an approved local provider requires an authentication value in the worker's process environment, scope its shell and tools so the worker cannot use that access to enumerate or export unrelated credentials.
 
+Treat native CMUX terminal capabilities as credentials.
+A detached helper may need to preserve its own inherited capability for authorized CMUX calls when process ancestry no longer establishes access.
+A newly created Qwen tab must obtain its own native identity and capability; do not reuse the parent orchestrator's capability as the child's identity.
+Keep a required capability in protected transport or the exact session's tool environment, never in prompts, receipts, process arguments or the server's global environment.
+
 An OpenCode file-read deny rule is not an operating-system sandbox when the worker also has unrestricted shell access.
 Scope shell access to the exact required commands, or use real process isolation for file, process and network boundaries.
 Verify the active controls before launch, and describe an instruction as guidance when no technical control enforces it.

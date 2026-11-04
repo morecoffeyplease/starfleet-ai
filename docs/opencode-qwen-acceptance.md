@@ -31,6 +31,19 @@ Native CMUX returns uppercase UUID strings while the initial launcher normalized
 Candidate `d193b9e` normalizes those UUIDs semantically while preserving exact session IDs and refusing malformed UUIDs.
 Its focused OpenCode test suite passed 11 tests; managed native launch qualification is still separate.
 
+## Detached-helper authentication control
+
+An initial managed-launch pilot on candidate `ad736a6` stopped during isolated profile notification inventory before Qwen session creation or model loading.
+The helper had removed CMUX's inherited terminal capability from its environment, and the detached process no longer qualified through native process ancestry.
+The owned API process stopped afterward.
+
+A separate read-only comparison in one detached helper held the command and environment constant except for preservation of its own native-issued `CMUX_SOCKET_CAPABILITY`.
+Without that capability, `cmux identify` returned access denied; with it, the command returned an actual caller identity.
+No capability value was printed or placed in arguments or receipts.
+This proves the tested authentication requirement for the detached helper, not managed Qwen delivery.
+A managed child must obtain its own new tab's native capability and scope any necessary server-side tool access to that exact session.
+Copying the parent capability into the shared server environment would not establish child ownership.
+
 ## Maximum-thinking startup and instruction reception
 
 An interactive OpenCode startup prompt requested one allowed fixture read and two known markers.
