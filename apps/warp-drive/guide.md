@@ -30,6 +30,8 @@ warp-drive scheduler --send
 ```
 
 The scheduler samples host signals every two seconds, grants at most one request per eligible worktree per round, and never starts or kills product commands.
+Among eligible unserved worktrees, explicit boosts come first, followed by the least recently served round and manual order, with waiting credit, request sequence and request ID breaking remaining ties.
+New worktrees start one round behind the current round so they can take a turn immediately; existing never-served rows retain round zero as a finite first-service debt until they are served.
 It exits if another scheduler already owns the same state directory.
 It does not start automatically when the tool is installed.
 Running `warp-drive scheduler` without `--send` samples and grants work but leaves all inbox messages pending.
@@ -44,7 +46,8 @@ The snapshot shows host sample freshness, observed and projected CPU, memory pre
 Active managed commands are estimated contributors, not proof that each command caused host load or must finish before a request can start.
 When policy identifies an active aged escape or a selected protected backfill target, the snapshot includes that request ID as the specific blocker, and a selected target remains waiting until a later admission pass.
 Host capacity, stale sample, memory pressure, and startup observation restrictions do not assign a causal reservation ID.
-The turn context shows current round, each ready worktree's manual order and served round, and whether it is eligible in the selection round if the scheduler runs now.
+The turn context shows current round, each ready worktree's manual order, stored and ordering served rounds, and whether it is eligible in the selection round if the scheduler runs now.
+Candidate snapshots use the same boost, least-recently-served, manual-order and deterministic request tie-breaks as the scheduler.
 The snapshot is not a FIFO rank, reservation promise or ETA, and a later sample or scheduler pass may change it.
 Status and doctor list completed request IDs whose owner lacks an exact Hailing route and give the supported enrollment or owner-authorized transfer action.
 The result remains durable, and the existing sending scheduler retries it after the owner route is available.
@@ -76,6 +79,7 @@ The target defaults to 95 percent and can be changed by the configured operator 
 New grants stay in projected load until a host sample arrives at least ten seconds after their helper start or grant time.
 Fitting work receives its ordinary worktree turn before an aged request protects its worktree from heavy backfill.
 After other currently serviceable worktrees have received their turns, one eligible aged heavy request may hold conflicting heavy backfill when releasing active managed work can restore the existing escape threshold.
+Protected aged-target selection and retention continue to use earned waiting credit and the existing protected-turn rules.
 During that protected turn, at most one light backfill may be active at a time so light work continues while repeated grants do not refill every slot.
 After managed work drains, protection can persist while a fresh low current sample waits for the existing recent CPU mean to settle, and replacement light work pauses during that short observation gap.
 A held, canceled, stale or actively served target worktree cannot hold this protection.

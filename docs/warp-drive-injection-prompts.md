@@ -7,6 +7,8 @@ They do not grant authority beyond the operator's existing instructions.
 ## Shared guidance for participating agents
 
 For CPU-intensive local work, read `warp-drive guide --print` and use its reservation workflow.
+Eligible unserved worktrees are selected by authorized boost, least recently served round, then manual order, with waiting credit and stable request details breaking ties.
+The existing protected aged-target path keeps its earned-credit selection and protected-turn behavior.
 Submit one meaningful CPU phase per reservation and declare the phase's actual simultaneous CPU worker count, workload family, size, and expected runtime.
 Do not sum worker counts across serial phases.
 Within one checkout, keep only one CPU-intensive request eligible when commands share generated files, caches, or a database.
