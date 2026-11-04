@@ -249,7 +249,7 @@ Use one row per observed run and include the candidate identity and the actual r
 Do not infer a benchmark, stable cadence, general security property or qualification from one synthetic run.
 
 The [native acceptance observations](opencode-qwen-acceptance.md) record a completed maximum-thinking read trial and the ownership/composer gaps it exposed.
-They do not qualify automatic delivery, Pattern Buffer recovery or Qwen-only orchestration.
+They include initial Pattern Buffer context/task delivery and task updates in completed compaction, but do not qualify automatic delivery, a resumed implementation turn or Qwen-only orchestration.
 The table below remains a template for subsequent role-specific trials.
 
 | Configuration and role | Task | Observation | Consequence | Limits | Resulting guidance |

@@ -51,6 +51,27 @@ It does not prove isolation from unrestricted shell commands, arbitrary filesyst
 The fixture used no real secrets and no real-secret discovery.
 Redaction after an explicitly allowed synthetic-token read, parent credential handling and Qwen-only orchestrator secret handling still require separate acceptance.
 
+## Pattern Buffer native context and compaction
+
+The first native Pattern Buffer source candidate was `569e48b`.
+The plugin was installed only into an explicit isolated OpenCode settings file and private trial runtime.
+A two-phase prepare/bind operation attached one immutable task receipt to an actual API-created OpenCode session before its interactive startup prompt.
+
+The outgoing primary requests contained the approved shared marker, implementer marker and exact first-task marker.
+They did not contain the orchestrator marker.
+Qwen completed the allowed read and reported the expected markers.
+After an explicit task update, a real manual compaction request contained the new task marker and omitted the old task marker from its current system context.
+The event stream recorded `session.compaction.started` and `session.compaction.ended` for that exact session.
+This proves initial context delivery and current-task delivery into the tested compaction call, not a subsequent resumed implementation turn.
+A local render after finishing the task omitted the active brief; model-visible finish behavior still needs a separate continuation check.
+The owned model runtime and relay stopped after the bounded run.
+
+A separate native negative control bound a fresh session and then temporarily made its synthetic owner context unreadable as UTF-8.
+The interactive startup recorded the Pattern Buffer context failure, reached idle and made zero requests to the capture-provider endpoint.
+No model runtime was started for that control.
+The original synthetic context bytes were restored exactly afterward.
+This establishes that the tested hook failure prevented provider invocation for this candidate, rather than relying on an instruction telling the model to stop.
+
 ## Native ownership and composer gaps
 
 Passively opening an API-created session did not initially register a native CMUX agent identity.
@@ -69,7 +90,8 @@ The trial does not establish that this duplicate caused either ownership or comp
 ## Remaining acceptance
 
 Managed profile dispatch and exact continuation require their own native acceptance.
-Pattern Buffer shared, role and exact-task delivery, task updates, finish semantics, resume and completed compaction recovery remain unproven for OpenCode.
+Pattern Buffer initial shared, role and exact-task delivery and an updated task in completed compaction are observed above.
+A post-compaction implementation turn, same-session resume and model-visible task-finish behavior still require native acceptance.
 Guarded messaging needs authoritative empty-versus-draft evidence, exact owner binding, actual wake receipt and held-permission/draft controls.
 The remaining synthetic-secret checks are parent credential handling, allowed-token redaction and Qwen-only orchestration.
 Qwen-only orchestration requires separate task-framing, dependency-relay, acceptance-reporting and escalation evidence.
