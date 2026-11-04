@@ -147,9 +147,8 @@ Its OpenCode-managed dispatch path requires a pilot-scoped OpenCode configuratio
 Use a fresh per-task connection manifest for the exact loopback API process.
 The OpenCode management API is separate from the Ollama inference endpoint, and its Basic authentication value must remain in a protected private file.
 Source code and a successful read-only preflight do not establish managed session creation, startup placement, continuation or safe sending.
-The parent-routing regression was corrected with focused tests, but the following native attempt created a session and tab without completing the startup handshake or sending a model message.
-A short startup command with a protected Starfleet launch descriptor is under implementation after a harmless long-versus-short command control.
-These failed startup attempts do not establish an API-only safe-send path.
+The parent-routing and startup-command failures were corrected, and a fresh Codex-Qwen managed session completed its exact baseline task using the short protected descriptor and explicit private XDG paths.
+This observed startup case does not qualify every parent route, Hailing delivery or a production API-only send path.
 
 Read the maintained [Pattern Buffer OpenCode guide](../apps/pattern-buffer/docs/opencode.md) for explicit plugin installation, two-phase task binding and exact session identity.
 The native pilot observed shared context, the implementer role and initial task text in a primary request, an updated task in completed compaction, and a broken-bound-context failure that resulted in zero provider requests.
@@ -161,9 +160,14 @@ Do not build or install a custom CMUX fork for this workflow.
 Keep automatic OpenCode inbound prompts and continuation held while composer state is unknown.
 The OpenCode 2.2.5 TUI plugin API has no documented draft accessor or atomic admission lock.
 Pinned source shows the local TUI submission path resets its composer state, which suggests an external API prompt may leave a visible draft intact; this inference is not runtime evidence.
-A bounded API-first experiment has been selected to check exact native session ownership, running and pending permission/form state, and draft preservation in stock CMUX.
-The experiment has not run, does not qualify an API-only safe-send path, and does not change current product guards.
-A human-controlled visible-session resume remains an unproven alternative and is not the selected experiment.
+A bounded API-first trial in a manually started visible session observed one API prompt and reply while a synthetic unsent draft remained visible and intact.
+It used no tools and was not Model Preferences managed dispatch or Hailing automatic delivery.
+A subsequent managed-session experiment also preserved the synthetic draft, while Model Preferences retained its production delivery hold.
+Separate preflight controls observed pending-form and pending-permission holds, with the exact scope and limits recorded in the [acceptance record](opencode-qwen-acceptance.md).
+These are limited draft-preservation observations and do not qualify a production API-sidechannel route.
+An explicit API-sidechannel policy is under qualification after its first Model Preferences continuation stopped with uncertain queue admission.
+The default strict composer policy is unchanged; do not opt in based only on source availability.
+Human-controlled visible-session resume remains a fallback requiring its own acceptance.
 OpenCode wake support in Warp-drive, Away Mode, Agent Notify, Discord Watch, Temporal Beacon and Starfleet Markup remains separately unqualified.
 Do not infer notification, wake, task completion or review feedback support from source identity handling alone.
 
@@ -172,9 +176,10 @@ Do not infer notification, wake, task completion or review feedback support from
 Stop before task launch if the exact local provider or model cannot be confirmed.
 Stop if an unexpected credential appears, a hosted request occurs, a permission boundary is broader than the task, or the task needs an unapproved path.
 Report the credential's location and category without copying its value, and wait for the parent to decide the next step.
-Stop if OpenCode shows a permission request, human-input obligation, draft or ambiguous composer state.
+Stop any managed or automatic send if OpenCode shows a permission request, human-input obligation, draft or ambiguous composer state.
 Do not treat an idle model state or empty permission list as evidence that the composer is empty.
 Do not use an API-only send or continuation path to bypass an unknown composer state.
+The synthetic draft-preservation control is evidence for one bounded visible-session trial, not authorization to bypass a production guard.
 
 ## Evidence and status
 

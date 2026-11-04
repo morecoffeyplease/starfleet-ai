@@ -1,7 +1,9 @@
 # Qwen operating guide
 
-This guide describes a bounded workflow for Codex or Claude orchestrators supervising Qwen implementers in OpenCode.
-It also describes the separate evidence required before a Qwen orchestrator can coordinate implementers.
+This guide covers Codex or Claude project orchestrators assigning bounded implementation or research to Qwen in OpenCode, and Qwen project orchestrators managing Qwen implementers with human or frontier-model assistance.
+The orchestrator performs ordinary project ownership: scope, dependencies, acceptance and reporting.
+The workflow does not require a separate policing service or zero human intervention.
+Record assistance and interventions so supervised observations are not presented as autonomous orchestration.
 Use the [OpenCode and local Qwen setup guide](opencode-qwen-setup.md) for the pinned pilot configuration and setup prerequisites.
 
 Every Qwen run uses a visible OpenCode tab or pane in the existing CMUX workspace assigned to that same task.
@@ -23,7 +25,7 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 
 | Component | Candidate source behavior | Observed native boundary |
 | --- | --- | --- |
-| Model Preferences | Exact provider/model preflight and managed dispatch path under active integration work | Real read-only preflight and a separate visible local startup task were observed; the parent guard was corrected in focused tests, but the following session/tab startup stopped before its handshake and any model message, so dispatch and continuation remain unqualified |
+| Model Preferences | Exact provider/model preflight and managed dispatch path under active integration work | Fresh Codex-Qwen managed startup, exact task admission and private TUI placement passed on one candidate; production continuation, every parent route and Qwen-only orchestration remain unqualified |
 | Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks | Initial shared/implementer/task delivery, updated task in completed compaction and pre-provider failure refusal passed; resumed implementation and model-visible finish remain unverified |
 | Hailing Frequencies and Discord Watch | Exact OpenCode identity and guarded API delivery paths in source | The stock CMUX composer state is `unknown`, so OpenCode inbound delivery and continuation remain held; the custom CMUX parser experiment is historical and gave no native empty-composer proof |
 | Agent Notify | OpenCode identity and owning-thread paths in source | No native Qwen-origin conversation or reply reception is recorded |
@@ -36,9 +38,13 @@ Check the saved profile against each session's intended profile before launch, a
 The observed Codex startup and Luna delegation do not establish Qwen orchestrator qualification.
 Use supported stock CMUX only for this workflow.
 The OpenCode 2.2.5 TUI plugin interface has no documented draft accessor or atomic admission lock, and no API-only safe-send bypass is qualified.
-The selected bounded API-first experiment will check exact native session ownership, running and pending permission/form state, and whether a prompt leaves an unsent draft intact.
-The experiment has not run, does not qualify API-only delivery and does not change current product guards.
-A human-controlled visible-session resume remains an unproven alternative and is not the selected experiment.
+One bounded API-first control in a manually started visible session observed an API reply while a synthetic unsent draft remained visible and intact.
+Separate preflight controls observed pending-form and pending-permission holds.
+A subsequent managed-session startup and API draft-preservation case also passed, with its production delivery guard still held.
+These cases do not qualify Hailing delivery, wake, every managed parent route or a production API-only path.
+An explicit API-sidechannel policy candidate is under qualification; its first actual Model Preferences continuation attempt stopped with uncertain queue admission and was not replayed.
+The strict composer policy remains the default.
+Human-controlled visible-session resume is an available fallback, but its own acceptance remains unproven.
 
 ### Operator guidance
 
@@ -116,17 +122,18 @@ Record candidate-specific acceptance separately before describing any behavior a
 
 ## Choose the operating role
 
-### Codex or Claude orchestrator with a Qwen implementer
+### Codex or Claude orchestrator with a Qwen worker
 
 The Codex or Claude orchestrator owns task scope, the worktree, dependencies, acceptance and the final report.
-The Qwen implementer owns only the paths explicitly assigned in its task card.
+The Qwen worker owns only the implementation or research task and paths explicitly assigned in its task card.
 The orchestrator relays all required upstream findings and does not expect the Qwen session to see sibling chats or hidden coordinator state.
 
 ### Qwen orchestrator
 
 Treat a Qwen orchestrator as a separate, unqualified role until a Qwen-only trial has exercised orchestration behavior directly.
 Codex-supervised Qwen implementer results do not qualify Qwen to set scope, manage dependencies, supervise its own workers or recover late results.
-Run the same bounded workflow under an explicit human owner and record the Qwen-only observations separately.
+Run the same bounded workflow under an explicit human owner and record Qwen-led delegation, worker results and supervisor interventions separately.
+Human or frontier-model assistance is allowed; preserve who made each decision and which parts Qwen performed.
 A human remains the authority for scope changes, approvals, review launches and uncertain outcomes.
 
 ## Prepare the run
@@ -237,7 +244,7 @@ Silence alone does not authorize a forced prompt, session resume, worker kill or
 Inspect ownership, visible session state, local resources, worktree changes and the last meaningful evidence before choosing a next action.
 Preserve uncertain outcomes until the exact candidate and command state are reconciled.
 For OpenCode, keep automated inbound prompts and continuation held while native composer state is unknown.
-The selected API-first experiment is not a production bypass and still requires native safety validation.
+The limited draft-preservation result is not a production bypass and does not qualify automatic delivery or continuation.
 
 Use bounded recovery by failure class:
 
@@ -275,6 +282,9 @@ Do not infer a benchmark, stable cadence, general security property or qualifica
 
 The [native acceptance observations](opencode-qwen-acceptance.md) record a completed maximum-thinking read trial and the ownership/composer gaps it exposed.
 They include initial Pattern Buffer context/task delivery and task updates in completed compaction, but do not qualify automatic delivery, a resumed implementation turn or Qwen-only orchestration.
+One separate maximum-thinking task delivered its Pattern Buffer context and completed the allowed read, but its final report included only one of five requested markers and failed that exact reporting criterion.
+A separate one-output control does not change the five-marker result.
+This single observation supports checking final-report completeness separately from mechanical context delivery, and does not define a general marker-count limit, context budget or task-size rule.
 The [setup guide](opencode-qwen-setup.md) records the observed OpenCode, Ollama and model settings, with clean-host setup and end-to-end orchestration still unqualified.
 The table below remains a template for subsequent role-specific trials.
 

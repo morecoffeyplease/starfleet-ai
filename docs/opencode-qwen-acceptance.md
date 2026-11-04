@@ -38,8 +38,45 @@ An earlier managed attempt stopped at the parent guard before sending a session 
 The Codex/Claude parent-routing regression was corrected, and its focused suite passed 25 tests while preserving the stricter OpenCode-parent contract.
 The following native attempt created its API session and same-workspace tab but stopped before the child handshake and any model message.
 A harmless startup-command control executed at 344 bytes but did not execute at 2,142 bytes, where the visible command was truncated.
-The supported stock-CMUX path is being changed to use a short command with a protected launch descriptor inside Starfleet.
-No uncertain session or prompt is replayed, and this does not qualify managed startup or the API-only delivery experiment.
+The short-command and XDG isolation changes passed 32 focused tests.
+A subsequent Codex-Qwen managed session on candidate `3c1e189` completed its exact startup task in a visible same-workspace tab with the selected `max` variant.
+Model Preferences recorded the admitted user message and completed assistant turn, and the new private TUI state contained the expected session ID.
+Its private descriptor forwarded only the four explicit XDG home paths and retained mode 0600.
+A separate experimental API follow-up in that managed session produced the expected reply while the synthetic unsent draft stayed visible and intact, and the draft did not enter the server transcript.
+The observed provider requests used maximum thinking, and shared and implementer Pattern Buffer context was present in the primary calls.
+The owned API and model processes stopped after the bounded test.
+Model Preferences still reported delivery held because native composer state was not proven empty; the experiment did not remove that production guard.
+This qualifies the tested fresh managed startup and experimental draft-preservation cases, not Hailing wake reception, every parent route, negative delivery control or general Qwen-only orchestration.
+No uncertain session or prompt was replayed.
+
+## Explicit API-sidechannel candidate
+
+Candidate `bde0ee5` adds an explicit, identity-bound API-sidechannel policy while keeping the strict composer policy as the default.
+Its first actual Model Preferences continuation attempt followed successful managed startup with `max` reasoning and Pattern Buffer context.
+An unsent synthetic draft was observed in the exact new tab before continuation.
+The continuation stopped with `prompt_queue_admission_unconfirmed`; the attempt was preserved without replay and the owned runtimes stopped.
+This is a failed acceptance result, not proof that the prompt was rejected or delivered.
+Persisted admission and message evidence must be reconciled before another send.
+A separate actual API control on candidate `792105b` observed a clear empty inbox followed by a `pending_inbox` hold after a synthetic queued message.
+That control used no model request and does not establish native wake delivery.
+
+## Visible-session API draft-preservation control
+
+A separate short OpenCode session was started directly in a visible tab and was not created through Model Preferences managed dispatch.
+The startup prompt returned its expected baseline response.
+While an unsent synthetic draft remained visible, one API prompt reached the same session and produced a reply.
+Direct before-and-after screen inspection showed the synthetic draft remained visible and intact.
+The two provider requests carried `reasoning_effort: "max"` and Pattern Buffer shared and implementer context without the orchestrator marker.
+No tools were invoked, and the provider transcript did not contain the synthetic draft text.
+The isolated API and model processes were stopped after the bounded trial.
+This is limited evidence that an API prompt preserved one visible synthetic draft on the tested candidate.
+This direct control by itself does not qualify managed launch, exact parent routing, Hailing delivery, wake, pending-permission handling or an API-only safe-send path.
+Current product guards remain unchanged.
+
+Separate API safety controls observed a Hailing preflight hold for a pending form and a clear preflight result in a queued-inbox red-control case.
+A task using an explicitly configured agent and an allowed fixture produced a pending permission, and the Hailing preflight held on `pending_permissions`.
+An earlier denied-action control was caused by a missing configured agent under the pinned source behavior, not a wrong API route.
+These controls do not prove that OpenCode presented an approval to a person or qualify all permission and message states.
 
 ## Detached-helper authentication control
 
@@ -67,6 +104,15 @@ That request omitted an explicit output-token field and accounted for 1,987 comp
 The entire bounded run took about 42 seconds, including model loading and the auxiliary request.
 These timings are one observation, not a throughput estimate or a basis for a universal heartbeat interval.
 Task budgets should account for auxiliary model calls as well as the worker's visible tool loop.
+
+## Five-marker task-output criterion
+
+A separate maximum-thinking task requested a real allowed fixture read and a final report containing five known markers.
+The request was admitted, the expected fixture was read, and Pattern Buffer context was present in the request.
+The final report named only the fixture marker and omitted the other four requested markers, so the exact reporting criterion failed.
+A separate one-output control has its own scope and does not change this failed result.
+This observation separates mechanical context delivery from final-report completeness for one task.
+It does not establish a general Qwen limitation, a universal marker-count limit, a context budget or a task-size rule.
 
 ## Synthetic secret-canary boundary
 
@@ -118,10 +164,10 @@ Guarded automatic delivery therefore remains held on this observed configuration
 Do not reinterpret unknown as empty, type a probe, clear a draft or synthesize hook records to make enrollment succeed.
 The pinned OpenCode 2.2.5 TUI plugin context and session API references have no documented draft accessor or atomic admission lock.
 The inspected server routes expose active-turn, inbox, permission and form state but do not expose unsent composer text.
-The selected bounded API-first experiment will check exact native session ownership, active-turn state, pending permissions and forms, and whether an external prompt leaves an unsent draft intact.
-The experiment has not run, does not qualify API-only delivery and does not change the current product guards.
+The initial API-first experiment checked exact native ownership and preserved one synthetic draft, as recorded above.
+The later explicit policy candidate remains under qualification after its uncertain-admission result.
 Source inspection of the [pinned TUI submission path](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/tui/src/component/prompt/index.tsx) and [TUI state handling](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/tui/src/context/data.tsx) suggests that an external API prompt leaves the TUI composer untouched because the local reset occurs in the TUI submission path.
-This is a source-based inference, not native evidence that pending draft text is preserved or that automation can safely run alongside it.
+This source-based inference is consistent with the bounded draft-preservation observations above; it does not establish safe automation in every state.
 A human-controlled visible-session resume remains an unproven alternative and is not the selected experiment.
 The installed project hook discovery also reported a duplicate server-plugin ID for a compatibility file; one package was active and the duplicate was failed.
 The trial does not establish that this duplicate caused either ownership or composer behavior.
@@ -142,11 +188,12 @@ A post-compaction implementation turn, same-session resume and model-visible tas
 Automatic OpenCode inbound delivery and continuation remain held while stock CMUX reports composer state `unknown`.
 No API-only send or continuation bypass is qualified.
 OpenCode API and plugin integration remain under investigation for safe ownership and delivery behavior.
-The selected API-first experiment is a bounded investigation only, and existing product guards remain unchanged.
+API-sidechannel qualification remains a bounded investigation; the default strict policy is unchanged.
 Guarded messaging still needs authoritative empty-versus-draft evidence, exact owner binding, actual wake receipt and held-permission/draft controls.
 A human-controlled visible-session resume is an unproven alternative, not the selected experiment.
 The remaining synthetic-secret checks are parent credential handling, allowed-token redaction and Qwen-only orchestration.
-Qwen-only orchestration requires separate task-framing, dependency-relay, acceptance-reporting and escalation evidence.
+Qwen-led orchestration with human or frontier-model assistance requires separate task-framing, actual worker delegation, dependency-relay, acceptance-reporting and escalation evidence.
+Record interventions without treating their presence as failure of the supervised workflow or claiming autonomous behavior.
 The earlier Codex-supervised worker results cannot establish those capabilities.
 The active Model Preferences integration work still needs fresh managed-session, explicit-maximum-variant, post-compaction continuation and failure-control evidence before its source candidate can be described as accepted.
 
