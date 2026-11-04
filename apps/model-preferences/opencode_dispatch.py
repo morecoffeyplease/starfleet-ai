@@ -782,7 +782,10 @@ def check_opencode_cli(binary: str | None = None) -> str:
         result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         raise OpenCodeDispatchError("opencode_cli_version_unverified") from None
-    if result.returncode != 0 or result.stdout.strip() != SUPPORTED_OPENCODE_VERSION:
+    version = SUPPORTED_OPENCODE_VERSION
+    accepted_outputs = {version, version + "\n", version + "\r\n",
+                        f"opencode v{version}", f"opencode v{version}\n", f"opencode v{version}\r\n"}
+    if result.returncode != 0 or not isinstance(result.stdout, str) or result.stdout not in accepted_outputs:
         raise OpenCodeDispatchError("unsupported_opencode_cli_version")
     return str(Path(binary).resolve())
 

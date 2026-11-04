@@ -347,6 +347,29 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertNotIn("provider configuration unavailable", str(raised.exception))
         self.assertNotIn(CANARY, str(raised.exception))
 
+    def test_opencode_cli_version_accepts_exact_banner_and_bare_version_only(self):
+        binary = "/fixture/bin/opencode"
+        accepted = ("opencode v2.2.5\n", "2.2.5", "2.2.5\n")
+        rejected = ("opencode v2.2.6\n", "prefix opencode v2.2.5\n",
+                    "opencode v2.2.5\nextra\n", "2.2.5\nextra\n")
+        for output in accepted:
+            with self.subTest(output=repr(output)), \
+                    patch.object(dispatch.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout=output, stderr="")) as run:
+                self.assertEqual(dispatch.check_opencode_cli(binary), str(Path(binary).resolve()))
+                run.assert_called_once_with([binary, "--version"], capture_output=True,
+                                            text=True, timeout=5)
+        for output in rejected:
+            with self.subTest(output=repr(output)), \
+                    patch.object(dispatch.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout=output, stderr="")), \
+                    self.assertRaisesRegex(dispatch.OpenCodeDispatchError, "unsupported_opencode_cli_version"):
+                dispatch.check_opencode_cli(binary)
+        with patch.object(dispatch.subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout="opencode v2.2.5\n", stderr="failure")), \
+                self.assertRaisesRegex(dispatch.OpenCodeDispatchError, "unsupported_opencode_cli_version"):
+            dispatch.check_opencode_cli(binary)
+
     def test_child_session_keeps_native_parent_session_separate_from_parent_task(self):
         connection = dispatch.load_connection(self.manifest)
         parent_session = "ses_parentFixture123"
