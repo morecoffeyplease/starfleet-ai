@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from urllib.parse import quote, urlsplit
 
@@ -71,6 +72,110 @@ def session_binding(root, gitdir, harness, session, agent=""):
     if harness == "opencode" or agent or not session:
         return None
     return auxiliary("sessions").lookup(root, gitdir, harness, session)
+
+
+def canonical_native_uuid(value, label):
+    if not isinstance(value, str) or re.fullmatch(
+            r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", value) is None:
+        raise ValueError(f"{label} must be the exact CMUX UUID")
+    return str(uuid.UUID(value)).upper()
+
+
+def validate_parent_task_id(value):
+    if not isinstance(value, str) or not value or len(value) > 256 or value.strip() != value:
+        raise ValueError("OpenCode parent task ID must be 1-256 non-padded characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("OpenCode parent task ID is not valid UTF-8") from None
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError("OpenCode parent task ID must not contain control characters")
+    return value
+
+
+def validate_opencode_parent_record(parent, owner):
+    fields = {"harness", "session_id", "task_id", "role", "owner_worktree", "owner_gitdir",
+              "surface_id", "workspace_id", "assignment_sha256"}
+    if not isinstance(parent, dict) or set(parent) != fields:
+        raise ValueError("OpenCode parent identity record is incomplete or ambiguous")
+    if (not isinstance(owner, dict) or set(owner) != {"root", "gitdir"} or
+            not isinstance(owner.get("root"), str) or not isinstance(owner.get("gitdir"), str)):
+        raise ValueError("OpenCode task owner identity is invalid")
+    if (parent.get("harness") != "opencode" or
+            not isinstance(parent.get("session_id"), str) or
+            not _OPENCODE_SESSION_ID.fullmatch(parent["session_id"]) or
+            parent.get("role") != "orchestrator" or
+            parent.get("owner_worktree") != owner.get("root") or
+            parent.get("owner_gitdir") != owner.get("gitdir")):
+        raise ValueError("OpenCode parent identity is foreign or not an orchestrator")
+    validate_parent_task_id(parent.get("task_id"))
+    for key in ("surface_id", "workspace_id"):
+        if canonical_native_uuid(parent.get(key), "OpenCode parent " + key) != parent[key]:
+            raise ValueError("OpenCode parent CMUX identity is not canonical")
+    digest = parent.get("assignment_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("OpenCode parent assignment proof is invalid")
+    return parent
+
+
+def opencode_parent_assignment(owner_root, owner_gitdir, session, task_id, surface, workspace,
+                               expected=None):
+    owner = {"root": str(owner_root), "gitdir": str(owner_gitdir)}
+    task_id = validate_parent_task_id(task_id)
+    if not isinstance(session, str) or not _OPENCODE_SESSION_ID.fullmatch(session):
+        raise ValueError("OpenCode parent must be the exact case-sensitive ses_ session ID")
+    surface = canonical_native_uuid(surface, "OpenCode parent CMUX_SURFACE_ID")
+    workspace = canonical_native_uuid(workspace, "OpenCode parent CMUX_WORKSPACE_ID")
+    owner_config, source = load(owner_root, owner_gitdir)
+    if owner_config.get("context_owner") or not enabled(owner_config):
+        raise ValueError("OpenCode parent owner must be directly initialized and enabled")
+    metadata_dir = owner_gitdir / "context-injector"
+    assignment_dir = metadata_dir / "sessions"
+    if metadata_dir.is_symlink() or assignment_dir.is_symlink():
+        raise ValueError("OpenCode parent assignment path must not contain a symlink")
+    if ((metadata_dir.exists() and not metadata_dir.is_dir()) or
+            (assignment_dir.exists() and not assignment_dir.is_dir())):
+        raise ValueError("OpenCode parent assignment path is ambiguous")
+    assignment = state_path(owner_gitdir, "opencode", session)
+    if assignment.is_symlink() or not assignment.is_file():
+        raise ValueError("exact OpenCode parent has no session assignment in the selected owner worktree")
+    raw = bounded(assignment, FILE_LIMIT)
+    try:
+        saved = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise ValueError("OpenCode parent session assignment is malformed") from None
+    if (not isinstance(saved, dict) or set(saved) != {"root", "role"} or
+            saved.get("root") != str(owner_root) or saved.get("role") != "orchestrator"):
+        raise ValueError("exact OpenCode parent assignment is foreign, task-bound or not an orchestrator")
+    role, origin, resolved = resolve_role(owner_root, owner_gitdir, owner_config,
+                                          "opencode", session)
+    if role != "orchestrator" or origin != "session assignment" or resolved != saved:
+        raise ValueError("OpenCode parent role is missing, ambiguous or changed")
+    content = sections(source)
+    if "orchestrator" not in content or "implementer" not in content:
+        raise ValueError("OpenCode parent owner context is missing an orchestrator or implementer section")
+    parent = {"harness": "opencode", "session_id": session, "task_id": task_id,
+              "role": "orchestrator", "owner_worktree": str(owner_root),
+              "owner_gitdir": str(owner_gitdir), "surface_id": surface,
+              "workspace_id": workspace,
+              "assignment_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest()}
+    validate_opencode_parent_record(parent, owner)
+    if expected is not None and parent != validate_opencode_parent_record(expected, owner):
+        raise ValueError("OpenCode parent assignment or native identity changed after preparation")
+    return parent
+
+
+def opencode_parent_from_environment(owner_root, owner_gitdir, task_id):
+    if os.environ.get("CMUX_AGENT_LAUNCH_KIND") != "opencode":
+        raise ValueError("OpenCode task preparation requires CMUX_AGENT_LAUNCH_KIND=opencode")
+    session = os.environ.get("OPENCODE_SESSION_ID")
+    surface = os.environ.get("CMUX_SURFACE_ID")
+    workspace = os.environ.get("CMUX_WORKSPACE_ID")
+    if not session:
+        raise ValueError("OpenCode task preparation requires the exact OPENCODE_SESSION_ID")
+    if not surface or not workspace:
+        raise ValueError("OpenCode task preparation requires exact CMUX_SURFACE_ID and CMUX_WORKSPACE_ID")
+    return opencode_parent_assignment(owner_root, owner_gitdir, session, task_id, surface, workspace)
 
 
 def record_event(root, event, harness=None, session=None, enrollment_id=None,
@@ -768,6 +873,15 @@ def read_task(root, gitdir, task_id):
                 not isinstance(data["session_id"], str)
                 or not _OPENCODE_SESSION_ID.fullmatch(data["session_id"])):
             raise ValueError("invalid OpenCode task session ID")
+        if "ticket_version" in data:
+            ticket_version = data["ticket_version"]
+            if ticket_version != 2 or data.get("parent_kind") not in (
+                    "opencode", "claude", "codex", "worktree"):
+                raise ValueError("invalid OpenCode task parent contract")
+            if (data["parent_kind"] == "opencode") != ("parent" in data):
+                raise ValueError("OpenCode parent contract is incomplete or ambiguous")
+        if "parent" in data:
+            validate_opencode_parent_record(data.get("parent"), data.get("owner"))
     digest = data.get("brief_sha256")
     if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise ValueError("invalid task brief digest")
@@ -799,6 +913,10 @@ def write_dispatch_receipt(path, root, gitdir, task_id):
                                                   "--cwd", str(root), "task-status", "--task-id", task_id])}
     if data["harness"] == "opencode":
         receipt.update(owner_gitdir=data["owner"]["gitdir"], role=data["role"])
+        if "ticket_version" in data:
+            receipt.update(ticket_version=data["ticket_version"], parent_kind=data["parent_kind"])
+        if data.get("parent") is not None:
+            receipt["parent"] = data["parent"]
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".receipt-")
     try:
@@ -858,16 +976,30 @@ def prepare_dispatch(root, gitdir, args):
     owner_config, source = load(owner_root, owner_gitdir)
     if owner_config.get("context_owner") or not enabled(owner_config):
         raise ValueError("owner must be a directly initialized, enabled worktree")
+    parent_record = None
+    parent_kind = None
     session_files = owner_root / ".context-injector" / "sessions"
-    kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").lower()
-    parent_harness = "claude" if kind in ("claude", "claudeteams") else "codex" if kind == "codex" else None
-    parent_session = os.environ.get("CLAUDE_CODE_SESSION_ID" if parent_harness == "claude" else "CODEX_THREAD_ID")
-    parent = session_binding(owner_root, owner_gitdir, parent_harness, parent_session) if parent_harness else None
-    if parent is not None or session_files.exists() or session_files.is_symlink():
-        if (parent is None or parent.state != "active" or parent.file_status != "valid" or
-                parent.source_sha256 != hashlib.sha256(bounded(source, FILE_LIMIT).encode()).hexdigest()):
-            raise ValueError("dispatch cannot substitute a worktree default for a session-specific parent mission; "
-                             "use a dedicated --owner-worktree containing the parent's approved standing context")
+    kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().lower()
+    if kind == "opencode":
+        if args.harness != "opencode":
+            raise ValueError("an OpenCode parent can prepare only an OpenCode child ticket")
+        parent_record = opencode_parent_from_environment(
+            owner_root, owner_gitdir, getattr(args, "parent_task_id", None))
+        parent_kind = "opencode"
+    else:
+        if args.harness == "opencode" and os.environ.get("OPENCODE_SESSION_ID"):
+            raise ValueError("OPENCODE_SESSION_ID requires CMUX_AGENT_LAUNCH_KIND=opencode")
+        parent_harness = "claude" if kind in ("claude", "claudeteams") else "codex" if kind == "codex" else None
+        parent_session = os.environ.get("CLAUDE_CODE_SESSION_ID" if parent_harness == "claude" else "CODEX_THREAD_ID")
+        parent = session_binding(owner_root, owner_gitdir, parent_harness, parent_session) if parent_harness else None
+        if parent is not None or session_files.exists() or session_files.is_symlink():
+            if (parent is None or parent.state != "active" or parent.file_status != "valid" or
+                    parent.source_sha256 != hashlib.sha256(bounded(source, FILE_LIMIT).encode()).hexdigest()):
+                raise ValueError("dispatch cannot substitute a worktree default for a session-specific parent mission; "
+                                 "use a dedicated --owner-worktree containing the parent's approved standing context")
+        parent_kind = parent_harness if parent is not None else "worktree"
+        if getattr(args, "parent_task_id", None) is not None:
+            raise ValueError("--parent-task-id is only valid for a verified OpenCode parent session")
     owner = {"root": str(owner_root), "gitdir": str(owner_gitdir)}
     if owner_root != root:
         validate_owner(root, owner)
@@ -904,7 +1036,10 @@ def prepare_dispatch(root, gitdir, args):
             receipt_path = opencode_receipt_path(args.receipt_file)
             if receipt_path.exists() or receipt_path.is_symlink():
                 raise ValueError("receipt file already exists; use a unique file for each preparation")
-            data.update(role=args.role, receipt_file=str(receipt_path))
+            data.update(role=args.role, receipt_file=str(receipt_path),
+                        ticket_version=2, parent_kind=parent_kind or "worktree")
+            if parent_record is not None:
+                data["parent"] = parent_record
         atomic(path, json.dumps(data, indent=2))
     return task_id
 
@@ -941,6 +1076,10 @@ def bind_opencode_dispatch(root, gitdir, args):
         data, _ = read_task(root, gitdir, args.task_id)
         owner = data.get("owner")
         owner_root, owner_gitdir = validate_owner(root, owner)
+        parent = data.get("parent")
+        if "parent" in data:
+            opencode_parent_assignment(owner_root, owner_gitdir, parent["session_id"], parent["task_id"],
+                                       parent["surface_id"], parent["workspace_id"], expected=parent)
         config, _ = load(root, gitdir)
         if config.get("context_owner") != owner:
             raise ValueError("child worktree owner pointer no longer matches the prepared task")
@@ -955,6 +1094,8 @@ def bind_opencode_dispatch(root, gitdir, args):
         if receipt_path.is_symlink() or not receipt_path.is_file():
             raise ValueError("prepared OpenCode receipt is missing or is not a regular file")
         receipt = json.loads(bounded(receipt_path, FILE_LIMIT))
+        if not isinstance(receipt, dict):
+            raise ValueError("receipt content does not match the pending task and owner pointers")
         expected = {
             "version": 1,
             "receipt_type": "immutable_dispatch_snapshot",
@@ -969,7 +1110,14 @@ def bind_opencode_dispatch(root, gitdir, args):
             "created_at": data["created_at"],
             "status": "pending",
         }
-        if not isinstance(receipt, dict) or any(receipt.get(key) != value for key, value in expected.items()):
+        if parent is not None:
+            expected["parent"] = parent
+        if "ticket_version" in data:
+            expected.update(ticket_version=data["ticket_version"], parent_kind=data["parent_kind"])
+        for key in ("parent", "ticket_version", "parent_kind"):
+            if (key in receipt) != (key in expected) or receipt.get(key) != expected.get(key):
+                raise ValueError("receipt parent contract does not match the prepared task")
+        if any(receipt.get(key) != value for key, value in expected.items()):
             raise ValueError("receipt content does not match the pending task and owner pointers")
         if binding.exists() or binding.is_symlink():
             raise ValueError("OpenCode session already has an assignment")
@@ -1241,8 +1389,11 @@ def opencode_context(root, gitdir, session):
                 or saved.get("role") != "implementer" or not saved.get("task_id")):
             raise ValueError("linked OpenCode worktree session is not bound to its prepared implementer task")
     text = render(root, "opencode", session)
+    assignment = state_path(gitdir, "opencode", session)
+    assignment_sha256 = (hashlib.sha256(bounded(assignment, FILE_LIMIT).encode("utf-8")).hexdigest()
+                         if assignment.exists() or assignment.is_symlink() else None)
     return {"status": "context", "harness": "opencode", "session_id": session,
-            "worktree": str(root), "text": text}
+            "worktree": str(root), "text": text, "assignment_sha256": assignment_sha256}
 
 
 def render_standing(root, source, harness, session, agent, role, origin, content):
@@ -1604,6 +1755,8 @@ def main():
     cmd.add_argument("--task-file", required=True)
     cmd.add_argument("--receipt-file", required=True)
     cmd.add_argument("--role", choices=("implementer",), required=True)
+    cmd.add_argument("--parent-task-id",
+                     help="exact active parent task reference when the caller is an OpenCode orchestrator")
     cmd = sub.add_parser("bind-dispatch", help="bind one prepared ticket to its exact native OpenCode session")
     cmd.add_argument("--harness", choices=("opencode",), required=True)
     cmd.add_argument("--session", required=True)
@@ -1824,9 +1977,15 @@ def main():
                 raise ValueError("OpenCode task preparation requires a dedicated child worktree")
             task_id = prepare_dispatch(root, gitdir, args)
             saved_receipt = write_dispatch_receipt(receipt, root, gitdir, task_id)
-            print(json.dumps({"task_id": task_id, "harness": "opencode", "role": args.role,
-                              "status": "pending", "receipt_file": str(receipt),
-                              "receipt_type": saved_receipt["receipt_type"]}))
+            result = {"task_id": task_id, "harness": "opencode", "role": args.role,
+                      "status": "pending", "receipt_file": str(receipt),
+                      "receipt_type": saved_receipt["receipt_type"]}
+            if "ticket_version" in saved_receipt:
+                result.update(ticket_version=saved_receipt["ticket_version"],
+                              parent_kind=saved_receipt["parent_kind"])
+            if saved_receipt.get("parent") is not None:
+                result["parent"] = saved_receipt["parent"]
+            print(json.dumps(result))
         elif args.command == "bind-dispatch":
             bind_opencode_dispatch(root, gitdir, args)
             print(json.dumps({"task_id": args.task_id, "harness": "opencode", "role": args.role,

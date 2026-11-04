@@ -1,4 +1,5 @@
 """Synthetic OpenCode adapter, dispatch, and plugin callback checks."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 PLUGIN = Path(__file__).parent / "opencode-plugin/server.js"
@@ -30,8 +32,17 @@ class OpenCodePatternBufferTests(unittest.TestCase):
         self.brief = self.base / "brief.md"
         self.brief.write_text("Implement the exact synthetic task and report evidence.\n")
         self.receipt = self.base / "receipt.json"
-        self.env = {**os.environ, "CMUX_AGENT_LAUNCH_KIND": "", "CODEX_THREAD_ID": "",
-                    "CLAUDE_CODE_SESSION_ID": ""}
+        self.parent_session = "ses_parent012345"
+        self.parent_task_id = "mp-parent-task-issue5"
+        self.surface_id = str(uuid.uuid4()).upper()
+        self.workspace_id = str(uuid.uuid4()).upper()
+        self.env = {**os.environ, "CMUX_AGENT_LAUNCH_KIND": "opencode",
+                    "OPENCODE_SESSION_ID": self.parent_session,
+                    "CMUX_SURFACE_ID": self.surface_id,
+                    "CMUX_WORKSPACE_ID": self.workspace_id,
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
+        self.call(self.owner, "assign", "--harness", "opencode", "--session", self.parent_session,
+                  "--role", "orchestrator")
 
     def git(self, cwd, *args):
         return subprocess.run(["git", "-C", str(cwd), *args], check=True,
@@ -43,11 +54,20 @@ class OpenCodePatternBufferTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         return result
 
-    def prepare(self, receipt=None, task_file=None):
-        result = self.call(self.child, "prepare-dispatch", "--harness", "opencode",
-                           "--owner-worktree", str(self.owner), "--task-file", str(task_file or self.brief),
-                           "--receipt-file", str(receipt or self.receipt), "--role", "implementer")
+    def prepare(self, receipt=None, task_file=None, parent_task_id="default"):
+        parent_task_id = self.parent_task_id if parent_task_id == "default" else parent_task_id
+        args = ["prepare-dispatch", "--harness", "opencode", "--owner-worktree", str(self.owner),
+                "--task-file", str(task_file or self.brief), "--receipt-file", str(receipt or self.receipt),
+                "--role", "implementer"]
+        if parent_task_id is not None:
+            args.extend(("--parent-task-id", parent_task_id))
+        result = self.call(self.child, *args)
         return json.loads(result.stdout)
+
+    def parent_assignment_path(self):
+        gitdir = Path(self.git(self.owner, "rev-parse", "--absolute-git-dir").stdout.strip())
+        key = hashlib.sha256(json.dumps(["opencode", self.parent_session, ""]).encode()).hexdigest()
+        return gitdir / "context-injector" / "sessions" / f"{key}.json"
 
     def bind(self, task, session="ses_012345abcdef", receipt=None, role="implementer", cwd=None, success=True):
         return self.call(cwd or self.child, "bind-dispatch", "--harness", "opencode",
@@ -78,6 +98,7 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
     def test_unassigned_open_code_session_does_not_inherit_worktree_default_or_parent_id(self):
         result = self.context("ses_unassigned", cwd=self.owner)
         self.assertEqual(result["status"], "context")
+        self.assertIsNone(result["assignment_sha256"])
         self.assertIn("role: unassigned", result["text"])
         self.assertNotIn("orchestrator context", result["text"])
         parts = self.plugin_call("ses_unassigned", "ses_parent", cwd=self.owner)
@@ -90,6 +111,21 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
         ticket = self.prepare()
         receipt_before = self.receipt.read_bytes()
         saved = json.loads(receipt_before)
+        self.assertEqual(ticket["parent"], saved["parent"])
+        self.assertEqual(ticket["parent"]["session_id"], self.parent_session)
+        self.assertEqual(ticket["parent"]["task_id"], self.parent_task_id)
+        self.assertEqual(ticket["parent"]["role"], "orchestrator")
+        self.assertEqual(ticket["parent"]["owner_worktree"], str(self.owner.resolve()))
+        self.assertEqual(ticket["parent"]["owner_gitdir"], str(Path(
+            self.git(self.owner, "rev-parse", "--absolute-git-dir").stdout.strip()).resolve()))
+        self.assertEqual(ticket["parent"]["surface_id"], self.surface_id)
+        self.assertEqual(ticket["parent"]["workspace_id"], self.workspace_id)
+        self.assertRegex(ticket["parent"]["assignment_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(ticket["ticket_version"], 2)
+        self.assertEqual(ticket["parent_kind"], "opencode")
+        parent_context = self.context(self.parent_session, cwd=self.owner)
+        self.assertIn("role: orchestrator", parent_context["text"])
+        self.assertEqual(parent_context["assignment_sha256"], ticket["parent"]["assignment_sha256"])
         self.assertEqual(saved["status"], "pending")
         self.assertEqual(saved["session_id"], None)
         self.assertEqual(saved["role"], "implementer")
@@ -143,7 +179,7 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
         self.prepare()
         self.call(self.child, "prepare-dispatch", "--harness", "opencode", "--owner-worktree",
                   str(self.owner), "--task-file", str(self.brief), "--receipt-file", str(self.receipt),
-                  "--role", "implementer", success=False)
+                  "--role", "implementer", "--parent-task-id", self.parent_task_id, success=False)
 
     def test_prepare_rejects_receipt_symlink_without_following_it(self):
         target = self.base / "receipt-target.json"
@@ -151,7 +187,7 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
         symlink.symlink_to(target)
         self.call(self.child, "prepare-dispatch", "--harness", "opencode", "--owner-worktree",
                   str(self.owner), "--task-file", str(self.brief), "--receipt-file", str(symlink),
-                  "--role", "implementer", success=False)
+                  "--role", "implementer", "--parent-task-id", self.parent_task_id, success=False)
         self.assertFalse(target.exists())
         self.assertEqual(json.loads(self.call(self.owner, "tasks").stdout)["tasks"], [])
 
@@ -161,12 +197,161 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
         failed_receipt = file_parent / "receipt.json"
         failed = self.call(self.child, "prepare-dispatch", "--harness", "opencode", "--owner-worktree",
                            str(self.owner), "--task-file", str(self.brief), "--receipt-file", str(failed_receipt),
-                           "--role", "implementer", success=False)
+                           "--role", "implementer", "--parent-task-id", self.parent_task_id, success=False)
         listing = json.loads(self.call(self.owner, "tasks").stdout)
         pending = [task for task in listing["tasks"] if Path(task["root"]).resolve() == self.child.resolve()]
         self.assertEqual(len(pending), 1, f"prepare: {failed.stderr}; task listing: {listing}")
         self.assertEqual(pending[0]["status"], "pending")
         self.assertEqual(pending[0]["receipt_file"], str(failed_receipt.resolve()))
+
+    def test_prepare_requires_exact_open_code_parent_scope_and_task_reference(self):
+        for key, value, message in (
+                ("CMUX_AGENT_LAUNCH_KIND", "codex", "OPENCODE_SESSION_ID requires CMUX_AGENT_LAUNCH_KIND=opencode"),
+                ("OPENCODE_SESSION_ID", "", "OPENCODE_SESSION_ID"),
+                ("CMUX_SURFACE_ID", "", "CMUX_SURFACE_ID"),
+                ("CMUX_SURFACE_ID", "not-a-uuid", "exact CMUX UUID"),
+                ("CMUX_WORKSPACE_ID", "", "CMUX_WORKSPACE_ID")):
+            with self.subTest(key=key):
+                original = self.env[key]
+                self.env[key] = value
+                result = self.call(self.child, "prepare-dispatch", "--harness", "opencode",
+                                   "--owner-worktree", str(self.owner), "--task-file", str(self.brief),
+                                   "--receipt-file", str(self.base / (key + ".json")), "--role", "implementer",
+                                   "--parent-task-id", self.parent_task_id, success=False)
+                self.assertIn(message, result.stderr)
+                self.env[key] = original
+        for invalid in ("", " padded", "padded ", "line\nbreak", "x" * 257):
+            with self.subTest(parent_task_id=repr(invalid)):
+                result = self.call(self.child, "prepare-dispatch", "--harness", "opencode",
+                                   "--owner-worktree", str(self.owner), "--task-file", str(self.brief),
+                                   "--receipt-file", str(self.base / (str(len(invalid)) + "-invalid.json")),
+                                   "--role", "implementer", "--parent-task-id", invalid, success=False)
+                self.assertEqual(result.returncode, 1)
+        listing = json.loads(self.call(self.owner, "tasks").stdout)
+        self.assertEqual(listing["tasks"], [])
+
+    def test_prepare_rejects_missing_foreign_ambiguous_and_non_orchestrator_parent(self):
+        assignment = self.parent_assignment_path()
+        original = assignment.read_bytes()
+        assignment.unlink()
+        self.call(self.child, "prepare-dispatch", "--harness", "opencode", "--owner-worktree",
+                  str(self.owner), "--task-file", str(self.brief), "--receipt-file",
+                  str(self.base / "missing.json"), "--role", "implementer",
+                  "--parent-task-id", self.parent_task_id, success=False)
+        assignment.write_bytes(original)
+
+        assignment.write_text(json.dumps({"root": str(self.base / "foreign-owner"), "role": "orchestrator"}))
+        foreign = self.call(self.child, "prepare-dispatch", "--harness", "opencode", "--owner-worktree",
+                            str(self.owner), "--task-file", str(self.brief), "--receipt-file",
+                            str(self.base / "foreign.json"), "--role", "implementer",
+                            "--parent-task-id", self.parent_task_id, success=False)
+        self.assertIn("foreign, task-bound or not an orchestrator", foreign.stderr)
+        assignment.write_bytes(original)
+
+        alternate = self.base / "alternate-parent.json"
+        alternate.write_bytes(original)
+        assignment.unlink()
+        assignment.symlink_to(alternate)
+        ambiguous = self.call(self.child, "prepare-dispatch", "--harness", "opencode", "--owner-worktree",
+                              str(self.owner), "--task-file", str(self.brief), "--receipt-file",
+                              str(self.base / "ambiguous.json"), "--role", "implementer",
+                              "--parent-task-id", self.parent_task_id, success=False)
+        self.assertIn("no session assignment", ambiguous.stderr)
+        assignment.unlink()
+        assignment.write_bytes(original)
+
+        sessions_dir = assignment.parent
+        detached_sessions = self.base / "detached-parent-sessions"
+        sessions_dir.rename(detached_sessions)
+        sessions_dir.symlink_to(detached_sessions, target_is_directory=True)
+        linked_directory = self.call(self.child, "prepare-dispatch", "--harness", "opencode",
+                                     "--owner-worktree", str(self.owner), "--task-file", str(self.brief),
+                                     "--receipt-file", str(self.base / "ambiguous-directory.json"),
+                                     "--role", "implementer", "--parent-task-id", self.parent_task_id,
+                                     success=False)
+        self.assertIn("assignment path must not contain a symlink", linked_directory.stderr)
+        sessions_dir.unlink()
+        detached_sessions.rename(sessions_dir)
+
+        self.call(self.owner, "assign", "--harness", "opencode", "--session", self.parent_session,
+                  "--role", "implementer")
+        role = self.call(self.child, "prepare-dispatch", "--harness", "opencode", "--owner-worktree",
+                         str(self.owner), "--task-file", str(self.brief), "--receipt-file",
+                         str(self.base / "wrong-role.json"), "--role", "implementer",
+                         "--parent-task-id", self.parent_task_id, success=False)
+        self.assertIn("not an orchestrator", role.stderr)
+        listing = json.loads(self.call(self.owner, "tasks").stdout)
+        self.assertEqual(listing["tasks"], [])
+
+    def test_bind_rejects_parent_assignment_removed_or_changed_after_prepare(self):
+        ticket = self.prepare()
+        assignment = self.parent_assignment_path()
+        assignment.unlink()
+        result = self.bind(ticket, success=False)
+        self.assertIn("no session assignment", result.stderr)
+        current = json.loads(self.call(self.child, "task-status", "--task-id", ticket["task_id"]).stdout)
+        self.assertEqual(current["status"], "pending")
+        self.assertIsNone(current["session_id"])
+
+        assignment.write_text(json.dumps({"root": str(self.owner.resolve()), "role": "orchestrator"}))
+        second_receipt = self.base / "changed-parent-receipt.json"
+        second_ticket = self.prepare(receipt=second_receipt)
+        self.call(self.owner, "assign", "--harness", "opencode", "--session", self.parent_session,
+                  "--role", "implementer")
+        changed = self.bind(second_ticket, receipt=second_receipt, success=False)
+        self.assertIn("not an orchestrator", changed.stderr)
+        current = json.loads(self.call(self.child, "task-status", "--task-id",
+                                       second_ticket["task_id"]).stdout)
+        self.assertEqual(current["status"], "pending")
+
+    def test_opencode_parent_contract_cannot_be_downgraded_by_removing_parent_record(self):
+        ticket = self.prepare()
+        child_gitdir = Path(self.git(self.child, "rev-parse", "--absolute-git-dir").stdout.strip())
+        task_file = child_gitdir / "context-injector" / "tasks" / ticket["task_id"] / "task.json"
+        saved = json.loads(task_file.read_text())
+        saved.pop("parent")
+        task_file.write_text(json.dumps(saved))
+        result = self.bind(ticket, success=False)
+        self.assertIn("parent contract is incomplete or ambiguous", result.stderr)
+        self.assertEqual(json.loads(task_file.read_text())["status"], "pending")
+
+    def test_codex_and_claude_parents_keep_existing_open_code_ticket_and_receipt_contract(self):
+        for harness, launch_kind, session_env, parent_session in (
+                ("codex", "codex", "CODEX_THREAD_ID", "codex_parent0123"),
+                ("claude", "claude", "CLAUDE_CODE_SESSION_ID", "claude_parent0123")):
+            with self.subTest(harness=harness):
+                for key in ("OPENCODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+                    self.env.pop(key, None)
+                self.env["CMUX_AGENT_LAUNCH_KIND"] = launch_kind
+                self.env[session_env] = parent_session
+                ticket_receipt = self.base / (harness + "-legacy-receipt.json")
+                self.call(self.owner, "session-enroll", "--harness", harness, "--session", parent_session,
+                          "--context-file", str((self.owner / ".context-injector" / "context.md").resolve()))
+                ticket = self.prepare(receipt=ticket_receipt, parent_task_id=None)
+                self.assertNotIn("parent", ticket)
+                self.assertEqual(ticket["ticket_version"], 2)
+                self.assertEqual(ticket["parent_kind"], harness)
+                saved_receipt = json.loads(ticket_receipt.read_text())
+                self.assertNotIn("parent", saved_receipt)
+                task_id_path = (Path(self.git(self.child, "rev-parse", "--absolute-git-dir").stdout.strip()) /
+                                "context-injector" / "tasks" / ticket["task_id"] / "task.json")
+                legacy_task = json.loads(task_id_path.read_text())
+                legacy_task.pop("ticket_version")
+                legacy_task.pop("parent_kind")
+                task_id_path.write_text(json.dumps(legacy_task))
+                saved_receipt.pop("ticket_version")
+                saved_receipt.pop("parent_kind")
+                ticket_receipt.write_text(json.dumps(saved_receipt))
+                child_session = "ses_" + harness.title() + "Child012345"
+                self.bind(ticket, session=child_session, receipt=ticket_receipt)
+                self.assertIn("role: implementer", self.context(child_session)["text"])
+                revised = self.base / (harness + "-revised.md")
+                revised.write_text("Legacy parent ticket remains explicitly updatable.\n")
+                self.call(self.child, "update-task", "--task-id", ticket["task_id"],
+                          "--task-file", str(revised))
+                self.assertIn("Legacy parent ticket remains", self.context(child_session)["text"])
+                self.call(self.child, "finish-task", "--task-id", ticket["task_id"])
+                self.assertIn("is finished", self.context(child_session)["text"])
 
     def test_install_and_hook_config_are_explicit_and_preserve_other_settings(self):
         settings = self.base / "isolated-opencode.json"

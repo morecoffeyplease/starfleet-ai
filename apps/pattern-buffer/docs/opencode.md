@@ -51,13 +51,30 @@ Use a directly initialized owner worktree and a separate child worktree in the s
 Create one bounded task brief and a unique receipt path before opening the implementer session.
 The first command creates a pending task and immutable receipt only, and never starts the OpenCode CLI or UI.
 
+When an OpenCode orchestrator prepares a child, its managed caller must provide the exact parent process scope through `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, `CMUX_SURFACE_ID` and `CMUX_WORKSPACE_ID` in that session's environment.
+The parent session must have an explicit owner-worktree assignment created with `assign --harness opencode --session ses_EXACT_PARENT_ID --role orchestrator`.
+For a registered, enabled owner, `context --harness opencode --session ses_EXACT_PARENT_ID` returns `assignment_sha256` for the exact session assignment bytes, or null when that session is unassigned.
+Pattern Buffer checks that the assignment belongs to the selected directly initialized owner worktree and has the orchestrator role, then records its digest and the explicit `--parent-task-id` in the child ticket and receipt.
+The nested parent record contains `harness`, `session_id`, `task_id`, `role`, `owner_worktree`, `owner_gitdir`, `surface_id`, `workspace_id` and `assignment_sha256`.
+Its `task_id` is the exact caller-supplied parent task reference, while the top-level `task_id` is the new Pattern Buffer child ticket.
+New OpenCode tickets carry `ticket_version: 2` and `parent_kind` so the exact OpenCode-parent contract is distinct from existing Claude/Codex parent checks and worktree-only preparation.
+Preexisting OpenCode tickets and receipts without these fields remain readable under their original contract.
+The assignment digest covers only Pattern Buffer's `{root, role}` registration and does not prove native session activity, current CMUX placement, OpenCode API permissions, active parent-task state or model reception.
+The managed caller must prove those facts against the exact native session and its private assignment before preparation, then recheck them immediately before child API session creation.
+The caller sets the OpenCode API `parentID` from that verified native parent session ID, separately from the parent task reference.
+Missing or changed Pattern Buffer assignment data fails closed during preparation or binding.
+When a verified Claude or Codex orchestrator prepares an OpenCode child, the existing parent-session checks remain in force and `--parent-task-id` is omitted.
+
+For an OpenCode parent, include the exact independently verified active parent task reference:
+
 ```sh
 python3 apps/pattern-buffer/pattern_buffer.py --cwd /absolute/path/to/child prepare-dispatch \
   --harness opencode \
   --owner-worktree /absolute/path/to/owner \
   --task-file /absolute/path/to/brief.md \
   --receipt-file /absolute/path/to/unique-receipt.json \
-  --role implementer
+  --role implementer \
+  --parent-task-id EXACT_ACTIVE_PARENT_TASK_ID
 ```
 
 After opening the visible native OpenCode session in that exact child worktree, obtain its exact case-sensitive `ses_...` ID from the native session identity display.
