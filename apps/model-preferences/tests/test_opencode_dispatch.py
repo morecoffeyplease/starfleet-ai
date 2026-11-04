@@ -770,12 +770,14 @@ class OpenCodeDispatchTest(unittest.TestCase):
                     receipt_path.write_text(json.dumps({"task_id": child_ticket, "harness": "opencode",
                         "role": "implementer", "status": "pending", "session_id": None,
                         "worktree": str(child), "owner_worktree": str(owner),
+                        "owner_gitdir": expected_parent["owner_gitdir"],
                         "brief_sha256": hashlib.sha256(task_file.read_bytes()).hexdigest(),
-                        "parent": expected_parent}))
+                        "ticket_version": 2, "parent_kind": "opencode", "parent": expected_parent}))
                     self.assertEqual(argv[argv.index("--cwd") + 1], str(child))
                     self.assertEqual(argv[argv.index("--owner-worktree") + 1], str(owner))
                     return {"status": "pending", "harness": "opencode", "role": "implementer",
-                            "task_id": child_ticket, "parent": expected_parent}
+                            "task_id": child_ticket, "ticket_version": 2,
+                            "parent_kind": "opencode", "parent": expected_parent}
                 if action == "bind-dispatch":
                     return {"status": "active", "task_id": child_ticket, "session_id": child_session,
                             "harness": "opencode", "role": "implementer"}
@@ -851,14 +853,102 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(pb_actions, ["context", "prepare-dispatch", "context", "bind-dispatch", "context"])
         self.assertNotIn(CMUX_CANARY, json.dumps(launch))
 
+    def test_codex_and_claude_parent_cli_dispatch_uses_legacy_pattern_buffer_contract(self):
+        cases = (("codex", "codex-thread-fixture", "CODEX_THREAD_ID", "codex"),
+                 ("codex", "codex-worktree-fixture", "CODEX_THREAD_ID", "worktree"),
+                 ("claude", "claude-session-fixture", "CLAUDE_CODE_SESSION_ID", "claude"),
+                 ("claude", "claude-worktree-fixture", "CLAUDE_CODE_SESSION_ID", "worktree"))
+        for parent_harness, parent_session, session_variable, receipt_parent_kind in cases:
+            case_name = f"{parent_harness}-{receipt_parent_kind}"
+            with self.subTest(parent_harness=parent_harness, receipt_parent_kind=receipt_parent_kind):
+                config_dir = self.root / f"{case_name}-cli-config"
+                state_dir = self.root / f"{case_name}-cli-state"
+                config = mp.example_config(); config["active"] = "Codex-Qwen"
+                mp.write(config_dir / "profiles.json", config)
+                owner = self.root / f"{case_name}-owner"; owner.mkdir()
+                child = self.root / f"{case_name}-child"; child.mkdir()
+                for worktree in (owner, child):
+                    subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+                task_file = self.root / f"{case_name}-task.txt"
+                task_file.write_text("Dispatch this bounded local Qwen implementation task.")
+                pb_script = self.root / f"{case_name}-pattern-buffer.py"
+                pb_script.write_text("# fake PB CLI boundary\n")
+                receipt_file = self.root / f"{case_name}-receipt.json"
+                workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+                child_ticket = "f" * 32
+                owner_gitdir = mp.git(owner, "rev-parse", "--absolute-git-dir").decode().strip()
+                pb_commands = []
+                current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                           "items": [{"lifecycle": "running", "placement": {"kind": "local"},
+                                      "freshness": {"state": "current"},
+                                      "projections": [{"workspace_id": workspace, "panel_id": surface}],
+                                      "agents": [{"kind": parent_harness, "session_id": parent_session,
+                                                  "state": "working"}]}]}
+
+                def fake_boundary(argv, stdin=None):
+                    if argv[0] == sys.executable and argv[1] == str(pb_script):
+                        pb_commands.append(list(argv))
+                        self.assertIn("prepare-dispatch", argv)
+                        self.assertNotIn("--parent-task-id", argv)
+                        receipt = {"task_id": child_ticket, "harness": "opencode", "role": "implementer",
+                                   "status": "pending", "session_id": None,
+                                   "worktree": str(child), "owner_worktree": str(owner),
+                                   "owner_gitdir": owner_gitdir,
+                                   "brief_sha256": hashlib.sha256(task_file.read_bytes()).hexdigest(),
+                                   "ticket_version": 2, "parent_kind": receipt_parent_kind}
+                        Path(argv[argv.index("--receipt-file") + 1]).write_text(json.dumps(receipt))
+                        return {"status": "pending", "harness": "opencode", "role": "implementer",
+                                "task_id": child_ticket, "ticket_version": 2,
+                                "parent_kind": receipt_parent_kind}
+                    if "identify" in argv:
+                        return {"caller": {"surface_type": "terminal", "workspace_id": workspace,
+                                            "surface_id": surface}}
+                    if "tree" in argv:
+                        return {"windows": [{"workspaces": [{"id": workspace, "panes": [
+                            {"id": "pane-parent-cli", "surfaces": [{"id": surface}]}]}]}]}
+                    if "current" in argv:
+                        return current
+                    raise AssertionError(f"Unexpected parent-dispatch request: {argv}")
+
+                args = mp.parser().parse_args([
+                    "--config-dir", str(config_dir), "--state-dir", str(state_dir),
+                    "dispatch", "--role", "implementer", "--cwd", str(child),
+                    "--task-file", str(task_file), "--opencode-manifest", str(self.manifest),
+                    "--pattern-buffer", str(pb_script), "--owner-worktree", str(owner),
+                    "--receipt-file", str(receipt_file),
+                ])
+                env = {"CMUX_AGENT_LAUNCH_KIND": parent_harness, "OPENCODE_SESSION_ID": "",
+                       "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
+                       session_variable: parent_session}
+                with patch.dict(os.environ, env), \
+                        patch.object(mp, "run_json", side_effect=fake_boundary), \
+                        patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"), \
+                        patch.object(mp.opencode_dispatch, "create_session",
+                                     side_effect=mp.opencode_dispatch.OpenCodeDispatchError(
+                                         "synthetic_stop_before_api_mutation")) as create:
+                    with self.assertRaisesRegex(mp.PreferenceError, "uncertain: synthetic_stop_before_api_mutation"):
+                        mp.execute(args)
+                self.assertEqual(len(pb_commands), 1)
+                self.assertEqual(create.call_args.kwargs["directory"], str(child))
+                self.assertIsNone(create.call_args.kwargs["parent_session_id"])
+                self.assertFalse(any(method == "POST" and path == "/api/session"
+                                     for method, path, _ in self.state.calls))
+                launches = list((state_dir / "launches").glob("*.json"))
+                self.assertEqual(len(launches), 1)
+                saved = json.loads(launches[0].read_text())
+                self.assertIsNone(saved["opencode_parent_session_id"])
+                self.assertEqual(saved["context_injector"]["parent_kind"], receipt_parent_kind)
+
     def test_pattern_buffer_child_receipt_binds_parent_session_and_task_separately(self):
         owner = self.root / "pb-owner"; owner.mkdir()
         child = self.root / "pb-child"; child.mkdir()
+        for worktree in (owner, child):
+            subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
         script = self.root / "pb-contract.py"; script.write_text("# synthetic PB boundary\n")
         task_file = self.root / "pb-child-task.txt"; task_file.write_text("Bounded child task.")
         receipt_path = self.root / "pb-receipt.json"
         workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-        parent = {"session_id": "ses_parentFixture123", "task_id": "parent-task-ref",
+        parent = {"harness": "opencode", "session_id": "ses_parentFixture123", "task_id": "parent-task-ref",
                   "owner_worktree": str(owner), "owner_gitdir": str(owner / ".git"),
                   "workspace_uuid": workspace, "surface_uuid": surface,
                   "assignment_sha256": "d" * 64, "launch_id": "a" * 32}
@@ -879,11 +969,13 @@ class OpenCodeDispatchTest(unittest.TestCase):
                 self.argv = argv
                 receipt = {"task_id": child_ticket, "harness": "opencode", "role": "implementer",
                            "status": "pending", "session_id": None, "worktree": str(child),
-                           "owner_worktree": str(owner), "brief_sha256": task_digest,
-                           "parent": expected_parent}
+                           "owner_worktree": str(owner), "owner_gitdir": parent["owner_gitdir"],
+                           "brief_sha256": task_digest,
+                           "ticket_version": 2, "parent_kind": "opencode", "parent": expected_parent}
                 Path(argv[argv.index("--receipt-file") + 1]).write_text(json.dumps(receipt))
                 return {"status": "pending", "harness": "opencode", "role": "implementer",
-                        "task_id": child_ticket, "parent": expected_parent}
+                        "task_id": child_ticket, "ticket_version": 2,
+                        "parent_kind": "opencode", "parent": expected_parent}
 
         fake = FakeApp()
         adapter = mp.prepare_opencode_pattern_buffer(fake, args, child, task_digest, parent)
@@ -893,6 +985,28 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(fake.argv[fake.argv.index("--parent-task-id") + 1], parent["task_id"])
         self.assertEqual(adapter["parent"]["session_id"], parent["session_id"])
         self.assertEqual(adapter["parent"]["task_id"], parent["task_id"])
+
+        downgraded_receipt_path = self.root / "pb-downgraded-receipt.json"
+        downgraded_args = SimpleNamespace(context_injector=str(script), owner_worktree=str(owner),
+                                          receipt_file=str(downgraded_receipt_path), role="implementer",
+                                          task_file=str(task_file))
+
+        class DowngradedFakeApp:
+            def run_json(self, argv, stdin=None):
+                self.argv = argv
+                receipt = {"task_id": child_ticket, "harness": "opencode", "role": "implementer",
+                           "status": "pending", "session_id": None, "worktree": str(child),
+                           "owner_worktree": str(owner), "owner_gitdir": parent["owner_gitdir"],
+                           "brief_sha256": task_digest, "ticket_version": 2, "parent_kind": "worktree"}
+                Path(argv[argv.index("--receipt-file") + 1]).write_text(json.dumps(receipt))
+                return {"status": "pending", "harness": "opencode", "role": "implementer",
+                        "task_id": child_ticket, "ticket_version": 2, "parent_kind": "worktree"}
+
+        downgraded = DowngradedFakeApp()
+        with self.assertRaisesRegex(mp.PreferenceError, "did not return the prepared OpenCode ticket"):
+            mp.prepare_opencode_pattern_buffer(downgraded, downgraded_args, child, task_digest, parent)
+        self.assertIn("--parent-task-id", downgraded.argv)
+        self.assertEqual(downgraded.argv[downgraded.argv.index("--parent-task-id") + 1], parent["task_id"])
 
     def test_tui_child_targets_only_the_verified_session_and_keeps_password_out_of_argv(self):
         connection = dispatch.load_connection(self.manifest)
