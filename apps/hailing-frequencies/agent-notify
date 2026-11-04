@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agent-notify - let CLI agents (Claude Code, Codex) contact a configured user
+# agent-notify - let CLI agents (Claude Code, Codex, OpenCode) contact a configured user
 # through a Discord forum channel, one forum post per ask.
 #
 #   agent-notify open  --urgency urgent|normal|fyi --title "..." [--issue N] [--body "..."] [--delivery auto|discord]
@@ -17,7 +17,7 @@
 # `open` builds the subject line itself, so --title is only the decision or
 # the reason for the contact:
 #   [Claude] example-repo/feature-branch #42 Formatting differs: which version should ship?
-# The agent kind is detected (Claude, Codex, else Agent; override with --kind),
+# The agent kind is detected (Claude, Codex, OpenCode, else Agent; override with --kind),
 # repo and worktree come from git, and --issue N looks the title up with `gh`
 # (pass --issue-title when `gh` cannot see it).
 #
@@ -88,10 +88,36 @@ post_id() {
 }
 
 agent_kind() {
-  if [ -n "${AGENT_NOTIFY_KIND:-}" ]; then printf '%s' "$AGENT_NOTIFY_KIND"
-  elif [ -n "${CLAUDECODE:-}" ]; then printf 'Claude'
-  elif env | grep -q '^CODEX_'; then printf 'Codex'
+  local launch="${CMUX_AGENT_LAUNCH_KIND:-}"
+  launch="$(printf '%s' "$launch" | tr '[:upper:]' '[:lower:]')"
+  if [ "$launch" = opencode ] || opencode_caller; then printf 'OpenCode'
+  elif [ -n "${AGENT_NOTIFY_KIND:-}" ]; then printf '%s' "$AGENT_NOTIFY_KIND"
+  elif [ "$launch" = claude ] || [ "$launch" = claudeteams ] || [ -n "${CLAUDECODE:-}" ]; then printf 'Claude'
+  elif [ "$launch" = codex ] || env | grep -q '^CODEX_'; then printf 'Codex'
   else printf 'Agent'; fi
+}
+
+opencode_caller() {
+  local launch="${CMUX_AGENT_LAUNCH_KIND:-}"
+  launch="$(printf '%s' "$launch" | tr '[:upper:]' '[:lower:]')"
+  [[ "$launch" != claude && "$launch" != claudeteams && "$launch" != codex ]] || return 1
+  [[ "${OPENCODE_SESSION_ID:-}" =~ ^ses_[A-Za-z0-9]+$ ]] || return 1
+  [[ "${CMUX_WORKSPACE_ID:-}" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || return 1
+  [[ "${CMUX_SURFACE_ID:-}" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]
+}
+
+discord_watch_owner_args() {
+  local launch="${CMUX_AGENT_LAUNCH_KIND:-}"
+  launch="$(printf '%s' "$launch" | tr '[:upper:]' '[:lower:]')"
+  if [ "$launch" = opencode ] || { [ -n "${OPENCODE_SESSION_ID:-}" ] && opencode_caller; }; then
+    if [ "$launch" != opencode ] || ! opencode_caller; then
+      echo 'agent-notify: OpenCode managed-thread registration requires an exact ses_ identity and CMUX workspace/surface scope' >&2
+      return 1
+    fi
+    DISCORD_WATCH_OWNER_SESSION="$OPENCODE_SESSION_ID"
+  else
+    DISCORD_WATCH_OWNER_SESSION=""
+  fi
 }
 
 # where_label - "repo", or "repo/worktree" when the session is in a linked
@@ -159,7 +185,13 @@ discord_watch_bin() {
 managed_thread() {
   local bin result
   bin="$(discord_watch_bin)" || return 1
-  result="$("$bin" managed "$1" 2>/dev/null)" || return 1
+  DISCORD_WATCH_OWNER_SESSION=""
+  if ! discord_watch_owner_args; then return 1; fi
+  if [ -n "$DISCORD_WATCH_OWNER_SESSION" ]; then
+    result="$("$bin" managed "$1" --session "$DISCORD_WATCH_OWNER_SESSION" 2>/dev/null)" || return 1
+  else
+    result="$("$bin" managed "$1" 2>/dev/null)" || return 1
+  fi
   if ! jq -e '.worker_health.ready_for_wakes == true' <<<"$result" >/dev/null 2>&1; then
     echo "agent-notify: thread $1 is registered, but an active sending worker is not confirmed; check discord-watch status" >&2
   fi
@@ -169,7 +201,16 @@ managed_thread() {
 register_thread() {
   local bin
   bin="$(discord_watch_bin)" || return 0
-  if ! "$bin" register "$1" >/dev/null; then
+  DISCORD_WATCH_OWNER_SESSION=""
+  if ! discord_watch_owner_args; then
+    echo "agent-notify: software-managed wake registration skipped for $1 because the OpenCode caller binding is incomplete" >&2
+    return 0
+  fi
+  if [ -n "$DISCORD_WATCH_OWNER_SESSION" ]; then
+    if ! "$bin" register "$1" --session "$DISCORD_WATCH_OWNER_SESSION" >/dev/null; then
+      echo "agent-notify: software-managed wake registration failed for $1; keep the legacy listener until the owner resolves it" >&2
+    fi
+  elif ! "$bin" register "$1" >/dev/null; then
     echo "agent-notify: software-managed wake registration failed for $1; keep the legacy listener until the owner resolves it" >&2
   fi
 }
@@ -460,7 +501,7 @@ cmd_wait() {
 # by repeating wait. Prints the reply. With --queue THREAD it also hands the
 # reply to that Codex session with `codex queue`, which wakes an idle TUI.
 cmd_watch() {
-  local id max=14400 queue="" codex="codex" deadline out status
+  local id max=14400 queue="" codex="codex" deadline out status launch
   id="$(post_id "${1:-}")"; shift
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -470,6 +511,10 @@ cmd_watch() {
       *) die "watch: unknown argument $1" ;;
     esac
   done
+  launch="$(printf '%s' "${CMUX_AGENT_LAUNCH_KIND:-}" | tr '[:upper:]' '[:lower:]')"
+  if [ -n "$queue" ] && { [ "$launch" = opencode ] || opencode_caller; }; then
+    die "watch --queue is Codex-only and cannot use an OpenCode session's inherited CODEX_THREAD_ID"
+  fi
   register_thread "$id"
   if managed_thread "$id"; then
     echo "agent-notify: thread $id has software-managed guarded wakes; this per-thread watch is unnecessary" >&2
@@ -489,7 +534,7 @@ cmd_watch() {
 # itself after delivering. Codex kills children of its own tool calls, so the
 # watcher must belong to CMUX. Exits 4 when this session cannot do that.
 cmd_listen() {
-  local id self codex cmux why="" watcher
+  local id self codex cmux why="" watcher launch
   id="$(post_id "${1:-}")"
   register_thread "$id"
   if managed_thread "$id"; then
@@ -500,7 +545,10 @@ cmd_listen() {
   # "cannot queue through an embedded app server".
   cmux="$(command -v cmux || true)"
   codex="$(which -a codex 2>/dev/null | grep -v '/cmux-cli-shims/' | head -1 || true)"
-  if [ -z "${CODEX_THREAD_ID:-}" ]; then why="not a Codex session (no CODEX_THREAD_ID)"
+  launch="$(printf '%s' "${CMUX_AGENT_LAUNCH_KIND:-}" | tr '[:upper:]' '[:lower:]')"
+  if [ "$launch" = opencode ] || opencode_caller; then
+    why="auto-wake with a Codex queue is only available to an exact Codex session"
+  elif [ -z "${CODEX_THREAD_ID:-}" ]; then why="not a Codex session (no CODEX_THREAD_ID)"
   elif [ -z "${CMUX_WORKSPACE_ID:-}" ] || [ -z "$cmux" ]; then
     why="this shell has no CMUX context (needs a CMUX tab and -s workspace-write with network_access=true)"
   elif [ -z "$codex" ]; then why="codex is not on PATH"

@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -112,7 +113,8 @@ class TemporalBeacon:
             path = self.app.cmux.hook_directory / (target["harness"] + "-hook-sessions.json")
             store = json.loads(path.read_text())
             record = next((value for key, value in store["sessions"].items()
-                           if key.upper() == target["session"]), {})
+                           if (key == target["session"] if target["harness"] == "opencode"
+                               else key.upper() == target["session"])), {})
             current = record.get("cwd") or record.get("workingDirectory")
             require(isinstance(current, str) and current,
                     "Canonical worktree is no longer present in the native session record")
@@ -120,26 +122,58 @@ class TemporalBeacon:
                     "Canonical worktree changed")
         return True
 
+    @staticmethod
+    def owner_key(target, worktree):
+        value = ":".join((target["harness"], target["session"], target["surface"],
+                           target["workspace"], str(target["started_at"]), worktree or "unknown-worktree"))
+        if target["harness"] == "opencode":
+            binding = {key: target[key] for key in (
+                "api_url", "password_file", "expected_server_pid", "session_directory",
+                "worktree_directory", "parent_task_id")}
+            encoded = json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            value += ":opencode-binding:" + hashlib.sha256(encoded).hexdigest()
+        return value
+
     def owner(self, verify=True):
         import hailing_frequencies as hf
         harness = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").lower()
-        require(harness in ("claude", "codex"),
-                "Cannot verify this caller. Run hailing-frequencies enroll --harness {claude|codex} --surface SURFACE --session SESSION --label NAME, then start Temporal Beacon from that session.")
-        env_key = "CLAUDE_CODE_SESSION_ID" if harness == "claude" else "CODEX_THREAD_ID"
+        require(harness in ("claude", "codex", "opencode"),
+                "Cannot verify this caller. Enroll the exact Claude, Codex, or OpenCode session before using Temporal Beacon.")
+        env_key = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
+                   "opencode": "OPENCODE_SESSION_ID"}[harness]
         session_value = os.environ.get(env_key)
         surface_value = os.environ.get("CMUX_SURFACE_ID")
-        require(session_value and surface_value,
-                f"Missing verified {env_key} or CMUX_SURFACE_ID. Enroll the observed session with hailing-frequencies enroll --harness {harness} --surface SURFACE --session SESSION --label NAME.")
-        session, surface = hf.identity(session_value), hf.identity(surface_value)
+        require(surface_value, "Missing verified CMUX_SURFACE_ID")
+        surface = hf.identity(surface_value)
         config = self.app.config()
-        target = next((item for item in config["targets"] if item["session"] == session), None)
+        workspace_value = os.environ.get("CMUX_WORKSPACE_ID")
+        workspace = hf.identity(workspace_value) if workspace_value else None
+        if harness == "opencode":
+            require(session_value, "OPENCODE_SESSION_ID is required for exact OpenCode timer ownership")
+            require(workspace is not None, "CMUX_WORKSPACE_ID is required for exact OpenCode timer ownership")
+            session = hf.session_identity(session_value, harness)
+            candidates = [item for item in config["targets"] if item["harness"] == harness and
+                          item["surface"] == surface and
+                          item["workspace"] == workspace and item["session"] == session]
+            require(len(candidates) == 1,
+                    "OpenCode owner is missing or does not match the exact session, surface, and workspace")
+            target = candidates[0]
+            require(os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").lower() == "opencode",
+                    "Caller launch kind does not match the enrolled OpenCode session")
+            require(workspace == target["workspace"], "CMUX_WORKSPACE_ID is required and must match OpenCode enrollment")
+        else:
+            require(session_value,
+                    f"Missing verified {env_key}. Enroll the observed session with hailing-frequencies enroll --harness {harness} --surface SURFACE --session SESSION --label NAME.")
+            session = hf.session_identity(session_value, harness)
+            target = next((item for item in config["targets"] if item["session"] == session), None)
         require(target is not None,
                 f"Session {session} is not enrolled. Enroll it with hailing-frequencies enroll --harness {harness} --surface {surface} --session {session} --label temporal-beacon.")
         require(target["harness"] == harness and target["surface"] == surface,
                 "Caller harness or surface differs from its enrolled exact owner")
         hook_path = self.app.cmux.hook_directory / (harness + "-hook-sessions.json")
         store = json.loads(hook_path.read_text())
-        record = next((value for key, value in store["sessions"].items() if key.upper() == session), {})
+        record = next((value for key, value in store["sessions"].items()
+                       if (key == session if harness == "opencode" else key.upper() == session)), {})
         worktree = record.get("cwd") or record.get("workingDirectory")
         if isinstance(worktree, str) and worktree:
             worktree = str(Path(worktree).expanduser().resolve())
@@ -147,7 +181,7 @@ class TemporalBeacon:
             worktree = None
         if verify:
             self.binding(target, worktree)
-        key = ":".join((harness, session, surface, target["workspace"], str(target["started_at"]), worktree or "unknown-worktree"))
+        key = self.owner_key(target, worktree)
         return target, key, worktree
 
     def _timer(self, db, timer_id):
@@ -201,7 +235,8 @@ class TemporalBeacon:
             reason = "exact owner is outside the supervisor send scope"
         elif not timer_worker_ready:
             reason = "no fresh Temporal Beacon worker heartbeat; restart the current installed worker"
-        return {"transport": "guarded_cmux", "worker_running": running, "send_enabled": sending,
+        transport = "guarded_opencode_api" if target["harness"] == "opencode" else "guarded_cmux"
+        return {"transport": transport, "worker_running": running, "send_enabled": sending,
                 "owner_in_send_scope": covered,
                 "timer_worker_ready": timer_worker_ready, "timer_scan_age_seconds": timer_scan_age,
                 "currently_covered": running and sending and covered and timer_worker_ready,
@@ -405,7 +440,7 @@ class TemporalBeacon:
         allowed = None
         if only_sessions is not None:
             import hailing_frequencies as hf
-            allowed = {hf.identity(session) for session in only_sessions}
+            allowed = {hf.session_identity(session) for session in only_sessions}
         with self.locked(), contextlib.closing(self.database()) as db:
             timers = db.execute("SELECT * FROM timers WHERE status='active' AND due_at<=? ORDER BY due_at", (now,)).fetchall()
             results = []
@@ -420,7 +455,19 @@ class TemporalBeacon:
                 if prior and prior[1] in ("submitted", "uncertain"):
                     db.commit()
                     continue
-                target = {key: timer[key] for key in ("surface", "workspace", "session", "harness", "started_at")}
+                try:
+                    matches = [item for item in self.app.config()["targets"]
+                               if all(item.get(key) == timer[key] for key in
+                                      ("surface", "workspace", "session", "harness", "started_at"))]
+                    matches = [item for item in matches
+                               if self.owner_key(item, timer["canonical_worktree"]) == timer["owner_key"]]
+                    require(len(matches) == 1, "Timer's exact session is no longer enrolled")
+                    target = matches[0]
+                except (ValueError, OSError, KeyError, TypeError) as exc:
+                    detail = str(exc)[:500]
+                    results.append({"timer_id": timer["id"], "status": "held", "detail": detail})
+                    db.commit()
+                    continue
                 idle_seconds = None
                 if timer["schedule"] == "idle":
                     idle_seconds = json.loads(timer["schedule_spec"])["value"]

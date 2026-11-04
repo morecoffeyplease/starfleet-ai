@@ -3,6 +3,8 @@
 Agent Notify opens and manages one Discord forum post per conversation for a configured Discord user.
 It can route a short attention notice to the current CMUX chat when the optional Away Mode tool is available.
 When Discord Watch is installed, new posts register to the exact current Hailing-enrolled session for guarded reply delivery.
+An OpenCode session is labeled `OpenCode` when its exact `ses_` ID and CMUX surface and workspace are present, even if inherited Codex variables also exist.
+Managed OpenCode registration additionally requires `CMUX_AGENT_LAUNCH_KIND=opencode` and passes that exact `OPENCODE_SESSION_ID` to Discord Watch.
 
 ## Requirements
 
@@ -176,6 +178,8 @@ For Claude Code, use `--harness claude` and the exact current Claude session ID 
 Replace the placeholders with the identities CMUX reports for this session.
 Do not use `--include-existing` or re-enroll an unchanged session to reset its cutoff or receipts.
 Read the [Hailing Frequencies guide](guide.md) before enrolling if the session identities or existing enrollment need inspection.
+For OpenCode, the managed launcher must seed `OPENCODE_SESSION_ID`, `CMUX_SURFACE_ID`, `CMUX_WORKSPACE_ID`, and `CMUX_AGENT_LAUNCH_KIND=opencode` through the supported per-session API environment after CMUX placement and before the initial task.
+OpenCode API servers do not inherit the TUI's CMUX environment, so Agent Notify does not infer ownership from a repository path or Codex thread variable.
 
 Install Discord Watch only when it is not already installed or needs an update:
 
@@ -187,6 +191,8 @@ discord-watch status
 ```
 
 Agent Notify automatically registers a newly created post to the exact current enrolled session when it can find `discord-watch` on `PATH`.
+OpenCode registration passes its exact `--session ses_ID`, and it requires the seeded OpenCode launch and CMUX scope values.
+The legacy `listen` and `watch --queue` queue handoff is Codex-only and refuses OpenCode sessions even when an inherited `CODEX_THREAD_ID` exists.
 Use one central Discord Watch worker for every registered thread.
 If `discord-watch status` shows a healthy worker, reuse it and do not start another.
 If there is no worker, follow the Discord Watch guide to start its one supervised worker in the authorized CMUX terminal.

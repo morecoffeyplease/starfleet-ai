@@ -14,7 +14,7 @@ MARKER = "# starfleet-hailing-frequencies:v1"
 BEACON_MARKER = "# starfleet-temporal-beacon:v1"
 AGENT_NOTIFY_MARKER = "# starfleet-agent-notify:v1"
 SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py", "guide.md",
-                "agent-notify", "agent-notify-guide.md")
+                "agent-notify", "agent-notify-guide.md", "opencode_adapter.py")
 SKILL_NAME = "skills/temporal-beacon/SKILL.md"
 AGENT_NOTIFY_SKILL_NAME = "skills/agent-notify/SKILL.md"
 SKILL_NAMES = (SKILL_NAME, AGENT_NOTIFY_SKILL_NAME)
@@ -40,7 +40,12 @@ def install(runtime_root, bin_dir, uninstall=False):
         agent_notify_launcher.unlink(missing_ok=True)
         return {"removed": str(launcher), "temporal_beacon_removed": str(beacon_launcher),
                 "agent_notify_removed": str(agent_notify_launcher), "runtime_and_state_preserved": True}
-    sources = {name: Path(__file__).with_name(name).read_bytes() for name in SOURCE_NAMES}
+    sources = {name: Path(__file__).with_name(name).read_bytes() for name in SOURCE_NAMES
+               if name != "opencode_adapter.py"}
+    adapter_source = Path(__file__).resolve().parent.parent / "opencode-adapter" / "opencode_adapter.py"
+    require(adapter_source.is_file() and not adapter_source.is_symlink(),
+            "OpenCode session adapter source is unavailable")
+    sources["opencode_adapter.py"] = adapter_source.read_bytes()
     for skill_name in SKILL_NAMES:
         skill_source = Path(__file__).parent / skill_name
         if skill_source.is_file():

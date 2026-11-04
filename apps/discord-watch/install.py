@@ -45,10 +45,14 @@ def install(runtime_root=None, bin_dir=None, uninstall=False):
 
     source_dir = Path(__file__).resolve().parent
     hailing_source = source_dir.parent / "hailing-frequencies" / "hailing_frequencies.py"
+    opencode_adapter_source = source_dir.parent / "opencode-adapter" / "opencode_adapter.py"
     if not hailing_source.is_file():
         raise ValueError("Hailing Frequencies source dependency is unavailable")
+    if not opencode_adapter_source.is_file() or opencode_adapter_source.is_symlink():
+        raise ValueError("OpenCode session adapter source dependency is unavailable")
     sources = {name: (source_dir / name).read_bytes() for name in SOURCE_NAMES}
     sources["hailing_frequencies.py"] = hailing_source.read_bytes()
+    sources["opencode_adapter.py"] = opencode_adapter_source.read_bytes()
     digest = hashlib.sha256(b"".join(
         name.encode("utf-8") + b"\0" + content for name, content in sources.items()
     )).hexdigest()

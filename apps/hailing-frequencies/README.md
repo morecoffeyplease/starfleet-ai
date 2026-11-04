@@ -1,6 +1,9 @@
 # Hailing Frequencies
 
 Hailing Frequencies watches native CMUX message queues and prompts explicitly enrolled Claude Code and Codex agents to check overdue messages.
+Its bounded OpenCode path accepts an exact `ses_` binding manifest and sends only through the authenticated loopback API after the same native input guard passes.
+The currently observed CMUX OpenCode input state is `unknown`, so OpenCode enrollment and sends remain held until CMUX reports an exact empty composer.
+OpenCode's supported TUI plugin API does not expose composer draft contents, so the implementation does not infer or synthesize an empty state.
 It is a local Python 3 standard-library CLI, with an observe-only default, opt-in supervised monitor, and independent health alerts.
 It does not own messages, mark another agent's messages read, poll Discord, install harness hooks, change models, or grant task authority.
 
@@ -42,7 +45,7 @@ hailing-frequencies init
 hailing-frequencies status
 ```
 
-The installer copies the source, printable guides, and skills to an immutable SHA-256 directory under `~/.local/share/starfleet-ai/hailing-frequencies/` and writes the owned launchers `~/.local/bin/hailing-frequencies`, `~/.local/bin/temporal-beacon`, and `~/.local/bin/agent-notify`.
+The installer copies the source, the read-only OpenCode session adapter, printable guides, and skills to an immutable SHA-256 directory under `~/.local/share/starfleet-ai/hailing-frequencies/` and writes the owned launchers `~/.local/bin/hailing-frequencies`, `~/.local/bin/temporal-beacon`, and `~/.local/bin/agent-notify`.
 It prints immutable paths for the Temporal Beacon and Agent Notify skills.
 Follow [Temporal Beacon skill registration](temporal-beacon.md#enable-agent-discovery) or the Agent Notify guide to make the selected skill discoverable in a harness.
 Removing a development worktree therefore does not remove the installed runtime.
@@ -65,6 +68,21 @@ If enrollment refuses a draft, permission prompt, missing session, disabled mess
 hailing-frequencies enroll --harness claude --surface SURFACE_UUID --session CLAUDE_SESSION_UUID --label claude-agent-1
 hailing-frequencies enroll --harness codex --surface SURFACE_UUID --session CODEX_SESSION_UUID --label cpu-officer
 ```
+
+OpenCode uses a separate explicit self-enrollment command because its session IDs are `ses_` strings and it has no Claude/Codex hook file.
+The Model Preferences worker supplies a private manifest containing the exact API session, loopback server, PID, worktree, and CMUX surface binding.
+The manifest uses the OpenCode adapter field names `session_id`, `expected_server_pid`, `session_directory`, `worktree_directory`, `cmux_workspace_uuid`, `cmux_surface_uuid`, and `parent_task_id`, plus `api_url` and `password_file`.
+The manifest and password file must be regular owner-only files with no symlink, and the password itself must exist only in the password file.
+The managed OpenCode launcher must seed `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, `CMUX_SURFACE_ID`, and `CMUX_WORKSPACE_ID` through the supported per-session API environment after CMUX placement and before the initial task.
+The OpenCode server does not inherit the TUI's CMUX environment, so enrollment refuses to infer those caller identities from the server process, working directory, or manifest alone.
+Run self-enrollment from a command launched by the exact OpenCode TUI on its CMUX surface with those three values present:
+
+```sh
+hailing-frequencies opencode-enroll --manifest /absolute/private/opencode-binding.json --label opencode-owner
+```
+
+Enrollment requires the current OpenCode hook record, exact CMUX surface and workspace, matching API session and server PID, matching native worktree, enabled native messaging, and an explicitly empty native composer.
+Passive server-opened sessions, missing hook records, a different CMUX surface, or an unknown composer state remain held.
 
 UUIDs above are placeholders for observed identities.
 Enrollment normally covers only messages created after enrollment.
@@ -156,6 +174,12 @@ CMUX chooses the agent-aware submit key; the app never uses `--force`, Escape, C
 Native CMUX input guards remain enabled.
 The host still owns concurrent keyboard/input handling; this is not a transaction that freezes a human's keyboard or atomically binds a prompt to a harness session across a restart.
 Do not use it as an unattended high-impact command sender.
+
+OpenCode sends use `POST /api/session/{ses_id}/prompt` after the read-only adapter confirms the expected 2.2.5 server PID and exact session directory, the session is not running, and pending permission and form lists are empty.
+The API does not expose native composer drafts, so a clear adapter result is insufficient without CMUX `surface.input_state` explicitly returning the exact empty state and no human-input obligation.
+Unknown, draft, permission, or stale native state records a durable hold with zero API sends and zero attempt consumption.
+The same held event can be checked again after the state becomes clear, while any request whose response is ambiguous remains uncertain and is never retried.
+The admitted user-message ID is API admission evidence only and does not prove that a model received or acted on the prompt.
 
 The monitor checks incoming queued and delivered-but-unread records for enrolled session generations, and exact reply metadata from a complete inbox snapshot.
 Outbound messages returned by CMUX inbox listing are excluded by exact recipient identity.

@@ -2,7 +2,7 @@
 
 Discord Watch polls explicitly registered agent-notify forum threads and queues replies from the configured Discord user.
 One supervised polling worker serves all registered threads independently of per-thread `agent-notify listen` processes.
-Each open thread has one exact owner copied from that session's Hailing Frequencies enrollment.
+Each open thread has one exact owner copied from that session's Hailing Frequencies enrollment, including an OpenCode API binding when applicable.
 
 Read the [setup guide](guide.md) for installation, enrollment, a bounded pilot, and day-to-day commands.
 Print the same guide from any working directory with `discord-watch guide --print`.
@@ -24,9 +24,11 @@ Duplicate `(thread, message)` pairs are ignored.
 
 For each thread, registration stores the exact Hailing Frequencies harness, surface, workspace, session, and generation.
 The central worker checks that the same target remains enrolled and validates the current CMUX projection and input guard before each wake.
-It never forces input, reads or clears CMUX messages, launches another agent, or sends a reply body in a wake.
-The prompt names one exact `discord-watch receive --thread THREAD --message MESSAGE` command.
-An empty composer with no human-input obligation is required by Hailing Frequencies' existing `Cmux.submit` guard.
+OpenCode wakes also recheck the exact authenticated API session, server PID, worktree, running state, pending permissions, and pending forms before using the OpenCode prompt route.
+The worker never forces terminal input, reads or clears CMUX messages, launches another agent, or sends a reply body in a wake.
+The prompt names one exact `discord-watch receive --thread THREAD --message MESSAGE` command, with `--session ses_ID` for OpenCode.
+An explicitly empty composer with no human-input obligation is required by Hailing Frequencies for every harness.
+The current native CMUX OpenCode input state remains `unknown`, so OpenCode wakes hold until native state is explicitly empty.
 Attachment filenames and HTTPS URLs are printed to the exact recipient during `receive` without downloading the files.
 
 The worker recognizes a remote archived thread or the cached `Closed` forum tag and closes that local registration without sending more wakes.
@@ -36,10 +38,10 @@ A global rate limit defers all thread requests until its retry time, while a per
 One thread's API error does not stop polling other registered threads.
 Each request has a finite timeout, response and message sizes are bounded, and catch-up is limited to 50 pages per scan.
 
-A confirmed CMUX submit moves one reply to `awaiting_receipt`.
+A confirmed guarded CMUX submit or exact OpenCode user-message admission moves one reply to `awaiting_receipt`.
 Discord Watch waits two minutes before a reminder and caps confirmed submits at three per reply.
 After the third wake remains unreceived for another interval, the reply becomes visibly `stalled`.
-A transport failure after CMUX begins submission is `uncertain` and is never retried automatically.
+A transport failure after CMUX or the OpenCode API begins submission is `uncertain` and is never retried automatically.
 The exact owner can resolve an uncertain, stalled, or held reply by explicitly receiving it.
 No operator command resets an uncertain send to pending.
 

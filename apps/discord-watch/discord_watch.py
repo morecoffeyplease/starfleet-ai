@@ -45,7 +45,7 @@ MAX_RECEIVE_MESSAGES = 20
 MAX_RECEIVE_BYTES = 64 * 1024
 MAX_WAKE_ATTEMPTS = 3
 REMIND_AFTER = 120
-ALLOWED_LAUNCH_KINDS = {"claude", "codex"}
+ALLOWED_LAUNCH_KINDS = {"claude", "codex", "opencode"}
 ACTIVE_MESSAGE_STATES = ("pending", "awaiting_receipt", "uncertain", "stalled")
 
 
@@ -334,12 +334,13 @@ class Watch:
         launch = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().lower()
         launch = {"claudeteams": "claude"}.get(launch, launch)
         require(launch in ALLOWED_LAUNCH_KINDS,
-                "Cannot verify this caller; run Discord Watch from its enrolled Claude or Codex session")
+                "Cannot verify this caller; run Discord Watch from an enrolled Claude, Codex, or OpenCode session")
         return launch
 
-    def current_owner(self, verify=True):
+    def current_owner(self, verify=True, session_hint=None):
         harness = self._launch_kind()
-        env_key = "CLAUDE_CODE_SESSION_ID" if harness == "claude" else "CODEX_THREAD_ID"
+        env_key = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
+                   "opencode": "OPENCODE_SESSION_ID"}[harness]
         session_value = os.environ.get(env_key)
         surface_value = os.environ.get("CMUX_SURFACE_ID")
         require(surface_value, "Missing verified CMUX_SURFACE_ID")
@@ -347,15 +348,28 @@ class Watch:
         config = self.hailing_config()
         matches = [item for item in config["targets"]
                    if item.get("surface") == surface and item.get("harness") == harness]
-        if session_value:
-            session = hf.identity(session_value)
+        workspace = os.environ.get("CMUX_WORKSPACE_ID")
+        if workspace:
+            workspace = hf.identity(workspace)
+            matches = [item for item in matches if item.get("workspace") == workspace]
+        if harness == "opencode":
+            require(workspace is not None, "OpenCode owner lookup requires the exact CMUX_WORKSPACE_ID")
+            require(isinstance(session_value, str) and session_value,
+                    "OpenCode owner lookup requires the exact OPENCODE_SESSION_ID")
+        selected_session = session_hint or session_value
+        if selected_session:
+            session = hf.session_identity(selected_session, harness)
             matches = [item for item in matches if item.get("session") == session]
         require(len(matches) == 1, "Caller is not an exact enrolled Hailing Frequencies target")
         target = matches[0]
-        workspace = os.environ.get("CMUX_WORKSPACE_ID")
-        if workspace:
-            require(hf.identity(workspace) == target.get("workspace"),
-                    "Caller workspace differs from its enrolled owner")
+        if workspace is not None:
+            require(workspace == target.get("workspace"), "Caller workspace differs from its enrolled owner")
+        if harness == "opencode":
+            require(session_value is None or hf.session_identity(session_value, harness) == target["session"],
+                    "Caller OpenCode session differs from the registered owner")
+        if session_hint and session_value:
+            require(hf.session_identity(session_hint, harness) == hf.session_identity(session_value, harness),
+                    "Selected session differs from the current harness session")
         target = self.binding_snapshot(target)
         if verify:
             self.cmux_factory().binding(target)
@@ -364,6 +378,9 @@ class Watch:
     @staticmethod
     def binding_snapshot(target):
         keys = ("harness", "session", "surface", "workspace", "started_at")
+        if target.get("harness") == "opencode":
+            keys += ("api_url", "password_file", "expected_server_pid", "session_directory",
+                     "worktree_directory", "parent_task_id")
         require(all(key in target for key in keys), "Hailing Frequencies owner binding is incomplete")
         return {key: target[key] for key in keys}
 
@@ -395,9 +412,9 @@ class Watch:
         require(remote.get("type") in (11, 12), "Discord channel is not a thread")
         return remote
 
-    def register(self, thread_id, after=None):
+    def register(self, thread_id, after=None, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
-        owner = self.current_owner()
+        owner = self.current_owner(session_hint=session_hint)
         credentials, api = self.read_credentials()
         remote = self.remote_thread(api, thread_id)
         require(not self.thread_closed(remote, credentials["closed_tag"]),
@@ -448,9 +465,9 @@ class Watch:
         require(not require_open or result["is_open"], "Thread registration is closed")
         return result
 
-    def managed(self, thread_id):
+    def managed(self, thread_id, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
-        current = self.current_owner()
+        current = self.current_owner(session_hint=session_hint)
         with contextlib.closing(self.database(create=False)) as db:
             thread = self._thread(db, thread_id)
             require(thread["owner"] == current,
@@ -462,9 +479,9 @@ class Watch:
         return {"thread": thread_id, "managed": True, "owner_session": current["session"],
                 "queue": counts, "worker_health": status}
 
-    def close(self, thread_id):
+    def close(self, thread_id, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
-        current = self.current_owner()
+        current = self.current_owner(session_hint=session_hint)
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
             thread = self._thread(db, thread_id)
@@ -475,10 +492,10 @@ class Watch:
                            (now, thread_id))
         return {"thread": thread_id, "closed": True, "pending_preserved": True}
 
-    def transfer(self, thread_id, from_session):
+    def transfer(self, thread_id, from_session, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
-        old_session = hf.identity(from_session)
-        current = self.current_owner()
+        old_session = hf.session_identity(from_session)
+        current = self.current_owner(session_hint=session_hint)
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
             thread = self._thread(db, thread_id)
@@ -674,13 +691,17 @@ class Watch:
             record = self._record_thread_error(db, thread_id, error, now)
             return {"thread": thread_id, "status": "error", "error": record}
 
-    def _wake_prompt(self, thread_id, message_id):
+    def _wake_prompt(self, thread_id, message_id, owner):
         launcher = shutil.which("discord-watch") or "discord-watch"
-        command = shlex.join([launcher, "--state-dir", str(self.directory),
-                              "--notify-home", str(self.notify_home),
-                              "--hailing-state", str(self.hailing_state),
-                              "--cmux", self.cmux_executable,
-                              "receive", "--thread", thread_id, "--message", message_id])
+        args = [launcher, "--state-dir", str(self.directory),
+                "--notify-home", str(self.notify_home),
+                "--hailing-state", str(self.hailing_state),
+                "--cmux", self.cmux_executable,
+                "receive", "--thread", thread_id]
+        if owner.get("harness") == "opencode":
+            args.extend(("--session", owner["session"]))
+        args.extend(("--message", message_id))
+        command = shlex.join(args)
         return ("A reply from the configured Discord user is ready in Discord Watch. At a safe checkpoint, retrieve the exact reply with:\n"
                 + command)
 
@@ -727,7 +748,7 @@ class Watch:
             return {"message": message_id, "state": "stalled", "would_wake": False}
         owner = thread["owner"]
         self.validate_registered_owner(owner)
-        prompt = self._wake_prompt(thread_id, message_id)
+        prompt = self._wake_prompt(thread_id, message_id, owner)
 
         def mark_transport_start():
             owner_json = json.dumps(owner, separators=(",", ":"))
@@ -863,9 +884,9 @@ class Watch:
         except (ValueError, OSError, sqlite3.Error):
             return
 
-    def receive(self, thread_id, message_id=None, output=None):
+    def receive(self, thread_id, message_id=None, output=None, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
-        current = self.current_owner()
+        current = self.current_owner(session_hint=session_hint)
         output = output or sys.stdout
         with contextlib.closing(self.database(create=False)) as db:
             thread = self._thread(db, thread_id, require_open=False)
@@ -896,7 +917,7 @@ class Watch:
             require(written == len(rendered), "Reply output was incomplete; no replies were acknowledged")
             output.flush()
             # Revalidate the exact live owner after the output boundary.
-            latest = self.current_owner()
+            latest = self.current_owner(session_hint=session_hint)
             require(latest == current, "Owner changed during reply output; no replies were acknowledged")
             now = self.clock()
             owner_json = json.dumps(current, separators=(",", ":"))
@@ -995,7 +1016,7 @@ class Watch:
                 "thread_in_send_scope": in_scope if thread_id is not None else None,
                 "thread_last_poll_age_seconds": thread_poll_age,
                 "thread_error": thread_error, "warnings": warnings,
-                "note": "A successful API poll and confirmed CMUX submit are distinct from explicit reply receipt."}
+                "note": "A successful API poll and confirmed CMUX submit or OpenCode user-message admission are distinct from explicit reply receipt."}
 
     def status(self):
         with contextlib.closing(self.database(create=False)) as db:
@@ -1150,16 +1171,21 @@ def parser():
     register = sub.add_parser("register", help="Register this thread to the exact current owner")
     register.add_argument("thread")
     register.add_argument("--after")
+    register.add_argument("--session", help="Select an exact OpenCode ses_ owner when the surface is ambiguous")
     managed = sub.add_parser("managed", help="Check exact current-owner registration")
     managed.add_argument("thread")
+    managed.add_argument("--session", help="Select an exact OpenCode ses_ owner when the surface is ambiguous")
     receive = sub.add_parser("receive", help="Output and acknowledge exact pending replies")
     receive.add_argument("--thread", required=True)
     receive.add_argument("--message")
+    receive.add_argument("--session", help="Select the exact enrolled OpenCode ses_ owner")
     close = sub.add_parser("close", help="Close this exact owner's local thread registration")
     close.add_argument("thread")
+    close.add_argument("--session", help="Select an exact OpenCode ses_ owner when the surface is ambiguous")
     transfer = sub.add_parser("transfer", help="Explicitly hand an open thread to this exact current owner")
     transfer.add_argument("thread")
     transfer.add_argument("--from-session", required=True)
+    transfer.add_argument("--session", help="Select an exact OpenCode ses_ owner when the surface is ambiguous")
     sub.add_parser("status", help="Show worker health and private queue metadata")
     sub.add_parser("doctor", help="Check state and configuration without printing credentials")
     for name in ("scan", "serve", "supervise"):
@@ -1178,21 +1204,21 @@ def main(argv=None):
     app = Watch(args.state_dir, args.hailing_state, args.notify_home, args.cmux)
     if args.command == "register":
         with app.locked():
-            result = app.register(args.thread, args.after)
+            result = app.register(args.thread, args.after, args.session)
     elif args.command == "managed":
-        result = app.managed(args.thread)
+        result = app.managed(args.thread, args.session)
     elif args.command == "receive":
         with app.locked(timeout=LOCK_TIMEOUT, name="receive.lock"):
-            result = app.receive(args.thread, args.message)
+            result = app.receive(args.thread, args.message, session_hint=args.session)
         if not result.get("received"):
             return 3
         return 0
     elif args.command == "close":
         with app.locked():
-            result = app.close(args.thread)
+            result = app.close(args.thread, args.session)
     elif args.command == "transfer":
         with app.locked():
-            result = app.transfer(args.thread, args.from_session)
+            result = app.transfer(args.thread, args.from_session, args.session)
     elif args.command == "status":
         result = app.status()
     elif args.command == "doctor":

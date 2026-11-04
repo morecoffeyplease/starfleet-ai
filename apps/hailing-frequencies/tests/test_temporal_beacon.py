@@ -442,6 +442,26 @@ class TemporalBeaconTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Missing verified CODEX_THREAD_ID"):
                 self.beacon.owner()
 
+    def test_opencode_timer_owner_requires_exact_seeded_session_and_workspace(self):
+        target = {**self.target, "session": "ses_TemporalFixture42", "harness": "opencode",
+                  "api_url": "http://127.0.0.1:4096", "password_file": str(self.root / "password"),
+                  "expected_server_pid": 12345, "session_directory": str(self.root),
+                  "worktree_directory": str(self.root), "parent_task_id": "task:temporal-fixture"}
+        hf.atomic_json(self.root / "config.json", {"version": 1, "targets": [target], "coordinator": None,
+            "remind_after": 300, "escalate_after": 900, "cooldown": 600, "interval": 5})
+        hf.atomic_json(self.root / "opencode-hook-sessions.json", {"sessions": {target["session"]: {
+            "surfaceId": target["surface"], "workspaceId": target["workspace"],
+            "startedAt": target["started_at"], "cwd": str(self.root)}}})
+        env = {"CMUX_AGENT_LAUNCH_KIND": "opencode", "CMUX_SURFACE_ID": target["surface"],
+               "CMUX_WORKSPACE_ID": target["workspace"]}
+        with patch.dict("os.environ", env, clear=True):
+            with self.assertRaisesRegex(ValueError, "OPENCODE_SESSION_ID"):
+                self.beacon.owner(verify=False)
+        env["OPENCODE_SESSION_ID"] = target["session"]
+        with patch.dict("os.environ", env, clear=True):
+            owner, _key, _worktree = self.beacon.owner(verify=False)
+        self.assertEqual(owner["session"], target["session"])
+
     def test_concurrent_timer_mutation_fails_with_actionable_retry(self):
         stream = (self.root / "timers.lock").open("a")
         hf.fcntl.flock(stream, hf.fcntl.LOCK_EX | hf.fcntl.LOCK_NB)

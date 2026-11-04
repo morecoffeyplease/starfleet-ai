@@ -280,4 +280,34 @@ failed_registration_id="$("$TOOL" open --delivery discord --kind Agent --title '
 assert_contains "$(cat "$TMP/managed-registration.err")" 'registration failed'
 [ -n "$failed_registration_id" ] || fail 'registration failure hid the created thread id'
 
+unset REGISTER_FAIL
+export CMUX_AGENT_LAUNCH_KIND=opencode
+export OPENCODE_SESSION_ID=ses_AgentNotifyFixture42
+export CODEX_THREAD_ID=stale-codex-thread-id
+export AGENT_NOTIFY_KIND=Codex
+opencode_id="$("$TOOL" open --delivery discord --title 'OpenCode managed owner' --body 'Fixture only' 2>"$TMP/opencode-open.err")"
+assert_eq "$opencode_id" 900000000000000010
+assert_contains "$(sed -n '10p' "$OPEN_LOG")" '[OpenCode]'
+assert_contains "$(cat "$MANAGED_LOG")" "register $opencode_id --session $OPENCODE_SESSION_ID"
+"$TOOL" watch "$opencode_id" 2>"$TMP/opencode-watch.err"
+assert_contains "$(cat "$MANAGED_LOG")" "managed $opencode_id --session $OPENCODE_SESSION_ID"
+assert_not_contains "$(cat "$TMP/opencode-watch.err")" 'Codex'
+export MANAGED_ENABLED=0
+if "$TOOL" listen "$opencode_id" 2>"$TMP/opencode-listen.err"; then fail 'OpenCode listen used a Codex queue'; else assert_eq "$?" 4; fi
+assert_contains "$(cat "$TMP/opencode-listen.err")" 'only available to an exact Codex session'
+if "$TOOL" watch "$opencode_id" --queue "$CODEX_THREAD_ID" 2>"$TMP/opencode-queue.err"; then
+  fail 'OpenCode watch accepted an inherited Codex queue'
+else
+  assert_eq "$?" 1
+fi
+assert_contains "$(cat "$TMP/opencode-queue.err")" 'cannot use an OpenCode session'
+export MANAGED_ENABLED=1
+unset AGENT_NOTIFY_KIND
+
+unset CMUX_SURFACE_ID
+unscoped_opencode_id="$("$TOOL" open --delivery discord --title 'OpenCode unscoped' --body 'Fixture only' 2>"$TMP/opencode-unscoped.err")"
+assert_eq "$unscoped_opencode_id" 900000000000000011
+assert_contains "$(cat "$TMP/opencode-unscoped.err")" 'OpenCode managed-thread registration requires an exact ses_ identity and CMUX workspace/surface scope'
+if rg -q "register $unscoped_opencode_id" "$MANAGED_LOG"; then fail 'unscoped OpenCode owner attempted managed registration'; fi
+
 printf '%s\n' 'agent-notify routing tests passed'

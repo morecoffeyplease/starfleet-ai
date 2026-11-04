@@ -21,8 +21,8 @@ Run `temporal-beacon doctor` before relying on delivery and read [the timer guid
 ## Identify the exact session
 
 Run `cmux current --json --limit 200` and `cmux --id-format both --json tree --all`.
-Match your actual harness session UUID to its CMUX panel or surface UUID and workspace UUID.
-Use your harness's reported session identity, such as Codex's `CODEX_THREAD_ID` when available, rather than choosing another visible agent.
+Match your actual harness session identity to its CMUX panel or surface UUID and workspace UUID.
+Use the harness's reported identity, such as Codex's `CODEX_THREAD_ID` or OpenCode's exact `ses_` session ID, rather than choosing another visible agent.
 In `cmux current`, match your own `agents[].session_id` and harness `kind`, then use that item's `projections[].panel_id` and `workspace_id` for enrollment.
 The panel ID is the current terminal surface; do not substitute `stable_surface_id` or `durable_surface_id`.
 Use the IDs CMUX reports; do not infer them from a workspace title, project folder, parent session, or helper terminal.
@@ -45,6 +45,26 @@ If the session is already enrolled unchanged, keep its existing cutoff and recei
 After enrollment, run `hailing-frequencies status` to confirm that the exact session is listed.
 Enrollment confirms saved configuration only; it does not prove a reminder reached or was read by the agent.
 
+### OpenCode self-enrollment
+
+OpenCode uses `hailing-frequencies opencode-enroll` with a private binding manifest supplied by the Model Preferences worker.
+The manifest fields are `session_id`, `expected_server_pid`, `session_directory`, `worktree_directory`, `cmux_workspace_uuid`, `cmux_surface_uuid`, and `parent_task_id`, plus `api_url` and `password_file`.
+The manifest and password file must be absolute regular files owned by you with mode `0600` or stricter and no symlink.
+The password file contains the OpenCode loopback API password, and the password itself never belongs in the manifest, command arguments, or logs.
+Before the initial task, the managed OpenCode launcher must seed `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, `CMUX_SURFACE_ID`, and `CMUX_WORKSPACE_ID` through the supported per-session API environment after CMUX placement.
+The OpenCode server does not inherit the TUI's CMUX environment, so enrollment refuses to infer caller identity from server process variables, working directory, or manifest fields alone.
+Run self-enrollment as a command launched by the exact OpenCode TUI on its owning CMUX surface with those three values present:
+
+```sh
+hailing-frequencies opencode-enroll --manifest /absolute/private/opencode-binding.json --label YOUR_LABEL
+```
+
+Enrollment requires the exact current OpenCode hook record, matching CMUX surface and workspace, matching API session and server PID, matching worktree, enabled native messaging, and an explicitly empty native composer.
+Passive API sessions without a current visible-TUI hook record, a session observed on another surface, or any mismatch remain held.
+In the current native pilot, CMUX reports OpenCode `surface.input_state` as `unknown`, so enrollment and API prompt submission remain held.
+OpenCode's supported TUI plugin API does not expose composer draft contents, and an API `clear` result is not proof that the native composer is empty.
+Keep the hold until CMUX can return an exact empty native input state; do not synthesize an empty attestation or force a send.
+
 ## Checkpoint attention
 
 The stronger Pattern Buffer compaction warning requires that session's Pattern Buffer checkpoint registration.
@@ -53,7 +73,7 @@ Optional Hailing Frequencies attention delivery also requires this exact Hailing
 During an eligible pressure warning, Pattern Buffer makes one Hailing Frequencies attempt with a three-second timeout.
 The urgent Pattern Buffer warning remains the fallback if the delivery is busy, held, unavailable, timed out, or uncertain.
 The hook does not retry the event; do not erase receipts or use a new key to force an uncertain submit again.
-`submitted` means CMUX confirmed a guarded submit, not that the agent received, read, or acted on it.
+`submitted` means CMUX confirmed a guarded submit or OpenCode's API admitted an exact user message, not that the agent received, read, or acted on it.
 
 ## Preserve holds and permissions
 

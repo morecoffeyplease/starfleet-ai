@@ -1,15 +1,16 @@
 # Discord Watch setup guide
 
 Discord Watch polls registered agent-notify forum threads for replies from the configured Discord user and keeps those replies in a private local queue.
-With `--send`, one supervised worker sends a guarded wake to the exact Claude or Codex session enrolled for each thread.
+With `--send`, one supervised worker sends a guarded wake to the exact Claude, Codex, or explicitly bound OpenCode session enrolled for each thread.
 The wake contains the exact `discord-watch receive` command and never contains the reply body.
 
 ## Prerequisites
 
 Use Python 3.9 or newer on macOS or another POSIX host with `fcntl`.
-Install or reuse `agent-notify`, Hailing Frequencies, and a current CMUX command that supports `current`, `surface.input_state`, and JSON `paste --submit` results.
+Install or reuse `agent-notify`, Hailing Frequencies, and a current CMUX command that supports `current` and `surface.input_state`.
+Claude and Codex also require JSON `paste --submit` results, while OpenCode requires the supported Hailing Frequencies API binding and a native empty-input result.
 Run `agent-notify guide --print` first for complete Discord Community, Forum, webhook, bot, permission, and private credential setup.
-The recipient must already be enrolled in Hailing Frequencies from the exact current Claude or Codex session.
+The recipient must already be enrolled in Hailing Frequencies from the exact current Claude or Codex session, or from the explicit OpenCode manifest path in the Hailing Frequencies guide.
 The existing `agent-notify` environment file must contain `DISCORD_BOT_TOKEN` and should contain `DISCORD_USER_ID` for the account whose replies should be queued.
 When `DISCORD_USER_ID` is omitted, Discord Watch uses the cached `user` written by `agent-notify doctor`.
 Never copy tokens into command arguments, repository files, or logs.
@@ -46,6 +47,9 @@ discord-watch doctor
 Use `--harness codex` and the exact `CODEX_THREAD_ID` for a Codex recipient.
 The surface, session, workspace, harness hook generation, receiving settings, and empty composer are checked at registration and before every wake.
 The command must run in the recipient's own CMUX session with its normal `CMUX_AGENT_LAUNCH_KIND`, session ID, and `CMUX_SURFACE_ID` environment.
+For OpenCode, keep the session's exact `ses_` identity and API binding in Hailing Frequencies, and pass `--session ses_ID` to owner commands when needed.
+OpenCode owner commands also require `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, and the exact `CMUX_SURFACE_ID` and `CMUX_WORKSPACE_ID` values seeded for that session.
+The current native CMUX OpenCode input state is `unknown`, so OpenCode registration and wakes remain held until CMUX proves the composer empty.
 
 ## Register an exact thread
 
@@ -54,6 +58,13 @@ From the recipient session that will own the thread, run:
 ```sh
 discord-watch register THREAD_ID
 discord-watch managed THREAD_ID
+```
+
+For OpenCode, supply the exact session ID explicitly:
+
+```sh
+discord-watch register THREAD_ID --session ses_EXACT_SESSION_ID
+discord-watch managed THREAD_ID --session ses_EXACT_SESSION_ID
 ```
 
 Registration uses the current session's exact Hailing Frequencies enrollment.
@@ -67,6 +78,7 @@ The legacy agent-notify listener should stop polling a thread after `managed` re
 Its JSON includes worker health, and a stale worker warning does not change ownership.
 
 Only the current registered owner can receive or locally close a thread.
+For OpenCode, the wake command includes its exact `--session ses_ID` owner so reply receipt does not depend on a guessed terminal or a tab title.
 To hand an open registration to a different current enrolled session, run `discord-watch transfer THREAD_ID --from-session OLD_SESSION_UUID` from the new owner's session.
 Transfer requires the old session ID to match the stored owner and preserves every unreceived reply.
 An explicit transfer resets confirmed-but-unreceived wakes for safe delivery to the new owner.
@@ -105,7 +117,7 @@ The receive command prints exact `[discord:THREAD:MESSAGE] author: content` reco
 That flush is a delivery boundary for the CLI and does not prove that the reply was read or understood.
 The private database stores message bodies, attachment filenames, and attachment URLs with owner-only filesystem permissions.
 Receive prints bounded attachment filenames and HTTPS URLs to the exact recipient and does not download files.
-Status distinguishes a confirmed CMUX submit from a recipient receipt and reports held, uncertain, and stalled states without printing reply bodies.
+Status distinguishes a confirmed CMUX submit or OpenCode user-message admission from a recipient receipt and reports held, uncertain, and stalled states without printing reply bodies.
 After the Discord thread is closed remotely, `close` closes its local registration and preserves unreceived replies for the current owner.
 
 ## Verification and delivery evidence

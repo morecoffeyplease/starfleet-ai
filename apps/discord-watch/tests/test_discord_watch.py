@@ -138,12 +138,13 @@ class DiscordWatchTests(unittest.TestCase):
                              cmux=self.cmux, now=self.clock)
         self.old_env = {key: os.environ.get(key) for key in (
             "CMUX_AGENT_LAUNCH_KIND", "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID",
-            "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")}
+            "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID")}
         os.environ["CMUX_AGENT_LAUNCH_KIND"] = "codex"
         os.environ["CMUX_SURFACE_ID"] = SURFACE_A
         os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_A
         os.environ["CODEX_THREAD_ID"] = SESSION_A
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        os.environ.pop("OPENCODE_SESSION_ID", None)
 
     def tearDown(self):
         for key, value in self.old_env.items():
@@ -196,6 +197,58 @@ class DiscordWatchTests(unittest.TestCase):
     def test_caller_without_session_env_uses_unique_surface_enrollment_and_binding(self):
         os.environ.pop("CODEX_THREAD_ID", None)
         self.assertEqual(self.register()["owner_session"], SESSION_A)
+
+    def test_opencode_session_self_registers_exact_owner_without_state_migration(self):
+        opencode_session = "ses_DiscordWatchFixture"
+        api_url = "http://127.0.0.1:4096"
+        password_file = str(self.root / "opencode-password")
+        self.targets = [target(session=opencode_session, harness="opencode",
+                               api_url=api_url, password_file=password_file,
+                               expected_server_pid=12345,
+                               session_directory=str(self.root), worktree_directory=str(self.root),
+                               parent_task_id="task:discord-watch-fixture")]
+        self._write_hailing()
+        os.environ["CMUX_AGENT_LAUNCH_KIND"] = "opencode"
+        os.environ["OPENCODE_SESSION_ID"] = opencode_session
+        owner = self.app.current_owner()
+        self.assertEqual(owner["session"], opencode_session)
+        self.assertEqual(owner["harness"], "opencode")
+        self.assertEqual(owner["expected_server_pid"], 12345)
+        self.assertEqual(self.register()["owner_session"], opencode_session)
+        managed = self.app.managed(THREAD)
+        self.assertTrue(managed["managed"])
+        with contextlib.closing(self.app.database(create=False)) as db:
+            row = db.execute("SELECT owner_json FROM threads WHERE thread_id=?", (THREAD,)).fetchone()
+            tables = {item[0] for item in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        registered_owner = json.loads(row[0])
+        self.assertEqual(registered_owner["session"], opencode_session)
+        self.assertEqual(registered_owner["api_url"], api_url)
+        self.assertIn("threads", tables)
+        self.assertIn("messages", tables)
+        self.assertNotIn("opencode_threads", tables)
+        prompt = self.app._wake_prompt(THREAD, "501", owner)
+        self.assertIn("receive --thread 100 --session ses_DiscordWatchFixture --message 501", prompt)
+
+    def test_opencode_current_owner_rejects_wrong_session_and_missing_workspace(self):
+        opencode_session = "ses_DiscordWatchFixture"
+        self.targets = [target(session=opencode_session, harness="opencode",
+                               api_url="http://127.0.0.1:4096", password_file=str(self.root / "secret"),
+                               expected_server_pid=12345, session_directory=str(self.root),
+                               worktree_directory=str(self.root), parent_task_id="task:fixture")]
+        self._write_hailing()
+        os.environ["CMUX_AGENT_LAUNCH_KIND"] = "opencode"
+        os.environ["OPENCODE_SESSION_ID"] = "ses_OtherSession"
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.current_owner()
+        os.environ["OPENCODE_SESSION_ID"] = opencode_session
+        os.environ.pop("CMUX_WORKSPACE_ID", None)
+        with self.assertRaisesRegex(ValueError, "CMUX_WORKSPACE_ID"):
+            self.app.current_owner()
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_A
+        os.environ.pop("OPENCODE_SESSION_ID", None)
+        with self.assertRaisesRegex(ValueError, "OPENCODE_SESSION_ID"):
+            self.app.current_owner(session_hint=opencode_session)
 
     def test_page_messages_and_cursor_roll_back_together_then_replay_after_restart(self):
         self.register()
