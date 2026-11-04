@@ -20,9 +20,10 @@ class InstallTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.source = self.root / "source checkout"
         self.source.mkdir()
-        for name in ("install.py", "model_preferences.py"):
+        for name in ("install.py", "model_preferences.py", "opencode_dispatch.py"):
             shutil.copyfile(APP / name, self.source / name)
         shutil.copyfile(APP / "cmux_transport.py", self.source / "cmux_transport.py")
+        shutil.copyfile(APP.parent / "opencode-adapter" / "opencode_adapter.py", self.source / "opencode_adapter.py")
         self.runtime = self.root / "data"
         self.bin = self.root / "bin"
         self.config = self.root / "config"
@@ -108,7 +109,8 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.claude.stat().st_mode), 0o640)
         backup = Path(next(x["backup"] for x in first["changed_settings"] if x["harness"] == "claude"))
         self.assertEqual(backup.read_bytes(), original)
-        paths = (self.claude, self.codex, self.command, self.runtime / "model_preferences.py")
+        paths = (self.claude, self.codex, self.command, self.runtime / "model_preferences.py",
+                 self.runtime / "opencode_dispatch.py", self.runtime / "opencode_adapter.py")
         before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
         second = self.install("--harness", "claude", "--harness", "codex")
         self.assertEqual(second["changed_settings"], [])

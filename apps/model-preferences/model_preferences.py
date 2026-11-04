@@ -25,6 +25,11 @@ _transport_spec = importlib.util.spec_from_file_location("model_preferences_cmux
 cmux_transport = importlib.util.module_from_spec(_transport_spec)
 _transport_spec.loader.exec_module(cmux_transport)
 PreferenceError = cmux_transport.PreferenceError
+_opencode_path = Path(__file__).resolve().with_name("opencode_dispatch.py")
+_opencode_spec = importlib.util.spec_from_file_location("model_preferences_opencode_dispatch", _opencode_path)
+opencode_dispatch = importlib.util.module_from_spec(_opencode_spec)
+sys.modules[_opencode_spec.name] = opencode_dispatch
+_opencode_spec.loader.exec_module(opencode_dispatch)
 
 
 def now():
@@ -109,6 +114,13 @@ def example_config():
         models[name] = {"harness": harness, "slug": slug,
                         "efforts": ["low", "medium", "high", "xhigh", "max"],
                         "source": "opt-in example; current availability is not checked"}
+    models["local-qwen3.6-35b"] = {
+        "harness": "opencode", "provider_id": "trial-local", "slug": "qwen3.6:35b", "efforts": ["max"],
+        "source": "opt-in example; native pilot verified the local OpenAI-compatible provider's max reasoning request and 32768 output limit",
+    }
+    qwen_max = choice("local-qwen3.6-35b", "max")
+    sol_medium = choice("codex-sol", "medium")
+    sol_high = choice("codex-sol", "high")
     return {"schema_version": 1, "active": None, "activation": None, "models": models, "profiles": {
         "Claude-Codex": profile("claude-opus", "codex-luna", ["codex-sol", "claude-opus"],
                                 ["claude-fable", "codex-astra"]),
@@ -116,6 +128,10 @@ def example_config():
         "Claude-only": profile("claude-opus", "claude-haiku", ["claude-opus"], ["claude-fable"]),
         "Claude-Muse": profile("claude-opus", "muse-spark", ["claude-opus"] * 2, ["claude-fable"] * 2),
         "Codex-Muse": profile("codex-sol", "muse-spark", ["codex-sol"], ["codex-astra"]),
+        "Codex-Qwen": {"orchestrator": sol_medium, "implementer": qwen_max, "researcher": qwen_max,
+                       "standard_review": [sol_high], "advanced_review": [sol_high]},
+        "Qwen-only": {"orchestrator": qwen_max, "implementer": qwen_max, "researcher": qwen_max,
+                      "standard_review": [sol_high], "advanced_review": [sol_high]},
     }, "approval_authority": {"label": None}, "review_rules": {"file_threshold": 10,
         "money_paths": ["**/money/**", "**/payments/**", "**/pricing/**"],
         "time_zone_paths": ["**/timezone/**", "**/timezones/**", "**/time-zone/**"],
@@ -143,7 +159,7 @@ def validate(config):
     require(isinstance(models, dict) and isinstance(profiles, dict), "Models and profiles must be objects.")
     for key, model in models.items():
         require(isinstance(model, dict), f"Invalid model {key}.")
-        require(model.get("harness") in ("codex", "claude", "muse"), f"Unknown harness for {key}.")
+        require(model.get("harness") in ("codex", "claude", "muse", "opencode"), f"Unknown harness for {key}.")
         slug = model.get("slug")
         require(isinstance(slug, str) and slug and not slug.startswith("-") and not any(c.isspace() for c in slug),
                 f"Exact model slug required for {key}.")
@@ -152,6 +168,14 @@ def validate(config):
                     for e in model["efforts"]), f"Invalid supported efforts for {key}.")
         if model["harness"] == "muse":
             require(slug.endswith("-contributor"), f"Muse model {key} must use a contributor slug.")
+        if model["harness"] == "opencode":
+            provider_id = model.get("provider_id")
+            require(isinstance(provider_id, str) and provider_id and len(provider_id) <= 128
+                    and not any(c.isspace() for c in provider_id),
+                    f"OpenCode model {key} requires its exact provider ID.")
+            require(model["efforts"] == ["max"], f"OpenCode model {key} requires the explicit max reasoning effort contract.")
+        else:
+            require("provider_id" not in model, f"Only OpenCode models may define provider_id ({key}).")
     for name, profile in profiles.items():
         require(isinstance(name, str) and name and isinstance(profile, dict) and set(profile) == set(ROLES),
                 f"Profile {name} must define exactly {', '.join(ROLES)}.")
@@ -171,6 +195,17 @@ def validate(config):
                 if name in ("Claude-Muse", "Codex-Muse"):
                     expected = "muse" if role in ("implementer", "researcher") else name.split("-")[0].lower()
                     require(m["harness"] == expected, f"{name}/{role} requires {expected}.")
+                if name in ("Codex-Qwen", "Qwen-only"):
+                    if role in ("standard_review", "advanced_review"):
+                        require(m["harness"] == "codex" and entry["model"] == "codex-sol" and entry["effort"] == "high",
+                                f"{name}/{role} requires the external Codex Sol high reviewer.")
+                    elif name == "Codex-Qwen" and role == "orchestrator":
+                        require(m["harness"] == "codex" and entry["model"] == "codex-sol" and entry["effort"] == "medium",
+                                "Codex-Qwen/orchestrator requires Codex Sol medium.")
+                    else:
+                        require(m["harness"] == "opencode" and entry["model"] == "local-qwen3.6-35b"
+                                and entry["effort"] == "max",
+                                f"{name}/{role} requires the exact local Qwen OpenCode model at max effort.")
     authority = config.get("approval_authority")
     require(isinstance(authority, dict) and set(authority) == {"label"} and
             (authority.get("label") is None or
@@ -194,7 +229,8 @@ def selection(config):
             model = config["models"][entry["model"]]
             resolved.append({"family": entry["model"], "harness": model["harness"],
                              "model": model["slug"], "effort": entry["effort"],
-                             "contributor_mode": model["harness"] == "muse"})
+                             "contributor_mode": model["harness"] == "muse",
+                             **({"provider_id": model["provider_id"]} if model["harness"] == "opencode" else {})})
         roles[role] = resolved if group else resolved[0]
     result = {"profile": name, "roles": roles, "review_rules": config["review_rules"],
               "approval_authority": config["approval_authority"]}
@@ -354,6 +390,7 @@ class App(CmuxTransport):
 def argv_for(choice, prompt, cwd, interactive=False):
     harness = choice["harness"]
     model, effort = choice["model"], choice["effort"]
+    require(harness != "opencode", "OpenCode uses an authenticated API and native CMUX binding, not a CLI subprocess; use the guarded OpenCode dispatch path.")
     require(shutil.which(harness) is not None, f"Selected harness unavailable: {harness}. No fallback permitted.")
     if harness == "codex":
         argv = ["codex"] + ([] if interactive else ["exec"])
@@ -504,7 +541,8 @@ def parser():
             s.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
     put = sub.add_parser("profile-put"); put.add_argument("name"); put.add_argument("--file", required=True)
     put.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
-    model = sub.add_parser("model-set"); model.add_argument("family"); model.add_argument("--harness", choices=("claude", "codex", "muse"), required=True)
+    model = sub.add_parser("model-set"); model.add_argument("family"); model.add_argument("--harness", choices=("claude", "codex", "muse", "opencode"), required=True)
+    model.add_argument("--provider-id")
     model.add_argument("--slug", required=True)
     model.add_argument("--efforts", nargs="+", required=True); model.add_argument("--source", required=True)
     model.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
@@ -523,11 +561,14 @@ def parser():
         if name == "dispatch":
             s.add_argument("--cwd", required=True); s.add_argument("--task-file", required=True)
             s.add_argument("--review-plan"); s.add_argument("--approval")
+            s.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review launch.")
+            s.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for guarded preflight.")
             s.add_argument("--pattern-buffer", "--context-injector", dest="context_injector", help="Pattern Buffer script; --context-injector is a compatibility alias."); s.add_argument("--owner-worktree")
             s.add_argument("--receipt-file", help="Forward a unique Pattern Buffer dispatch snapshot path; requires its script and owner worktree.")
     resume = sub.add_parser("resume", help="Continue an exited, identity-verified Codex launch with its recorded choice.")
     resume.add_argument("launch"); resume.add_argument("--task-file", required=True)
     resume.add_argument("--review-plan"); resume.add_argument("--approval")
+    resume.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review continuation.")
     review = sub.add_parser("review-plan"); review.add_argument("--cwd", required=True)
     review.add_argument("--base", required=True); review.add_argument("--facts", required=True)
     review.add_argument("--full", action="store_true", help="Print every path; default output is a bounded preview of the full saved scope.")
@@ -565,6 +606,248 @@ def resolve(snapshot, role, slot):
     else:
         require(slot is None, "--slot applies only to reviewer groups.")
     return {"profile": snapshot["profile"], "selection": snapshot["selection"], "role": role, **choice}
+
+
+def cmux_uuid(value, field):
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PreferenceError(f"CMUX {field} UUID is unavailable; no OpenCode session created.") from exc
+
+
+def opencode_destination():
+    caller = run_json(["cmux", "--json", "--id-format", "uuids", "identify"]).get("caller") or {}
+    workspace = cmux_uuid(caller.get("workspace_id"), "workspace")
+    surface = cmux_uuid(caller.get("surface_id"), "surface")
+    tree = run_json(["cmux", "--json", "--id-format", "uuids", "tree", "--all"])
+    panes = [pane for window in tree.get("windows", []) for ws in window.get("workspaces", [])
+             if str(ws.get("id", "")).lower() == workspace.lower()
+             for pane in ws.get("panes", [])
+             if any(str(item.get("id", "")).lower() == surface.lower() for item in pane.get("surfaces", []))]
+    require(len(panes) == 1, "Cannot identify one exact caller pane; no OpenCode session created.")
+    return {"workspace_uuid": workspace, "surface_uuid": surface, "pane_id": panes[0]["id"]}
+
+
+def prepare_opencode_pattern_buffer(app, args, cwd, task_digest):
+    require(args.context_injector and args.owner_worktree and args.receipt_file,
+            "OpenCode Pattern Buffer dispatch requires --pattern-buffer, --owner-worktree and a unique --receipt-file.")
+    require(args.role == "implementer", "OpenCode Pattern Buffer dispatch is available for implementer only.")
+    script = Path(args.context_injector).expanduser().resolve(strict=True)
+    require(script.is_file(), "Pattern Buffer script is unavailable.")
+    owner = Path(args.owner_worktree).expanduser().resolve(strict=True)
+    receipt_path = Path(args.receipt_file).expanduser().absolute()
+    require(not receipt_path.exists() and not receipt_path.is_symlink(), "Pattern Buffer receipt path must be new and unique.")
+    prepared = app.run_json([sys.executable, str(script), "--cwd", str(cwd), "prepare-dispatch",
+                             "--harness", "opencode", "--owner-worktree", str(owner),
+                             "--task-file", str(Path(args.task_file).resolve()),
+                             "--receipt-file", str(receipt_path), "--role", "implementer"])
+    receipt = read(receipt_path)
+    require(prepared.get("status") == "pending" and prepared.get("harness") == "opencode"
+            and prepared.get("role") == "implementer" and prepared.get("task_id") == receipt.get("task_id"),
+            "Pattern Buffer did not return the prepared OpenCode ticket; no session created.")
+    require(receipt.get("harness") == "opencode" and receipt.get("role") == "implementer"
+            and receipt.get("status") == "pending" and receipt.get("session_id") is None
+            and receipt.get("worktree") == str(cwd) and receipt.get("owner_worktree") == str(owner)
+            and receipt.get("brief_sha256") == task_digest,
+            "Pattern Buffer ticket does not match the exact task, worktree and owner; no session created.")
+    task_id = safe_id(receipt.get("task_id"))
+    return {"script": str(script), "owner_worktree": str(owner), "receipt": str(receipt_path), "task_id": task_id}
+
+
+def bind_opencode_pattern_buffer(app, adapter, session):
+    receipt = read(adapter["receipt"])
+    cli = [sys.executable, adapter["script"], "--cwd", receipt["worktree"]]
+    bound = app.run_json([*cli, "bind-dispatch", "--harness", "opencode", "--session", session,
+                          "--task-id", adapter["task_id"], "--receipt-file", adapter["receipt"],
+                          "--role", "implementer"])
+    require(bound.get("status") == "active" and bound.get("task_id") == adapter["task_id"]
+            and bound.get("session_id") == session and bound.get("harness") == "opencode"
+            and bound.get("role") == "implementer",
+            "Pattern Buffer did not confirm the exact OpenCode session binding; no prompt sent.")
+
+
+def update_opencode_launch(app, launch):
+    with locked(app.config_dir):
+        app.save_state(f"launches/{launch['id']}", launch)
+
+
+def signal_private(path, value):
+    try:
+        opencode_dispatch.write_private_json(path, value)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"Private OpenCode launch signal failed: {exc.code}.") from None
+
+
+def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
+    require(choice["role"] in ("implementer", "researcher"),
+            "OpenCode initial dispatch is available for implementer or researcher; orchestrator handoff needs a separate native workflow.")
+    require(args.opencode_manifest, "OpenCode dispatch requires --opencode-manifest with a mode-0600 loopback API connection.")
+    try:
+        connection = opencode_dispatch.load_connection(args.opencode_manifest)
+        require(connection.parent_task_id, "OpenCode manifest must name the explicit parent_task_id.")
+        require(Path(git(cwd, "rev-parse", "--show-toplevel").decode().strip()).resolve() == cwd,
+                "OpenCode --cwd must be the exact Git worktree root so session and worktree identity remain distinct and verifiable.")
+        # Confirm the exact provider/model/output/variant contract before creating a server-side session.
+        evidence = opencode_dispatch.preflight(connection, choice)
+        binary = opencode_dispatch.check_opencode_cli()
+        destination = opencode_destination()
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"OpenCode preflight held: {exc.code}") from None
+    if args.context_injector or args.owner_worktree or args.receipt_file:
+        adapter = prepare_opencode_pattern_buffer(app, args, cwd, hashlib.sha256(task_bytes).hexdigest())
+    else:
+        adapter = None
+
+    brief = task_bytes.decode("utf-8")
+    prompt = DELEGATION + " Use the current researcher role for authorized research. Verify its findings.\n\n" + brief
+    prompt_bytes = prompt.encode("utf-8")
+    require(0 < len(prompt_bytes) <= 32768, "OpenCode startup prompt must be at most 32768 UTF-8 bytes.")
+    launch_id = uuid.uuid4().hex
+    task_digest = hashlib.sha256(task_bytes).hexdigest()
+    prompt_file = app.state_dir / "opencode-launches" / f"{launch_id}.prompt"
+    handshake_file = app.state_dir / "opencode-launches" / f"{launch_id}.handshake.json"
+    release_file = app.state_dir / "opencode-launches" / f"{launch_id}.release.json"
+    abort_file = app.state_dir / "opencode-launches" / f"{launch_id}.abort.json"
+    launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
+              "context_injector": adapter, "slot": args.slot, "task_digest": task_digest,
+              "status": "session_create_pending", "api_contract": evidence.api_contract,
+              "api_origin": evidence.api_origin, "expected_server_pid": evidence.server_pid,
+              "parent_task_id": connection.parent_task_id, "caller_workspace_uuid": destination["workspace_uuid"],
+              "caller_surface_uuid": destination["surface_uuid"], "session_directory": str(cwd),
+              "worktree_directory": str(cwd), "prompt_snapshot": str(prompt_file)}
+
+    with locked(app.config_dir):
+        active_launches = app.state_dir / "launches"
+        if active_launches.is_dir():
+            for path in active_launches.glob("*.json"):
+                previous = read(path)
+                if (previous.get("choice", {}).get("harness") == "opencode"
+                        and previous.get("cwd") == str(cwd) and previous.get("task_digest") == task_digest
+                        and previous.get("choice", {}).get("selection") == choice["selection"]
+                        and previous.get("status") in ("session_create_pending", "session_created", "task_bound",
+                                                        "surface_opening", "native_binding_pending", "uncertain", "running")):
+                    raise PreferenceError(f"Matching OpenCode launch {previous.get('id')} is unresolved or live; inspect it before retrying.")
+
+        try:
+            opencode_dispatch.write_private_snapshot(prompt_file, prompt_bytes)
+        except opencode_dispatch.OpenCodeDispatchError as exc:
+            raise PreferenceError(f"OpenCode launch preparation failed: {exc.code}.") from None
+        app.save_state(f"launches/{launch['id']}", launch)
+    creation_attempted = False
+    surface_opened = False
+    try:
+        # Recheck immediately before creation in case provider configuration or server identity changed.
+        evidence = opencode_dispatch.preflight(connection, choice)
+        creation_attempted = True
+        created = opencode_dispatch.create_session(connection, directory=str(cwd), choice=choice,
+                                                   launch_id=launch_id, task_digest=task_digest,
+                                                   parent_task_id=connection.parent_task_id)
+        session = created["session_id"]
+        launch.update(status="session_created", native_session=session,
+                      opencode_parent_session_id=created.get("parent_session_id"),
+                      model=created["model"], session_directory=created["directory"])
+        update_opencode_launch(app, launch)
+        if adapter:
+            launch["status"] = "task_binding_pending"
+            update_opencode_launch(app, launch)
+            bind_opencode_pattern_buffer(app, adapter, session)
+            launch["status"] = "task_bound"
+            launch["pattern_buffer_task_id"] = adapter["task_id"]
+            launch["pattern_buffer_owner_worktree"] = adapter["owner_worktree"]
+            update_opencode_launch(app, launch)
+
+        helper = Path(__file__).resolve().with_name("opencode_dispatch.py")
+        child = [sys.executable, str(helper), "tui-child", "--manifest", str(Path(args.opencode_manifest).expanduser().resolve()),
+                 "--session", session, "--directory", str(cwd), "--prompt-file", str(prompt_file),
+                 "--provider-id", choice["provider_id"], "--model-id", choice["model"],
+                 "--launch-id", launch_id, "--selection", choice["selection"], "--task-digest", task_digest,
+                 "--handshake-file", str(handshake_file), "--release-file", str(release_file),
+                 "--abort-file", str(abort_file), "--binary", binary]
+        launch["status"] = "surface_opening"
+        update_opencode_launch(app, launch)
+        surface_opened = True
+        opened = run_json(["cmux", "--json", "--id-format", "uuids", "new-surface", "--type", "terminal",
+                           "--workspace", destination["workspace_uuid"], "--pane", destination["pane_id"],
+                           "--working-directory", str(cwd), "--focus", "false", "--command", shlex.join(child)])
+        surface = cmux_uuid(opened.get("surface_id"), "new surface")
+        workspace = cmux_uuid(opened.get("workspace_id", destination["workspace_uuid"]), "new workspace")
+        require(workspace.lower() == destination["workspace_uuid"].lower(),
+                "OpenCode surface opened in a different CMUX workspace; prompt remains held.")
+        launch.update(status="native_binding_pending", cmux_workspace_uuid=workspace, cmux_surface_uuid=surface,
+                      surface_opened_at=now())
+        update_opencode_launch(app, launch)
+
+        deadline = time.monotonic() + 15
+        handshake = None
+        while time.monotonic() < deadline:
+            if handshake_file.exists():
+                handshake = opencode_dispatch.read_private_json(handshake_file)
+                break
+            time.sleep(0.1)
+        expected_handshake = {"launch_id": launch_id, "session_id": session,
+                              "workspace_uuid": workspace, "surface_uuid": surface}
+        require(isinstance(handshake, dict) and all(handshake.get(k) == v for k, v in expected_handshake.items()),
+                "OpenCode child CMUX handshake did not match the exact new surface; initial prompt was not released.")
+        socket_path = handshake.get("cmux_socket_path")
+        opencode_dispatch.set_session_environment(connection, session, workspace_uuid=workspace,
+                                                  surface_uuid=surface, launch_id=launch_id,
+                                                  cmux_socket_path=socket_path)
+        signal_private(release_file, expected_handshake)
+
+        launch["status"] = "native_binding_pending"
+        launch["initial_prompt_released_at"] = now()
+        update_opencode_launch(app, launch)
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            current = app.current()
+            try:
+                native = opencode_dispatch.require_native_dispatch_binding(
+                    expected_workspace=workspace, expected_surface=surface,
+                    expected_session=session, current=current)
+            except opencode_dispatch.OpenCodeDispatchError as exc:
+                if exc.code == "native_session_surface_binding_pending":
+                    time.sleep(1)
+                    continue
+                raise
+            if native["state"] == "working":
+                time.sleep(1)
+                continue
+            if native["state"] == "needs_input" or (native["state"] == "unknown" and native["lifecycle"] != "idle"):
+                raise opencode_dispatch.OpenCodeDispatchError("native_session_state_unknown")
+            identity = opencode_dispatch.inspect_session(
+                connection, session_id=session, session_directory=str(cwd), worktree_directory=str(cwd),
+                workspace_uuid=workspace, surface_uuid=surface, parent_task_id=connection.parent_task_id)
+            launch.update(status="running", native_binding=native, identity=identity,
+                          initial_turn_state="idle", execution_result="turn_idle",
+                          delivery_readiness="held",
+                          delivery_hold_codes=["native_composer_state_not_exposed"], native_bound_at=now())
+            update_opencode_launch(app, launch)
+            try:
+                prompt_file.unlink()
+            except OSError:
+                pass
+            return {"launch": launch_id, "choice": choice, "status": "running", "session": session,
+                    "cmux_workspace_uuid": workspace, "cmux_surface_uuid": surface,
+                    "initial_turn_state": "idle", "execution_result": "turn_idle",
+                    "delivery_readiness": "held",
+                    "delivery_hold_codes": ["native_composer_state_not_exposed"], "identity": identity}
+        raise opencode_dispatch.OpenCodeDispatchError("native_binding_timeout")
+    except BaseException as exc:
+        if surface_opened:
+            try:
+                signal_private(abort_file, {"launch_id": launch_id, "reason": "native_binding_unconfirmed"})
+            except PreferenceError:
+                pass
+        code = exc.code if isinstance(exc, opencode_dispatch.OpenCodeDispatchError) else "dispatch_uncertain"
+        launch.update(status="uncertain" if creation_attempted else "failed", error_code=code,
+                      uncertain_since=now() if creation_attempted else None)
+        update_opencode_launch(app, launch)
+        if not surface_opened:
+            try:
+                prompt_file.unlink()
+            except OSError:
+                pass
+        raise PreferenceError(f"OpenCode launch {launch_id} {launch['status']}: {code}. Inspect its exact session and CMUX surface before retrying.") from None
 
 
 def execute(args):
@@ -612,8 +895,11 @@ def execute(args):
                 config["active"] = args.profile
             elif command == "model-set":
                 require(args.family and not any(c.isspace() for c in args.family), "Model family must be a nonempty token.")
+                require((args.harness == "opencode") == bool(args.provider_id),
+                        "Pass --provider-id for OpenCode models only.")
                 config["models"][args.family] = {"harness": args.harness, "slug": args.slug,
-                                                  "efforts": args.efforts, "source": args.source}
+                                                  "efforts": args.efforts, "source": args.source,
+                                                  **({"provider_id": args.provider_id} if args.harness == "opencode" else {})}
             elif command == "profile-put":
                 config["profiles"][args.name] = read(args.file)
             else:
@@ -747,43 +1033,52 @@ def execute(args):
             choice = resolve(selection(config), args.role, args.slot)
             require(args.role != "orchestrator", "Use handoff-start for successor orchestrators.")
             cwd = Path(args.cwd).resolve(); require(cwd.is_dir(), "Task directory is missing.")
-            prompt = Path(args.task_file).read_text()
-            require(0 < len(prompt.encode()) <= 16384, "Task brief must be 1 to 16384 bytes.")
+            task_bytes = Path(args.task_file).read_bytes()
+            try:
+                prompt = task_bytes.decode("utf-8")
+            except UnicodeError as exc:
+                raise PreferenceError("Task brief must be UTF-8.") from exc
+            require(0 < len(task_bytes) <= 16384 and prompt.strip(), "Task brief must be 1 to 16384 bytes of nonempty UTF-8.")
             validate_review(app, config, args, choice, cwd)
-            require(bool(args.context_injector) == bool(args.owner_worktree), "Pattern Buffer needs both its script and --owner-worktree.")
-            if args.context_injector:
-                require(args.role == "implementer" and choice["harness"] in ("claude", "codex"),
-                        f"Pattern Buffer automatic task replay is unavailable for role {args.role} on harness {choice['harness']}. "
-                        "It supports Claude/Codex implementers only. Use plain Model Preferences dispatch without "
-                        "--context-injector, --owner-worktree or --receipt-file, putting required context in --task-file "
-                        "and retaining applicable review/permission flags. "
-                        "Guide: apps/model-preferences/README.md#pattern-buffer-support")
-            prompt = DELEGATION + " Use the current researcher role for authorized research. Verify its findings.\n\n" + prompt
-            argv = argv_for(choice, prompt, cwd)
-            launch_id = uuid.uuid4().hex
-            adapter = None
-            if args.context_injector:
-                receipt = (Path(args.receipt_file).expanduser().absolute() if args.receipt_file else
-                           app.state_dir.resolve() / "ci-receipts" / f"{launch_id}.json")
-                adapter = {"script": str(Path(args.context_injector).resolve()),
-                           "owner_worktree": str(Path(args.owner_worktree).resolve()), "receipt": str(receipt)}
-                # The owning app supplies stdin. Do not change its approved brief.
-                argv = argv_for(choice, "-", cwd)
-                if choice["harness"] == "claude":
-                    argv = argv[:-1]
-                argv = [sys.executable, str(Path(args.context_injector).resolve()), "--cwd", str(cwd), "dispatch",
-                        "--owner-worktree", str(Path(args.owner_worktree).resolve()), "--harness", choice["harness"],
-                        "--task-file", str(Path(args.task_file).resolve()),
-                        "--receipt-file", str(receipt),
-                        "--", *argv]
-            launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
-                      "context_injector": adapter, "slot": args.slot,
-                      "task_digest": hashlib.sha256(Path(args.task_file).read_bytes()).hexdigest(), "status": "starting"}
-            app.save_state(f"launches/{launch['id']}", launch)
+            if choice["harness"] == "opencode":
+                opencode_task = task_bytes
+            else:
+                require(bool(args.context_injector) == bool(args.owner_worktree), "Pattern Buffer needs both its script and --owner-worktree.")
+                if args.context_injector:
+                    require(args.role == "implementer" and choice["harness"] in ("claude", "codex"),
+                            f"Pattern Buffer automatic task replay is unavailable for role {args.role} on harness {choice['harness']}. "
+                            "It supports Claude/Codex implementers only. Use plain Model Preferences dispatch without "
+                            "--context-injector, --owner-worktree or --receipt-file, putting required context in --task-file "
+                            "and retaining applicable review/permission flags. "
+                            "Guide: apps/model-preferences/README.md#pattern-buffer-support")
+                prompt = DELEGATION + " Use the current researcher role for authorized research. Verify its findings.\n\n" + prompt
+                argv = argv_for(choice, prompt, cwd)
+                launch_id = uuid.uuid4().hex
+                adapter = None
+                if args.context_injector:
+                    receipt = (Path(args.receipt_file).expanduser().absolute() if args.receipt_file else
+                               app.state_dir.resolve() / "ci-receipts" / f"{launch_id}.json")
+                    adapter = {"script": str(Path(args.context_injector).resolve()),
+                               "owner_worktree": str(Path(args.owner_worktree).resolve()), "receipt": str(receipt)}
+                    argv = argv_for(choice, "-", cwd)
+                    if choice["harness"] == "claude":
+                        argv = argv[:-1]
+                    argv = [sys.executable, str(Path(args.context_injector).resolve()), "--cwd", str(cwd), "dispatch",
+                            "--owner-worktree", str(Path(args.owner_worktree).resolve()), "--harness", choice["harness"],
+                            "--task-file", str(Path(args.task_file).resolve()),
+                            "--receipt-file", str(receipt), "--", *argv]
+                launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
+                          "context_injector": adapter, "slot": args.slot,
+                          "task_digest": hashlib.sha256(task_bytes).hexdigest(), "status": "starting"}
+                if choice["profile"] in ("Codex-Qwen", "Qwen-only") and choice["role"].endswith("_review"):
+                    launch["review_authorization_sha256"] = hashlib.sha256(args.review_authorization.encode()).hexdigest()
+                app.save_state(f"launches/{launch['id']}", launch)
         elif command.startswith("handoff-"):
             return handoff(app, config, args)
         else:
             raise PreferenceError("Unsupported command.")
+    if command == "dispatch" and choice["harness"] == "opencode":
+        return dispatch_opencode(app, args, config, choice, cwd, opencode_task)
     if command in ("activate", "model-set", "profile-put", "authority-set", "notify"):
         notice = app.notify(after, args.orchestrators, retry=command == "notify")
         return {"changed": command != "notify", "active": after, "notification": notice}
@@ -809,6 +1104,10 @@ def execute(args):
 def validate_review(app, config, args, choice, cwd):
     if not choice["role"].endswith("_review"):
         return
+    if choice["profile"] in ("Codex-Qwen", "Qwen-only"):
+        authorization = getattr(args, "review_authorization", None)
+        require(isinstance(authorization, str) and authorization.strip(),
+                "Every review launch in a Qwen profile requires a fresh --review-authorization on this command, including standard review.")
     require(args.review_plan, "Review dispatch requires a review-plan, including standard review.")
     plan = app.state(f"reviews/{safe_id(args.review_plan)}", None)
     require(plan, "Unknown review plan.")
@@ -949,6 +1248,8 @@ def resume_launch(app, args):
             attempt = {"id": uuid.uuid4().hex, "launch": launch_id, "session": session, "choice": choice,
                        "task_digest": hashlib.sha256(brief).hexdigest(), "created_at": now(), "status": "starting",
                        "previous": previous.get("id") if previous else None}
+            if choice["profile"] in ("Codex-Qwen", "Qwen-only") and choice["role"].endswith("_review"):
+                attempt["review_authorization_sha256"] = hashlib.sha256(args.review_authorization.encode()).hexdigest()
             app.save_state(f"continuations/{session}", attempt)
             app.save_state(f"attempts/{attempt['id']}", attempt)
         try:

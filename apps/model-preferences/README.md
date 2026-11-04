@@ -91,3 +91,39 @@ The application stores profile configuration under the XDG config directory and 
 Use the CLI's --config-dir and --state-dir options to select isolated paths for a separate installation.
 Existing schema-v1 configurations without an approval label remain readable with authority unconfigured and are not rewritten on read.
 Approval and handoff-close actions fail closed until the operator uses authority-set.
+
+## OpenCode local Qwen dispatch
+
+The opt-in examples include `local-qwen3.6-35b`, `Codex-Qwen` and `Qwen-only`, and initialization never activates them.
+`Codex-Qwen` selects Codex Sol medium as orchestrator, local Qwen at max effort for implementation and research, and Codex Sol high for reviews.
+`Qwen-only` selects local Qwen at max effort for orchestration, implementation and research, and Codex Sol high for reviews.
+Every review launch in either reserved profile requires a fresh `--review-authorization` value on that command, including standard review, and the state record keeps only its SHA-256 digest.
+Advanced reviews also require the existing exact-scope plan and explicit configured-authority approval.
+
+The OpenCode family binds an exact provider ID and model slug instead of asking OpenCode to resolve a model name.
+For a new configuration, record the observed local provider and model explicitly.
+
+    model-preferences model-set local-qwen3.6-35b --harness opencode --provider-id trial-local --slug qwen3.6:35b --efforts max --source "verified OpenCode 2.2.5 local provider"
+
+OpenCode dispatch requires a pre-existing OpenCode 2.2.5 API server with Basic authentication on a loopback IP address and the exact local provider/model enabled.
+The separate JSON connection manifest and password file must be regular files owned by the current user with mode `0600`, and neither may be a symlink.
+The manifest contains `api_url`, `expected_server_pid`, `password_file` and an explicit `parent_task_id`; optional `metadata` can pin `provider_id` and `model_id`.
+The password stays in its private file and is not copied into the manifest, process arguments, launch records or receipts.
+The API PID and loopback origin bind the connection for this preflight, but OpenCode 2.2.5 exposes no stable server-startup identity, so PID reuse remains a limitation.
+
+Launch an implementer or researcher task from the exact Git worktree root while running inside the intended CMUX pane.
+
+    model-preferences --config-dir /private/config --state-dir /private/state dispatch --role implementer --cwd /absolute/path/to/worktree --task-file /absolute/path/to/task.md --opencode-manifest /private/opencode-connection.json
+
+The helper checks the authenticated API version, server PID, exact provider and model, local provider URL, tools, the named `max` reasoning variant and a distinct output budget of at least 32768 tokens before creating a session.
+It creates the session through the API, records the returned native `ses_` ID, and verifies the session directory and selected model before opening an interactive TUI with its initial prompt.
+When Pattern Buffer dispatch is requested, its immutable task snapshot is prepared and bound to that exact native session before the initial prompt is released.
+The child TUI obtains its CMUX workspace and surface UUIDs from its own `cmux identify` result, and a private launch barrier requires those UUIDs to match the exact newly opened surface before the session-scoped CMUX environment is set and the initial prompt is released.
+The initial execution can be recorded as idle only after current native projection maps the exact session to that exact surface and API inspection reports no active turn, pending permissions or pending forms.
+Delivery readiness remains held because the inspected native interface does not expose a supported composer-draft guard.
+Wrong or ambiguous surfaces, timeouts and uncertain sends remain unresolved and block retry until inspected.
+Titles and working directories alone never establish a native session identity.
+
+Managed OpenCode continuation, wake, resume and successor-orchestrator handoff are not supported by this slice and remain held.
+OpenCode API inspection does not expose unsent composer contents or a stable process-start identifier, and those gaps prevent a safe managed continuation contract.
+The server and TUI must already be running in the intended environment, and this command never starts or configures a global OpenCode service.
