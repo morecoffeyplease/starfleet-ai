@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 
 SUPPORTED_OPENCODE_VERSION = "2.2.5"
-API_CONTRACT = "opencode-v2.2.5-session-inspection-1"
+API_CONTRACT = "opencode-v2.2.5-session-inspection-2"
 HTTP_TIMEOUT_SECONDS = 2.0
 MAX_HTTP_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 128 * 1024
@@ -390,6 +390,13 @@ class OpenCodeSessionAdapter:
             api_state = self._session_status(active_json, bound.session_id)
             if api_state == "running":
                 raise AdapterError("session_busy")
+
+            inbox_json = self._json_object(
+                self._get(f"/api/session/{quoted_id}/inbox"),
+                "inbox_state_unavailable",
+            )
+            if self._pending_list(inbox_json):
+                raise AdapterError("pending_inbox")
 
             permission_json = self._json_object(
                 self._get(f"/api/session/{quoted_id}/permission"),

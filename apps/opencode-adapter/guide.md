@@ -25,8 +25,8 @@ Only server version 2.2.5 is accepted by this first contract.
 
 The inspection reads GET /api/info and the exact GET /api/session/{sessionID} route.
 It compares the returned session ID and location directory with the caller's expected values.
-It then reads GET /api/session/active and the exact session's pending permission and form lists.
-An active `running` entry, archived session, pending permission, pending form, mismatched identity, unknown state, unsupported schema, authentication error, timeout, and oversized response all produce a hold.
+It then reads GET /api/session/active and the exact session's inbox, pending permission, and form lists.
+An active `running` entry, archived session, pending inbox item, pending permission, pending form, mismatched identity, unknown state, unsupported schema, authentication error, timeout, and oversized response all produce a hold.
 In v2.2.5, a session absent from the active map is inactive.
 The API call set contains only GET requests.
 The socket timeout applies to each blocking operation, not a total inspection deadline.

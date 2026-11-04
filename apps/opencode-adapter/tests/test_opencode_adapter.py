@@ -42,6 +42,7 @@ class FakeOpenCodeServer:
             "subpath": "",
         }
         self.active = {}
+        self.inbox = []
         self.permissions = []
         self.forms = []
         self.overrides = {}
@@ -94,6 +95,8 @@ class FakeOpenCodeServer:
                     value = {"data": owner.session}
                 elif self.path == "/api/session/active":
                     value = {"data": owner.active}
+                elif self.path == f"/api/session/{SESSION_ID}/inbox":
+                    value = {"data": owner.inbox}
                 elif self.path == f"/api/session/{SESSION_ID}/permission":
                     value = {"data": owner.permissions}
                 elif self.path == f"/api/session/{SESSION_ID}/form":
@@ -160,6 +163,7 @@ class OpenCodeAdapterTests(unittest.TestCase):
                 "/api/info",
                 f"/api/session/{SESSION_ID}",
                 "/api/session/active",
+                f"/api/session/{SESSION_ID}/inbox",
                 f"/api/session/{SESSION_ID}/permission",
                 f"/api/session/{SESSION_ID}/form",
                 "/api/info",
@@ -238,6 +242,25 @@ class OpenCodeAdapterTests(unittest.TestCase):
         self.server.forms = [{"id": "form_fixture"}]
         result = self.client.inspect(self.binding)
         self.assertEqual(result.hold_codes, ("pending_forms",))
+
+    def test_pending_inbox_holds_and_malformed_or_unavailable_inbox_fails_closed(self):
+        self.server.inbox = [{"id": "inbox_fixture", "type": "user"}]
+        result = self.client.inspect(self.binding)
+        self.assertEqual(result.hold_codes, ("pending_inbox",))
+
+        inbox_path = f"/api/session/{SESSION_ID}/inbox"
+        self.server.inbox = []
+        self.server.overrides[inbox_path] = (200, {"data": {"unexpected": "shape"}})
+        result = self.client.inspect(self.binding)
+        self.assertEqual(result.hold_codes, ("unsupported_api_schema",))
+
+        self.server.overrides[inbox_path] = (503, {})
+        result = self.client.inspect(self.binding)
+        self.assertEqual(result.hold_codes, ("inbox_state_unavailable",))
+
+        self.server.overrides[inbox_path] = (200, b"not-json")
+        result = self.client.inspect(self.binding)
+        self.assertEqual(result.hold_codes, ("invalid_json",))
 
     def test_archived_session_holds(self):
         self.server.session = {

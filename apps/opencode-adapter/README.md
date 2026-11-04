@@ -6,20 +6,20 @@ It is a narrow foundation for later Model Preferences, Pattern Buffer, and Haili
 ## Supported contract
 
 The first contract accepts only an API server that reports version 2.2.5.
-Its adapter contract identifier is opencode-v2.2.5-session-inspection-1.
-It reads the official v2 routes for server info, an exact session, active session state, pending permissions, and pending forms.
+Its adapter contract identifier is opencode-v2.2.5-session-inspection-2.
+It reads the official v2 routes for server info, an exact session, active session state, the exact session inbox, pending permissions, and pending forms.
 The OpenCode [v2.2.5 tagged protocol source](https://github.com/anomalyco/opencode/tree/v2.2.5/packages/protocol/src/groups) defines the inspected routes and response fields.
 The OpenCode [v2.2.5 session schema](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/schema/src/session.ts) and [location schema](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/schema/src/location.ts) define the session identity projection.
 The OpenCode [v2 server guide](https://opencode.ai/v2/docs/server) describes the HTTP server and its API.
 The OpenCode [v2 web guide](https://opencode.ai/v2/docs/cli/web) documents Basic authentication and the fixed v2 username opencode.
 
-The inspected routes are GET /api/info, GET /api/session/{sessionID}, GET /api/session/active, GET /api/session/{sessionID}/permission, and GET /api/session/{sessionID}/form.
+The inspected routes are GET /api/info, GET /api/session/{sessionID}, GET /api/session/active, GET /api/session/{sessionID}/inbox, GET /api/session/{sessionID}/permission, and GET /api/session/{sessionID}/form.
 The client sends Basic authentication on every authenticated request and rejects endpoints that do not first challenge unauthenticated access.
 It accepts only an explicit HTTP URL with a numeric loopback IP address and port.
 It rejects hostnames, non-loopback addresses, HTTPS URLs, redirects, and URL-embedded credentials.
 It ignores environment proxy settings so authenticated requests go directly to the loopback address.
 The per-operation socket timeout is capped at five seconds and successful response bodies are limited to 128 KiB.
-The server version, usable process PID, session ID, session location, active state, permission list, and form list are validated before a clear inspection is returned.
+The server version, usable process PID, session ID, session location, active state, inbox list, permission list, and form list are validated before a clear inspection is returned.
 Any mismatch, missing required value, unsupported version, unknown state, HTTP error, or malformed schema produces a hold.
 
 This adapter does not send messages, change session state, answer questions, approve permissions, start services, or write configuration.
@@ -43,9 +43,9 @@ The parent task ID is caller-supplied and is not verified by OpenCode.
 
 ## State result
 
-The result disposition is clear only when the exact session is returned from the expected authenticated API process, the session is not archived, it is absent from the active-session map, and both pending lists are empty.
+The result disposition is clear only when the exact session is returned from the expected authenticated API process, the session is not archived, it is absent from the active-session map, and the inbox, permission, and form lists are empty.
 In v2.2.5 the active-session map contains `{ "type": "running" }` entries, and any such entry returns hold.
-An unknown active-state shape, pending permission request, pending form, archived session, or unsupported response returns hold.
+An unknown active-state shape, pending inbox item, pending permission request, pending form, archived session, or unsupported response returns hold.
 OpenCode documents sessions absent from the active-session response as inactive, which this adapter reports as `inactive`.
 The inspected API does not expose native composer drafts, so clear means only that these API-visible checks passed.
 The inspected routes are separate reads and do not provide an atomic state snapshot, so session state can change between or immediately after requests.
@@ -74,4 +74,4 @@ Run the bounded fake-server tests from the repository root:
     python3 -m unittest discover -s apps/opencode-adapter/tests -p 'test_*.py' -v
 
 The tests use only a local synthetic HTTP server and temporary directories.
-They cover exact session and directory matching, PID mismatch, running and unknown-state holds, pending permission and form holds, version and schema refusal, Basic authentication, timeout and response bounds, non-loopback refusal, and absence of non-GET requests.
+They cover exact session and directory matching, PID mismatch, running and unknown-state holds, pending inbox, permission, and form holds, malformed or unavailable inbox responses, version and schema refusal, Basic authentication, timeout and response bounds, non-loopback refusal, and absence of non-GET requests.

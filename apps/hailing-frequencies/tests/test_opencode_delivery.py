@@ -25,6 +25,7 @@ class FakeOpenCodeServer:
     def __init__(self, directory):
         self.directory = str(directory)
         self.active = {}
+        self.inbox = []
         self.permissions = []
         self.forms = []
         self.post_status = 200
@@ -72,6 +73,8 @@ class FakeOpenCodeServer:
                                        "paths": {"tmp": "/tmp/opencode-fixture"}})
                 elif self.path == "/api/session/active":
                     self.respond(200, {"data": owner.active})
+                elif self.path == f"/api/session/{SESSION}/inbox":
+                    self.respond(200, {"data": owner.inbox})
                 elif self.path == f"/api/session/{SESSION}":
                     self.respond(200, {"data": {"id": SESSION,
                         "location": {"directory": owner.directory}, "time": {"archived": None}}})
@@ -265,6 +268,16 @@ class OpenCodeDeliveryTests(unittest.TestCase):
         with self.assertRaises(hf.DeliveryHoldError):
             self.submit()
         self.assertEqual(self.server.posts, [])
+
+    def test_pending_api_inbox_is_durable_hold_without_send_or_attempt(self):
+        self.server.inbox = [{"id": "inbox-fixture", "type": "user"}]
+
+        result = self.attention_once(key="pending-opencode-inbox")
+
+        self.assertEqual((result["outcome"], result["attempted"]), ("held", False))
+        self.assertEqual(self.server.posts, [])
+        row = self.app.prior_attention_intent(self.target, "pending-opencode-inbox")
+        self.assertEqual(row[1:3], ("held", 0))
 
     def test_wrong_visible_surface_or_worktree_holds(self):
         self.hook_record["surfaceId"] = "CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC"
