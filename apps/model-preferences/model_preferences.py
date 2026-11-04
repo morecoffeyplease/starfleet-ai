@@ -952,6 +952,7 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
               "context_injector": adapter, "slot": args.slot, "task_digest": task_digest,
               "status": "session_create_pending", "api_contract": evidence.api_contract,
               "api_origin": evidence.api_origin, "expected_server_pid": evidence.server_pid,
+              "delivery_policy": connection.delivery_policy,
               "parent_task_id": connection.parent_task_id, "caller_workspace_uuid": destination["workspace_uuid"],
               "caller_surface_uuid": destination["surface_uuid"], "session_directory": str(cwd),
               "worktree_directory": str(cwd), "task_id": adapter["task_id"] if adapter else connection.parent_task_id,
@@ -1144,9 +1145,9 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
             except opencode_dispatch.OpenCodeDispatchError:
                 hold_codes.append("native_hook_generation_unavailable")
             try:
-                opencode_dispatch.require_native_empty_composer(run_cmux_rpc,
-                                                               expected_workspace=workspace,
-                                                               expected_surface=surface)
+                opencode_dispatch.require_native_delivery_binding(
+                    run_cmux_rpc, expected_workspace=workspace, expected_surface=surface,
+                    allow_composer_state=connection.delivery_policy == "api_sidechannel")
             except (opencode_dispatch.OpenCodeDispatchError, PreferenceError):
                 hold_codes.append("native_composer_state_not_proven_empty")
             execution_result = "turn_idle" if turn["state"] == "complete" else "turn_failed"
@@ -1572,7 +1573,8 @@ def resume_opencode_launch(app, args, brief):
                     "Current profile choice conflicts with this OpenCode session; nothing sent.")
             require(connection.parent_task_id == launch.get("parent_task_id")
                     and connection.api_origin == launch.get("api_origin")
-                    and connection.expected_server_pid == launch.get("expected_server_pid"),
+                    and connection.expected_server_pid == launch.get("expected_server_pid")
+                    and connection.delivery_policy == launch.get("delivery_policy", "native_empty_composer"),
                     "OpenCode manifest no longer matches the exact server and task binding.")
             text = brief.decode("utf-8")
             require(text.strip(), "Continuation task must be nonempty UTF-8.")
@@ -1619,9 +1621,10 @@ def resume_opencode_launch(app, args, brief):
                 expected_started_at=launch["native_started_at"])
             require(hook["agent_lifecycle"] == "idle",
                     "Exact OpenCode hook lifecycle is not idle; nothing sent.")
-            opencode_dispatch.require_native_empty_composer(run_cmux_rpc,
-                                                           expected_workspace=launch["cmux_workspace_uuid"],
-                                                           expected_surface=launch["cmux_surface_uuid"])
+            opencode_dispatch.require_native_delivery_binding(
+                run_cmux_rpc, expected_workspace=launch["cmux_workspace_uuid"],
+                expected_surface=launch["cmux_surface_uuid"],
+                allow_composer_state=connection.delivery_policy == "api_sidechannel")
             adapter = launch.get("context_injector")
             if choice["role"] == "orchestrator":
                 require(isinstance(adapter, dict) and adapter.get("role") == "orchestrator",

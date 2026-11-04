@@ -23,6 +23,7 @@ The server version, usable process PID, session ID, session location, active sta
 Any mismatch, missing required value, unsupported version, unknown state, HTTP error, or malformed schema produces a hold.
 
 This adapter does not send messages, change session state, answer questions, approve permissions, start services, or write configuration.
+It also exposes a pure delivery-policy validator for OpenCode-bound components, but that helper does not inspect composer state or change the API inspection result.
 It has no installer, persistent configuration, or user-facing session command.
 The printable instructions are in [guide.md](guide.md).
 

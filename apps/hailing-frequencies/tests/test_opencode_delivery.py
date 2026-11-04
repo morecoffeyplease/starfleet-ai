@@ -28,6 +28,7 @@ class FakeOpenCodeServer:
         self.inbox = []
         self.permissions = []
         self.forms = []
+        self.overrides = {}
         self.post_status = 200
         self.post_delay = 0
         self.post_response = {"data": {"id": "msg_HailingFixture1", "sessionID": SESSION,
@@ -68,6 +69,10 @@ class FakeOpenCodeServer:
                 if not self.authorized():
                     self.respond(401, {})
                     return
+                if self.path in owner.overrides:
+                    status, value = owner.overrides[self.path]
+                    self.respond(status, value)
+                    return
                 if self.path == "/api/info":
                     self.respond(200, {"version": "2.2.5", "pid": os.getpid(), "urls": [],
                                        "paths": {"tmp": "/tmp/opencode-fixture"}})
@@ -93,7 +98,11 @@ class FakeOpenCodeServer:
                 except (UnicodeError, ValueError):
                     self.respond(400, {})
                     return
-                if not isinstance(request, dict) or set(request) != {"text"} or not isinstance(request["text"], str):
+                valid_text = isinstance(request, dict) and isinstance(request.get("text"), str)
+                strict_shape = isinstance(request, dict) and set(request) == {"text"}
+                queue_shape = (isinstance(request, dict) and set(request) == {"text", "delivery", "resume"}
+                               and request.get("delivery") == "queue" and request.get("resume") is True)
+                if not valid_text or not (strict_shape or queue_shape):
                     self.respond(400, {})
                     return
                 if owner.post_delay:
@@ -179,6 +188,31 @@ class OpenCodeDeliveryTests(unittest.TestCase):
         with patch.dict("os.environ", self.env, clear=False):
             return self.app.attention_once(SESSION, key, body, SURFACE)
 
+    def opencode_manifest(self, delivery_policy=None):
+        manifest = {
+            "api_url": self.target["api_url"], "password_file": self.target["password_file"],
+            "session_id": self.target["session"], "expected_server_pid": self.target["expected_server_pid"],
+            "session_directory": self.target["session_directory"],
+            "worktree_directory": self.target["worktree_directory"],
+            "cmux_workspace_uuid": self.target["workspace"], "cmux_surface_uuid": self.target["surface"],
+            "parent_task_id": self.target["parent_task_id"],
+        }
+        if delivery_policy is not None:
+            manifest["delivery_policy"] = delivery_policy
+        path = self.root / "opencode-binding.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def enroll_api_sidechannel(self):
+        config = self.app.config()
+        config["targets"] = []
+        hf.atomic_json(self.state / "config.json", config)
+        with patch.dict("os.environ", self.env, clear=False):
+            result = self.app.enroll_opencode(self.opencode_manifest("api_sidechannel"), "api-sidechannel")
+        self.target = result["enrolled"]
+        return self.target
+
     def test_manifest_self_enrollment_binds_session_server_directories_and_surface(self):
         manifest = {
             "api_url": self.target["api_url"], "password_file": self.target["password_file"],
@@ -202,8 +236,27 @@ class OpenCodeDeliveryTests(unittest.TestCase):
         self.assertEqual(enrolled["session_directory"], str(self.worktree))
         self.assertEqual(enrolled["worktree_directory"], str(self.worktree))
         self.assertEqual(enrolled["surface"], SURFACE)
+        self.assertEqual(enrolled["delivery_policy"], "native_empty_composer")
         self.assertNotIn(PASSWORD, json.dumps(result))
         self.assertEqual(self.app.config()["targets"][0]["session"], SESSION)
+
+    def test_manifest_policy_is_explicit_validated_and_existing_policy_cannot_change(self):
+        invalid = self.opencode_manifest("future-policy")
+        with self.assertRaisesRegex(ValueError, "delivery policy"):
+            hf.load_opencode_manifest(invalid)
+
+        config = self.app.config()
+        config["targets"] = []
+        hf.atomic_json(self.state / "config.json", config)
+        with patch.dict("os.environ", self.env, clear=False):
+            strict = self.app.enroll_opencode(self.opencode_manifest(), "strict")
+        before = self.app.config()["targets"]
+        self.assertEqual(strict["enrolled"]["delivery_policy"], "native_empty_composer")
+
+        with patch.dict("os.environ", self.env, clear=False):
+            with self.assertRaisesRegex(ValueError, "unenroll explicitly"):
+                self.app.enroll_opencode(self.opencode_manifest("api_sidechannel"), "strict")
+        self.assertEqual(self.app.config()["targets"], before)
 
     def test_manifest_self_enrollment_requires_exact_caller_session(self):
         manifest = {
@@ -268,6 +321,126 @@ class OpenCodeDeliveryTests(unittest.TestCase):
         with self.assertRaises(hf.DeliveryHoldError):
             self.submit()
         self.assertEqual(self.server.posts, [])
+
+    def test_api_sidechannel_queues_while_composer_state_is_unknown_or_draft(self):
+        self.enroll_api_sidechannel()
+        self.server.post_response["data"]["delivery"] = {"mode": "queue"}
+
+        cases = (("unknown", "idle"), ("draft", "idle"))
+        for index, (state, lifecycle) in enumerate(cases):
+            with self.subTest(state=state, lifecycle=lifecycle):
+                self.guard["state"] = state
+                self.guard["lifecycle"] = lifecycle
+                result = self.attention_once(key=f"api-policy-{index}")
+                self.assertEqual((result["outcome"], result["attempted"]), ("submitted", True))
+
+        self.assertEqual(len(self.server.posts), 2)
+        for path, _authorization, body in self.server.posts:
+            self.assertEqual(path, f"/api/session/{SESSION}/prompt")
+            self.assertEqual(json.loads(body.decode("utf-8")), {
+                "text": "Synthetic attention prompt", "delivery": "queue", "resume": True})
+
+    def test_api_sidechannel_queue_mismatch_and_timeout_are_uncertain_without_replay(self):
+        self.enroll_api_sidechannel()
+        self.guard["state"] = "unknown"
+        self.server.post_response["data"]["delivery"] = {"mode": "direct"}
+
+        mismatch = self.attention_once(key="api-queue-mismatch")
+        self.assertEqual((mismatch["outcome"], mismatch["attempted"]), ("uncertain", True))
+        mismatch_row = self.app.prior_attention_intent(self.target, "api-queue-mismatch")
+        self.assertEqual(mismatch_row[1:3], ("uncertain", 1))
+        self.assertEqual(self.attention_once(key="api-queue-mismatch"), mismatch)
+        self.assertEqual(len(self.server.posts), 1)
+
+        self.server.post_response["data"]["delivery"] = {"mode": "queue"}
+        self.server.post_delay = 0.2
+        with patch.object(hf, "OPENCODE_HTTP_TIMEOUT", 0.05):
+            timeout = self.attention_once(key="api-queue-timeout")
+            self.assertEqual((timeout["outcome"], timeout["attempted"]), ("uncertain", True))
+            self.assertEqual(self.attention_once(key="api-queue-timeout"), timeout)
+        self.assertEqual(len(self.server.posts), 2)
+
+    def test_api_sidechannel_keeps_api_receiving_and_human_input_holds(self):
+        self.enroll_api_sidechannel()
+        cases = (
+            ("active", {SESSION: {"type": "running"}}),
+            ("inbox", [{"id": "queued-fixture"}]),
+            ("permissions", [{"id": "permission-fixture"}]),
+            ("forms", [{"id": "form-fixture"}]),
+            ("inbox-malformed", {"data": {"unexpected": "shape"}}),
+            ("inbox-unavailable", (503, {})),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                if field == "active":
+                    self.server.active = value
+                elif field.startswith("inbox-"):
+                    status, body = (200, value) if field == "inbox-malformed" else value
+                    self.server.overrides[f"/api/session/{SESSION}/inbox"] = (status, body)
+                else:
+                    setattr(self.server, field, value)
+                key = f"api-policy-{field}"
+                result = self.attention_once(key=key)
+                self.assertEqual((result["outcome"], result["attempted"]), ("held", False))
+                row = self.app.prior_attention_intent(self.target, key)
+                self.assertEqual(row[1:3], ("held", 0))
+                self.server.active = {}
+                self.server.inbox = []
+                self.server.permissions = []
+                self.server.forms = []
+                self.server.overrides.clear()
+
+        guard_cases = (
+            {"waiting_on_human": True}, {"blocks_typing": True}, {"agent": False},
+            {"terminal": False}, {"lifecycle": "needsInput"}, {"lifecycle": "unknown"},
+            {"state": "future-state"},
+        )
+        for index, changes in enumerate(guard_cases):
+            with self.subTest(guard=changes):
+                self.guard.update(changes)
+                key = f"api-policy-guard-{index}"
+                result = self.attention_once(key=key)
+                self.assertEqual((result["outcome"], result["attempted"]), ("held", False))
+                self.guard = {"surface_id": SURFACE, "workspace_id": WORKSPACE, "state": "unknown",
+                              "agent": True, "terminal": True, "blocks_typing": False,
+                              "waiting_on_human": False, "lifecycle": "idle"}
+        for index, field in enumerate(("surface_id", "workspace_id", "state", "blocks_typing",
+                                       "waiting_on_human", "lifecycle", "agent", "terminal")):
+            with self.subTest(missing=field):
+                self.guard.pop(field)
+                key = f"api-policy-missing-guard-{index}"
+                result = self.attention_once(key=key)
+                self.assertEqual((result["outcome"], result["attempted"]), ("held", False))
+                self.guard = {"surface_id": SURFACE, "workspace_id": WORKSPACE, "state": "unknown",
+                              "agent": True, "terminal": True, "blocks_typing": False,
+                              "waiting_on_human": False, "lifecycle": "idle"}
+        for key, value in (("messages_enabled", False), ("receiving", False),
+                           ("workspace_receiving", False)):
+            self.settings[key] = value
+            result = self.attention_once(key=f"api-policy-{key}-off")
+            self.assertEqual((result["outcome"], result["attempted"]), ("held", False))
+            self.settings[key] = True
+        self.assertEqual(self.server.posts, [])
+
+    def test_api_sidechannel_still_requires_exact_native_binding_and_generation(self):
+        self.enroll_api_sidechannel()
+        original_current = copy.deepcopy(self.current)
+        original_hook = copy.deepcopy(self.hook_record)
+        cases = (
+            ("projection", lambda: self.current["items"][0]["projections"][0].update(
+                panel_id="CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC")),
+            ("generation", lambda: self.hook_record.update(startedAt=STARTED_AT + 1)),
+            ("worktree", lambda: self.hook_record.update(cwd=str(self.root))),
+        )
+        for name, change in cases:
+            with self.subTest(binding=name):
+                self.current = copy.deepcopy(original_current)
+                self.hook_record = copy.deepcopy(original_hook)
+                change()
+                self._write_hook()
+                result = self.attention_once(key=f"api-policy-binding-{name}")
+                self.assertEqual((result["outcome"], result["attempted"]), ("held", False))
+                self.assertEqual(self.server.posts, [])
 
     def test_pending_api_inbox_is_durable_hold_without_send_or_attempt(self):
         self.server.inbox = [{"id": "inbox-fixture", "type": "user"}]

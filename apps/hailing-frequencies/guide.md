@@ -49,6 +49,8 @@ Enrollment confirms saved configuration only; it does not prove a reminder reach
 
 OpenCode uses `hailing-frequencies opencode-enroll` with a private binding manifest supplied by the Model Preferences worker.
 The manifest fields are `session_id`, `expected_server_pid`, `session_directory`, `worktree_directory`, `cmux_workspace_uuid`, `cmux_surface_uuid`, and `parent_task_id`, plus `api_url` and `password_file`.
+Optional `delivery_policy` accepts `native_empty_composer` or `api_sidechannel`; omission selects `native_empty_composer`.
+The policy is stored with the enrolled target, and changing it requires explicit unenrollment and reenrollment.
 The manifest and password file must be absolute regular files owned by you with mode `0600` or stricter and no symlink.
 The password file contains the OpenCode loopback API password, and the password itself never belongs in the manifest, command arguments, or logs.
 Before the initial task, the managed OpenCode launcher must seed `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, `CMUX_SURFACE_ID`, and `CMUX_WORKSPACE_ID` through the supported per-session API environment after CMUX placement.
@@ -59,11 +61,14 @@ Run self-enrollment as a command launched by the exact OpenCode TUI on its ownin
 hailing-frequencies opencode-enroll --manifest /absolute/private/opencode-binding.json --label YOUR_LABEL
 ```
 
-Enrollment requires the exact current OpenCode hook record, matching CMUX surface and workspace, matching API session and server PID, matching worktree, enabled native messaging, and an explicitly empty native composer.
+Enrollment requires the exact current OpenCode hook record, matching CMUX surface and workspace, matching API session and server PID, matching worktree, and enabled native messaging.
+The default policy requires an explicitly empty composer.
+The experimental `api_sidechannel` policy permits only `empty`, `draft`, or `unknown` composer classifications and sends an explicit queue request with resume enabled.
+Both policies still require exact agent and terminal identity, an active native lifecycle, exact current and hook owner, no blocking input, no human-input obligation, active native receiving, an inactive API session, and empty API inbox, permission, and form lists.
 Passive API sessions without a current visible-TUI hook record, a session observed on another surface, or any mismatch remain held.
-In the current native pilot, CMUX reports OpenCode `surface.input_state` as `unknown`, so enrollment and API prompt submission remain held.
-OpenCode's supported TUI plugin API does not expose composer draft contents, and an API `clear` result is not proof that the native composer is empty.
-Keep the hold until CMUX can return an exact empty native input state; do not synthesize an empty attestation or force a send.
+The default policy holds when CMUX reports OpenCode `surface.input_state` as `unknown`.
+The API does not expose composer drafts, and `api_sidechannel` is an explicit experimental choice to queue work without claiming that the composer is empty.
+The opt-in never bypasses missing or mismatched identities, dialogs, disabled receiving, active API work, or pending inbox, permission, or form state.
 
 ## Checkpoint attention
 
@@ -78,7 +83,8 @@ The hook does not retry the event; do not erase receipts or use a new key to for
 ## Preserve holds and permissions
 
 Current binding, human-input, and native messaging guards must pass for delivery.
-Drafts, approvals, unknown input state, missing identities, disabled messaging, and busy state are reasons to stop and report.
+Approvals, missing identities, disabled messaging, active API work, pending inbox, pending permission or form state, and unknown guard obligations are reasons to stop and report under either delivery policy.
+The default policy also holds draft and unknown composer classifications.
 Do not clear a hold, force terminal input, change CMUX socket policy, widen permissions, or install hooks to bypass a refusal.
 If the sandbox or another permission boundary denies an operation, preserve state and report the exact error to the operator or an explicitly authorized coordinator.
 Do not widen permissions or impersonate another session to get past a denial.

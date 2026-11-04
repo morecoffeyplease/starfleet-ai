@@ -18,6 +18,8 @@ from dataclasses import dataclass
 
 SUPPORTED_OPENCODE_VERSION = "2.2.5"
 API_CONTRACT = "opencode-v2.2.5-session-inspection-2"
+DEFAULT_DELIVERY_POLICY = "native_empty_composer"
+API_SIDECHANNEL_DELIVERY_POLICY = "api_sidechannel"
 HTTP_TIMEOUT_SECONDS = 2.0
 MAX_HTTP_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 128 * 1024
@@ -31,6 +33,13 @@ class AdapterError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+def validate_delivery_policy(value: object) -> str:
+    """Validate the explicit, bounded OpenCode delivery policy vocabulary."""
+    if type(value) is not str or value not in (DEFAULT_DELIVERY_POLICY, API_SIDECHANNEL_DELIVERY_POLICY):
+        raise AdapterError("invalid_delivery_policy")
+    return value
 
 
 @dataclass(frozen=True)

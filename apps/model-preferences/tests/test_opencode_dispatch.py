@@ -80,8 +80,10 @@ class FakeAPIState:
         self.pending_startup_prompt = None
         self.sent_prompts = []
         self.active_sessions = {}
+        self.pending_inbox = []
         self.pending_permissions = []
         self.pending_forms = []
+        self.prompt_delivery_mode = "queue"
         self.delay_info = False
         self.delay_create = False
         self.large_info = False
@@ -165,6 +167,8 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
             return self.respond(200, {"data": self.state.active_sessions})
         if self.path == f"/api/session/{SESSION}":
             return self.respond(200, {"data": self.state.session()})
+        if self.path == f"/api/session/{SESSION}/inbox":
+            return self.respond(200, {"data": self.state.pending_inbox})
         if self.path == f"/api/session/{SESSION}/permission":
             return self.respond(200, {"data": self.state.pending_permissions})
         if self.path == f"/api/session/{SESSION}/form":
@@ -212,7 +216,10 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
             self.state.sent_prompts.append(payload)
             return self.respond(200, {"data": {"id": f"msg_user{len(self.state.sent_prompts)}",
                                                 "sessionID": SESSION, "type": "user", "time": {},
-                                                "payload": {}, "delivery": {}}})
+                                                "payload": {},
+                                                "delivery": {"mode": (self.state.prompt_delivery_mode
+                                                                          if payload.get("delivery") == "queue"
+                                                                          else "steer")}}})
         return self.respond(404)
 
     def do_PUT(self):
@@ -432,11 +439,17 @@ class OpenCodeDispatchTest(unittest.TestCase):
             mp.dispatch_opencode(app, args, config, choice, worktree, task_file.read_bytes())
         create_session.assert_not_called()
 
-    def continuation_fixture(self, *, native_state="idle", guard_state="empty", wrong_surface=False):
+    def continuation_fixture(self, *, native_state="idle", guard_state="empty", wrong_surface=False,
+                             delivery_policy=None, guard_blocks_typing=None):
         self.state.active_sessions = {}
         self.state.pending_permissions = []
         self.state.pending_forms = []
         self.state.sent_prompts = []
+        self.state.prompt_delivery_mode = "queue"
+        if delivery_policy is not None:
+            manifest = json.loads(self.manifest.read_text())
+            manifest["delivery_policy"] = delivery_policy
+            self.manifest.write_text(json.dumps(manifest)); self.manifest.chmod(0o600)
         fixture_id = uuid.uuid4().hex
         config_dir, state_dir = self.root / ("resume-config-" + fixture_id), self.root / ("resume-state-" + fixture_id)
         config = mp.example_config()
@@ -460,6 +473,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
                   "task_id": connection.parent_task_id, "task_digest": task_digest,
                   "api_origin": connection.api_origin, "api_contract": "opencode-v2.2.5-model-preflight-1",
                   "expected_server_pid": connection.expected_server_pid,
+                  "delivery_policy": connection.delivery_policy,
                   "session_directory": created["directory"], "worktree_directory": str(worktree),
                   "cmux_workspace_uuid": workspace, "cmux_surface_uuid": surface,
                   "native_started_at": 123.0, "execution_result": "turn_idle", "slot": None,
@@ -483,7 +497,9 @@ class OpenCodeDispatchTest(unittest.TestCase):
             if method == "surface.input_state":
                 return {"surface_id": params["surface_id"], "workspace_id": workspace,
                         "agent": True, "terminal": True, "state": guard_state,
-                        "blocks_typing": guard_state != "empty", "waiting_on_human": False,
+                        "blocks_typing": (guard_state != "empty" if guard_blocks_typing is None
+                                          else guard_blocks_typing),
+                        "waiting_on_human": False,
                         "lifecycle": "idle"}
             if method == "agent.message.settings":
                 return {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
@@ -656,10 +672,53 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(result["status"], "submitted")
         self.assertEqual(result["session"], SESSION)
         self.assertEqual(len(self.state.sent_prompts), 1)
+        self.assertEqual(self.state.sent_prompts[0], {"text": "Continue with one distinct synthetic task."})
         saved = app.state(f"continuations/{SESSION}", None)
         self.assertEqual(saved["status"], "submitted")
         self.assertEqual(saved["message_id"], result["message_id"])
         self.assertNotIn("Continue with one distinct synthetic task.", json.dumps(saved))
+
+    def test_api_sidechannel_continuation_queues_while_composer_is_unknown(self):
+        app, _launch, args, current, hook_path, cmux = self.continuation_fixture(
+            guard_state="unknown", guard_blocks_typing=False, delivery_policy="api_sidechannel")
+        with patch.object(app, "current", return_value=current), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                patch.object(mp, "run_json", side_effect=cmux):
+            result = mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
+        self.assertEqual(result["status"], "submitted")
+        self.assertEqual(self.state.sent_prompts, [{
+            "text": "Continue with one distinct synthetic task.", "delivery": "queue", "resume": True}])
+
+    def test_api_sidechannel_continuation_wrong_queue_admission_is_uncertain_and_not_replayed(self):
+        app, _launch, args, current, hook_path, cmux = self.continuation_fixture(
+            guard_state="draft", guard_blocks_typing=False, delivery_policy="api_sidechannel")
+        self.state.prompt_delivery_mode = "steer"
+        with patch.object(app, "current", return_value=current), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                patch.object(mp, "run_json", side_effect=cmux), \
+                self.assertRaisesRegex(mp.PreferenceError, "prompt_queue_admission_unconfirmed"):
+            mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
+        attempt = app.state(f"continuations/{SESSION}", None)
+        self.assertEqual(attempt["status"], "uncertain")
+        self.assertEqual(attempt["error_code"], "prompt_queue_admission_unconfirmed")
+        self.assertEqual(len(self.state.sent_prompts), 1)
+        with patch.object(app, "current", return_value=current), \
+                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
+                patch.object(mp, "run_json", side_effect=cmux), \
+                self.assertRaisesRegex(mp.PreferenceError, "uncertain admission"):
+            mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
+        self.assertEqual(len(self.state.sent_prompts), 1)
+
+    def test_opencode_resume_rejects_a_changed_delivery_policy(self):
+        app, _launch, args, _current, _hook_path, _cmux = self.continuation_fixture()
+        manifest = json.loads(self.manifest.read_text())
+        manifest["delivery_policy"] = "api_sidechannel"
+        self.manifest.write_text(json.dumps(manifest)); self.manifest.chmod(0o600)
+
+        with self.assertRaisesRegex(mp.PreferenceError, "manifest no longer matches"):
+            mp.resume_opencode_launch(app, args, Path(args.task_file).read_bytes())
+
+        self.assertEqual(self.state.sent_prompts, [])
 
     def test_opencode_continuation_holds_busy_draft_unknown_and_wrong_surface_without_sending(self):
         cases = (("busy", {"active": {SESSION: {"type": "running"}}}, "empty", False,
@@ -1343,6 +1402,24 @@ class OpenCodeDispatchTest(unittest.TestCase):
         with self.assertRaisesRegex(dispatch.OpenCodeDispatchError, "loopback_ip_literal_required"):
             dispatch._loopback_origin("http://localhost:4096")
 
+    def test_delivery_policy_defaults_strict_and_rejects_unknown_or_malformed_values(self):
+        connection = dispatch.load_connection(self.manifest)
+        self.assertEqual(connection.delivery_policy, "native_empty_composer")
+
+        manifest = json.loads(self.manifest.read_text())
+        manifest["delivery_policy"] = "api_sidechannel"
+        self.manifest.write_text(json.dumps(manifest)); self.manifest.chmod(0o600)
+        connection = dispatch.load_connection(self.manifest)
+        self.assertEqual(connection.delivery_policy, "api_sidechannel")
+
+        for value in (None, "", "API_SIDECHANNEL", "future_policy", [], True):
+            with self.subTest(value=repr(value)):
+                manifest["delivery_policy"] = value
+                self.manifest.write_text(json.dumps(manifest)); self.manifest.chmod(0o600)
+                with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+                    dispatch.load_connection(self.manifest)
+                self.assertEqual(raised.exception.code, "invalid_delivery_policy")
+
     def test_wrong_created_directory_or_model_is_not_accepted(self):
         connection = dispatch.load_connection(self.manifest)
         self.state.session_directory = str(self.root / "wrong")
@@ -1435,6 +1512,9 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertNotIn(CANARY, str(raised.exception))
 
     def test_initial_dispatch_waits_for_delayed_prompt_admission_before_accepting_idle_state(self):
+        manifest = json.loads(self.manifest.read_text())
+        manifest["delivery_policy"] = "api_sidechannel"
+        self.manifest.write_text(json.dumps(manifest)); self.manifest.chmod(0o600)
         config_dir, state_dir = self.root / "config", self.root / "state"
         config = mp.example_config()
         config["active"] = "Qwen-only"
@@ -1488,7 +1568,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
                 params = json.loads(argv[-1])
                 if method == "surface.input_state":
                     return {"surface_id": params["surface_id"], "workspace_id": workspace,
-                            "agent": True, "terminal": True, "state": "empty", "blocks_typing": False,
+                            "agent": True, "terminal": True, "state": "unknown", "blocks_typing": False,
                             "waiting_on_human": False, "lifecycle": "idle"}
                 if method == "agent.message.settings":
                     return {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
@@ -1509,6 +1589,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(self.state.message_reads, 3)
         self.assertEqual(launch["native_session"], SESSION)
         self.assertEqual(launch["parent_task_id"], "task-parent-fixture")
+        self.assertEqual(launch["delivery_policy"], "api_sidechannel")
         self.assertEqual(launch["expected_server_pid"], 4242)
         self.assertEqual(launch["cmux_workspace_uuid"], workspace)
         self.assertEqual(launch["cmux_surface_uuid"], opened_surface)

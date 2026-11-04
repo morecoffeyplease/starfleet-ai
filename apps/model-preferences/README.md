@@ -108,6 +108,12 @@ For a new configuration, record the observed local provider and model explicitly
 OpenCode dispatch requires a pre-existing OpenCode 2.2.5 API server with Basic authentication on a loopback IP address and the exact local provider/model enabled.
 The separate JSON connection manifest and password file must be regular files owned by the current user with mode `0600`, and neither may be a symlink.
 The manifest contains `api_url`, `expected_server_pid`, `password_file` and an explicit `parent_task_id`; optional `metadata` can pin `provider_id` and `model_id`.
+Optional top-level `delivery_policy` accepts `native_empty_composer` or `api_sidechannel`; omission selects `native_empty_composer`.
+Model Preferences records the selected policy with the exact launch and refuses a resume if the private manifest changes it.
+The explicit `api_sidechannel` policy permits only `empty`, `draft`, or `unknown` native composer classifications while retaining exact current, hook, API, lifecycle, receiving, and human-input guards.
+Both policies require an inactive API session and empty inbox, permission, and form lists.
+An opted-in continuation sends `text`, `delivery: queue`, and `resume: true`, and remains uncertain unless the exact API message is admitted to the queue.
+The policy does not change startup prompts or role choices, and changing it on a recorded launch holds before a continuation send.
 The password stays in its private file and is not copied into the manifest, process arguments, launch records or receipts.
 The API PID and loopback origin bind the connection for this preflight, but OpenCode 2.2.5 exposes no stable server-startup identity, so PID reuse remains a limitation.
 
@@ -145,7 +151,8 @@ Continue a recorded OpenCode session with a new bounded task only when the exact
 
     model-preferences --config-dir /private/config --state-dir /private/state resume LAUNCH_ID --task-file /absolute/path/to/follow-up.md --opencode-manifest /private/opencode-connection.json
 
-Before one API prompt is sent, the exact native composer must report empty, native receiving must be enabled, CMUX current and hook records must match the recorded session generation, and OpenCode API inspection must report idle with no pending permissions or forms.
+Before one Model Preferences continuation prompt is sent, the default policy requires an empty native composer, while `api_sidechannel` permits a `draft` or `unknown` composer classification with no blocking input or human-input obligation.
+Both policies require native receiving, exact CMUX current and hook records for the recorded session generation, an idle OpenCode API session, and no pending inbox work, permissions, or forms.
 The helper persists a send intent before the API request.
 If the response is uncertain, the exact session is held against automatic retry.
 An accepted prompt records submission only; later model output is not inferred.

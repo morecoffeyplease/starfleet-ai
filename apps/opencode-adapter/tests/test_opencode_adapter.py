@@ -171,6 +171,14 @@ class OpenCodeAdapterTests(unittest.TestCase):
             ],
         )
 
+    def test_delivery_policy_validator_accepts_only_the_two_explicit_values(self):
+        self.assertEqual(oa.validate_delivery_policy("native_empty_composer"), "native_empty_composer")
+        self.assertEqual(oa.validate_delivery_policy("api_sidechannel"), "api_sidechannel")
+        for value in (None, "", "API_SIDECHANNEL", "future", [], True):
+            with self.subTest(value=repr(value)), self.assertRaises(oa.AdapterError) as raised:
+                oa.validate_delivery_policy(value)
+            self.assertEqual(raised.exception.code, "invalid_delivery_policy")
+
     def test_wrong_session_id_holds(self):
         self.server.session = {**self.server.session, "id": "ses_another"}
 

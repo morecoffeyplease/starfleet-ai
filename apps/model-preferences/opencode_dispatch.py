@@ -56,6 +56,7 @@ class Connection:
     password: str
     metadata: dict
     parent_task_id: str | None = None
+    delivery_policy: str = "native_empty_composer"
 
     def __repr__(self) -> str:
         return f"Connection(api_origin={self.api_origin!r}, expected_server_pid={self.expected_server_pid}, authenticated=True)"
@@ -145,6 +146,42 @@ def _loopback_origin(value: object, *, allow_path: bool = False) -> str:
     return f"http://{host}:{port}"
 
 
+def _shared_delivery_policy_validator():
+    candidates = (
+        Path(__file__).resolve().with_name("opencode_adapter.py"),
+        Path(__file__).resolve().parent.parent / "opencode-adapter" / "opencode_adapter.py",
+    )
+    for candidate in candidates:
+        if candidate.is_file() and not candidate.is_symlink():
+            name = "model_preferences_opencode_adapter"
+            loaded = sys.modules.get(name)
+            if loaded is not None and Path(getattr(loaded, "__file__", "")).resolve() == candidate.resolve():
+                return loaded
+            spec = importlib.util.spec_from_file_location(name, candidate)
+            if spec is None or spec.loader is None:
+                break
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(name, None)
+                raise OpenCodeDispatchError("delivery_policy_validator_unavailable") from None
+            return module
+    raise OpenCodeDispatchError("delivery_policy_validator_unavailable")
+
+
+def _validate_delivery_policy(value: object) -> str:
+    adapter = _shared_delivery_policy_validator()
+    validator = getattr(adapter, "validate_delivery_policy", None)
+    if not callable(validator):
+        raise OpenCodeDispatchError("delivery_policy_validator_unavailable")
+    try:
+        return validator(value)
+    except ValueError:
+        raise OpenCodeDispatchError("invalid_delivery_policy") from None
+
+
 def load_connection(manifest_path: str | Path) -> Connection:
     raw = _private_bytes(str(manifest_path), MAX_MANIFEST_BYTES, "private_manifest_required")
     try:
@@ -156,6 +193,7 @@ def load_connection(manifest_path: str | Path) -> Connection:
     allowed = {
         "api_url", "password_file", "expected_server_pid", "session_id", "session_directory",
         "worktree_directory", "cmux_workspace_uuid", "cmux_surface_uuid", "parent_task_id", "metadata",
+        "delivery_policy",
     }
     if set(manifest) - allowed:
         raise OpenCodeDispatchError("unsupported_manifest_schema")
@@ -182,7 +220,9 @@ def load_connection(manifest_path: str | Path) -> Connection:
     if (not isinstance(parent_task_id, str) or not parent_task_id.strip() or len(parent_task_id) > 256
             or any(ord(char) < 32 for char in parent_task_id)):
         raise OpenCodeDispatchError("invalid_parent_task_id")
-    return Connection(api_origin, pid, password, metadata, parent_task_id)
+    delivery_policy = ("native_empty_composer" if "delivery_policy" not in manifest
+                       else _validate_delivery_policy(manifest["delivery_policy"]))
+    return Connection(api_origin, pid, password, metadata, parent_task_id, delivery_policy)
 
 
 class _Client:
@@ -1020,8 +1060,9 @@ def require_native_hook_binding(*, expected_workspace: str, expected_surface: st
             "agent_lifecycle": lifecycle, "worktree_directory": actual_worktree}
 
 
-def require_native_empty_composer(run_rpc, *, expected_workspace: str, expected_surface: str) -> dict:
-    """Require CMUX's exact empty-composer and native receiving guards before a prompt send."""
+def require_native_delivery_binding(run_rpc, *, expected_workspace: str, expected_surface: str,
+                                    allow_composer_state: bool = False) -> dict:
+    """Require the exact native owner, input, lifecycle and receiving guards before a prompt send."""
     try:
         workspace = str(uuid.UUID(expected_workspace))
         surface = str(uuid.UUID(expected_surface))
@@ -1037,8 +1078,9 @@ def require_native_empty_composer(run_rpc, *, expected_workspace: str, expected_
         raise OpenCodeDispatchError("native_input_state_identity_mismatch") from None
     if input_surface != surface or input_workspace != workspace:
         raise OpenCodeDispatchError("native_input_state_identity_mismatch")
+    allowed_composer_states = ("empty", "draft", "unknown") if allow_composer_state else ("empty",)
     if (guard.get("agent") is not True or guard.get("terminal") is not True
-            or guard.get("state") != "empty" or guard.get("blocks_typing") is not False
+            or guard.get("state") not in allowed_composer_states or guard.get("blocks_typing") is not False
             or guard.get("waiting_on_human") is not False
             or guard.get("lifecycle") not in _ACTIVE_LIFECYCLES):
         raise OpenCodeDispatchError("native_composer_not_empty")
@@ -1052,14 +1094,24 @@ def require_native_empty_composer(run_rpc, *, expected_workspace: str, expected_
             "messages_enabled": True, "receiving": True, "workspace_receiving": True}
 
 
+def require_native_empty_composer(run_rpc, *, expected_workspace: str, expected_surface: str) -> dict:
+    """Require CMUX's exact empty-composer guard before a prompt send."""
+    return require_native_delivery_binding(run_rpc, expected_workspace=expected_workspace,
+                                           expected_surface=expected_surface,
+                                           allow_composer_state=False)
+
+
 def send_prompt(connection: Connection, *, session_id: str, text: str) -> dict:
-    """Submit one API prompt after the caller has completed the exact native empty-composer guard."""
+    """Submit one API prompt after the caller has completed the exact native guard."""
     if not isinstance(session_id, str) or not re.fullmatch(r"^ses_[A-Za-z0-9]+$", session_id):
         raise OpenCodeDispatchError("invalid_session_id")
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 16 * 1024:
         raise OpenCodeDispatchError("invalid_prompt")
     quoted_id = urllib.parse.quote(session_id, safe="")
-    status, body = _Client(connection).post(f"/api/session/{quoted_id}/prompt", {"text": text})
+    payload = {"text": text}
+    if connection.delivery_policy == "api_sidechannel":
+        payload.update({"delivery": "queue", "resume": True})
+    status, body = _Client(connection).post(f"/api/session/{quoted_id}/prompt", payload)
     value = _json(status, body)
     data = value.get("data")
     if not isinstance(data, dict):
@@ -1069,6 +1121,10 @@ def send_prompt(connection: Connection, *, session_id: str, text: str) -> dict:
             or data.get("sessionID") != session_id or data.get("type") != "user"
             or not all(key in data for key in ("time", "payload", "delivery"))):
         raise OpenCodeDispatchError("prompt_response_unconfirmed")
+    if connection.delivery_policy == "api_sidechannel":
+        delivery = data.get("delivery")
+        if not isinstance(delivery, dict) or delivery.get("mode") != "queue":
+            raise OpenCodeDispatchError("prompt_queue_admission_unconfirmed")
     return {"message_id": message_id, "session_id": session_id,
             "admission": "confirmed", "transport": "opencode_api"}
 

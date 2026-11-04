@@ -40,6 +40,9 @@ OPENCODE_MANIFEST_FIELDS = frozenset((
     "api_url", "password_file", "session_id", "expected_server_pid", "session_directory",
     "worktree_directory", "cmux_workspace_uuid", "cmux_surface_uuid", "parent_task_id",
 ))
+OPENCODE_MANIFEST_OPTIONAL_FIELDS = frozenset(("delivery_policy",))
+OPENCODE_DEFAULT_DELIVERY_POLICY = "native_empty_composer"
+OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY = "api_sidechannel"
 OPENCODE_HTTP_TIMEOUT = 5
 OPENCODE_RESPONSE_LIMIT = 128 * 1024
 
@@ -109,14 +112,29 @@ def load_opencode_manifest(path):
     except (UnicodeError, ValueError):
         raise ValueError("OpenCode manifest is not valid JSON") from None
     require(isinstance(value, dict), "OpenCode manifest must be a JSON object")
-    require(set(value) == OPENCODE_MANIFEST_FIELDS,
+    require(OPENCODE_MANIFEST_FIELDS.issubset(value) and
+            set(value).issubset(OPENCODE_MANIFEST_FIELDS | OPENCODE_MANIFEST_OPTIONAL_FIELDS),
             "OpenCode manifest fields do not match the supported session binding contract")
+    value["delivery_policy"] = opencode_delivery_policy(value)
     require(isinstance(value.get("api_url"), str), "OpenCode API URL is missing")
     require(isinstance(value.get("password_file"), str), "OpenCode password file path is missing")
     for key in ("password_file", "session_directory", "worktree_directory"):
         require(isinstance(value.get(key), str) and Path(value[key]).is_absolute(),
                 f"OpenCode manifest {key} must be an absolute path")
     return value
+
+
+def opencode_delivery_policy(target):
+    require(isinstance(target, dict), "OpenCode delivery policy target is malformed")
+    if "delivery_policy" not in target:
+        return OPENCODE_DEFAULT_DELIVERY_POLICY
+    adapter = opencode_adapter_module()
+    validator = getattr(adapter, "validate_delivery_policy", None)
+    require(callable(validator), "OpenCode delivery policy validator is unavailable")
+    try:
+        return validator(target["delivery_policy"])
+    except ValueError:
+        raise ValueError("OpenCode delivery policy is invalid") from None
 
 
 def opencode_adapter_module():
@@ -179,11 +197,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def opencode_prompt(target, password, prompt):
     adapter = opencode_adapter_module()
+    policy = opencode_delivery_policy(target)
     origin = adapter.OpenCodeSessionAdapter._validate_origin(target["api_url"])
     quoted_session = urllib.parse.quote(target["session"], safe="")
+    payload = {"text": prompt}
+    if policy == OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY:
+        payload.update({"delivery": "queue", "resume": True})
     request = urllib.request.Request(
         origin + f"/api/session/{quoted_session}/prompt",
-        data=json.dumps({"text": prompt}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         headers={
             "Accept": "application/json",
             "Authorization": "Basic " + base64.b64encode(
@@ -226,6 +248,10 @@ def opencode_prompt(target, password, prompt):
                     "OpenCode prompt response was not associated with the exact session")
             require(all(key in data for key in ("time", "payload", "delivery")),
                     "OpenCode prompt response was not confirmed")
+            if policy == OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY:
+                delivery = data.get("delivery")
+                require(isinstance(delivery, dict) and delivery.get("mode") == "queue",
+                        "OpenCode queue admission was not confirmed")
     except (UnicodeError, ValueError) as error:
         raise ValueError(str(error) or "OpenCode prompt response was not confirmed") from None
     except (OSError, TimeoutError, http.client.HTTPException):
@@ -410,10 +436,16 @@ class Cmux:
         require(isinstance(input_surface, str) and input_surface.upper() == target["surface"] and
                 isinstance(input_workspace, str) and input_workspace.upper() == target["workspace"],
                 "OpenCode input owner changed")
+        policy = opencode_delivery_policy(target)
+        state = guard.get("state")
+        guard_lifecycle = guard.get("lifecycle")
+        if policy == OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY:
+            eligible_composer_state = state in ("empty", "draft", "unknown")
+        else:
+            eligible_composer_state = state == "empty"
         require(guard.get("agent") is True and guard.get("terminal") is True and
-                guard.get("state") == "empty" and guard.get("blocks_typing") is False and
-                guard.get("waiting_on_human") is False and
-                guard.get("lifecycle") in ACTIVE_LIFECYCLES,
+                eligible_composer_state and guard.get("blocks_typing") is False and
+                guard.get("waiting_on_human") is False and guard_lifecycle in ACTIVE_LIFECYCLES,
                 "OpenCode human draft, approval, unknown input state or inactive session")
         settings = self.rpc("agent.message.settings", target=target["surface"])
         require(isinstance(settings, dict), "Native messaging settings are unknown")
@@ -509,6 +541,12 @@ class Monitor:
                         "OpenCode target paths must be absolute")
                 require(type(target.get("expected_server_pid")) is int and target["expected_server_pid"] > 0,
                         "Invalid OpenCode API server PID")
+                if "delivery_policy" in target:
+                    require(opencode_delivery_policy(target) == target["delivery_policy"],
+                            "Invalid OpenCode delivery policy")
+            else:
+                require("delivery_policy" not in target,
+                        "Delivery policy is supported only for OpenCode targets")
             require(target["surface"] not in surfaces and target["session"] not in sessions,
                     "Duplicate surface or session enrollment")
             surfaces.add(target["surface"])
@@ -561,6 +599,7 @@ class Monitor:
             "session_directory": manifest["session_directory"],
             "worktree_directory": manifest["worktree_directory"],
             "parent_task_id": manifest["parent_task_id"],
+            "delivery_policy": manifest["delivery_policy"],
             "label": label.strip(),
         }
         require(os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().casefold() == "opencode",
@@ -596,7 +635,9 @@ class Monitor:
         config = self.config()
         existing = next((item for item in config["targets"] if item["session"] == target["session"]), None)
         expected = {**target, "cutoff": existing["cutoff"]} if existing else target
-        require(existing is None or existing == expected,
+        existing_binding = ({**existing, "delivery_policy": opencode_delivery_policy(existing)}
+                            if existing else None)
+        require(existing is None or existing_binding == expected,
                 "OpenCode enrollment differs; unenroll explicitly before changing its binding")
         require(not any(item["surface"] == target["surface"] and
                         item["session"] != target["session"] for item in config["targets"]),
