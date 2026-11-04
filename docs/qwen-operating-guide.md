@@ -26,6 +26,7 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 | Hailing Frequencies and Discord Watch | Exact OpenCode ownership and guarded API delivery, including Temporal continuation integration | Automatic delivery remains held while the tested native composer state is unknown; configured enrollment is not wake reception |
 | Agent Notify | OpenCode identity labeling and owning-thread integration | Native Qwen-origin conversation and reply reception need qualification |
 | Warp-drive and Away Mode | OpenCode ownership handling in source | Native Qwen job completion and away-context reception need qualification |
+| Starfleet Markup | Existing owner-bound CLI and foreground listener; automatic native routes currently target Claude or Codex | No OpenCode automatic feedback-wake qualification; create review documents only when requested |
 | Qwen-only orchestration | Opt-in model profile records | A profile is not orchestration proof; fresh parent startup, actual child delegation, acceptance reporting and escalation remain separate trials |
 
 The active shared profile remains independent of these opt-in examples.
@@ -309,3 +310,4 @@ If a decision needs human approval, leave the decision pending and record the ho
 [Pattern Buffer](../apps/pattern-buffer/README.md) and its [OpenCode guide](../apps/pattern-buffer/docs/opencode.md) describe explicit context installation and exact task binding.
 [Implementer dispatch](../apps/pattern-buffer/docs/implementer-dispatch.md) describes receipt and completion evidence boundaries.
 [Warp-drive](../apps/warp-drive/README.md) describes local CPU reservation controls when those are part of an authorized workflow.
+[Starfleet Markup](../apps/starfleet-markup/README.md) describes requested document reviews, exact ownership, foreground event reception and the current native wake limits.

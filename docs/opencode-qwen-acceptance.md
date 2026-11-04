@@ -28,7 +28,8 @@ Candidate `2dda6cc` passed the component verifier with 90 tests, including synth
 A separate real read-only preflight against the owned OpenCode 2.2.5 server confirmed the authenticated API identity, exact local provider and model, the `max` variant and a 32,768-token output allowance.
 That check did not create a session, launch a model or qualify managed dispatch.
 Native CMUX returns uppercase UUID strings while the initial launcher normalized expected UUIDs to lowercase.
-The current native-binding comparison needs semantic UUID normalization before a managed launch can be qualified; case differences must not weaken exact ownership checks.
+Candidate `d193b9e` normalizes those UUIDs semantically while preserving exact session IDs and refusing malformed UUIDs.
+Its focused OpenCode test suite passed 11 tests; managed native launch qualification is still separate.
 
 ## Maximum-thinking startup and instruction reception
 
