@@ -3,6 +3,7 @@
 These observations describe bounded local trials on November 4, 2026.
 They are not a benchmark, security certification or a claim that every Starfleet component supports OpenCode.
 Private connection data, transcripts and native identifiers are excluded.
+See the [setup guide](opencode-qwen-setup.md) for a portable summary of the observed runtime configuration and prerequisites.
 
 ## Configuration
 
@@ -109,15 +110,25 @@ Do not reinterpret unknown as empty, type a probe, clear a draft or synthesize h
 The installed project hook discovery also reported a duplicate server-plugin ID for a compatibility file; one package was active and the duplicate was failed.
 The trial does not establish that this duplicate caused either ownership or composer behavior.
 
+## CMUX OpenCode composer source status
+
+The CMUX parser source candidate `415c17db5ef4ea4a2ced7b820baca451b3efbd88` adds a conservative native OpenCode composer-state path.
+Its scoped Swift package suite passed 879 tests across 101 suites, and four targeted static source checks passed.
+The isolated build-only check remains pending, and the tested installed CMUX is unchanged.
+The tested installed CMUX continues to report composer state `unknown`, so Hailing Frequencies must keep OpenCode delivery held.
+Native empty-versus-draft acceptance and the tagged-launch developer-account prerequisite remain unresolved.
+Source-level parser checks do not establish installed runtime behavior or safe delivery.
+
 ## Remaining acceptance
 
 Managed profile dispatch and exact continuation require their own native acceptance.
 Pattern Buffer initial shared, role and exact-task delivery and an updated task in completed compaction are observed above.
 A post-compaction implementation turn, same-session resume and model-visible task-finish behavior still require native acceptance.
-Guarded messaging needs authoritative empty-versus-draft evidence, exact owner binding, actual wake receipt and held-permission/draft controls.
+Guarded messaging needs an installed CMUX build that provides authoritative empty-versus-draft evidence, exact owner binding, actual wake receipt and held-permission/draft controls.
 The remaining synthetic-secret checks are parent credential handling, allowed-token redaction and Qwen-only orchestration.
 Qwen-only orchestration requires separate task-framing, dependency-relay, acceptance-reporting and escalation evidence.
 The earlier Codex-supervised worker results cannot establish those capabilities.
+The active Model Preferences integration work still needs fresh managed-session, explicit-maximum-variant, post-compaction continuation and failure-control evidence before its source candidate can be described as accepted.
 
 ## Sources
 

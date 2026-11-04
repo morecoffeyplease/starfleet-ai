@@ -2,6 +2,7 @@
 
 This guide describes a bounded workflow for Codex or Claude orchestrators supervising Qwen implementers in OpenCode.
 It also describes the separate evidence required before a Qwen orchestrator can coordinate implementers.
+Use the [OpenCode and local Qwen setup guide](opencode-qwen-setup.md) for the pinned pilot configuration and setup prerequisites.
 
 Every Qwen run uses a visible OpenCode tab or pane in the existing CMUX workspace assigned to that same task.
 Keep the task, session, worktree and candidate identity together in that workspace.
@@ -9,25 +10,26 @@ Use the exact locally configured provider and model for the run, and disable pro
 If OpenCode cannot show which provider and model are active, stop before assigning work.
 
 This is operating guidance and an evidence record format.
-It does not add a Starfleet adapter, launch command, permission boundary or native task replay feature.
+The source tree contains opt-in OpenCode paths in several components, but source presence alone does not establish native acceptance or supported end-to-end operation.
+The observed native behavior and remaining gaps are listed below and in the [acceptance record](opencode-qwen-acceptance.md).
 
 ## Current support and evidence boundary
 
 ### Source support and native qualification
 
-This candidate includes opt-in OpenCode adapters; it does not enable them in existing installations or activate a Qwen profile.
+Some components have opt-in OpenCode source candidates, and this guide does not enable them in an existing installation or activate a Qwen profile.
 Keep source implementation, simulated verification and observed native behavior separate when selecting a workflow.
 The [acceptance observations](opencode-qwen-acceptance.md) record the tested runtime configuration and remaining gaps.
 
 | Component | Candidate source behavior | Observed native boundary |
 | --- | --- | --- |
-| Model Preferences | Exact local provider/model/max preflight and initial implementer/researcher dispatch into a new tab in the existing workspace | Real read-only preflight passed; managed launch and continuation need separate native qualification |
+| Model Preferences | Exact provider/model preflight and managed dispatch path under active integration work | Real read-only preflight and a separate visible local startup task were observed; managed dispatch and continuation remain unqualified |
 | Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks | Initial shared/implementer/task delivery, updated task in completed compaction and pre-provider failure refusal passed; resumed implementation and model-visible finish remain unverified |
-| Hailing Frequencies and Discord Watch | Exact OpenCode ownership and guarded API delivery, including Temporal continuation integration | Automatic delivery remains held while the tested native composer state is unknown; configured enrollment is not wake reception |
-| Agent Notify | OpenCode identity labeling and owning-thread integration | Native Qwen-origin conversation and reply reception need qualification |
-| Warp-drive and Away Mode | OpenCode ownership handling in source | Native Qwen job completion and away-context reception need qualification |
+| Hailing Frequencies and Discord Watch | Exact OpenCode identity and guarded API delivery paths in source | The installed native composer state is `unknown`, so automatic delivery remains held; a CMUX source fix has package and static checks but no completed app build or native empty-composer proof yet |
+| Agent Notify | OpenCode identity and owning-thread paths in source | No native Qwen-origin conversation or reply reception is recorded |
+| Warp-drive and Away Mode | OpenCode owner identity paths in source | Native Qwen job completion and away-context reception are unqualified |
 | Starfleet Markup | Existing owner-bound CLI and foreground listener; automatic native routes currently target Claude or Codex | No OpenCode automatic feedback-wake qualification; create review documents only when requested |
-| Qwen-only orchestration | Opt-in model profile records | A profile is not orchestration proof; fresh parent startup, actual child delegation, acceptance reporting and escalation remain separate trials |
+| Qwen-only orchestration | Opt-in model profile records | A profile is not orchestration proof; Qwen-only startup, actual child delegation, acceptance reporting and escalation remain unqualified |
 
 The active shared profile remains independent of these opt-in examples.
 Check the saved profile against each session's intended profile before launch, and do not globally activate a trial preference.
@@ -237,7 +239,7 @@ Use bounded recovery by failure class:
 | Provider or model unavailable, or a fallback appears | Stop the run and ask the owner to resolve the exact route. |
 | Permission denied by a tool | Record the denied action and stop using that tool; do not widen permissions. |
 | Known transient failure before execution began | Retry once after confirming the state is unchanged and the cause has cleared. |
-| Timeout after a command may have started | Inspect its result and candidate before any retry; preserve uncertainty meanwhile. |
+| Timeout after a command may have started | Inspect the exact command, session and candidate before retrying; preserve uncertainty until authoritative state resolves it. |
 | Resource pressure or out-of-memory | Pause new heavy work, inspect resource ownership, and ask before reducing or splitting scope. |
 | Unknown failure | Make one read-only diagnosis, report evidence and stop if the cause remains unclear. |
 | Late or duplicate result | Compare its task, session, worktree and candidate against current ownership before accepting any artifact. |
@@ -266,6 +268,7 @@ Do not infer a benchmark, stable cadence, general security property or qualifica
 
 The [native acceptance observations](opencode-qwen-acceptance.md) record a completed maximum-thinking read trial and the ownership/composer gaps it exposed.
 They include initial Pattern Buffer context/task delivery and task updates in completed compaction, but do not qualify automatic delivery, a resumed implementation turn or Qwen-only orchestration.
+The [setup guide](opencode-qwen-setup.md) records the observed OpenCode, Ollama and model settings, with clean-host setup and end-to-end orchestration still unqualified.
 The table below remains a template for subsequent role-specific trials.
 
 | Configuration and role | Task | Observation | Consequence | Limits | Resulting guidance |
