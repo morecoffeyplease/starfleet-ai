@@ -44,6 +44,9 @@ class FakeAPIState:
         self.challenge = True
         self.provider_url = "http://127.0.0.1:11459/v1"
         self.provider_package = "@opencode/ai/providers/openai-compatible"
+        self.lazy_provider_registry = False
+        self.provider_catalog_loaded = False
+        self.provider_route_missing = False
         self.model_enabled = True
         self.model_tools = True
         self.model_output = 32768
@@ -127,10 +130,15 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
             return self.respond(200, {"version": self.state.version, "pid": self.state.pid,
                                       "urls": [], "paths": {"tmp": str(self.state.root)}})
         if self.path == f"/api/provider/{PROVIDER}":
+            if (self.state.provider_route_missing or
+                    (self.state.lazy_provider_registry and not self.state.provider_catalog_loaded)):
+                return self.respond(404, {"error": "provider configuration unavailable"})
             return self.respond(200, {"location": {"directory": str(self.state.root)}, "data": {
                 "id": PROVIDER, "package": self.state.provider_package,
                 "settings": {"baseURL": self.state.provider_url, "apiKey": "synthetic-provider-key"}}})
         if self.path == "/api/model":
+            if self.state.lazy_provider_registry:
+                self.state.provider_catalog_loaded = True
             return self.respond(200, {"location": {"directory": str(self.state.root)}, "data": [{
                 "id": MODEL, "modelID": MODEL, "providerID": PROVIDER, "package": self.state.model_package,
                 "enabled": self.state.model_enabled, "body": self.state.model_body,
@@ -323,6 +331,21 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(self.state.environment["variables"]["MODEL_PREFERENCES_TASK_ID"], "task-child-fixture")
         self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
         self.assertNotIn(CANARY, repr(connection))
+
+    def test_cold_provider_registry_is_initialized_by_model_catalog_read(self):
+        self.state.lazy_provider_registry = True
+        proof = dispatch.preflight(self.manifest, self.choice)
+        self.assertEqual(proof.provider_id, PROVIDER)
+        paths = [path.split("?", 1)[0] for method, path, _ in self.state.calls if method == "GET"]
+        self.assertLess(paths.index("/api/model"), paths.index(f"/api/provider/{PROVIDER}"))
+
+    def test_provider_http_diagnostic_exposes_only_operation_and_status(self):
+        self.state.provider_route_missing = True
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.preflight(self.manifest, self.choice)
+        self.assertEqual(raised.exception.code, "provider_config_http_status_404")
+        self.assertNotIn("provider configuration unavailable", str(raised.exception))
+        self.assertNotIn(CANARY, str(raised.exception))
 
     def test_child_session_keeps_native_parent_session_separate_from_parent_task(self):
         connection = dispatch.load_connection(self.manifest)
@@ -949,6 +972,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
                  ("model_enabled", False, "exact_model_unavailable"),
                  ("model_tools", False, "model_tool_capability_unverified"),
                  ("model_output", 4096, "model_output_limit_below_maximum_effort"),
+                 ("model_package", "unexpected-package", "unsupported_provider_package"),
                  ("model_body", {"reasoning_effort": "low"}, "max_reasoning_request_body_unverified"),
                  ("variant_settings", {"reasoningEffort": "high"}, "max_reasoning_variant_unverified"))
         for field, value, code in cases:

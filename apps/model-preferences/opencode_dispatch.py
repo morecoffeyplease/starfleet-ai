@@ -249,8 +249,11 @@ class _Client:
         return self.request("PUT", path, payload)
 
 
-def _json(status: int, body: bytes) -> dict:
+def _json(status: int, body: bytes, *, operation: str | None = None) -> dict:
     if status != 200:
+        if isinstance(operation, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,39}", operation):
+            status_label = str(status) if type(status) is int and 100 <= status <= 599 else "unknown"
+            raise OpenCodeDispatchError(f"{operation}_http_status_{status_label}")
         raise OpenCodeDispatchError("api_request_rejected")
     try:
         value = json.loads(body.decode("utf-8"))
@@ -298,22 +301,15 @@ def preflight(manifest_path: str | Path | Connection, choice: dict) -> Preflight
     challenge_scheme = challenge.split(None, 1)[0].lower() if challenge else ""
     if challenge_status != 401 or challenge_scheme != "basic":
         raise OpenCodeDispatchError("authenticated_api_challenge_required")
-    info = _json(*client.get("/api/info"))
+    info = _json(*client.get("/api/info"), operation="api_info")
     version, pid = _api_instance(info)
     if version != SUPPORTED_OPENCODE_VERSION:
         raise OpenCodeDispatchError("unsupported_opencode_version")
     if isinstance(pid, bool) or not isinstance(pid, int) or pid != connection.expected_server_pid:
         raise OpenCodeDispatchError("opencode_server_pid_mismatch")
-    provider_id_path = urllib.parse.quote(provider_id, safe="")
-    provider_response = _json(*client.get(f"/api/provider/{provider_id_path}"))
-    provider = provider_response.get("data")
-    if not isinstance(provider, dict) or provider.get("id") != provider_id:
-        raise OpenCodeDispatchError("unsupported_provider_schema")
-    settings = provider.get("settings")
-    if not isinstance(settings, dict):
-        raise OpenCodeDispatchError("local_provider_base_url_unavailable")
-    local_origin = _provider_origin(settings.get("baseURL"))
-    models_response = _json(*client.get("/api/model"))
+    # OpenCode 2.2.5 lazily initializes provider descriptors from the model catalog.
+    # Read the catalog first so the exact provider route is available on a cold API process.
+    models_response = _json(*client.get("/api/model"), operation="model_catalog")
     models = models_response.get("data")
     if not isinstance(models, list):
         raise OpenCodeDispatchError("unsupported_model_schema")
@@ -340,7 +336,17 @@ def preflight(manifest_path: str | Path | Connection, choice: dict) -> Preflight
     variant_settings = max_variant.get("settings") if isinstance(max_variant, dict) else None
     if not isinstance(variant_settings, dict) or variant_settings.get("reasoningEffort") != MAX_REASONING_EFFORT:
         raise OpenCodeDispatchError("max_reasoning_variant_unverified")
-    final_info = _json(*client.get("/api/info"))
+    provider_id_path = urllib.parse.quote(provider_id, safe="")
+    provider_response = _json(*client.get(f"/api/provider/{provider_id_path}"),
+                              operation="provider_config")
+    provider = provider_response.get("data")
+    if not isinstance(provider, dict) or provider.get("id") != provider_id:
+        raise OpenCodeDispatchError("unsupported_provider_schema")
+    settings = provider.get("settings")
+    if not isinstance(settings, dict):
+        raise OpenCodeDispatchError("local_provider_base_url_unavailable")
+    local_origin = _provider_origin(settings.get("baseURL"))
+    final_info = _json(*client.get("/api/info"), operation="api_info")
     final_version, final_pid = _api_instance(final_info)
     if final_version != version or final_pid != pid:
         raise OpenCodeDispatchError("opencode_server_changed_during_preflight")
