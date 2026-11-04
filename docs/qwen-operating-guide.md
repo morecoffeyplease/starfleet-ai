@@ -23,9 +23,9 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 
 | Component | Candidate source behavior | Observed native boundary |
 | --- | --- | --- |
-| Model Preferences | Exact provider/model preflight and managed dispatch path under active integration work | Real read-only preflight and a separate visible local startup task were observed; managed dispatch and continuation remain unqualified |
+| Model Preferences | Exact provider/model preflight and managed dispatch path under active integration work | Real read-only preflight and a separate visible local startup task were observed; the parent guard was corrected in focused tests, but the following session/tab startup stopped before its handshake and any model message, so dispatch and continuation remain unqualified |
 | Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks | Initial shared/implementer/task delivery, updated task in completed compaction and pre-provider failure refusal passed; resumed implementation and model-visible finish remain unverified |
-| Hailing Frequencies and Discord Watch | Exact OpenCode identity and guarded API delivery paths in source | The installed native composer state is `unknown`, so automatic delivery remains held; a CMUX source fix has package and static checks but no completed app build or native empty-composer proof yet |
+| Hailing Frequencies and Discord Watch | Exact OpenCode identity and guarded API delivery paths in source | The stock CMUX composer state is `unknown`, so OpenCode inbound delivery and continuation remain held; the custom CMUX parser experiment is historical and gave no native empty-composer proof |
 | Agent Notify | OpenCode identity and owning-thread paths in source | No native Qwen-origin conversation or reply reception is recorded |
 | Warp-drive and Away Mode | OpenCode owner identity paths in source | Native Qwen job completion and away-context reception are unqualified |
 | Starfleet Markup | Existing owner-bound CLI and foreground listener; automatic native routes currently target Claude or Codex | No OpenCode automatic feedback-wake qualification; create review documents only when requested |
@@ -34,6 +34,11 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 The active shared profile remains independent of these opt-in examples.
 Check the saved profile against each session's intended profile before launch, and do not globally activate a trial preference.
 The observed Codex startup and Luna delegation do not establish Qwen orchestrator qualification.
+Use supported stock CMUX only for this workflow.
+The OpenCode 2.2.5 TUI plugin interface has no documented draft accessor or atomic admission lock, and no API-only safe-send bypass is qualified.
+The selected bounded API-first experiment will check exact native session ownership, running and pending permission/form state, and whether a prompt leaves an unsent draft intact.
+The experiment has not run, does not qualify API-only delivery and does not change current product guards.
+A human-controlled visible-session resume remains an unproven alternative and is not the selected experiment.
 
 ### Operator guidance
 
@@ -231,6 +236,8 @@ Do not wait for every worker before reporting independent completed results.
 Silence alone does not authorize a forced prompt, session resume, worker kill or retry.
 Inspect ownership, visible session state, local resources, worktree changes and the last meaningful evidence before choosing a next action.
 Preserve uncertain outcomes until the exact candidate and command state are reconciled.
+For OpenCode, keep automated inbound prompts and continuation held while native composer state is unknown.
+The selected API-first experiment is not a production bypass and still requires native safety validation.
 
 Use bounded recovery by failure class:
 

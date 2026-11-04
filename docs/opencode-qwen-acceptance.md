@@ -32,6 +32,15 @@ Native CMUX returns uppercase UUID strings while the initial launcher normalized
 Candidate `d193b9e` normalizes those UUIDs semantically while preserving exact session IDs and refusing malformed UUIDs.
 Its focused OpenCode test suite passed 11 tests; managed native launch qualification is still separate.
 
+## Managed-dispatch attempts
+
+An earlier managed attempt stopped at the parent guard before sending a session message or message part.
+The Codex/Claude parent-routing regression was corrected, and its focused suite passed 25 tests while preserving the stricter OpenCode-parent contract.
+The following native attempt created its API session and same-workspace tab but stopped before the child handshake and any model message.
+A harmless startup-command control executed at 344 bytes but did not execute at 2,142 bytes, where the visible command was truncated.
+The supported stock-CMUX path is being changed to use a short command with a protected launch descriptor inside Starfleet.
+No uncertain session or prompt is replayed, and this does not qualify managed startup or the API-only delivery experiment.
+
 ## Detached-helper authentication control
 
 An initial managed-launch pilot on candidate `ad736a6` stopped during isolated profile notification inventory before Qwen session creation or model loading.
@@ -107,24 +116,35 @@ After the task completed, the native input-state API reported an OpenCode agent 
 An inactive model and empty permission/form lists do not establish that a user has no draft.
 Guarded automatic delivery therefore remains held on this observed configuration.
 Do not reinterpret unknown as empty, type a probe, clear a draft or synthesize hook records to make enrollment succeed.
+The pinned OpenCode 2.2.5 TUI plugin context and session API references have no documented draft accessor or atomic admission lock.
+The inspected server routes expose active-turn, inbox, permission and form state but do not expose unsent composer text.
+The selected bounded API-first experiment will check exact native session ownership, active-turn state, pending permissions and forms, and whether an external prompt leaves an unsent draft intact.
+The experiment has not run, does not qualify API-only delivery and does not change the current product guards.
+Source inspection of the [pinned TUI submission path](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/tui/src/component/prompt/index.tsx) and [TUI state handling](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/tui/src/context/data.tsx) suggests that an external API prompt leaves the TUI composer untouched because the local reset occurs in the TUI submission path.
+This is a source-based inference, not native evidence that pending draft text is preserved or that automation can safely run alongside it.
+A human-controlled visible-session resume remains an unproven alternative and is not the selected experiment.
 The installed project hook discovery also reported a duplicate server-plugin ID for a compatibility file; one package was active and the duplicate was failed.
 The trial does not establish that this duplicate caused either ownership or composer behavior.
 
-## CMUX OpenCode composer source status
+## Historical CMUX parser experiment
 
-The CMUX parser source candidate `415c17db5ef4ea4a2ced7b820baca451b3efbd88` adds a conservative native OpenCode composer-state path.
-Its scoped Swift package suite passed 879 tests across 101 suites, and four targeted static source checks passed.
-The isolated build-only check remains pending, and the tested installed CMUX is unchanged.
-The tested installed CMUX continues to report composer state `unknown`, so Hailing Frequencies must keep OpenCode delivery held.
-Native empty-versus-draft acceptance and the tagged-launch developer-account prerequisite remain unresolved.
-Source-level parser checks do not establish installed runtime behavior or safe delivery.
+The custom CMUX parser source experiment passed 879 package tests across 101 suites, four targeted static checks and an isolated app build-only check.
+The candidate was never installed or launched for native OpenCode composer verification.
+The currently used stock CMUX continues to report composer state `unknown`, so Hailing Frequencies must keep OpenCode delivery held.
+The custom source experiment is historical and is not a supported deployment route for these docs.
+Use supported stock CMUX and do not claim native empty-versus-draft acceptance from source or build-only checks.
 
 ## Remaining acceptance
 
 Managed profile dispatch and exact continuation require their own native acceptance.
 Pattern Buffer initial shared, role and exact-task delivery and an updated task in completed compaction are observed above.
 A post-compaction implementation turn, same-session resume and model-visible task-finish behavior still require native acceptance.
-Guarded messaging needs an installed CMUX build that provides authoritative empty-versus-draft evidence, exact owner binding, actual wake receipt and held-permission/draft controls.
+Automatic OpenCode inbound delivery and continuation remain held while stock CMUX reports composer state `unknown`.
+No API-only send or continuation bypass is qualified.
+OpenCode API and plugin integration remain under investigation for safe ownership and delivery behavior.
+The selected API-first experiment is a bounded investigation only, and existing product guards remain unchanged.
+Guarded messaging still needs authoritative empty-versus-draft evidence, exact owner binding, actual wake receipt and held-permission/draft controls.
+A human-controlled visible-session resume is an unproven alternative, not the selected experiment.
 The remaining synthetic-secret checks are parent credential handling, allowed-token redaction and Qwen-only orchestration.
 Qwen-only orchestration requires separate task-framing, dependency-relay, acceptance-reporting and escalation evidence.
 The earlier Codex-supervised worker results cannot establish those capabilities.
@@ -134,4 +154,5 @@ The active Model Preferences integration work still needs fresh managed-session,
 
 [Ollama v0.32.14 reasoning conversion](https://github.com/ollama/ollama/blob/v0.32.14/openai/openai.go) defines the accepted request values for the pinned runtime.
 [OpenCode v2.2.5 protocol groups](https://github.com/anomalyco/opencode/tree/v2.2.5/packages/protocol/src/groups) define the inspected API shapes.
+[OpenCode v2.2.5 TUI context](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/plugin/src/tui/context.ts) and [session protocol](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/protocol/src/groups/session.ts) define the available plugin and session surfaces reviewed for draft safety.
 See the [operating guide](qwen-operating-guide.md) for the required distinction between provisional tactics and observed evidence.
