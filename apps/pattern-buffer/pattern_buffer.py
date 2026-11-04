@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import sqlite3
@@ -21,6 +22,7 @@ import uuid
 from urllib.parse import quote, urlsplit
 
 ROLES = ("implementer", "orchestrator")
+HARNESS_CHOICES = ("claude", "codex", "opencode")
 LIMIT = 8192
 FILE_LIMIT = 32768
 HOOK_INPUT_LIMIT = 1024 * 1024
@@ -28,6 +30,7 @@ TASK_LIMIT = 16384
 INJECTION_LIMIT = 24576
 DISPATCH_ENV = "STARFLEET_CONTEXT_DISPATCH"
 REPO_PROFILE_LIMIT = 32768
+_OPENCODE_SESSION_ID = re.compile(r"^ses_[A-Za-z0-9]+$")
 
 
 class DispatchFailure(ValueError):
@@ -65,7 +68,7 @@ def auxiliary(name):
 
 
 def session_binding(root, gitdir, harness, session, agent=""):
-    if agent or not session:
+    if harness == "opencode" or agent or not session:
         return None
     return auxiliary("sessions").lookup(root, gitdir, harness, session)
 
@@ -404,6 +407,8 @@ def locked(path):
 def settings_path(harness, explicit=None):
     if explicit:
         return Path(explicit).expanduser().absolute()
+    if harness == "opencode":
+        raise ValueError("OpenCode settings must be passed explicitly with --settings")
     if harness == "codex":
         return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "hooks.json"
     return Path.home() / ".claude" / "settings.json"
@@ -444,7 +449,9 @@ def self_enroll(root, gitdir, args):
     return module.enroll(sys.modules[__name__], checkpoints(), root, gitdir, args)
 
 
-def hook_config(harness, script=None, with_checkpoints=True):
+def hook_config(harness, script=None, with_checkpoints=True, opencode_plugin=None):
+    if harness == "opencode":
+        return {"plugins": [str(Path(opencode_plugin or opencode_plugin_directory()).resolve())]}
     command = shlex.join([sys.executable, str(script or Path(__file__).resolve()),
                           "hook", "--harness", harness]) + marker(harness)
     handler = {"type": "command", "command": command, "timeout": 5}
@@ -460,6 +467,18 @@ def hook_config(harness, script=None, with_checkpoints=True):
                 extra_handler.pop("additionalContextLimit", None)
             result["hooks"][event] = [{"hooks": [extra_handler]}]
     return result
+
+
+def opencode_runtime_directory(runtime_dir=None):
+    base = (Path(runtime_dir).expanduser().absolute() if runtime_dir else
+            Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+            / "starfleet-ai" / "context-injector")
+    return base
+
+
+def opencode_plugin_directory(runtime_dir=None):
+    runtime = opencode_runtime_directory(runtime_dir) if runtime_dir else Path(__file__).resolve().parent
+    return runtime / "opencode-plugin"
 
 
 def read_settings(path):
@@ -488,6 +507,8 @@ def owned(handler, harness):
 
 
 def configure_hooks(args):
+    if args.harness == "opencode":
+        return configure_opencode(args)
     path = settings_path(args.harness, args.settings)
     with locked(path.with_name(path.name + ".context-injector.lock")):
         data = read_settings(path)
@@ -598,6 +619,68 @@ def configure_hooks(args):
             print("Worktree context, assignments, backups, and runtime copies were retained.")
 
 
+def configure_opencode(args):
+    if args.command == "install" and (not args.checkpoints or args.bin_dir):
+        raise ValueError("OpenCode uses a plugin and does not accept Claude/Codex hook or launcher options")
+    path = settings_path("opencode", args.settings)
+    if path.is_symlink():
+        raise ValueError("OpenCode settings path must not be a symlink")
+    runtime = opencode_runtime_directory(args.runtime_dir)
+    plugin = opencode_plugin_directory(runtime)
+    plugin_entry = str(plugin.resolve())
+    with locked(path.with_name(path.name + ".context-injector.lock")):
+        data = read_settings(path)
+        plugins = data.get("plugins", [])
+        if not isinstance(plugins, list) or any(not isinstance(item, str) for item in plugins):
+            raise ValueError("OpenCode plugins must be an array of strings")
+        before = json.dumps(data, sort_keys=True)
+        if args.command == "install":
+            for candidate in (runtime, plugin):
+                if candidate.is_symlink():
+                    raise ValueError(f"OpenCode runtime path must not be a symlink: {candidate}")
+            runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not runtime.is_dir():
+                raise ValueError("OpenCode runtime path is not a directory")
+            source_root = Path(__file__).resolve().parent
+            copies = {
+                runtime / "pattern_buffer.py": Path(__file__).resolve(),
+                runtime / "pattern_buffer_sessions.py": auxiliary_source("sessions"),
+                runtime / "pattern_buffer_reliability.py": auxiliary_source("reliability"),
+                runtime / "pattern_buffer_checkpoint.py": checkpoint_source(),
+                runtime / "pattern_buffer_enrollment.py": enrollment_source(),
+                runtime / "guide.md": guide_source(),
+                plugin / "package.json": source_root / "opencode-plugin/package.json",
+                plugin / "server.js": source_root / "opencode-plugin/server.js",
+            }
+            plugin.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if plugin.is_symlink():
+                raise ValueError("OpenCode plugin directory must not be a symlink")
+            for destination, source in copies.items():
+                if destination.is_symlink():
+                    raise ValueError(f"OpenCode runtime file must not be a symlink: {destination}")
+                atomic(destination, bounded(source, FILE_LIMIT if source.name == "guide.md" else 256 * 1024))
+            if plugin_entry not in plugins:
+                data["plugins"] = [*plugins, plugin_entry]
+        else:
+            remaining = [item for item in plugins if item != plugin_entry]
+            if remaining != plugins:
+                data["plugins"] = remaining
+            elif "plugins" in data:
+                data["plugins"] = plugins
+        changed = json.dumps(data, sort_keys=True) != before
+        if changed and path.exists():
+            backup = path.with_name(path.name + f".context-injector-backup-{uuid.uuid4().hex}")
+            atomic(backup, bounded(path, 1024 * 1024))
+        if changed:
+            atomic(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        print(f"{args.command}: {path} ({'updated' if changed else 'unchanged'})")
+        if args.command == "install":
+            print(f"Runtime: {runtime}")
+            print("OpenCode plugin configured in the operator-supplied settings file; native delivery is not verified.")
+        else:
+            print("OpenCode settings entry removed; runtime files were retained.")
+
+
 def sections(path):
     return sections_text(bounded(path, FILE_LIMIT))
 
@@ -627,6 +710,8 @@ def sections_text(text):
 def state_path(gitdir, harness, session, agent=""):
     if not isinstance(session, str) or not session or len(session) > 512:
         raise ValueError("a nonempty session ID is required (maximum 512 characters)")
+    if harness == "opencode" and not _OPENCODE_SESSION_ID.fullmatch(session):
+        raise ValueError("OpenCode requires the exact case-sensitive ses_ session ID")
     if not isinstance(agent, str) or len(agent) > 512:
         raise ValueError("invalid agent ID")
     key = hashlib.sha256(json.dumps([harness, session, agent]).encode()).hexdigest()
@@ -654,7 +739,7 @@ def resolve_role(root, gitdir, config, harness, session, agent="", forced_role=N
             raise ValueError("invalid session registration")
         origin = "session assignment"
     # Children never inherit the worktree's primary-session default.
-    if not role and not agent:
+    if not role and not agent and harness != "opencode":
         role = config.get("default_role")
         if role:
             origin = "worktree default"
@@ -673,9 +758,16 @@ def read_task(root, gitdir, task_id):
     data = json.loads(bounded(path, FILE_LIMIT))
     if (not isinstance(data, dict) or data.get("root") != str(root)
             or data.get("gitdir") != str(gitdir)
-            or data.get("harness") not in ("claude", "codex")
+            or data.get("harness") not in ("claude", "codex", "opencode")
             or data.get("status") not in ("pending", "active", "finished")):
         raise ValueError("invalid task registration")
+    if data["harness"] == "opencode":
+        if data.get("role") not in ROLES:
+            raise ValueError("invalid OpenCode task role")
+        if data.get("session_id") is not None and (
+                not isinstance(data["session_id"], str)
+                or not _OPENCODE_SESSION_ID.fullmatch(data["session_id"])):
+            raise ValueError("invalid OpenCode task session ID")
     digest = data.get("brief_sha256")
     if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise ValueError("invalid task brief digest")
@@ -705,6 +797,8 @@ def write_dispatch_receipt(path, root, gitdir, task_id):
                "note": "Immutable snapshot written before launch, not live task state; use task_status_command for current metadata.",
                "task_status_command": shlex.join([sys.executable, str(Path(__file__).resolve()),
                                                   "--cwd", str(root), "task-status", "--task-id", task_id])}
+    if data["harness"] == "opencode":
+        receipt.update(owner_gitdir=data["owner"]["gitdir"], role=data["role"])
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".receipt-")
     try:
@@ -716,6 +810,13 @@ def write_dispatch_receipt(path, root, gitdir, task_id):
     finally:
         os.unlink(temporary)
     return receipt
+
+
+def opencode_receipt_path(value):
+    path = Path(value).expanduser().absolute()
+    if path.is_symlink():
+        raise ValueError("OpenCode receipt path must not be a symlink")
+    return path.resolve()
 
 
 def list_owner_tasks(owner_cwd, status=None):
@@ -795,6 +896,15 @@ def prepare_dispatch(root, gitdir, args):
         data = {"root": str(root), "gitdir": str(gitdir), "harness": args.harness,
                 "owner": owner, "created_at": time.time(), "status": "pending",
                 "session_id": None, "brief_sha256": digest}
+        if args.harness == "opencode":
+            if getattr(args, "role", None) != "implementer":
+                raise ValueError("OpenCode task preparation requires an explicit implementer role")
+            if not getattr(args, "receipt_file", None):
+                raise ValueError("OpenCode task preparation requires --receipt-file")
+            receipt_path = opencode_receipt_path(args.receipt_file)
+            if receipt_path.exists() or receipt_path.is_symlink():
+                raise ValueError("receipt file already exists; use a unique file for each preparation")
+            data.update(role=args.role, receipt_file=str(receipt_path))
         atomic(path, json.dumps(data, indent=2))
     return task_id
 
@@ -817,6 +927,55 @@ def bind_dispatch(root, gitdir, harness, session, task_id):
         data.update(status="active", session_id=session)
         atomic(path, json.dumps(data, indent=2))
         atomic(binding, json.dumps({"root": str(root), "role": "implementer", "task_id": task_id}))
+
+
+def bind_opencode_dispatch(root, gitdir, args):
+    if args.harness != "opencode" or args.role != "implementer":
+        raise ValueError("OpenCode binding requires the prepared implementer role")
+    if not isinstance(args.session, str) or not _OPENCODE_SESSION_ID.fullmatch(args.session):
+        raise ValueError("OpenCode binding requires the exact case-sensitive ses_ session ID")
+    path = task_path(gitdir, args.task_id)
+    binding = state_path(gitdir, "opencode", args.session)
+    receipt_path = opencode_receipt_path(args.receipt_file)
+    with locked(binding.with_suffix(".lock")), locked(path.with_suffix(".lock")):
+        data, _ = read_task(root, gitdir, args.task_id)
+        owner = data.get("owner")
+        owner_root, owner_gitdir = validate_owner(root, owner)
+        config, _ = load(root, gitdir)
+        if config.get("context_owner") != owner:
+            raise ValueError("child worktree owner pointer no longer matches the prepared task")
+        if data.get("harness") != "opencode" or data.get("role") != args.role:
+            raise ValueError("task receipt harness or prepared role does not match")
+        if data.get("receipt_file") != str(receipt_path):
+            raise ValueError("receipt path does not match the prepared task ticket")
+        if data.get("status") != "pending" or data.get("session_id") is not None:
+            raise ValueError("only an unbound pending OpenCode ticket can be claimed")
+        if time.time() - data["created_at"] > 600:
+            raise ValueError("unclaimed OpenCode ticket expired; prepare a fresh ticket")
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            raise ValueError("prepared OpenCode receipt is missing or is not a regular file")
+        receipt = json.loads(bounded(receipt_path, FILE_LIMIT))
+        expected = {
+            "version": 1,
+            "receipt_type": "immutable_dispatch_snapshot",
+            "task_id": args.task_id,
+            "owner_worktree": str(owner_root),
+            "owner_gitdir": str(owner_gitdir),
+            "worktree": str(root),
+            "harness": "opencode",
+            "role": "implementer",
+            "session_id": None,
+            "brief_sha256": data["brief_sha256"],
+            "created_at": data["created_at"],
+            "status": "pending",
+        }
+        if not isinstance(receipt, dict) or any(receipt.get(key) != value for key, value in expected.items()):
+            raise ValueError("receipt content does not match the pending task and owner pointers")
+        if binding.exists() or binding.is_symlink():
+            raise ValueError("OpenCode session already has an assignment")
+        data.update(status="active", session_id=args.session)
+        atomic(path, json.dumps(data, indent=2))
+        atomic(binding, json.dumps({"root": str(root), "role": "implementer", "task_id": args.task_id}))
 
 
 def dispatch_command(root, args):
@@ -1060,6 +1219,30 @@ def render(cwd, harness, session, agent="", forced_role=None):
     if len(text.encode()) > INJECTION_LIMIT:
         raise ValueError("combined reminder and task exceed the 24 KiB injection limit")
     return text
+
+
+def opencode_context(root, gitdir, session):
+    if not isinstance(session, str) or not _OPENCODE_SESSION_ID.fullmatch(session):
+        raise ValueError("OpenCode context requires the exact case-sensitive ses_ session ID")
+    config_path = gitdir / "context-injector" / "config.json"
+    if not config_path.exists() and not config_path.is_symlink():
+        return {"status": "unregistered", "harness": "opencode", "session_id": session,
+                "worktree": str(root)}
+    config, _ = load(root, gitdir)
+    if not enabled(config):
+        return {"status": "disabled", "harness": "opencode", "session_id": session,
+                "worktree": str(root)}
+    if config.get("context_owner"):
+        binding = state_path(gitdir, "opencode", session)
+        if binding.is_symlink() or not binding.is_file():
+            raise ValueError("linked OpenCode worktree requires an explicit active task/session binding")
+        saved = json.loads(bounded(binding, FILE_LIMIT))
+        if (not isinstance(saved, dict) or saved.get("root") != str(root)
+                or saved.get("role") != "implementer" or not saved.get("task_id")):
+            raise ValueError("linked OpenCode worktree session is not bound to its prepared implementer task")
+    text = render(root, "opencode", session)
+    return {"status": "context", "harness": "opencode", "session_id": session,
+            "worktree": str(root), "text": text}
 
 
 def render_standing(root, source, harness, session, agent, role, origin, content):
@@ -1415,6 +1598,21 @@ def main():
     cmd.add_argument("--prepare-only", action="store_true", help="create a dispatch ticket without launching a process")
     cmd.add_argument("--receipt-file", help="write an exclusive immutable JSON dispatch snapshot with a live task lookup command")
     cmd.add_argument("argv", nargs=argparse.REMAINDER)
+    cmd = sub.add_parser("prepare-dispatch", help="create an immutable pending OpenCode ticket without launching a session")
+    cmd.add_argument("--owner-worktree", required=True)
+    cmd.add_argument("--harness", choices=("opencode",), required=True)
+    cmd.add_argument("--task-file", required=True)
+    cmd.add_argument("--receipt-file", required=True)
+    cmd.add_argument("--role", choices=("implementer",), required=True)
+    cmd = sub.add_parser("bind-dispatch", help="bind one prepared ticket to its exact native OpenCode session")
+    cmd.add_argument("--harness", choices=("opencode",), required=True)
+    cmd.add_argument("--session", required=True)
+    cmd.add_argument("--task-id", required=True)
+    cmd.add_argument("--receipt-file", required=True)
+    cmd.add_argument("--role", choices=("implementer",), required=True)
+    cmd = sub.add_parser("context", help="render current context for a native OpenCode context hook")
+    cmd.add_argument("--harness", choices=("opencode",), required=True)
+    cmd.add_argument("--session", required=True)
     cmd = sub.add_parser("tasks", help="list this owner's tasks across registered Git worktrees; not proof of success")
     cmd.add_argument("--owner-worktree", help="directly initialized owner; defaults to --cwd")
     cmd.add_argument("--status", choices=("pending", "active", "finished"))
@@ -1426,19 +1624,20 @@ def main():
     for name in ("enable", "disable"):
         sub.add_parser(name, help=f"{name} future injections for this worktree")
     status = sub.add_parser("status", help="report registration, enabled state, and optional hook presence")
-    status.add_argument("--harness", choices=("claude", "codex"))
+    status.add_argument("--harness", choices=HARNESS_CHOICES)
     status.add_argument("--session", help="report the exact session's selected standing context")
     status.add_argument("--settings", help="inspect an explicit settings JSON file")
+    status.add_argument("--runtime-dir", help="inspect the OpenCode plugin in an explicit runtime directory")
     handoff = sub.add_parser("handoff-check", help="read-only local configuration check for an orchestrator successor")
     handoff.add_argument("--harness", choices=("claude", "codex"), required=True)
     handoff.add_argument("--session", required=True)
     handoff.add_argument("--settings", help="inspect an explicit settings JSON file")
     for name in ("install", "uninstall"):
-        cmd = sub.add_parser(name, help=f"{name} only this app's owned user-level hook")
-        cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+        cmd = sub.add_parser(name, help=f"{name} only this app's owned harness integration")
+        cmd.add_argument("--harness", choices=HARNESS_CHOICES, required=True)
         cmd.add_argument("--settings", help="override the user-level settings JSON path")
+        cmd.add_argument("--runtime-dir", help="override the stable installed runtime directory")
         if name == "install":
-            cmd.add_argument("--runtime-dir", help="override the stable installed runtime directory")
             cmd.add_argument("--bin-dir", help="install the pattern-buffer launcher here; defaults to ~/.local/bin for standard installs and the runtime directory for custom --runtime-dir installs")
             mode = cmd.add_mutually_exclusive_group()
             mode.add_argument("--checkpoints", action="store_true", default=True,
@@ -1447,7 +1646,7 @@ def main():
                               help="explicit recovery-only installation without pressure hooks or Claude telemetry")
     for name in ("assign", "preview"):
         cmd = sub.add_parser(name)
-        cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+        cmd.add_argument("--harness", choices=HARNESS_CHOICES, required=True)
         cmd.add_argument("--session", required=True)
         cmd.add_argument("--agent", default="")
         cmd.add_argument("--role", choices=ROLES, required=name == "assign")
@@ -1497,7 +1696,8 @@ def main():
     cmd = sub.add_parser("hook")
     cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
     cmd = sub.add_parser("hook-config", help="print configuration to merge manually")
-    cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+    cmd.add_argument("--harness", choices=HARNESS_CHOICES, required=True)
+    cmd.add_argument("--runtime-dir", help="select the OpenCode plugin runtime directory")
     mode = cmd.add_mutually_exclusive_group()
     mode.add_argument("--checkpoints", action="store_true", default=True)
     mode.add_argument("--no-checkpoints", action="store_false", dest="checkpoints")
@@ -1543,7 +1743,11 @@ def main():
             hook(args.harness)
             return 0
         if args.command == "hook-config":
-            print(json.dumps(hook_config(args.harness, with_checkpoints=args.checkpoints), indent=2))
+            if args.harness == "opencode" and not args.checkpoints:
+                raise ValueError("OpenCode context plugins do not use Pattern Buffer checkpoint hooks")
+            runtime_plugin = opencode_plugin_directory(args.runtime_dir) if args.harness == "opencode" else None
+            print(json.dumps(hook_config(args.harness, with_checkpoints=args.checkpoints,
+                                         opencode_plugin=runtime_plugin), indent=2))
             return 0
         if args.command == "statusline":
             return statusline(args.delegate_json)
@@ -1612,6 +1816,23 @@ def main():
                     os.dup2(handle.fileno(), 0)
                 os.chdir(root)
                 os.execvpe(executable, command, {**os.environ, DISPATCH_ENV: task_id})
+        elif args.command == "prepare-dispatch":
+            receipt = opencode_receipt_path(args.receipt_file)
+            if receipt.exists() or receipt.is_symlink():
+                raise ValueError("receipt file already exists; use a unique file for each preparation")
+            if root == checkout(args.owner_worktree)[0]:
+                raise ValueError("OpenCode task preparation requires a dedicated child worktree")
+            task_id = prepare_dispatch(root, gitdir, args)
+            saved_receipt = write_dispatch_receipt(receipt, root, gitdir, task_id)
+            print(json.dumps({"task_id": task_id, "harness": "opencode", "role": args.role,
+                              "status": "pending", "receipt_file": str(receipt),
+                              "receipt_type": saved_receipt["receipt_type"]}))
+        elif args.command == "bind-dispatch":
+            bind_opencode_dispatch(root, gitdir, args)
+            print(json.dumps({"task_id": args.task_id, "harness": "opencode", "role": args.role,
+                              "session_id": args.session, "status": "active"}))
+        elif args.command == "context":
+            print(json.dumps(opencode_context(root, gitdir, args.session), ensure_ascii=False))
         elif args.command == "tasks":
             result = list_owner_tasks(args.owner_worktree or root, args.status)
             print(json.dumps(result, indent=2))
@@ -1628,6 +1849,8 @@ def main():
                 if args.command == "update-task":
                     if data["status"] == "finished":
                         raise ValueError("finished tasks cannot be revived; dispatch a new assignment")
+                    if data["harness"] == "opencode" and data["status"] == "pending":
+                        raise ValueError("pending OpenCode receipts are immutable; prepare a fresh dispatch ticket")
                     brief = bounded(Path(args.task_file).expanduser().absolute(), TASK_LIMIT)
                     data["brief_sha256"] = snapshot_brief(path, brief)
                     data["updated_at"] = time.time()
@@ -1661,10 +1884,19 @@ def main():
             if args.harness:
                 settings = settings_path(args.harness, args.settings)
                 data = read_settings(settings)
-                result.update(settings_file=str(settings), owned_hook_handlers=sum(
-                    owned(handler, args.harness)
-                    for group in data.get("hooks", {}).get("SessionStart", [])
-                    for handler in group["hooks"]))
+                result["settings_file"] = str(settings)
+                if args.harness == "opencode":
+                    plugins = data.get("plugins", [])
+                    if not isinstance(plugins, list) or any(not isinstance(item, str) for item in plugins):
+                        raise ValueError("OpenCode plugins must be an array of strings")
+                    plugin = str(opencode_plugin_directory(
+                        opencode_runtime_directory(args.runtime_dir)).resolve())
+                    result["owned_plugin_entries"] = plugins.count(plugin)
+                else:
+                    result["owned_hook_handlers"] = sum(
+                        owned(handler, args.harness)
+                        for group in data.get("hooks", {}).get("SessionStart", [])
+                        for handler in group["hooks"])
             if args.session:
                 if not args.harness:
                     raise ValueError("--session requires --harness")
@@ -1739,7 +1971,9 @@ def main():
             else:
                 print(f"Initialized {root}; edit {source}. No hooks installed.")
         elif args.command == "assign":
-            load(root, gitdir)
+            config, _ = load(root, gitdir)
+            if args.harness == "opencode" and config.get("context_owner"):
+                raise ValueError("linked OpenCode implementers must bind a prepared task ticket instead of assigning a role")
             if session_binding(root, gitdir, args.harness, args.session, args.agent) is not None:
                 raise ValueError("session has isolated standing context; use session-enroll --reviewed-update")
             path = state_path(gitdir, args.harness, args.session, args.agent)

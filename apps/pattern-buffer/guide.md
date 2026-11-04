@@ -1,6 +1,6 @@
 # Pattern Buffer guide
 
-Pattern Buffer restores approved worktree context to Claude Code and Codex at startup, resume and recovery.
+Pattern Buffer restores approved worktree context to Claude Code and Codex at startup, resume and recovery, with an opt-in OpenCode context plugin pilot.
 It can also remind enrolled orchestrators to refresh a private checkpoint as context fills.
 It is a local Python CLI with no daemon, database or model-based role detection.
 It requires Python 3.10 or newer, Git, and macOS or Linux.
@@ -44,6 +44,10 @@ It also installs the Pattern Buffer CLI aliases without adding another hook or t
 python3 apps/pattern-buffer/pattern_buffer.py install --harness codex
 python3 apps/pattern-buffer/pattern_buffer.py install --harness claude
 ```
+
+For the OpenCode v2.2.5 context hook pilot, use a dedicated OpenCode settings copy and pass it explicitly.
+The adapter requires an exact session ID and does not infer roles from worktree defaults or OpenCode parent IDs.
+Read the [OpenCode adapter guide](docs/opencode.md) for isolated setup, two-phase task binding, limits and native verification requirements.
 
 The generic `pattern-buffer` launcher goes to `$HOME/.local/bin` for a standard install.
 Add that directory to `PATH` using your usual shell setup if you want the short command.

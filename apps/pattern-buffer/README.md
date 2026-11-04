@@ -1,6 +1,6 @@
 # Pattern Buffer
 
-Pattern Buffer restores editable, worktree-specific context to Claude Code and Codex at startup, resume and compaction.
+Pattern Buffer restores editable, worktree-specific context to Claude Code and Codex at startup, resume and compaction, with an opt-in OpenCode context plugin pilot.
 It also supports exact-session context enrollment, explicit successor handoffs, bounded task replay, private dispatch receipts and local reliability observations.
 The historical Context Injector command and source paths remain compatibility aliases.
 
@@ -55,7 +55,9 @@ Dispatch enrolls an implementer worktree, binds a task brief to the owner and la
 The CLI does not infer a broader sandbox, role, model or repository permission from the task file.
 The task owner can update or finish a task explicitly, and recovery never replays a changed or finished task implicitly.
 The [implementer dispatch guide](docs/implementer-dispatch.md) documents the supported launch, update, recovery and ownership boundaries.
+The [OpenCode adapter guide](docs/opencode.md) documents its versioned context hook, explicit two-phase task binding, opt-in setup and native delivery limits.
 Use a unique --receipt-file path when an immutable local snapshot is useful; a receipt is not live task status.
+OpenCode preparation and binding are separate from Claude and Codex launch dispatch, and never start an OpenCode process.
 
 ## Storage and event behavior
 
@@ -78,6 +80,7 @@ If context does not appear, inspect status, validate and preview, then check the
 Doctor reads local registration and content only; it does not certify hook activation, model reception or compliance.
 After installation changes, restart or resume the harness according to its own configuration reload behavior.
 Native delivery checks require a separate bounded pilot in disposable state and are not established by these local tests.
+The OpenCode adapter is covered by synthetic Python and Node callback fixtures only.
 
 The canonical implementation is [pattern_buffer.py](pattern_buffer.py).
 The [editable default template](templates/default.md) is the source starter used for new worktrees.
