@@ -164,7 +164,8 @@ Current Pattern Buffer dispatched-task integration supports implementers only; k
 Read the maintained [Pattern Buffer OpenCode guide](../apps/pattern-buffer/docs/opencode.md) for explicit plugin installation, two-phase task binding and exact session identity.
 The native pilot observed shared context, the implementer role and initial task text in a primary request, an updated task in completed compaction, and a broken-bound-context failure that resulted in zero provider requests.
 A separate managed case resumed a permitted fixture read after compaction and correctly held continuation after task finish without another provider request.
-Code editing after compaction and model reception of the finished notice remain unqualified.
+A later supervised case completed a same-session post-compaction edit; the chief reviewed its unchanged diff and ran four passing behavior tests.
+Qwen itself did not run those tests or issue a native test permission request, and model reception of the finished notice remains unqualified.
 
 Hailing Frequencies currently holds OpenCode delivery while the installed CMUX projection reports composer state `unknown`.
 The historical CMUX parser experiment passed its package and build-only checks but was never installed or launched for a native empty-composer check.
@@ -181,10 +182,15 @@ The first explicit-policy continuation exposed a receipt-schema mismatch after a
 A fresh trial after correction passed actual Model Preferences continuation with the exact visible draft intact and absent from server context.
 A fresh candidate passed actual Qwen-origin Hailing self-enrollment with an exact persisted identity binding while its tool call was running.
 On that enrollment candidate, one experimental API-sidechannel Hailing wake completed its exact Qwen reply, and a pending-inbox control refused further delivery without new provider activity.
-Recipient inbox reading and other pending-interaction controls remain under qualification.
+A fresh case on `818a082` subsequently completed the Qwen-origin own-inbox CLI and exact local receipt while its API was running.
+Independent tool and request-channel inspection attributed the completed max-Qwen body-derived reply to the primary tool result.
+This qualifies bounded inbox consumption; other pending-interaction controls, Discord replies and timer delivery retain their separate gaps.
 The default strict composer policy is unchanged; do not opt in based only on source availability.
 Human-controlled visible-session resume remains a fallback requiring its own acceptance.
-OpenCode wake support in Warp-drive, Away Mode, Agent Notify, Discord Watch, Temporal Beacon and Starfleet Markup remains separately unqualified.
+A later timer case on `2dd9410` qualified actual Qwen-origin timer creation while busy, without delivery or automatic wake.
+A local-synthetic Discord Watch case on `ffd0a31` qualified receipt and primary-model body consumption, without remote registration or ingestion.
+Lifecycle identity and delivery-policy changes were accepted separately at `084faeee`.
+Other unobserved component behavior remains a reporting limit; representative tool use and ordinary software tests are the completion standard, without requiring an exhaustive live Qwen matrix.
 Do not infer notification, wake, task completion or review feedback support from source identity handling alone.
 
 ## Stop conditions

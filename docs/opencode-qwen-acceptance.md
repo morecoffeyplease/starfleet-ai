@@ -185,7 +185,7 @@ A maximum-thinking native coding case completed the four assigned file reads and
 Its later verification read misspelled a directory segment in the absolute path, and the permission guard rejected that resource as `external_directory`.
 The trial stopped at the denied call before the native test-command stage; it does not qualify the complete coding workflow.
 The original edit, denial and stopped-run evidence were preserved.
-A follow-up supervised case is being prepared with a bounded parent-approved path correction and unchanged permissions; that recovery remains unqualified.
+The later D5 supervised case below has its own exact-session assistance and parent acceptance evidence; it does not retroactively pass this earlier denied-path attempt.
 
 ## Complete CMUX project integration
 
@@ -205,7 +205,7 @@ The owner worktree was preserved and the owned API and model stopped after the c
 This establishes registration on that candidate, without permitting prompt delivery while busy.
 A subsequent native case on the same candidate qualified one real native-source Hailing reminder, exact admitted API body and completed Qwen max marker reply under explicit API-sidechannel policy.
 A queued-inbox negative control held without new batches, attempts, provider calls or API context changes.
-The recipient inbox CLI and original native-message body consumption remain unqualified.
+That wake case did not exercise the recipient inbox CLI or original native-message body consumption; B12 qualifies those separately below.
 A subsequent Qwen-origin own-inbox call on `586ff71` reproduced a busy refusal while its actual tool turn was running.
 The exact native source was eligible, identity and self-enrollment checks passed, and no output or acknowledgment was produced.
 This establishes a receipt-side readiness problem to correct and retest; it does not establish successful inbox reading.
@@ -214,7 +214,59 @@ Delivery retains its separate activity, pending interaction, native input and ex
 The receipt-side identity correction was integrated into source candidate `7098036` after that reproduction.
 Its first fresh positive inbox trial failed during managed startup before the inbox command, so it does not qualify inbox reading or disprove the receipt-side correction.
 Candidate `818a082` adds bounded observation of authoritative native startup readiness, including running-to-idle transitions after API completion.
-Source tests and that waiting logic do not establish native inbox consumption, complete coding acceptance or successful Qwen-led delegation on the newer candidate.
+Source tests and that waiting logic do not by themselves establish native inbox consumption, complete coding acceptance or successful Qwen-led delegation on the newer candidate.
+
+A fresh B12 native case on `818a082` completed the actual Qwen-origin own-inbox command while its API was running.
+The CLI returned the exact selected native body with exit zero and recorded the local source receipt; no Hailing prompt-delivery attempt or batch was created during that read.
+Independent persisted-tool inspection and a request-start channel audit confirmed that the primary tool result was the only pre-final input carrying the body-derived token.
+The completed assistant reply used the exact local Qwen model at `max` and returned that token.
+The owner worktree was preserved and both owned runtimes stopped.
+This qualifies that bounded inbox CLI receipt and primary-model body consumption, without establishing Discord reply receipt, timer delivery, a general messaging path or strict empty-composer support.
+
+## Native timer creation failure
+
+A separate TC2 native case on `818a082` completed exact self-enrollment before invoking the documented Temporal Beacon timer-creation command from Qwen's running tool turn.
+The CLI returned exit one with `OpenCode API inspection held: session_busy`, empty stdout and unchanged empty timer state.
+Independent persisted-tool and private-state inspection confirmed the API was running immediately before and after the command, one completed shell helper and no receipt database afterward.
+Both owned runtimes stopped and the owner worktree was preserved.
+This is a reproduced timer-creation failure, not timer success, wake delivery or a reason to weaken prompt-delivery guards.
+The creation-only identity correction was accepted at `2dd9410`.
+A fresh TC5 case on that candidate completed the actual Qwen timer-creation command while the API was running, with exit zero and exactly one new active timer in raw state.
+The exact owner, native generation, worktree, request and two-minute due interval matched the CLI output; no occurrences or delivery worker were present.
+All three captured provider request starts were primary Pattern Buffer-bound local Qwen at `max` with the configured output allowance, using an explicit private title-generation overlay.
+Both owned runtimes stopped and the owner worktree was preserved.
+This qualifies bounded timer creation only, without timer delivery, automatic wake or continuation consumption.
+An earlier fresh case on the same source timed out in bootstrap before any timer command; it remains a startup timeout, not a timer-fix failure.
+
+## Native synthetic Discord receive failure
+
+A separate DW1 native case on `818a082` used a private synthetic owner and pending-reply fixture without remote Discord registration, ingestion or real credentials.
+After exact Hailing enrollment, Qwen invoked the selected Discord Watch receive command once during its running tool turn.
+The CLI returned exit one with `session_busy` and empty stdout.
+Independent inspection confirmed the exact synthetic owner and one pending reply without a receipt, unchanged logical fixture state, and API-running samples around the completed tool call.
+Both owned runtimes stopped and the owner worktree was preserved.
+This reproduces the receive-side busy refusal; it does not qualify a remote reply roundtrip, automatic wake or successful recipient receipt.
+The receive-identity correction at `ffd0a31` passed a fresh DW2 case against a local synthetic reply.
+The actual Qwen receive command output the exact selected body and recorded its receipt while the API was running.
+Independent persisted-tool and request-start inspection attributed the completed max-Qwen body-derived reply exclusively to the primary tool result.
+Both owned runtimes stopped and owner state was preserved.
+This qualifies bounded local-synthetic receive and body consumption, without remote Discord registration or ingestion proof.
+Later lifecycle and immutable delivery-policy changes were accepted at `084faeee`; acceptance of that source remains distinct from a real Discord roundtrip.
+
+## Supervised coding and acceptance attribution
+
+On candidate `818a082`, D5 completed same-session compaction with the current task in a local max-thinking request.
+Its original observer waited for a bootstrap message that no longer appeared in the post-compaction context.
+The chief verified the exact session and task state, then submitted one assisted coding continuation in that same session.
+Qwen completed six scoped tools and changed only the assigned Python file; the chief reviewed the unchanged diff and ran four behavior tests with exit zero.
+The later Qwen test turn returned prose without a shell tool or native permission request.
+The original automated attempt was stopped and retained as partial; the accepted observation is supervised post-compaction Qwen coding with parent-run behavior acceptance.
+It does not establish Qwen-executed tests, a native test permission request, finished-task behavior in that case or autonomous completion.
+
+A separate A11 case on the same source completed six scoped Qwen coding tools and a one-file diff reviewed by the chief.
+Its private review receipt had the wrong file mode and an extra schema field, so the automated observer stopped before tests.
+That result is partial coding evidence with a receipt-transport failure, not an observed Qwen or source failure.
+A Qwen-led C5 preparation stopped before model dispatch because its private wrapper configuration was missing; it establishes no child-coding result.
 
 ## Native ownership and composer gaps
 
@@ -246,22 +298,19 @@ The currently used stock CMUX continues to report composer state `unknown`, so s
 The custom source experiment is historical and is not a supported deployment route for these docs.
 Use supported stock CMUX and do not claim native empty-versus-draft acceptance from source or build-only checks.
 
-## Remaining acceptance
+## Representative verification and remaining limits
 
-One managed startup and explicit-policy continuation case have native acceptance; remaining parent routes and interaction controls still require their own evidence.
-Pattern Buffer initial shared, role and exact-task delivery and an updated task in completed compaction are observed above.
-Same-session post-compaction permitted-read continuation passed separately; code editing after compaction and model-visible task-finish behavior still require native acceptance.
-Automatic OpenCode inbound delivery and continuation remain held while stock CMUX reports composer state `unknown`.
-The explicit API-sidechannel candidate has one bounded Model Preferences pass and is not a universal safe-send guarantee.
-OpenCode API and plugin integration remain under investigation for safe ownership and delivery behavior.
-API-sidechannel qualification remains a bounded investigation; the default strict policy is unchanged.
-Default strict messaging still needs authoritative empty-composer evidence; explicit API-sidechannel messaging has native registration, actual wake receipt and a pending-inbox refusal pass, with other pending-interaction controls and inbox reading still requiring their own evidence.
-A human-controlled visible-session resume is an unproven alternative, not the selected experiment.
-The remaining synthetic-secret checks are parent credential handling, allowed-token redaction and Qwen-only orchestration.
-Qwen-led orchestration with human or frontier-model assistance requires separate task-framing, actual worker delegation, dependency-relay, acceptance-reporting and escalation evidence.
-Record interventions without treating their presence as failure of the supervised workflow or claiming autonomous behavior.
-The earlier Codex-supervised worker results cannot establish those capabilities.
-Remaining managed-workflow acceptance includes code implementation, Qwen-led child delegation, native inbox consumption and the remaining failure controls; native self-enrollment has its separate pass above.
+The current completion standard is representative relevant tool use, ordinary software verification and accurate reporting of limits.
+It does not require every tool or branch to run live through Qwen, full autonomy, Qwen-executed tests or a native test permission request.
+Reuse the recorded HF, Temporal, Pattern Buffer and supervised coding observations within their exact candidate and assistance boundaries.
+One representative light Warp job and one real Discord roundtrip are separate workflow observations; their results must be recorded when actually available.
+No exhaustive live matrix or additional model trial is implied by an unobserved table cell.
+
+Strict delivery remains held on unknown composer state; the opted-in experimental API-sidechannel cases do not establish universal send safety.
+Timer creation and local-synthetic Discord receipt do not establish timer delivery or remote Discord ingestion.
+Qwen-led child coding, general autonomous orchestration, model-visible finished-task behavior in D5, parent credential isolation and allowed-token redaction remain unproven.
+These are reporting limits, not added completion gates or authority to launch more inference.
+Retain failed and uncertain attempts, record assistance precisely, and preserve existing human and rollout holds.
 
 ## Sources
 

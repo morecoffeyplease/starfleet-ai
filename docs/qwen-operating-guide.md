@@ -26,11 +26,11 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 | Component | Candidate source behavior | Observed native boundary |
 | --- | --- | --- |
 | Model Preferences | Exact provider/model preflight and managed dispatch path under active integration work | Fresh Codex-Qwen startup and one explicit-policy managed continuation preserved a visible synthetic draft; every parent route and Qwen-led orchestration remain unqualified |
-| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks | Initial context, updated compaction context, same-session permitted read after compaction and finished-task continuation refusal passed; code editing after compaction and model-visible finish remain unverified |
-| Hailing Frequencies | Exact OpenCode identity, enrollment and guarded API delivery | Native self-enrollment, one experimental API-sidechannel wake and pending-inbox refusal passed; strict delivery still holds unknown composer state, and recipient inbox reading remains unqualified |
-| Discord Watch | Exact thread ownership and guarded Hailing delivery | No OpenCode Discord reply wake or recipient receipt has been observed |
-| Temporal Beacon | Exact enrolled owner and bounded timer continuation | No OpenCode timer wake or recipient receipt has been observed |
-| Agent Notify | OpenCode identity and owning-thread paths in source | No native Qwen-origin conversation or reply reception is recorded |
+| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks | Initial context, compaction, same-session read and a separate finished-task refusal passed; D5 added assisted post-compaction Qwen coding with four parent-run passing tests, without Qwen test execution |
+| Hailing Frequencies | Exact OpenCode identity, enrollment and guarded API delivery | Native self-enrollment, one experimental API-sidechannel wake, pending-inbox refusal and B12 bounded own-inbox receipt/body consumption passed on their recorded candidates; strict delivery still holds unknown composer state |
+| Discord Watch | Exact thread ownership and guarded Hailing delivery | DW1 reproduced busy receive refusal; DW2 on `ffd0a31` passed local-synthetic receipt and exclusive primary-model body attribution; remote Discord ingestion remains separate |
+| Temporal Beacon | Exact enrolled owner and bounded timer continuation | TC2 reproduced busy timer creation; TC5 on `2dd9410` passed actual Qwen creation with one exact active timer; delivery and automatic wake unobserved |
+| Agent Notify | OpenCode identity and owning-thread paths in source | Real conversation/reply outcomes are tracked separately; local-synthetic receipt does not prove remote ingestion |
 | Warp-drive and Away Mode | OpenCode owner identity paths in source | Native Qwen job completion and away-context reception are unqualified |
 | Starfleet Markup | Existing owner-bound CLI and foreground listener; automatic native routes currently target Claude or Codex | No OpenCode automatic feedback-wake qualification; create review documents only when requested |
 | Starfleet Policy Guard | Delivery reports and native-owner seats for documented Claude/Codex GitHub CLI paths | No OpenCode policy-seat load or native-owner action observed; do not infer an OpenCode gate |
@@ -46,7 +46,8 @@ One bounded API-first control in a manually started visible session observed an 
 Separate preflight controls observed pending-form and pending-permission holds.
 A subsequent managed-session startup and API draft-preservation case also passed, with its production delivery guard still held.
 The later experimental Hailing wake and pending-inbox refusal case has its own recorded pass.
-These observations do not qualify recipient inbox consumption, every managed parent route or a universal production API-only path.
+The older draft and wake observations do not qualify every managed parent route or a universal production API-only path.
+The later B12 case separately qualified one own-inbox receipt and primary-model body consumption on `818a082`.
 The first explicit-policy Model Preferences attempt stopped with uncertain admission and was not replayed; persisted evidence exposed a receipt-schema mismatch.
 After correction, a fresh actual managed continuation completed its reply with the unsent draft intact and absent from server context.
 The strict composer policy remains the default.
@@ -99,7 +100,7 @@ Do not place secret values in terminal arguments, reports, shared context, logs,
 ### Synthetic canary acceptance evidence
 
 Use only fake canary values and inspect file access, tool requests, visible output, logs and network boundaries for the exact candidate.
-Test parent handling separately from Qwen worker handling, and run Qwen-only qualification separately from Codex-supervised runs.
+When a future task specifically evaluates secret handling, distinguish parent, worker and Qwen-led observations rather than treating one role as evidence for another.
 The entries below are acceptance checks, not results.
 The worker denied-read subset has one recorded native observation; the other checks remain untested.
 That canary summary omits the source candidate SHA, so its checked-surfaces observation has a source-attribution gap and cannot establish exact-candidate acceptance for the current aggregate.
@@ -142,6 +143,11 @@ A separate bootstrap attempt completed its required reply before Model Preferenc
 Treat API completion, native lifecycle observation and readiness as separate observations, and retain their timestamps.
 An uncertain launch is not permission to replay the initial prompt.
 Any startup waiting must remain bounded and require exact authoritative identity, idle state and interaction guards before delivery readiness.
+
+A post-compaction case completed compaction with current task context, then reached an inactive API context containing compaction and idle records without its earlier bootstrap user message.
+The frozen observer continued waiting for that removed message instead of recognizing the current post-compaction state.
+Validate the exact current native session, active task, interaction holds and post-compaction turn rather than assuming a pre-compaction visible message ID survives.
+Keep the original partial observer result and any separately authorized same-session assisted continuation as separate evidence; do not replay compaction or infer a product failure from this observer assumption.
 
 ### Candidate-specific evidence
 
@@ -312,7 +318,7 @@ The permission guard rejected that path and the trial stopped before its native 
 Provide exact task-relative paths when the pinned tool supports them, or copy the canonical assigned path from current task evidence without reconstructing it.
 A denied path is evidence of the requested resource and guard result; inspect both before deciding whether the worker misunderstood scope or mistyped an authorized path.
 A parent may issue a bounded corrected assignment within unchanged authority and permissions, with the intervention recorded.
-The prepared supervised correction has not yet established a successful recovery result, so this guidance does not imply a validated retry cadence.
+D5 later used one exact-session assisted continuation and parent acceptance; that single outcome does not establish a general retry cadence.
 
 ## Review boundary
 
@@ -331,7 +337,8 @@ Do not infer a benchmark, stable cadence, general security property or qualifica
 
 The [native acceptance observations](opencode-qwen-acceptance.md) record a completed maximum-thinking read trial and the ownership/composer gaps it exposed.
 They include current Pattern Buffer task context, completed compaction, a same-session read continuation, experimental draft-preserving continuation and one experimental Hailing wake.
-Post-compaction code editing, native code/test completion and Qwen-led child delegation remain unqualified.
+D5 later added a scoped same-session post-compaction Qwen edit through chief assistance and four parent-run passing behavior tests.
+Qwen-executed tests, native test permission requests and Qwen-led child coding remain unproven; they are limits, not extra completion gates.
 One separate maximum-thinking task delivered its Pattern Buffer context and completed the allowed read, but its final report included only one of five requested markers and failed that exact reporting criterion.
 A separate one-output control does not change the five-marker result.
 This single observation supports checking final-report completeness separately from mechanical context delivery, and does not define a general marker-count limit, context budget or task-size rule.
@@ -346,26 +353,34 @@ The trial labels identify observations, not public commands or reproducibility p
 | A8 implementer | `cb392f8` | Edit and permitted self-check read | An exact-count observer rejected the allowed reread | Verify allowed resources, required coverage and the diff instead of one fixed valid tool sequence; tests did not run |
 | B7 recipient | `586ff71` | Self-enrollment during its running tool turn | Authenticated native self-enrollment completed | Registration identity and prompt readiness are distinct; this alone does not prove wake delivery |
 | B9 recipient | `586ff71` | Native-source attention and queued-inbox control | Exact reminder and max-Qwen marker completed; queued work prevented another delivery | Experimental API-sidechannel wake and one pending-inbox safeguard only |
-| B10 recipient | `586ff71` | Read its own native inbox during its tool turn | Actual CLI refused with session_busy and no output or acknowledgment | Read/receipt identity needs a separate qualification; the source correction has not yet passed native retesting |
+| B10 recipient | `586ff71` | Read its own native inbox during its tool turn | Actual CLI refused with session_busy and no output or acknowledgment | This failure did not qualify read/receipt identity; B12 later qualified the corrected newer candidate separately |
 | A9 implementer | `cb392f8` | No-tool managed bootstrap | Required reply completed before an uncertain native-state result; exact hook record appeared later | Correlate API, native and hook observations without replaying admission; no subsequent coding turn |
-| B11 recipient | `7098036` | Fresh inbox qualification after receipt-side identity correction | Managed startup failed before the inbox CLI | The source correction remains unqualified natively; no inbox consumption pass |
+| B11 recipient | `7098036` | Fresh inbox qualification after receipt-side identity correction | Managed startup failed before the inbox CLI | No inbox consumption pass from this attempt; B12 later qualified the newer candidate separately |
+| B12 recipient | `818a082` | Read its own selected native inbox body during a running tool turn | CLI exit zero, exact local receipt and completed max-Qwen body-derived token; primary tool result was the sole pre-final token input | Bounded inbox receipt and body consumption only; no send attempt/batch or Discord/timer qualification |
+| D5 implementer | `818a082` | Same-session compaction and scoped edit | Chief-assisted continuation produced six Qwen tools and one-file edit; chief reviewed unchanged diff and ran four passing tests | Supervised post-compaction coding with parent acceptance; original automation partial, Qwen test turn prose only |
+| A11 implementer | `818a082` | Scoped native coding | Six tools and one-file diff reviewed by chief; private review-receipt transport stopped observer before tests | Partial coding evidence; no model or source failure inferred |
+| DW2 recipient | `ffd0a31` | Local synthetic reply receipt | Exact CLI body and persisted receipt, completed max-Qwen token attributed only to primary tool result | No remote Discord registration or ingestion proof |
+| TC5 owner | `2dd9410` | Create a two-minute timer during running tool turn | CLI exit zero, exactly one raw active timer and no occurrences, exact identity and schedule | Creation only; no delivery worker, automatic wake or continuation consumption |
 
-The documentation aggregate starts from source `818a082`, which adds bounded authoritative startup readiness observation after the B11 failure.
+The documentation aggregate starts from source `818a082` and includes the accepted Temporal creation chain through `2dd9410` and Discord receipt/lifecycle policy chain through `084faeee`.
 The earlier native passes retain their original candidate pins and are not silently promoted to this newer source.
 Canonical aggregate verification and Model Preferences component verification are separate from native qualification.
 
-### Complete workflow qualification
+### Representative workflow verification
 
-The intended endstate includes both Codex-led Qwen implementation and research, and Qwen-led Qwen implementation with recorded human or frontier assistance.
-The bounded MP/PB passes are prerequisites within that endstate and do not replace either orchestration direction.
-For each direction, require the actual task framing, exclusive worktree/path ownership, tool execution, implementation, acceptance command, result relay and owner acceptance observed on the selected candidate.
-Qualify post-compaction editing separately from the existing permitted-read pass.
-Keep synthetic secret handling, visible approval handling and uncertain-outcome preservation explicit in the acceptance ledger.
+Verify representative relevant tool use and run ordinary software tests on the final candidate.
+Do not require every component or branch to run live through Qwen, full autonomy, Qwen-executed tests or a native test permission request as a completion gate.
+Reuse the recorded HF, Temporal, Pattern Buffer and supervised coding evidence with its exact source pins and assistance attribution.
+One representative light Warp job and one real Discord roundtrip provide useful additional workflow observations when actually completed.
+A prepared card, queued job or open post is not a completed roundtrip.
+Record the actual results without launching more inference solely to fill a matrix.
 
-For messaging and human-contact workflows, track recipient inbox reading, Discord Watch reply receipt, Agent Notify conversation and reply, Temporal Beacon wake, Warp completion receipt and Away context reception as separate component outcomes.
-Those unobserved paths remain gaps in the broader tool matrix even when a particular bounded worker case does not invoke them.
-Starfleet Markup's OpenCode automatic wake and Policy Guard's OpenCode native seat are outside the documented native adapter contracts; record those limits rather than treating unrelated Claude/Codex evidence as OpenCode support.
-No passing subset establishes that every tool is qualified, and no missing optional component justifies changing the agreed two-direction endstate.
+Codex-supervised Qwen work and Qwen-led child coding remain different claims.
+The former has representative read, scoped edit, compaction and parent acceptance evidence; the latter has not been demonstrated by these trials.
+Keep that limit visible without inventing another live acceptance gate.
+Timer creation does not establish timer delivery, and a local-synthetic Discord receive does not establish remote ingestion.
+Markup automatic OpenCode wake and Policy Guard native OpenCode seats are outside the documented adapter contracts.
+Ordinary software checks cover branches, while behavioral claims stay bounded by observed evidence.
 
 Use the following record shape for additional observations.
 
@@ -373,8 +388,8 @@ Use the following record shape for additional observations.
 | --- | --- | --- | --- | --- | --- |
 | [exact provider, model, thinking setting, OpenCode version, CMUX workspace, and role] | [objective and candidate] | [what was directly observed] | [what changed in the task or decision] | [sample size, candidate, tools, and unverified behavior] | [guidance supported by this observation] |
 
-For Qwen-only qualification, add evidence for task framing, dependency relay, tool-boundary handling, acceptance reporting, waiting approval and late-result reconciliation.
-Report any missing category as unverified.
+A future claim of Qwen-led orchestration needs its own actual delegation and owner-acceptance evidence.
+Until then, report that capability as unverified without starting new trials solely to complete this table.
 Update provisional cadence, task-size, context and retry guidance only from recorded trial evidence.
 
 ## Compact report
