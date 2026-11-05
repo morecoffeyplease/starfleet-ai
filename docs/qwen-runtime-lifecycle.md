@@ -6,9 +6,13 @@ It covers both a Codex-Qwen implementer and a Qwen-only orchestrator, including 
 ## Readiness gate
 
 This is a source-checked operator recipe, not a clean-host or end-to-end qualification.
-The current Pattern Buffer OpenCode plugin supplies current context and task text to primary and compaction requests, but its OpenCode integration does not implement the required pressure warning, compaction telemetry, native recovery evidence, or native delivery confirmation.
-Both Codex-Qwen and Qwen-only work must also satisfy the Prime Directive contract, which is not yet integrated into this candidate.
-Do not dispatch work until both requirements have an implemented and reviewed contract for each mode.
+The candidate Pattern Buffer source now includes an opt-in OpenCode lower-anchor pressure reminder, descriptor validation, and checkpoint and compaction lifecycle accounting.
+Its same-session usage and runtime descriptor, native plugin loading, recovery behavior, and warning delivery remain unqualified.
+The candidate also includes an opt-in Policy Guard OpenCode Prime Directive plugin with focused source coverage, but native plugin loading, permission handling, and covered action outcomes remain unqualified.
+The Prime Directive plugin passes event data as JSON to a local CLI bridge, and that bridge does not authenticate the event cryptographically.
+A local caller able to invoke the bridge can forge its event shape and bypass the plugin's native permission assertion, subject to the remaining local owner, checkout, and report checks.
+Treat this as a cooperative workflow guard, not an adversarial local-process or operating-system boundary.
+Do not dispatch until the required bounded native acceptance for both features has completed for the selected mode and the owner records its evidence.
 
 The current Model Preferences source reads the API password from the private manifest and places it in the OpenCode TUI process environment.
 This source fact does not establish whether tool subprocesses can read the value; they may use a sanitized environment or execute in another process boundary.
@@ -227,7 +231,8 @@ python3 "$PB" status --harness opencode \
 If the approved CMUX installation requires its project OpenCode hook, run `cmux hooks opencode install --project` from each exact owner or child worktree.
 That is a project-scoped install command, not a read-only status check or proof of live hook delivery.
 Managed dispatch must still confirm the exact session, worktree, CMUX workspace, surface, and hook generation before it releases the prompt.
-The installed OpenCode Pattern Buffer plugin does not currently provide the readiness-gated pressure warning described above.
+The OpenCode Pattern Buffer source includes the opt-in lower-anchor pressure warning described in its guide.
+It remains disabled until an exact-session descriptor is reviewed and imported, and native warning delivery is not yet qualified.
 
 ## Start one owned runtime pair
 

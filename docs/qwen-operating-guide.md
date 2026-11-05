@@ -6,7 +6,8 @@ The workflow does not require a separate policing service or zero human interven
 Record assistance and interventions so supervised observations are not presented as autonomous orchestration.
 Use the [OpenCode and local Qwen setup guide](opencode-qwen-setup.md) for the pinned pilot configuration and setup prerequisites.
 Use the [Qwen runtime lifecycle runbook](qwen-runtime-lifecycle.md) for private runtime startup, exact managed dispatch commands, worker scaling and owned shutdown.
-The runbook is gated on the required Pattern Buffer pressure warning and Prime Directive contracts for both Codex-Qwen and Qwen-only; those requirements are not yet integrated into this candidate.
+The runbook remains gated on native acceptance of the Pattern Buffer pressure reminder and Policy Guard Prime Directive plugin for the selected mode.
+Both source implementations are present in this candidate, but their native warning, recovery, plugin loading, permission and covered-action outcomes remain unqualified.
 
 Every Qwen run uses a visible OpenCode tab or pane in the existing CMUX workspace assigned to that same task.
 Keep the task, session, worktree and candidate identity together in that workspace.
@@ -27,15 +28,15 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 
 | Component | Candidate source behavior | Observed native boundary |
 | --- | --- | --- |
-| Model Preferences | Exact provider/model preflight and managed dispatch path under active integration work | Fresh Codex-Qwen startup and one explicit-policy managed continuation preserved a visible synthetic draft; every parent route and Qwen-led orchestration remain unqualified |
-| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks | Initial context, compaction, same-session read and a separate finished-task refusal passed; D5 added assisted post-compaction Qwen coding with four parent-run passing tests, without Qwen test execution |
+| Model Preferences | Exact provider/model/variant preflight and managed dispatch path in candidate source | Fresh Codex-Qwen startup and one explicit-policy managed continuation preserved a visible synthetic draft; every parent route and Qwen-led orchestration remain unqualified |
+| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks, opt-in lower-anchor pressure reminder, and checkpoint lifecycle accounting | Initial context, compaction, same-session read and a separate finished-task refusal passed; D5 added assisted post-compaction Qwen coding with four parent-run passing tests, without Qwen test execution; native pressure, recovery and warning delivery remain unqualified |
 | Hailing Frequencies | Exact OpenCode identity, enrollment and guarded API delivery | Native self-enrollment, one experimental API-sidechannel wake, pending-inbox refusal and B12 bounded own-inbox receipt/body consumption passed on their recorded candidates; strict delivery still holds unknown composer state |
 | Discord Watch | Exact thread ownership and guarded Hailing delivery | DW1 reproduced busy receive refusal; DW2 on `ffd0a31` passed local-synthetic receipt and exclusive primary-model body attribution; remote Discord ingestion remains separate |
 | Temporal Beacon | Exact enrolled owner and bounded timer continuation | TC2 reproduced busy timer creation; TC5 on `2dd9410` passed actual Qwen creation with one exact active timer; delivery and automatic wake unobserved |
 | Agent Notify | OpenCode identity and owning-thread paths in source | N1 on `084faeee` completed one assisted real reply/owner-close roundtrip in the same persisted session; automatic DW wake, managed receipt and native-hook restoration remain unqualified |
 | Warp-drive and Away Mode | OpenCode owner identity paths in source | Native Qwen job completion and away-context reception are unqualified |
 | Starfleet Markup | Existing owner-bound CLI and foreground listener; automatic native routes currently target Claude or Codex | No OpenCode automatic feedback-wake qualification; create review documents only when requested |
-| Starfleet Policy Guard | Delivery reports and native-owner seats for documented Claude/Codex GitHub CLI paths | No OpenCode policy-seat load or native-owner action observed; do not infer an OpenCode gate |
+| Starfleet Policy Guard | Delivery reports and native-owner seats for documented Claude/Codex paths; opt-in OpenCode plugin source for bounded Prime Directive actions | Native OpenCode plugin load and covered-action outcomes remain unqualified; its local JSON bridge is cooperative and can bypass the plugin permission assertion, so do not treat it as an adversarial boundary |
 | Qwen-only orchestration | Opt-in model profile records | A profile is not orchestration proof; Qwen-only startup, actual child delegation, acceptance reporting and escalation remain unqualified |
 
 The active shared profile remains independent of these opt-in examples.

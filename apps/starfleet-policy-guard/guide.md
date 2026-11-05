@@ -62,7 +62,11 @@ Use the same actual OpenCode session and session API project/location for later 
 
 The plugin reads `sessionID`, agent, message ID and call ID from the actual server tool context, then calls the OpenCode session API for the session's exact ID, parent ID, project ID and location directory.
 The `OPENCODE_SESSION_ID` shell environment variable is not an owner identity and cannot enroll a seat.
-The native server plugin is the supported caller of the internal `lane.py opencode` bridge; manually supplied bridge JSON and arbitrary local scripts remain outside this coverage.
+The native server plugin passes its event and tool arguments as JSON on stdin to the local `lane.py opencode` bridge.
+The bridge validates the event shape but does not authenticate it cryptographically.
+A local caller that can invoke this bridge can manufacture event JSON and attempt covered operations without the plugin's native permission assertion, subject to the remaining local owner, checkout, and report checks.
+This is a cooperative workflow guard, not an adversarial local-process or operating-system boundary.
+Do not give untrusted local workers access to the bridge or seat state, and do not claim that plugin source or its JSON event proves native authorization.
 The root session and every child session are distinct owners, and a child does not inherit a parent's seat.
 Use `prime_directive_manage` with `operation: "rebind-owner"` from the incoming actual session for an explicit owner-authorized handoff.
 The handoff preserves seat and PR history, archives the old owner's receipt, and requires a new report from the incoming owner.

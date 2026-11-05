@@ -1,6 +1,6 @@
 # Starfleet Policy Guard
 
-Policy Guard provides a local delivery report and an optional native-owner seat for supported GitHub CLI paths.
+Policy Guard provides a local delivery report and optional native-owner seats for supported GitHub CLI paths, including an opt-in OpenCode plugin source candidate for bounded Prime Directive actions.
 Reports organize audit, target-awareness, conflict and canonical verification evidence without running those checks or granting readiness, merge or deployment authority.
 The seat can gate only its documented command paths; it does not intercept arbitrary scripts, other applications, web/API actions or commands outside its adapters.
 
@@ -41,6 +41,8 @@ Local verification is evidence for the recorded source and verification inputs, 
 The reported verification command must exactly match the canonical command documented by the repository.
 Policy Guard neither guesses a package manager nor runs the command while reporting.
 Configured installation and adapter state are not proof that a native runtime loaded the hook or that a message was delivered.
+The OpenCode plugin uses a local JSON CLI bridge that does not authenticate its event payload cryptographically, so this remains a cooperative workflow guard rather than an adversarial local-process boundary.
+Native plugin loading and covered action outcomes remain unqualified; see the [setup guide](guide.md) for the bridge limitation and the exact acceptance boundary.
 
 The separate `guard.py` workflow uses the local policy in `config/default-policy.json` and is distinct from the delivery-only seat.
 Its fixture workflow does not make filesystem access a security boundary and does not install into a lane through the seat installer.

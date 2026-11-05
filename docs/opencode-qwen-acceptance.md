@@ -274,9 +274,17 @@ The Pattern Buffer OpenCode checkpoint adapter now has source coverage for expli
 Its context plugin uses the shared atomic publisher and retains an invalid-draft advisory until that draft content changes.
 Compaction attempts and failures do not increment the observed successful-completion count, and duplicate or foreign-session events are rejected.
 The event stream has no replay guarantee, so generation coverage remains uncertain.
-The current context callback is too late to warn before v2.2.5 automatic compaction decides to compact.
-Pressure warnings remain disabled because exact same-session usage and the runtime/window/config descriptor have not qualified this candidate.
+The v2.2.5 context callback is too late to warn before automatic compaction decides to compact.
+Pattern Buffer source now includes an opt-in warning from a last-measured lower-anchor token total and requires a reviewed descriptor bound to the exact session and runtime configuration.
+Without that descriptor, the reminder stays disabled; exact current occupancy and guaranteed headroom are not available from this source.
+No native descriptor, hook load or warning delivery has qualified this candidate.
 This source change has not been installed or exercised in a native OpenCode session; the offline controls and canonical verification remain separate evidence.
+
+The current integration candidate also includes a Policy Guard OpenCode plugin source path for bounded Prime Directive actions.
+Its focused fixtures are source coverage only; no native plugin load, permission decision or covered GitHub action was qualified on this candidate.
+The plugin passes event data as JSON to a local CLI bridge that does not authenticate the event cryptographically.
+A local caller able to invoke that bridge can forge event data and bypass the plugin's native permission assertion, subject to the remaining local owner, checkout and report checks.
+Treat this as a cooperative workflow guard, not an adversarial local-process or operating-system boundary.
 
 Passively opening an API-created session did not initially register a native CMUX agent identity.
 A subsequent actual startup task produced OpenCode lifecycle events and a native session record.
