@@ -20,6 +20,7 @@ When a compatible installed entrypoint is verified, the refusal prints a complet
 Run the reported compatible command when one is available.
 If installation refuses an unowned or damaged entrypoint, preserve that runtime and run the reported same-settings recovery command into a new empty runtime.
 The recovery install updates only the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
+The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
 Review the harness's normal reload and trust controls after changing the hook command.
 An orchestrator handoff to an already-installed harness usually needs the [read-only handoff check](session-enrollments.md#read-only-handoff-check), not another installation.
 From this app's directory, install the updated adapter for each harness that needs it:

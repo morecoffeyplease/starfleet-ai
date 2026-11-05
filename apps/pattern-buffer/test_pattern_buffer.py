@@ -766,11 +766,16 @@ else:
         self.assertIn("exactly one installed Pattern Buffer hook", report["checks"]["hook_runtime"]["detail"])
 
         self.cli("install", *recovery_only_options, "--runtime-dir", str(runtime))
+        old_launcher = runtime / "pattern-buffer"
+        old_launcher_bytes = old_launcher.read_bytes()
         damaged_entrypoints = [runtime / "context_injector_codex.py", runtime / "pattern_buffer_codex.py",
                                runtime / "pattern_buffer.py"]
         for entrypoint in damaged_entrypoints:
             entrypoint.write_text("stale runtime")
         damaged_bytes = [entrypoint.read_bytes() for entrypoint in damaged_entrypoints]
+        old_launcher_before = subprocess.run([str(old_launcher), "guide", "--print"],
+                                             capture_output=True, text=True)
+        self.assertNotEqual(old_launcher_before.returncode, 0)
         stale = self.cli("handoff-check", "--harness", "codex", "--session", "successor",
                          "--settings", str(settings), success=False)
         report = json.loads(stale.stdout)
@@ -778,8 +783,12 @@ else:
         self.assertIn("runtime differs", report["checks"]["hook_runtime"]["detail"])
         self.assertIn("Same-settings recovery command:", report["checks"]["hook_runtime"]["next_action"])
         self.assertIn(str(settings), report["checks"]["hook_runtime"]["next_action"])
-        recovery_args = shlex.split(report["checks"]["hook_runtime"]["next_action"].split(
-            "Same-settings recovery command: ", 1)[1])
+        next_action = report["checks"]["hook_runtime"]["next_action"]
+        recovery_text, recovery_command = next_action.split("Same-settings recovery command: ", 1)
+        recovery_args = shlex.split(recovery_command)
+        recovery_runtime = Path(recovery_args[recovery_args.index("--runtime-dir") + 1])
+        self.assertIn("Any existing PATH launcher remains unchanged", recovery_text)
+        self.assertIn(shlex.quote(str(recovery_runtime / "pattern-buffer")), recovery_text)
         self.assertIn("--no-checkpoints", recovery_args)
 
         settings_before_refusal = settings.read_bytes()
@@ -790,18 +799,35 @@ else:
         self.assertEqual(settings.read_bytes(), settings_before_refusal)
         self.assertEqual([entrypoint.read_bytes() for entrypoint in damaged_entrypoints], damaged_bytes)
 
-        runtime = self.root.parent / "fresh runtime with spaces"
-        self.assertFalse(runtime.exists())
-        self.cli("install", *recovery_only_options, "--runtime-dir", str(runtime))
+        self.assertEqual(old_launcher.read_bytes(), old_launcher_bytes)
+        self.assertFalse(recovery_runtime.exists())
+        recovery = subprocess.run(recovery_args, capture_output=True, text=True)
+        self.assertEqual(recovery.returncode, 0, recovery.stdout + recovery.stderr)
         self.assertNotEqual(settings.read_bytes(), settings_before_refusal)
         self.assertEqual([entrypoint.read_bytes() for entrypoint in damaged_entrypoints], damaged_bytes)
+        old_launcher_after = subprocess.run([str(old_launcher), "guide", "--print"],
+                                            capture_output=True, text=True)
+        self.assertEqual((old_launcher_after.returncode, old_launcher_after.stdout, old_launcher_after.stderr),
+                         (old_launcher_before.returncode, old_launcher_before.stdout, old_launcher_before.stderr))
+        self.assertEqual(old_launcher.read_bytes(), old_launcher_bytes)
         data = json.loads(settings.read_text())
         self.assertEqual(data["unrelated"], {"setting": True})
         self.assertEqual(data["hooks"]["Stop"], [{"hooks": [{"type": "command", "command": "echo untouched"}]}])
         handler = data["hooks"]["SessionStart"][0]["hooks"][0]
-        self.assertIn(str(runtime / "context_injector_codex.py"), handler["command"])
-        recovered = self.cli("handoff-check", "--harness", "codex", "--session", "successor",
-                             "--settings", str(settings))
+        self.assertIn(str(recovery_runtime / "context_injector_codex.py"), handler["command"])
+        new_launcher = recovery_runtime / "pattern-buffer"
+        guide = subprocess.run([str(new_launcher), "guide", "--print"], capture_output=True, text=True)
+        self.assertEqual(guide.returncode, 0, guide.stdout + guide.stderr)
+        self.assertTrue(guide.stdout.startswith("# Pattern Buffer guide\n"))
+        status = subprocess.run([str(new_launcher), "--cwd", str(self.root), "status", "--harness", "codex",
+                                 "--settings", str(settings)], capture_output=True, text=True)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertTrue(json.loads(status.stdout)["registered"])
+        self.assertEqual(json.loads(status.stdout)["owned_hook_handlers"], 1)
+        recovered = subprocess.run([str(new_launcher), "--cwd", str(self.root), "handoff-check",
+                                    "--harness", "codex", "--session", "successor", "--settings", str(settings)],
+                                   capture_output=True, text=True)
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
         recovered_report = json.loads(recovered.stdout)
         self.assertTrue(recovered_report["checks"]["hook_runtime"]["ok"])
         self.assertTrue(recovered_report["configuration_ready"])
@@ -1386,6 +1412,9 @@ print(json.dumps({{'stdin':sys.stdin.read(),'argv':sys.argv,'context':json.loads
         self.assertIn("--settings", recovery)
         self.assertEqual(recovery[recovery.index("--settings") + 1], str(settings))
         recovery_runtime = Path(recovery[recovery.index("--runtime-dir") + 1])
+        recovery_guidance_text = result.stderr.split("Same-settings recovery command: ", 1)[0]
+        self.assertIn("Any existing PATH launcher remains unchanged", recovery_guidance_text)
+        self.assertIn(shlex.quote(str(recovery_runtime / "pattern-buffer")), recovery_guidance_text)
         self.assertNotEqual(recovery_runtime, runtime)
         self.assertFalse(recovery_runtime.exists())
         self.assertFalse(started.exists())

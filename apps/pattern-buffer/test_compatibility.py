@@ -146,6 +146,43 @@ class RenameCompatibilityTests(unittest.TestCase):
             self.assertFalse(settings.exists())
             self.assertFalse(settings.with_name(settings.name + ".context-injector.lock").exists())
 
+    def test_other_harness_alias_refusal_reports_same_settings_recovery_without_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            runtime = folder / "runtime"
+            codex_settings = folder / "codex.json"
+            claude_settings = folder / "claude.json"
+            env = {**os.environ, "HOME": str(folder), "XDG_DATA_HOME": str(folder / "data"),
+                   "CODEX_HOME": str(folder / ".codex")}
+            for harness, settings in (("codex", codex_settings), ("claude", claude_settings)):
+                installed = subprocess.run([sys.executable, str(CURRENT_CLI), "install", "--harness", harness,
+                                            "--settings", str(settings), "--runtime-dir", str(runtime)],
+                                           capture_output=True, text=True, env=env)
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+
+            damaged = runtime / "pattern_buffer_claude.py"
+            damaged.write_text("unowned other-harness runtime\n")
+            runtime_before = {path.name: path.read_bytes() for path in runtime.iterdir() if path.is_file()}
+            settings_before = {path: path.read_bytes() for path in (codex_settings, claude_settings)}
+            refused = subprocess.run([sys.executable, str(CURRENT_CLI), "install", "--harness", "codex",
+                                      "--settings", str(codex_settings), "--runtime-dir", str(runtime)],
+                                     capture_output=True, text=True, env=env)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("refusing to update unowned runtime entrypoint", refused.stderr)
+            self.assertIn("Same-settings recovery command:", refused.stderr)
+            guidance, command = refused.stderr.split("Same-settings recovery command: ", 1)
+            recovery = shlex.split(command)
+            self.assertEqual(recovery[recovery.index("--harness") + 1], "codex")
+            self.assertEqual(recovery[recovery.index("--settings") + 1], str(codex_settings))
+            recovery_runtime = Path(recovery[recovery.index("--runtime-dir") + 1])
+            self.assertIn("Any existing PATH launcher remains unchanged", guidance)
+            self.assertIn(shlex.quote(str(recovery_runtime / "pattern-buffer")), guidance)
+            self.assertFalse(recovery_runtime.exists())
+            self.assertEqual({path.name: path.read_bytes() for path in runtime.iterdir() if path.is_file()},
+                             runtime_before)
+            self.assertEqual({path: path.read_bytes() for path in settings_before}, settings_before)
+            self.assertFalse(codex_settings.with_name(codex_settings.name + ".context-injector.lock").exists())
+
     def test_install_refuses_unowned_entrypoints_and_orphan_helpers_before_any_write(self):
         for filename, content, expected in (
                 ("context_injector_claude.py", "third-party entrypoint\n", "unowned runtime entrypoint"),

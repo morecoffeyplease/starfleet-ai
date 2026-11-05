@@ -35,6 +35,7 @@ From a source checkout, install the selected harness into a new empty runtime us
 Use the matching harness name and settings file for Claude.
 The generated recovery command preserves whether checkpoint hooks were enabled for that settings file.
 This updates the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
+The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
 Review the harness's normal reload and trust controls after the install; installation does not confirm delivery.
 
 Initialize a directly managed Git worktree with an editable context file.

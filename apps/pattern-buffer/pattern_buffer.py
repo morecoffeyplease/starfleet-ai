@@ -472,13 +472,16 @@ def recovery_install_command(harness, explicit_settings, checkpoints=True):
                "--settings", str(settings), "--runtime-dir", str(candidate)]
     if not checkpoints:
         command.append("--no-checkpoints")
-    return shlex.join(command)
+    return candidate, shlex.join(command)
 
 
 def recovery_guidance(harness, explicit_settings, checkpoints=True):
-    command = recovery_install_command(harness, explicit_settings, checkpoints)
+    runtime, command = recovery_install_command(harness, explicit_settings, checkpoints)
+    launcher = shlex.quote(str(runtime / "pattern-buffer"))
     return (RECOVERY_GUIDANCE_PREFIX + "Install this harness into a new empty runtime with the same settings file. "
-            "Then review its normal reload and trust controls; delivery remains unverified. "
+            "Any existing PATH launcher remains unchanged; use " + launcher +
+            " for commands against the recovered runtime. Then review its normal reload and trust controls; "
+            "delivery remains unverified. "
             + RECOVERY_COMMAND_MARKER + command)
 
 
@@ -641,7 +644,14 @@ def prepare_install(args):
     if bin_directory.exists() and not bin_directory.is_dir():
         raise ValueError("launcher directory must be a directory")
     other_harness = "claude" if args.harness == "codex" else "codex"
-    other_aliases = existing_owned_aliases(base, other_harness) if base.exists() else []
+    if base.exists():
+        try:
+            other_aliases = existing_owned_aliases(base, other_harness)
+        except ValueError as error:
+            guidance = recovery_guidance(args.harness, args.settings, args.checkpoints)
+            raise ValueError(f"{error}. {guidance}") from error
+    else:
+        other_aliases = []
     install_scripts = [runtime, canonical_runtime, harness_alias, *other_aliases]
     runtime_paths = [path for script in install_scripts for path in runtime_bundle_paths(script)]
     runtime_paths.extend((base / "guide.md", base / "pattern-buffer.template"))

@@ -111,6 +111,7 @@ When the selected hook belongs to another supported runtime, the refusal include
 This command does not install, repair, enroll, restart or change native trust.
 When no compatible entrypoint is available and installation refuses a damaged or unowned file, preserve that runtime and use the reported same-settings recovery command to install into a new empty runtime.
 The recovery command updates the selected harness's owned hook setting while leaving worktree enrollment and checkpoint files in place.
+The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
 Review the harness's normal reload and trust controls after changing the hook command.
 The local handoff result still does not prove native hook delivery or model receipt.
 
