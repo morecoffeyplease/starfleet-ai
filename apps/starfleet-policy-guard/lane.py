@@ -2244,7 +2244,7 @@ def setup_guidance(cwd, state, detail):
                                   product_root, 'record', '--help'])
         return guidance('none', 'Setup is intact. A recorded report is separate from setup and is needed only before covered delivery; use existing evidence when that delivery is intended.', record_help)
     if state.get('seat_id') is None and not owner:
-        return guidance('none', 'This active legacy per-PR binding remains usable. Migration is not required just because the installation is legacy.')
+        return guidance('none', 'This active legacy per-PR binding remains usable. Migration is not required just because the installation is legacy; continue existing repository checks and human approval requirements before covered delivery.')
     return guidance('none', 'The active attachment, owner and installed source are confirmed. No setup change is recommended; existing report, repository checks and human approval requirements remain separate.')
 
 
@@ -2510,6 +2510,8 @@ def coverage_summary(cwd, detail):
         'Branch: ' + detail['branch'],
         'PR: declared=' + (binding['declared_current_pr'] or 'unknown') + '; bound=' +
         (binding['installed_pr'] or 'none') + ' (' + binding['state'] + '; hosted identity unchecked)',
+        *(['PR note: The declared PR differs from the local binding. Confirm the product branch and PR before covered delivery.']
+          if binding['state'] == 'different-pr-bound' else []),
         'Owner: ' + owner,
         'Installed source: ' + (str(source.get('revision') or 'unknown') + ' (' + source['integrity'] + ')'
                                 if has_state else 'none'),

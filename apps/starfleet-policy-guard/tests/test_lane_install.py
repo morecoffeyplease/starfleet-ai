@@ -96,6 +96,10 @@ class LaneInstallTest(unittest.TestCase):
             else:
                 os.environ[key] = value
 
+    def terminal_env(self):
+        return {key: value for key, value in self.env.items() if key not in (
+            'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CMUX_AGENT_LAUNCH_KIND')}
+
     def git(self, *args, ok=True):
         result = subprocess.run(['git', '-C', str(self.repo), *map(str, args)], capture_output=True, text=True)
         if ok:
@@ -272,7 +276,8 @@ class LaneInstallTest(unittest.TestCase):
 
     def test_coverage_without_installation_is_readonly_and_unknown(self):
         before = self.git('status', '--porcelain').stdout
-        value = json.loads(self.call('coverage', '--pr-url', self.url).stdout)
+        terminal_env = self.terminal_env()
+        value = json.loads(self.call('coverage', '--pr-url', self.url, env=terminal_env).stdout)
         self.assertEqual(value['binding']['state'], 'not-installed')
         self.assertIsNone(value['source_intact'])
         self.assertEqual(value['setup_guidance']['action'], 'attach')
@@ -887,10 +892,10 @@ class LaneInstallTest(unittest.TestCase):
         coverage_help = ' '.join(self.call('coverage', '--help').stdout.split())
         migration_help = ' '.join(self.call('migrate-plan', '--help').stdout.split())
         self.assertIn('optionally binding a PR or discovering it later', plan_help)
-        self.assertIn('Inspect checkout attachment, PR binding', parent_help)
-        self.assertIn('Inspect checkout attachment, PR binding', status_help)
-        self.assertIn('Read-only attachment, binding, owner', parent_help)
-        self.assertIn('attachment, binding, owner', coverage_help)
+        self.assertIn('Inspect attachment, owner, source and report state', parent_help)
+        self.assertIn('Inspect attachment, owner, source and report state', status_help)
+        self.assertIn('Read-only attachment and observed-path coverage', parent_help)
+        self.assertIn('attachment and observed-path coverage', coverage_help)
         self.assertIn('including a no-PR lane', parent_help)
         self.assertIn('including a no-PR lane', migration_help)
 
@@ -909,12 +914,13 @@ class LaneInstallTest(unittest.TestCase):
 
     def test_coverage_summary_without_installation_points_to_standalone_reporting(self):
         before = self.git('status', '--porcelain').stdout
-        result = self.call('coverage', '--summary', '--pr-url', self.url).stdout
+        terminal_env = self.terminal_env()
+        result = self.call('coverage', '--summary', '--pr-url', self.url, env=terminal_env).stdout
         self.assertIn('not installed here', result)
-        self.assertIn('Standalone reporting needs no enrollment', result)
-        self.assertIn('delivery report --help', result)
+        self.assertIn('proof-only work need no enrollment', result)
+        self.assertIn('guide --print', result)
         self.assertIn('Fix-round enforcement: not installed by the delivery lane', result)
-        self.assertLessEqual(len(result.splitlines()), 10)
+        self.assertLessEqual(len(result.splitlines()), 11)
         self.assertEqual(self.git('status', '--porcelain').stdout, before)
         self.assertFalse((self.repo / '.git/starfleet-delivery-lane').exists())
         self.assertFalse(self.forwarded.exists())
@@ -923,38 +929,70 @@ class LaneInstallTest(unittest.TestCase):
         self.install()
         self.record()
         # Legacy per-PR installations have no native owner, including in a plain terminal.
-        terminal_env = {key: value for key, value in self.env.items() if key not in (
-            'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CMUX_AGENT_LAUNCH_KIND')}
+        terminal_env = self.terminal_env()
         state = self.repo / '.git/starfleet-delivery-lane/state.json'
         before = state.read_bytes()
         valid = self.call('coverage', '--summary', '--pr-url', self.url, env=terminal_env).stdout
         self.assertIn('Report: valid-local-snapshot', valid)
-        self.assertIn('Continue under repository checks', valid)
-        (self.repo / 'product.txt').write_text('Unverified change\n')
-        stale = self.call('coverage', '--summary', env=terminal_env).stdout
-        self.assertIn('Report: stale-or-unusable', stale)
-        self.assertIn('Record a report from existing evidence', stale)
+        self.assertIn('repository checks and human approval requirements before covered delivery', valid)
         other = self.url.replace('/901', '/902')
         mismatch = self.call('coverage', '--summary', '--pr-url', other, env=terminal_env).stdout
         self.assertIn('declared=' + other, mismatch)
         self.assertIn('bound=' + self.url, mismatch)
+        self.assertIn('PR note: The declared PR differs from the local binding.', mismatch)
+        self.assertIn('Next setup: none', mismatch)
+        self.assertIn('Report: valid-local-snapshot', mismatch)
+        (self.repo / 'product.txt').write_text('Unverified change\n')
+        stale = self.call('coverage', '--summary', env=terminal_env).stdout
+        self.assertIn('Report: stale-or-unusable', stale)
+        self.assertIn('separate from setup', stale)
+        self.assertIn('needed only before covered delivery', stale)
         self.assertIn('Confirm the product branch and PR', mismatch)
         self.assertEqual(state.read_bytes(), before)
         self.assertFalse(self.forwarded.exists())
 
     def test_coverage_summary_prioritizes_recovery_over_report_work(self):
-        self.install()
-        detail = json.loads(self.call('coverage').stdout)
-        detail['upgrade'] = {'state': 'in-progress', 'recovery_command': 'reviewed-recovery-command'}
-        text = lane_runtime.coverage_summary(self.repo, detail)
-        self.assertIn('Next: Recover the interrupted upgrade: reviewed-recovery-command', text)
-        self.assertNotIn('Next: Record', text)
-        detail['upgrade']['state'] = 'none'
-        detail['source_intact'] = False
-        self.assertIn('Next: Ask the installation owner', lane_runtime.coverage_summary(self.repo, detail))
-        detail['source_intact'] = True
-        detail['native_session']['matches_installed_owner'] = False
-        self.assertIn('Next: Confirm the owning native session', lane_runtime.coverage_summary(self.repo, detail))
+        old_source = self.source_checkout('summary-recovery-old-pin')
+        new_source = self.source_checkout('summary-recovery-new-pin')
+        owner_session = 'codex-fixture-thread'
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID=owner_session)
+        self.settings.unlink()
+        self.settings.parent.rmdir()
+        self.install_from_source(old_source, lane=True, env=owner_env)
+        planned = self.call_source(new_source, 'upgrade-plan', env=owner_env)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        plan = json.loads(planned.stdout)
+        with mock.patch.object(lane_runtime, 'APP', new_source), mock.patch.object(
+                lane_runtime, 'SELF', new_source / 'lane.py'):
+            self.interrupt_upgrade_after_settings(plan['plan_sha256'], env=owner_env)
+        journal = Path(lane_runtime.upgrade_journal_path(self.repo))
+        self.assertTrue(journal.exists())
+
+        summary = self.call_source(new_source, 'coverage', '--summary', env=owner_env)
+        self.assertEqual(summary.returncode, 0, summary.stderr)
+        self.assertIn('Report: absent', summary.stdout)
+        self.assertIn('Next setup: recover - An upgrade journal is pending', summary.stdout)
+        self.assertNotIn('record --help', summary.stdout)
+        self.assertIn('Run: ', summary.stdout)
+        recover_command = summary.stdout.split('Run: ', 1)[1].splitlines()[0]
+        self.assertIn('upgrade-recover --rollback', recover_command)
+
+        wrong_owner = dict(owner_env, CODEX_THREAD_ID='codex-different-owner')
+        wrong = self.call_source(new_source, 'status', env=wrong_owner)
+        self.assertEqual(wrong.returncode, 0, wrong.stderr)
+        recommendation = json.loads(wrong.stdout)['setup_guidance']
+        self.assertEqual(recommendation['action'], 'inspect')
+        self.assertIsNone(recommendation['command'])
+        self.assertIn('native owner or checkout context is not confirmed', recommendation['reason'])
+        wrong_summary = self.call_source(new_source, 'coverage', '--summary', env=wrong_owner)
+        self.assertEqual(wrong_summary.returncode, 0, wrong_summary.stderr)
+        self.assertIn('Next setup: inspect - An upgrade journal is pending', wrong_summary.stdout)
+        self.assertNotIn('Run: ', wrong_summary.stdout)
+
+        recovered = subprocess.run(shlex.split(recover_command), cwd=self.repo, env=owner_env,
+                                   capture_output=True, text=True)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(journal.exists())
 
     def test_owner_flags_without_lane_refuse_before_plan_or_install(self):
         before = self.settings.read_bytes()
@@ -1147,9 +1185,11 @@ class LaneInstallTest(unittest.TestCase):
     def test_missing_enrollment_names_the_delivery_only_plan_not_full_guard(self):
         result = self.call('record', '--evidence', self.packet, ok=False)
         self.assertEqual(result.returncode, 2)
-        self.assertIn('--session-root', result.stderr)
-        self.assertIn('plan --pr-url', result.stderr)
+        self.assertIn('Standalone reporting and proof-only work need no enrollment', result.stderr)
+        self.assertIn('actual native owner', result.stderr)
+        self.assertIn('real PR and target inputs', result.stderr)
         self.assertIn('Do not use guard.py enroll', result.stderr)
+        self.assertNotIn('<actual-', result.stderr)
 
     def test_packet_url_casing_is_normalized_but_wrong_pr_and_ref_are_rejected(self):
         self.install()
@@ -1770,7 +1810,12 @@ class LaneInstallTest(unittest.TestCase):
         old_source = self.source_checkout('status-old-pin')
         self.install_from_source(old_source)
         self.call_source(old_source, 'record', '--evidence', self.packet, '--format', 'json')
-        value = json.loads(self.call('status').stdout)
+        immutable_runtime = self.base / 'immutable-successor-runtime'
+        shutil.copytree(APP, immutable_runtime, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        terminal_env = self.terminal_env()
+        result = self.call_source(immutable_runtime, 'status', env=terminal_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
         self.assertEqual(value['binding_type'], 'legacy-per-pr')
         self.assertEqual(value['installed_source']['integrity'], 'intact')
         self.assertFalse(value['executing_cli']['matches_installed_pin'])
@@ -1781,6 +1826,7 @@ class LaneInstallTest(unittest.TestCase):
         self.assertIn('Do not use rebind-owner', value['successor_guidance'])
         self.assertEqual(value['setup_guidance']['action'], 'upgrade')
         self.assertIsNone(value['setup_guidance']['command'])
+        self.assertIn('not a clean committed Git source', value['setup_guidance']['reason'])
         self.assertNotIn('stale', value['report_status']['reason'])
 
     def test_status_recommends_upgrade_plan_from_clean_distinct_source(self):
