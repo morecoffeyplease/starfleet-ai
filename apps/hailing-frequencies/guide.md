@@ -61,7 +61,9 @@ Run self-enrollment as a command launched by the exact OpenCode TUI on its ownin
 hailing-frequencies opencode-enroll --manifest /absolute/private/opencode-binding.json --label YOUR_LABEL
 ```
 
-Enrollment requires the exact current OpenCode hook record, matching CMUX surface and workspace, matching API session and server PID, matching worktree, and enabled native messaging.
+Enrollment verifies the exact current OpenCode hook record, matching CMUX surface and workspace, matching API session and server PID, matching worktree, session generation, and enabled native messaging.
+It may register the exact session while that API session is busy because registration records identity rather than send readiness.
+Each delivery still requires an inactive API session with no pending inbox, permission, or form state, and it rechecks all native composer and human-input guards.
 The default policy requires an explicitly empty composer.
 The experimental `api_sidechannel` policy permits only `empty`, `draft`, or `unknown` composer classifications and sends an explicit queue request with resume enabled.
 Both policies still require exact agent and terminal identity, an active native lifecycle, exact current and hook owner, no blocking input, no human-input obligation, active native receiving, an inactive API session, and empty API inbox, permission, and form lists.

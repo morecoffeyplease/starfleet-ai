@@ -23,10 +23,12 @@ OpenCode v2 Basic authentication uses the username opencode.
 The password is supplied in memory by the embedding caller and is not printed or stored by this adapter.
 Only server version 2.2.5 is accepted by this first contract.
 
-The inspection reads GET /api/info and the exact GET /api/session/{sessionID} route.
-It compares the returned session ID and location directory with the caller's expected values.
-It then reads GET /api/session/active and the exact session's inbox, pending permission, and form lists.
-An active `running` entry, archived session, pending inbox item, pending permission, pending form, mismatched identity, unknown state, unsupported schema, authentication error, timeout, and oversized response all produce a hold.
+`inspect_identity(binding)` reads GET /api/info and the exact GET /api/session/{sessionID} route, then rechecks the API server version and PID.
+It returns `identity_verified` only when the returned session ID, location directory, archive state, and caller-supplied PID and directories match.
+This identity result does not inspect activity, inbox, permission, or form state and cannot be used as send readiness.
+`inspect(binding)` performs the same identity checks, then reads GET /api/session/active and the exact session's inbox, pending permission, and form lists.
+An active `running` entry, pending inbox item, pending permission, pending form, mismatched identity, unknown state, unsupported schema, authentication error, timeout, and oversized response all produce a hold from the readiness inspection.
+Archived sessions are held by both operations.
 In v2.2.5, a session absent from the active map is inactive.
 The API call set contains only GET requests.
 The socket timeout applies to each blocking operation, not a total inspection deadline.
@@ -53,7 +55,8 @@ The variable resolved_password must come from the embedding component's approved
     )
     inspection = adapter.inspect(binding)
 
-Treat disposition clear as an observation that only the listed API-visible checks passed.
+Treat readiness disposition clear as an observation that only the listed API-visible checks passed.
+Treat identity disposition `identity_verified` as identity evidence only.
 The OpenCode API does not expose native composer drafts, so a future send path needs a separate draft guard.
 The API checks are separate reads rather than one atomic snapshot, and session state can change between or immediately after requests.
 

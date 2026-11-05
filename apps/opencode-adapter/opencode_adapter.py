@@ -91,6 +91,22 @@ class Inspection:
 
 
 @dataclass(frozen=True)
+class IdentityInspection:
+    """Authenticated session identity without a send-readiness claim."""
+
+    disposition: str
+    hold_codes: tuple[str, ...]
+    identity: BoundIdentity | None
+    limitations: tuple[str, ...] = (
+        "session_activity_and_pending_interactions_not_inspected",
+        "native_draft_state_not_exposed_by_inspected_api",
+        "cmux_surface_to_server_process_link_is_caller_supplied",
+        "parent_task_ownership_is_caller_supplied",
+        "server_pid_is_not_a_stable_startup_identifier",
+    )
+
+
+@dataclass(frozen=True)
 class _HttpResponse:
     status: int
     headers: object
@@ -351,52 +367,70 @@ class OpenCodeSessionAdapter:
             raise AdapterError("unsupported_api_schema")
         return pending
 
+    def _identity_context(self, binding: SessionBinding):
+        bound = _validated_binding(binding)
+        version, pid = self._authenticated_api_info()
+        if pid != bound.expected_server_pid:
+            raise AdapterError("api_server_pid_mismatch")
+
+        quoted_id = urllib.parse.quote(bound.session_id, safe="")
+        session_json = self._json_object(
+            self._get(f"/api/session/{quoted_id}"),
+            "session_unavailable",
+        )
+        session = self._session_data(session_json, bound.session_id)
+        remote_directory = _normalized_directory(session["location"]["directory"])
+        if remote_directory != bound.session_directory:
+            raise AdapterError("session_directory_mismatch")
+        if remote_directory != bound.worktree_directory:
+            raise AdapterError("worktree_directory_mismatch")
+
+        identity = BoundIdentity(
+            api_contract=API_CONTRACT,
+            api_origin=self._origin,
+            api_server_version=version,
+            api_server_pid=pid,
+            opencode_session_id=session["id"],
+            opencode_parent_session_id=session.get("parentID"),
+            opencode_location_directory=remote_directory,
+            opencode_subpath=session.get("subpath"),
+            session_directory=bound.session_directory,
+            worktree_directory=bound.worktree_directory,
+            cmux_workspace_uuid=bound.cmux_workspace_uuid,
+            cmux_surface_uuid=bound.cmux_surface_uuid,
+            parent_task_id=bound.parent_task_id,
+        )
+
+        archived = session["time"].get("archived") is not None
+        return version, pid, quoted_id, identity, archived
+
+    def inspect_identity(self, binding: SessionBinding) -> IdentityInspection:
+        """Verify exact API/session identity without checking send readiness."""
+        identity = None
+        try:
+            version, pid, _quoted_id, identity, archived = self._identity_context(binding)
+            if archived:
+                raise AdapterError("session_archived")
+            final_version, final_pid = self._authenticated_api_info()
+            if final_version != version or final_pid != pid:
+                raise AdapterError("api_server_instance_changed")
+            return IdentityInspection("identity_verified", (), identity)
+        except AdapterError as error:
+            return IdentityInspection("hold", (error.code,), identity)
+
     def inspect(self, binding: SessionBinding) -> Inspection:
         identity = None
         api_state = "unknown"
         try:
-            bound = _validated_binding(binding)
-            version, pid = self._authenticated_api_info()
-            if pid != bound.expected_server_pid:
-                raise AdapterError("api_server_pid_mismatch")
-
-            quoted_id = urllib.parse.quote(bound.session_id, safe="")
-            session_json = self._json_object(
-                self._get(f"/api/session/{quoted_id}"),
-                "session_unavailable",
-            )
-            session = self._session_data(session_json, bound.session_id)
-            remote_directory = _normalized_directory(session["location"]["directory"])
-            if remote_directory != bound.session_directory:
-                raise AdapterError("session_directory_mismatch")
-            if remote_directory != bound.worktree_directory:
-                raise AdapterError("worktree_directory_mismatch")
-
-            identity = BoundIdentity(
-                api_contract=API_CONTRACT,
-                api_origin=self._origin,
-                api_server_version=version,
-                api_server_pid=pid,
-                opencode_session_id=session["id"],
-                opencode_parent_session_id=session.get("parentID"),
-                opencode_location_directory=remote_directory,
-                opencode_subpath=session.get("subpath"),
-                session_directory=bound.session_directory,
-                worktree_directory=bound.worktree_directory,
-                cmux_workspace_uuid=bound.cmux_workspace_uuid,
-                cmux_surface_uuid=bound.cmux_surface_uuid,
-                parent_task_id=bound.parent_task_id,
-            )
-
-            archived = session["time"].get("archived")
-            if archived is not None:
+            version, pid, quoted_id, identity, archived = self._identity_context(binding)
+            if archived:
                 raise AdapterError("session_archived")
 
             active_json = self._json_object(
                 self._get("/api/session/active"),
                 "session_status_unavailable",
             )
-            api_state = self._session_status(active_json, bound.session_id)
+            api_state = self._session_status(active_json, identity.opencode_session_id)
             if api_state == "running":
                 raise AdapterError("session_busy")
 

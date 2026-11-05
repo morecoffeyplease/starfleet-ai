@@ -240,6 +240,38 @@ class OpenCodeDeliveryTests(unittest.TestCase):
         self.assertNotIn(PASSWORD, json.dumps(result))
         self.assertEqual(self.app.config()["targets"][0]["session"], SESSION)
 
+    def test_busy_session_can_enroll_by_identity_but_delivery_stays_held(self):
+        config = self.app.config()
+        config["targets"] = []
+        hf.atomic_json(self.state / "config.json", config)
+        self.server.active[SESSION] = {"type": "running"}
+        self.server.inbox = [{"id": "queued-fixture"}]
+        self.server.permissions = [{"id": "permission-fixture"}]
+        self.server.forms = [{"id": "form-fixture"}]
+        self.current["items"][0]["agents"][0]["state"] = "working"
+        self.hook_record["agentLifecycle"] = "running"
+        self._write_hook()
+        self.guard.update(state="draft", waiting_on_human=True)
+        self.server.gets.clear()
+
+        with patch.dict("os.environ", self.env, clear=False):
+            enrolled = self.app.enroll_opencode(self.opencode_manifest("api_sidechannel"), "busy-owner")
+
+        self.target = enrolled["enrolled"]
+        self.assertEqual(self.target["session"], SESSION)
+        self.assertEqual(self.target["started_at"], STARTED_AT)
+        self.assertNotIn("/api/session/active", self.server.gets)
+        self.assertFalse(any(path.endswith(("/inbox", "/permission", "/form"))
+                            for path in self.server.gets))
+
+        result = self.attention_once(key="busy-enrolled-session")
+
+        self.assertEqual((result["outcome"], result["attempted"]), ("held", False))
+        self.assertIn("/api/session/active", self.server.gets)
+        self.assertEqual(self.server.posts, [])
+        row = self.app.prior_attention_intent(self.target, "busy-enrolled-session")
+        self.assertEqual(row[1:3], ("held", 0))
+
     def test_manifest_policy_is_explicit_validated_and_existing_policy_cannot_change(self):
         invalid = self.opencode_manifest("future-policy")
         with self.assertRaisesRegex(ValueError, "delivery policy"):
@@ -277,6 +309,28 @@ class OpenCodeDeliveryTests(unittest.TestCase):
         with patch.dict("os.environ", env, clear=True):
             with self.assertRaisesRegex(ValueError, "OPENCODE_SESSION_ID"):
                 self.app.enroll_opencode(path, "pilot")
+        self.assertEqual(self.app.config()["targets"], [])
+
+    def test_identity_enrollment_mismatch_does_not_save_target(self):
+        config = self.app.config()
+        config["targets"] = []
+        hf.atomic_json(self.state / "config.json", config)
+        manifest = self.opencode_manifest("api_sidechannel")
+        value = json.loads(manifest.read_text())
+        value["expected_server_pid"] += 1
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+        manifest.chmod(0o600)
+
+        with patch.dict("os.environ", self.env, clear=False):
+            with self.assertRaisesRegex(ValueError, "API identity held: api_server_pid_mismatch"):
+                self.app.enroll_opencode(manifest, "mismatch")
+        self.assertEqual(self.app.config()["targets"], [])
+
+        self.current["items"][0]["projections"][0]["workspace_id"] = SURFACE
+        manifest = self.opencode_manifest("api_sidechannel")
+        with patch.dict("os.environ", self.env, clear=False):
+            with self.assertRaisesRegex(ValueError, "CMUX workspace changed"):
+                self.app.enroll_opencode(manifest, "mismatch")
         self.assertEqual(self.app.config()["targets"], [])
 
     def test_wrong_server_pid_or_directory_holds_before_post(self):

@@ -13,7 +13,8 @@ The OpenCode [v2.2.5 session schema](https://github.com/anomalyco/opencode/blob/
 The OpenCode [v2 server guide](https://opencode.ai/v2/docs/server) describes the HTTP server and its API.
 The OpenCode [v2 web guide](https://opencode.ai/v2/docs/cli/web) documents Basic authentication and the fixed v2 username opencode.
 
-The inspected routes are GET /api/info, GET /api/session/{sessionID}, GET /api/session/active, GET /api/session/{sessionID}/inbox, GET /api/session/{sessionID}/permission, and GET /api/session/{sessionID}/form.
+The readiness inspection reads GET /api/info, GET /api/session/{sessionID}, GET /api/session/active, GET /api/session/{sessionID}/inbox, GET /api/session/{sessionID}/permission, and GET /api/session/{sessionID}/form.
+The identity inspection reads only GET /api/info and GET /api/session/{sessionID}, with a final server-info check to detect an instance change.
 The client sends Basic authentication on every authenticated request and rejects endpoints that do not first challenge unauthenticated access.
 It accepts only an explicit HTTP URL with a numeric loopback IP address and port.
 It rejects hostnames, non-loopback addresses, HTTPS URLs, redirects, and URL-embedded credentials.
@@ -42,9 +43,14 @@ This client compares that explicit PID with GET /api/info before and after sessi
 The client validates the CMUX UUID formats but does not connect to CMUX to authenticate their mapping.
 The parent task ID is caller-supplied and is not verified by OpenCode.
 
-## State result
+## Identity and readiness results
 
-The result disposition is clear only when the exact session is returned from the expected authenticated API process, the session is not archived, it is absent from the active-session map, and the inbox, permission, and form lists are empty.
+`inspect_identity(binding)` returns `identity_verified` only after the authenticated server, PID, exact session ID, session directory, worktree directory, archive state, and final API instance check match the explicit binding.
+It deliberately does not read session activity, inbox, permission, or form state, so its result does not establish send readiness.
+Identity callers must independently verify native CMUX session, surface, workspace, worktree, and generation before persisting an enrollment.
+
+`inspect(binding)` retains the stricter readiness result and returns `clear` only when the exact session is returned from the expected authenticated API process, the session is not archived, it is absent from the active-session map, and the inbox, permission, and form lists are empty.
+
 In v2.2.5 the active-session map contains `{ "type": "running" }` entries, and any such entry returns hold.
 An unknown active-state shape, pending inbox item, pending permission request, pending form, archived session, or unsupported response returns hold.
 OpenCode documents sessions absent from the active-session response as inactive, which this adapter reports as `inactive`.

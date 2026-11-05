@@ -162,7 +162,7 @@ def opencode_adapter_module():
     raise ValueError("OpenCode session adapter is unavailable; reinstall Hailing Frequencies")
 
 
-def opencode_binding(target):
+def _opencode_api_binding(target, *, identity_only):
     adapter = opencode_adapter_module()
     password_path = target.get("password_file")
     raw_password = _read_private_file(password_path, "OpenCode password file", 4096)
@@ -184,10 +184,21 @@ def opencode_binding(target):
         cmux_surface_uuid=target["surface"],
         parent_task_id=target["parent_task_id"],
     )
-    inspection = adapter.OpenCodeSessionAdapter(target["api_url"], password).inspect(binding)
-    require(inspection.disposition == "clear",
-            "OpenCode API inspection held: " + ", ".join(inspection.hold_codes or ("unknown_state",)))
+    client = adapter.OpenCodeSessionAdapter(target["api_url"], password)
+    inspection = client.inspect_identity(binding) if identity_only else client.inspect(binding)
+    expected_disposition = "identity_verified" if identity_only else "clear"
+    require(inspection.disposition == expected_disposition,
+            ("OpenCode API identity held: " if identity_only else "OpenCode API inspection held: ")
+            + ", ".join(inspection.hold_codes or ("unknown_state",)))
     return password, inspection
+
+
+def opencode_binding(target):
+    return _opencode_api_binding(target, identity_only=False)
+
+
+def opencode_identity_binding(target):
+    return _opencode_api_binding(target, identity_only=True)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -361,7 +372,13 @@ class Cmux:
                 "Native messaging is disabled")
         return True
 
-    def _opencode_native_binding(self, target):
+    def enrollment_binding(self, target):
+        """Verify exact OpenCode identity without requiring the session to be idle."""
+        require(target.get("harness") == "opencode", "Enrollment identity check requires OpenCode")
+        opencode_identity_binding(target)
+        return self._opencode_native_binding(target, require_delivery_readiness=False)
+
+    def _opencode_native_binding(self, target, *, require_delivery_readiness=True):
         current = self.command("current", "--limit", "200")
         require(isinstance(current, dict), "CMUX current snapshot is unknown")
         require(not current.get("truncated", True), "CMUX current snapshot is incomplete")
@@ -428,6 +445,9 @@ class Cmux:
         require(len(visible_agents) == 1 and visible_agents[0].get("state") in ("working", "idle"),
                 "Exact OpenCode CMUX session projection is missing, ambiguous or inactive")
 
+        if not require_delivery_readiness:
+            return self._require_opencode_message_receiving(target)
+
         guard = self.rpc("surface.input_state", surface_id=target["surface"])
         require(isinstance(guard, dict), "OpenCode input state is unknown")
         input_surface = guard.get("surface_id")
@@ -446,6 +466,9 @@ class Cmux:
                 eligible_composer_state and guard.get("blocks_typing") is False and
                 guard.get("waiting_on_human") is False and guard_lifecycle in ACTIVE_LIFECYCLES,
                 "OpenCode human draft, approval, unknown input state or inactive session")
+        return self._require_opencode_message_receiving(target)
+
+    def _require_opencode_message_receiving(self, target):
         settings = self.rpc("agent.message.settings", target=target["surface"])
         require(isinstance(settings, dict), "Native messaging settings are unknown")
         require(all(settings.get(key) is True for key in
@@ -630,7 +653,7 @@ class Monitor:
                 "OpenCode native session generation is unavailable")
         target["started_at"] = started
         target["cutoff"] = started if include_existing else self.clock()
-        self.cmux.binding(target)
+        self.cmux.enrollment_binding(target)
         config = self.config()
         existing = next((item for item in config["targets"] if item["session"] == target["session"]), None)
         expected = {**target, "cutoff": existing["cutoff"]} if existing else target

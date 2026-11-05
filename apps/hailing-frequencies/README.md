@@ -59,7 +59,7 @@ Claude Code must support the host's immediate-send key; the initial pilot used v
 
 Run `cmux current --json --limit 200` and `cmux --id-format both --json tree --all` to observe the actual harness session, surface, and workspace.
 Do not guess identities from a workspace title, inherit a parent's identity for a child, or enroll helper terminals.
-Session enrollment validates CMUX's current projection, the harness hook record, the workspace, the session generation, native receiving settings, and a free agent composer.
+Claude and Codex enrollment validates CMUX's current projection, the harness hook record, the workspace, the session generation, native receiving settings, and a free agent composer.
 Claude additionally requires the active session binding for that surface.
 The normal `backgroundWorkPending` lifecycle is eligible when the exact owner is present and the composer is empty with no human-input obligation.
 Omitted historical child-session records do not block a positively identified current owner; a missing exact owner or a truncated whole-surface snapshot still refuses enrollment and sending.
@@ -86,7 +86,9 @@ hailing-frequencies opencode-enroll --manifest /absolute/private/opencode-bindin
 
 Enrollment requires the current OpenCode hook record, exact CMUX surface and workspace, matching API session and server PID, matching native worktree, and enabled native messaging.
 The default policy also requires an explicitly empty native composer, while `api_sidechannel` permits only exact `empty`, `draft`, or `unknown` composer classifications.
-Both policies require agent and terminal identity, `blocks_typing: false`, `waiting_on_human: false`, an active native lifecycle, exact current and hook state, and an inactive API session with empty inbox, permission, and form lists.
+Both policies require agent and terminal identity, `blocks_typing: false`, `waiting_on_human: false`, an active native lifecycle, exact current and hook state, and an inactive API session with empty inbox, permission, and form lists before sending.
+OpenCode enrollment verifies authenticated API, exact session, PID, directories, native surface, workspace, worktree, and session generation, and may register while the exact API session is busy.
+Registration does not establish send readiness or bypass any later busy, inbox, permission, form, composer, human-input, or receiving guard.
 Passive server-opened sessions, missing hook records, a different CMUX surface, disabled receiving, an input dialog, or an unknown guard obligation remain held.
 
 UUIDs above are placeholders for observed identities.

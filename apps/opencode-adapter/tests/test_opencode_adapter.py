@@ -234,6 +234,35 @@ class OpenCodeAdapterTests(unittest.TestCase):
         result = self.client.inspect(self.binding)
         self.assertEqual(result.hold_codes, ("unknown_session_status",))
 
+    def test_identity_inspection_verifies_busy_identity_without_claiming_readiness(self):
+        self.server.active[SESSION_ID] = {"type": "running"}
+        self.server.inbox = [{"id": "inbox-fixture"}]
+        self.server.permissions = [{"id": "permission-fixture"}]
+        self.server.forms = [{"id": "form-fixture"}]
+
+        result = self.client.inspect_identity(self.binding)
+
+        self.assertEqual(result.disposition, "identity_verified")
+        self.assertEqual(result.hold_codes, ())
+        self.assertEqual(result.identity.opencode_session_id, SESSION_ID)
+        self.assertEqual(result.identity.api_server_pid, PID)
+        self.assertIn("session_activity_and_pending_interactions_not_inspected", result.limitations)
+        paths = [path for _method, path, _authorization in self.server.requests]
+        self.assertEqual(paths.count("/api/session/active"), 0)
+        self.assertFalse(any(path.endswith(("/inbox", "/permission", "/form")) for path in paths))
+        self.assertEqual({method for method, _path, _authorization in self.server.requests}, {"GET"})
+
+    def test_identity_inspection_keeps_exact_pid_and_directory_guards(self):
+        wrong_pid = oa.SessionBinding(**{**self.binding.__dict__, "expected_server_pid": PID + 1})
+        result = self.client.inspect_identity(wrong_pid)
+        self.assertEqual(result.hold_codes, ("api_server_pid_mismatch",))
+
+        wrong_directory = oa.SessionBinding(
+            **{**self.binding.__dict__, "worktree_directory": str(Path(self.temp.name).resolve())}
+        )
+        result = self.client.inspect_identity(wrong_directory)
+        self.assertEqual(result.hold_codes, ("worktree_directory_mismatch",))
+
     def test_valid_server_info_without_os_pid_holds(self):
         self.server.server_info = {**self.server.server_info, "pid": 0}
 
