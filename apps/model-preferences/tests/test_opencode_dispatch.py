@@ -1567,9 +1567,12 @@ class OpenCodeDispatchTest(unittest.TestCase):
                     current={**current, "items": [altered]}, allow_startup_unknown=True)
             self.assertEqual(raised.exception.code, code)
 
-    def dispatch_initial_native_observation(self, *, native_states, hook_after_poll=None,
+    def dispatch_initial_native_observation(self, *, native_states, native_lifecycles=None,
+                                           native_input_states=None, native_freshness=None,
+                                           hook_after_poll=None,
                                            timeout_seconds=180, delay_startup_messages=False,
-                                           wrong_surface=False, hook_arrives_during_check=False):
+                                           wrong_surface=False, hook_arrives_during_check=False,
+                                           current_error=None, delivery_error=None):
         manifest = json.loads(self.manifest.read_text())
         manifest["delivery_policy"] = "api_sidechannel"
         self.manifest.write_text(json.dumps(manifest)); self.manifest.chmod(0o600)
@@ -1626,16 +1629,23 @@ class OpenCodeDispatchTest(unittest.TestCase):
                     dispatch.write_private_json(hook_path, {"sessions": {SESSION: {
                         "workspaceId": workspace, "surfaceId": opened_surface, "startedAt": 123.0,
                         "agentLifecycle": "idle", "cwd": str(repo)}}})
-                state = native_states[min(current_polls - 1, len(native_states) - 1)]
+                native_index = min(current_polls - 1, len(native_states) - 1)
+                state = native_states[native_index]
+                lifecycle = (native_lifecycles[native_index] if native_lifecycles is not None else "running")
+                input_state = (native_input_states[native_index] if native_input_states is not None
+                               else "unknown" if state == "unknown" else None)
+                freshness = (native_freshness[native_index] if native_freshness is not None else "current")
                 return {"truncated": False, "owner_availability": {"agent_sessions": "available"},
-                    "items": [{"lifecycle": "running", "placement": {"kind": "local"},
-                    "freshness": {"state": "current"},
+                    "items": [{"lifecycle": lifecycle, "placement": {"kind": "local"},
+                    "freshness": {"state": freshness},
                     "projections": [{"workspace_id": workspace, "panel_id": current_surface}],
                     "agents": [{"kind": "opencode", "session_id": SESSION, "state": state,
-                                "input_state": "unknown" if state == "unknown" else None}]}]}
+                                "input_state": input_state}]}]}
             if "rpc" in argv:
                 method = argv[argv.index("rpc") + 1]
                 params = json.loads(argv[-1])
+                if method == "surface.input_state" and delivery_error:
+                    raise mp.opencode_dispatch.OpenCodeDispatchError(delivery_error)
                 if method == "surface.input_state":
                     return {"surface_id": params["surface_id"], "workspace_id": workspace,
                             "agent": True, "terminal": True, "state": "unknown", "blocks_typing": False,
@@ -1661,6 +1671,10 @@ class OpenCodeDispatchTest(unittest.TestCase):
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(mp, "run_json", side_effect=cmux))
+            if current_error:
+                stack.enter_context(patch.object(
+                    app, "current",
+                    side_effect=mp.opencode_dispatch.OpenCodeDispatchError(current_error)))
             stack.enter_context(patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path))
             stack.enter_context(patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"))
             if hook_arrives_during_check:
@@ -1750,22 +1764,144 @@ class OpenCodeDispatchTest(unittest.TestCase):
         launch = observed["launch"]
         self.assertEqual(launch["status"], "uncertain")
         self.assertEqual(launch["error_code"], "native_binding_timeout")
-        self.assertEqual(launch["startup_readiness_observation"]["reason"], "native_hook_record_missing")
+        readiness = launch["startup_readiness_observation"]
+        self.assertEqual(readiness["reason"], "native_binding_timeout")
+        self.assertIn("native_hook_record_missing",
+                      [item["reason"] for item in readiness["classifications"]])
         self.assertEqual(sum(method == "POST" and path == "/api/session"
                              for method, path, _ in self.state.calls), 1)
         self.assertEqual(sum("new-surface" in argv for argv in observed["cmux_calls"]), 1)
         self.assertEqual(self.state.sent_prompts, [])
         self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
 
-    def test_completed_startup_with_working_native_state_holds_without_retry(self):
+    def test_completed_startup_waits_for_exact_native_working_transition_to_idle(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["working", "working", "idle"], hook_after_poll=0, timeout_seconds=6)
+        launch = observed["launch"]
+        self.assertIsNone(observed["failure"])
+        self.assertEqual(observed["result"]["delivery_readiness"], "ready")
+        self.assertEqual(observed["current_polls"], 3)
+        self.assertEqual(launch["startup_readiness_observation"]["state"], "ready")
+        self.assertEqual(launch["startup_readiness_observation"]["wait_count"], 2)
+        self.assertEqual(launch["startup_readiness_observation"]["poll_count"], 3)
+        classifications = launch["startup_readiness_observation"]["classifications"]
+        reasons = [item["reason"] for item in classifications]
+        self.assertEqual(reasons, ["startup_turn_completed_native_working",
+                                   "startup_turn_completed_native_working",
+                                   "startup_native_binding_ready"])
+        native = classifications[0]["native_observation"]
+        self.assertEqual(native["native_state"], "working")
+        self.assertEqual(native["native_lifecycle"], "running")
+        self.assertEqual(native["native_freshness"], "current")
+        self.assertIsNone(native["native_input_state"])
+        self.assertEqual(sum(method == "POST" and path == "/api/session"
+                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(self.state.sent_prompts, [])
+        self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
+
+    def test_persistent_exact_native_working_times_out_with_bounded_observations(self):
         observed = self.dispatch_initial_native_observation(
             native_states=["working"], hook_after_poll=0, timeout_seconds=3)
+        launch = observed["launch"]
+        readiness = launch["startup_readiness_observation"]
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_binding_timeout", observed["failure"])
+        self.assertEqual(observed["current_polls"], 3)
+        self.assertEqual(launch["status"], "uncertain")
+        self.assertEqual(launch["error_code"], "native_binding_timeout")
+        self.assertEqual(readiness["state"], "timed_out")
+        self.assertEqual(readiness["reason"], "native_binding_timeout")
+        self.assertEqual(readiness["poll_count"], 3)
+        self.assertEqual(readiness["wait_count"], 3)
+        self.assertLessEqual(len(readiness["classifications"]), 182)
+        self.assertEqual(readiness["classification_count"], len(readiness["classifications"]))
+        native = readiness["native_observation"]
+        self.assertEqual(native["native_state"], "working")
+        self.assertEqual(native["native_lifecycle"], "running")
+        self.assertEqual(native["native_freshness"], "current")
+        self.assertIsNone(native["native_input_state"])
+        self.assertNotIn("session_id", json.dumps(readiness))
+        self.assertEqual(sum(method == "POST" and path == "/api/session"
+                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(self.state.sent_prompts, [])
+        self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
+
+    def test_working_with_pending_input_remains_an_immediate_hold_with_bounded_evidence(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["working"], native_input_states=["needs_input"],
+            hook_after_poll=0, timeout_seconds=3)
+        readiness = observed["launch"]["startup_readiness_observation"]
         self.assertIsNone(observed["result"])
         self.assertIn("native_session_state_unknown", observed["failure"])
         self.assertEqual(observed["current_polls"], 1)
-        self.assertEqual(observed["launch"]["status"], "uncertain")
-        self.assertEqual(sum(method == "POST" and path == "/api/session"
-                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(readiness["state"], "held")
+        self.assertEqual(readiness["reason"], "native_session_state_unknown")
+        self.assertEqual(readiness["native_observation"]["native_state"], "working")
+        self.assertEqual(readiness["native_observation"]["native_input_state"], "needs_input")
+        self.assertEqual(readiness["wait_count"], 0)
+        self.assertEqual(self.state.sent_prompts, [])
+
+    def test_working_on_a_different_surface_remains_an_immediate_hold_with_evidence(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["working"], hook_after_poll=0, timeout_seconds=3, wrong_surface=True)
+        readiness = observed["launch"]["startup_readiness_observation"]
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_session_visible_on_other_surface", observed["failure"])
+        self.assertEqual(observed["current_polls"], 1)
+        self.assertEqual(readiness["state"], "held")
+        self.assertEqual(readiness["reason"], "native_session_visible_on_other_surface")
+        self.assertFalse(readiness["native_observation"]["expected_surface_match"])
+        self.assertEqual(readiness["wait_count"], 0)
+        self.assertEqual(self.state.sent_prompts, [])
+
+    def test_stale_working_native_projection_remains_an_immediate_hold_with_evidence(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["working"], native_freshness=["stale"], hook_after_poll=0, timeout_seconds=3)
+        readiness = observed["launch"]["startup_readiness_observation"]
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_session_observation_stale", observed["failure"])
+        self.assertEqual(observed["current_polls"], 1)
+        self.assertEqual(readiness["state"], "held")
+        self.assertEqual(readiness["reason"], "native_session_observation_stale")
+        self.assertEqual(readiness["native_observation"]["native_freshness"], "stale")
+        self.assertEqual(readiness["wait_count"], 0)
+        self.assertEqual(self.state.sent_prompts, [])
+
+    def test_working_with_nonrunning_lifecycle_remains_an_immediate_hold(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["working"], native_lifecycles=["idle"], hook_after_poll=0, timeout_seconds=3)
+        readiness = observed["launch"]["startup_readiness_observation"]
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_session_state_unknown", observed["failure"])
+        self.assertEqual(observed["current_polls"], 1)
+        self.assertEqual(readiness["state"], "held")
+        self.assertEqual(readiness["native_observation"]["native_lifecycle"], "idle")
+        self.assertEqual(readiness["wait_count"], 0)
+        self.assertEqual(self.state.sent_prompts, [])
+
+    def test_unavailable_current_observation_is_recorded_as_bounded_hold(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["idle"], hook_after_poll=0, timeout_seconds=3,
+            current_error="native_current_unavailable")
+        readiness = observed["launch"]["startup_readiness_observation"]
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_current_unavailable", observed["failure"])
+        self.assertEqual(readiness["state"], "held")
+        self.assertEqual(readiness["reason"], "native_current_unavailable")
+        self.assertEqual(readiness["native_observation"]["status"], "observation_unavailable")
+        self.assertEqual(readiness["native_observation"]["candidates"], [])
+        self.assertEqual(self.state.sent_prompts, [])
+
+    def test_delivery_hold_records_bounded_specific_guard_reason(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["idle"], hook_after_poll=0, timeout_seconds=3,
+            delivery_error="native_input_state_identity_mismatch")
+        readiness = observed["launch"]["startup_readiness_observation"]
+        self.assertIsNone(observed["failure"])
+        self.assertEqual(observed["result"]["delivery_readiness"], "held")
+        self.assertEqual(readiness["state"], "held")
+        self.assertEqual(readiness["reason"], "native_composer_state_not_proven_empty")
+        self.assertEqual(readiness["delivery_guard_reason"], "native_input_state_identity_mismatch")
         self.assertEqual(self.state.sent_prompts, [])
 
     def test_completed_startup_with_needs_input_holds_without_retry(self):

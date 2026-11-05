@@ -904,6 +904,85 @@ def _native_hook_observation_pending(session):
     return False
 
 
+def _bounded_native_value(value, allowed):
+    if value is None:
+        return None
+    return value if isinstance(value, str) and value in allowed else "unrecognized"
+
+
+def _bounded_startup_reason(value, fallback="startup_observation_unclassified"):
+    if (isinstance(value, str) and value and len(value) <= 96 and value.isascii()
+            and all(char.islower() or char.isdigit() or char == "_" for char in value)):
+        return value
+    return fallback
+
+
+def _native_startup_diagnostic(current, expected_session, expected_workspace, expected_surface):
+    states = ("working", "idle", "needs_input", "unknown")
+    lifecycles = ("running", "idle", "backgroundWorkPending")
+    freshness_states = ("current", "stale")
+    input_states = ("unknown", "empty", "draft", "needs_input")
+    diagnostic = {"schema": "cmux-current-opencode-v1", "status": "unknown",
+                  "observation_truncated": None, "agent_sessions_available": False,
+                  "items_observed": 0, "items_total_capped": 0, "items_truncated": False,
+                  "agent_lists_truncated": False, "candidate_count_capped": 0,
+                  "candidates_truncated": False, "candidates": []}
+    if not isinstance(current, dict):
+        diagnostic["status"] = "observation_unavailable"
+        return diagnostic
+    diagnostic["observation_truncated"] = (current.get("truncated")
+                                           if isinstance(current.get("truncated"), bool) else None)
+    availability = current.get("owner_availability")
+    diagnostic["agent_sessions_available"] = (
+        isinstance(availability, dict) and availability.get("agent_sessions") == "available")
+    items = current.get("items")
+    if not isinstance(items, list):
+        diagnostic["status"] = "items_schema_unknown"
+        return diagnostic
+    scan_limit = 256
+    diagnostic["status"] = "observed"
+    diagnostic["items_observed"] = min(len(items), scan_limit)
+    diagnostic["items_total_capped"] = min(len(items), 9999)
+    diagnostic["items_truncated"] = len(items) > scan_limit
+    for item in items[:scan_limit]:
+        if not isinstance(item, dict):
+            continue
+        agents = item.get("agents")
+        if not isinstance(agents, list):
+            continue
+        if len(agents) > 64:
+            diagnostic["agent_lists_truncated"] = True
+        projections = item.get("projections")
+        projections = projections if isinstance(projections, list) else []
+        expected_workspace_match = any(
+            isinstance(projection, dict) and isinstance(projection.get("workspace_id"), str)
+            and projection["workspace_id"].casefold() == expected_workspace.casefold()
+            for projection in projections)
+        expected_surface_match = any(
+            isinstance(projection, dict) and isinstance(projection.get("panel_id"), str)
+            and projection["panel_id"].casefold() == expected_surface.casefold()
+            for projection in projections)
+        for agent in agents[:64]:
+            if (not isinstance(agent, dict) or agent.get("kind") != "opencode"
+                    or agent.get("session_id") != expected_session):
+                continue
+            diagnostic["candidate_count_capped"] = min(diagnostic["candidate_count_capped"] + 1, 9999)
+            if len(diagnostic["candidates"]) < 8:
+                diagnostic["candidates"].append({
+                    "native_state": _bounded_native_value(agent.get("state"), states),
+                    "native_lifecycle": _bounded_native_value(item.get("lifecycle"), lifecycles),
+                    "native_freshness": _bounded_native_value(
+                        item.get("freshness", {}).get("state")
+                        if isinstance(item.get("freshness"), dict) else None, freshness_states),
+                    "native_input_state": _bounded_native_value(agent.get("input_state"), input_states),
+                    "expected_workspace_match": expected_workspace_match,
+                    "expected_surface_match": expected_surface_match})
+    diagnostic["candidates_truncated"] = diagnostic["candidate_count_capped"] > len(diagnostic["candidates"])
+    if diagnostic["candidate_count_capped"] == 1:
+        diagnostic.update(diagnostic["candidates"][0])
+    return diagnostic
+
+
 def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
     role = choice["role"]
     require(role in ("orchestrator", "implementer", "researcher"),
@@ -1017,6 +1096,62 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
     creation_attempted = False
     surface_opened = False
     last_startup_readiness = None
+    startup_observation_history = []
+    startup_poll_count = 0
+    startup_wait_count = 0
+    startup_classification_count = 0
+    startup_first_wait_at = None
+    startup_last_wait_at = None
+    startup_started_at = None
+    startup_started_monotonic = None
+
+    def classify_startup(classification, reason, current=None, turn=None, *, persist=True):
+        nonlocal last_startup_readiness, startup_wait_count, startup_classification_count
+        nonlocal startup_first_wait_at, startup_last_wait_at
+        reason = _bounded_startup_reason(reason)
+        observed_at = now()
+        startup_classification_count = min(
+            startup_classification_count + 1, NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 2)
+        if classification == "waiting":
+            startup_wait_count = min(startup_wait_count + 1, NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 1)
+            startup_first_wait_at = startup_first_wait_at or observed_at
+            startup_last_wait_at = observed_at
+        turn_state = _bounded_native_value(
+            turn.get("state") if isinstance(turn, dict) else None,
+            ("not_admitted", "running", "complete", "failed"))
+        sample = {"classification": classification, "reason": reason,
+                  "observed_at": observed_at,
+                  "elapsed_seconds": min(float(NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS),
+                                         round(max(0.0, _native_startup_clock() - startup_started_monotonic), 3))
+                  if startup_started_monotonic is not None else 0.0,
+                  "poll_number": min(startup_poll_count, NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 1),
+                  "wait_number": startup_wait_count,
+                  "startup_turn_state": turn_state,
+                  "native_observation": _native_startup_diagnostic(current, session, workspace, surface)}
+        startup_observation_history.append(sample)
+        history_limit = NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 2
+        if len(startup_observation_history) > history_limit:
+            del startup_observation_history[0]
+        last_startup_readiness = {
+            "schema_version": 2,
+            "state": classification,
+            "reason": reason,
+            "observed_at": observed_at,
+            "started_at": startup_started_at,
+            "elapsed_seconds": sample["elapsed_seconds"],
+            "poll_count": sample["poll_number"],
+            "wait_count": startup_wait_count,
+            "classification_count": startup_classification_count,
+            "first_wait_at": startup_first_wait_at,
+            "last_wait_at": startup_last_wait_at,
+            "startup_turn_state": turn_state,
+            "native_observation": sample["native_observation"],
+            "classifications": list(startup_observation_history)}
+        if persist:
+            launch["startup_readiness_observation"] = last_startup_readiness
+            update_opencode_launch(app, launch)
+        return last_startup_readiness
+
     try:
         # Recheck immediately before creation in case provider configuration or server identity changed.
         evidence = opencode_dispatch.preflight(connection, choice)
@@ -1119,32 +1254,49 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
         launch["status"] = "native_binding_pending"
         launch["initial_prompt_released_at"] = now()
         update_opencode_launch(app, launch)
-        deadline = _native_startup_clock() + NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS
+        startup_started_at = now()
+        startup_started_monotonic = _native_startup_clock()
+        deadline = startup_started_monotonic + NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS
+        last_startup_current = None
+        last_startup_turn = None
         while _native_startup_clock() < deadline:
-            current = app.current()
+            startup_poll_count = min(startup_poll_count + 1, NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 1)
+            try:
+                current = app.current()
+            except Exception as exc:
+                reason = (exc.code if isinstance(exc, opencode_dispatch.OpenCodeDispatchError)
+                          else "native_current_observation_unavailable")
+                classify_startup("held", reason)
+                raise
+            last_startup_current = current
             try:
                 native = opencode_dispatch.require_native_dispatch_binding(
                     expected_workspace=workspace, expected_surface=surface,
                     expected_session=session, current=current, allow_startup_unknown=True)
             except opencode_dispatch.OpenCodeDispatchError as exc:
                 if exc.code == "native_session_surface_binding_pending":
-                    last_startup_readiness = {"state": "waiting", "reason": exc.code,
-                                              "observed_at": now()}
+                    classify_startup("waiting", exc.code, current)
                     _native_startup_pause()
                     continue
+                classify_startup("held", exc.code, current)
                 raise
-            if native["state"] == "needs_input":
+            if (native["state"] == "needs_input"
+                    or native.get("input_state") not in (None, "unknown", "empty")):
+                classify_startup("held", "native_session_state_unknown", current)
                 raise opencode_dispatch.OpenCodeDispatchError("native_session_state_unknown")
-            if (native["state"] == "unknown"
-                    and native.get("input_state") not in (None, "unknown", "empty")):
-                raise opencode_dispatch.OpenCodeDispatchError("native_session_state_unknown")
-            turn = opencode_dispatch.startup_turn_observation(
-                connection, session_id=session, prompt_sha256=launch["startup_prompt_sha256"],
-                provider_id=choice["provider_id"], model_id=choice["model"])
+            try:
+                turn = opencode_dispatch.startup_turn_observation(
+                    connection, session_id=session, prompt_sha256=launch["startup_prompt_sha256"],
+                    provider_id=choice["provider_id"], model_id=choice["model"])
+            except opencode_dispatch.OpenCodeDispatchError as exc:
+                classify_startup("held", exc.code, current)
+                raise
+            last_startup_turn = turn
+            if not isinstance(turn, dict) or turn.get("state") not in ("not_admitted", "running", "complete", "failed"):
+                classify_startup("held", "startup_turn_observation_schema_unknown", current, turn)
+                raise opencode_dispatch.OpenCodeDispatchError("startup_turn_observation_schema_unknown")
             if turn["state"] == "not_admitted":
-                last_startup_readiness = {"state": "waiting", "reason": "startup_prompt_not_admitted",
-                                          "native_state": native["state"],
-                                          "native_lifecycle": native["lifecycle"], "observed_at": now()}
+                classify_startup("waiting", "startup_prompt_not_admitted", current, turn)
                 _native_startup_pause()
                 continue
             if turn["state"] == "running":
@@ -1164,19 +1316,26 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
                     if native_generation is not None:
                         launch["native_started_at"] = native_generation
                     update_opencode_launch(app, launch)
-                last_startup_readiness = {"state": "waiting", "reason": "startup_turn_running",
-                                          "native_state": native["state"],
-                                          "native_lifecycle": native["lifecycle"], "observed_at": now()}
+                classify_startup("waiting", "startup_turn_running", current, turn)
                 _native_startup_pause()
                 continue
+            if turn["state"] == "failed":
+                classify_startup("held", "startup_turn_failed", current, turn)
+                raise opencode_dispatch.OpenCodeDispatchError("startup_turn_failed")
             if native["state"] == "unknown":
-                last_startup_readiness = {"state": "waiting", "reason": "native_state_unknown",
-                                          "native_state": native["state"],
-                                          "native_lifecycle": native["lifecycle"],
-                                          "freshness": native["freshness"], "observed_at": now()}
+                classify_startup("waiting", "native_session_state_unknown", current, turn)
                 _native_startup_pause()
                 continue
+            if native["state"] == "working":
+                if (turn["state"] == "complete" and native["lifecycle"] == "running"
+                        and native.get("input_state") in (None, "unknown", "empty")):
+                    classify_startup("waiting", "startup_turn_completed_native_working", current, turn)
+                    _native_startup_pause()
+                    continue
+                classify_startup("held", "native_session_state_unknown", current, turn)
+                raise opencode_dispatch.OpenCodeDispatchError("native_session_state_unknown")
             if native["state"] != "idle":
+                classify_startup("held", "native_session_state_unknown", current, turn)
                 raise opencode_dispatch.OpenCodeDispatchError("native_session_state_unknown")
             try:
                 identity = opencode_dispatch.inspect_session(
@@ -1184,10 +1343,10 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
                     workspace_uuid=workspace, surface_uuid=surface, parent_task_id=connection.parent_task_id)
             except opencode_dispatch.OpenCodeDispatchError as exc:
                 if exc.code == "session_guard_session_busy":
-                    last_startup_readiness = {"state": "waiting", "reason": exc.code,
-                                              "native_state": native["state"], "observed_at": now()}
+                    classify_startup("waiting", exc.code, current, turn)
                     _native_startup_pause()
                     continue
+                classify_startup("held", exc.code, current, turn)
                 raise
             hold_codes = []
             try:
@@ -1197,36 +1356,41 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
                 native_generation = hook["started_at"]
             except opencode_dispatch.OpenCodeDispatchError as exc:
                 if exc.code in ("native_hook_store_unavailable", "native_hook_session_unavailable"):
-                    hook_pending = _native_hook_observation_pending(session)
-                    last_startup_readiness = {
-                        "state": "waiting",
-                        "reason": "native_hook_record_missing" if hook_pending else "native_hook_record_arrived",
-                        "native_state": native["state"], "native_lifecycle": native["lifecycle"],
-                        "startup_turn_state": turn["state"], "observed_at": now()}
+                    try:
+                        hook_pending = _native_hook_observation_pending(session)
+                    except opencode_dispatch.OpenCodeDispatchError as hook_error:
+                        classify_startup("held", hook_error.code, current, turn)
+                        raise
+                    classify_startup("waiting",
+                                     "native_hook_record_missing" if hook_pending else "native_hook_record_arrived",
+                                     current, turn)
                     _native_startup_pause()
                     continue
+                classify_startup("held", exc.code, current, turn)
                 raise
+            delivery_guard_reason = None
             try:
                 opencode_dispatch.require_native_delivery_binding(
                     run_cmux_rpc, expected_workspace=workspace, expected_surface=surface,
                     allow_composer_state=connection.delivery_policy == "api_sidechannel")
-            except (opencode_dispatch.OpenCodeDispatchError, PreferenceError):
+            except opencode_dispatch.OpenCodeDispatchError as exc:
                 hold_codes.append("native_composer_state_not_proven_empty")
-            execution_result = "turn_idle" if turn["state"] == "complete" else "turn_failed"
-            last_startup_readiness = {"state": "ready" if not hold_codes else "held",
-                                      "native_state": native["state"],
-                                      "native_lifecycle": native["lifecycle"],
-                                      "native_freshness": native["freshness"],
-                                      "startup_turn_state": turn["state"],
-                                      "native_hook_generation_bound": native_generation is not None,
-                                      "api_identity_verified": True,
-                                      "native_composer_guard": "passed" if not hold_codes else "held",
-                                      "observed_at": now()}
+                delivery_guard_reason = _bounded_startup_reason(
+                    exc.code, "native_delivery_binding_unavailable")
+            except PreferenceError:
+                hold_codes.append("native_composer_state_not_proven_empty")
+                delivery_guard_reason = "native_delivery_binding_unavailable"
+            execution_result = "turn_idle"
+            readiness = classify_startup(
+                "held" if hold_codes else "ready",
+                hold_codes[0] if hold_codes else "startup_native_binding_ready",
+                current, turn, persist=False)
+            readiness["delivery_guard_reason"] = delivery_guard_reason
             launch.update(status="running", native_binding=native, identity=identity,
                           initial_turn_state="idle", execution_result=execution_result,
                           startup_turn=turn, delivery_readiness="ready" if not hold_codes else "held",
                           delivery_hold_codes=hold_codes, native_bound_at=now(),
-                          startup_readiness_observation=last_startup_readiness)
+                          startup_readiness_observation=readiness)
             if native_generation is not None:
                 launch["native_started_at"] = native_generation
             update_opencode_launch(app, launch)
@@ -1239,12 +1403,23 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
                     "initial_turn_state": "idle", "execution_result": execution_result,
                     "delivery_readiness": launch["delivery_readiness"],
                     "delivery_hold_codes": hold_codes, "identity": identity}
+        classify_startup("timed_out", "native_binding_timeout", last_startup_current, last_startup_turn)
         raise opencode_dispatch.OpenCodeDispatchError("native_binding_timeout")
     except BaseException as exc:
         if surface_opened:
             try:
                 signal_private(abort_file, {"launch_id": launch_id, "reason": "native_binding_unconfirmed"})
             except PreferenceError:
+                pass
+        if (launch.get("initial_prompt_released_at") and
+                (last_startup_readiness is None
+                 or last_startup_readiness.get("state") not in ("held", "timed_out"))):
+            failure_reason = (exc.code if isinstance(exc, opencode_dispatch.OpenCodeDispatchError)
+                              else "startup_observation_failed")
+            try:
+                classify_startup("held", failure_reason,
+                                 locals().get("last_startup_current"), locals().get("last_startup_turn"))
+            except Exception:
                 pass
         code = exc.code if isinstance(exc, opencode_dispatch.OpenCodeDispatchError) else "dispatch_uncertain"
         launch.update(status="uncertain" if creation_attempted else "failed", error_code=code,
