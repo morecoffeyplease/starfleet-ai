@@ -5,6 +5,8 @@ It is a setup recipe for controlled local trials, not a claim that every Starfle
 The model was tested as GGUF Q4_K_M with a 131,072-token context, 32,768-token output allowance and the maximum reasoning setting exposed by this provider.
 The observations came from one Apple M5 Max host with 128 GB of unified memory and are not a performance recommendation.
 Clean-host installation, clean-host model download and the full end-to-end Starfleet orchestration path have not been qualified.
+Use the [Qwen runtime lifecycle runbook](qwen-runtime-lifecycle.md) for the source-checked private runtime, profile, managed dispatch, worker scaling, and owned shutdown command sequence.
+That runbook is gated on the required Pattern Buffer pressure warning and Prime Directive contracts, which are not yet integrated into this candidate.
 
 ## Prerequisites
 
@@ -83,7 +85,14 @@ The `edit` allowance illustrates where a task-scoped rule belongs, but that exac
             "reasoning": { "supported": true, "effort": ["max"] }
           },
           "compatibility": { "maxTokensField": "max_tokens" },
-          "body": { "reasoning_effort": "max" }
+          "body": { "reasoning_effort": "max" },
+          "variants": [
+            {
+              "id": "max",
+              "settings": { "reasoningEffort": "max" },
+              "body": { "reasoning_effort": "max" }
+            }
+          ]
         }
       }
     }
@@ -154,9 +163,11 @@ Read the maintained [Model Preferences guide](../apps/model-preferences/README.m
 Its OpenCode-managed dispatch path requires a pilot-scoped OpenCode configuration, a pre-existing API server authenticated on loopback and an owner-only private connection manifest.
 Use a fresh per-task connection manifest for the exact loopback API process.
 The OpenCode management API is separate from the Ollama inference endpoint, and its Basic authentication value must remain in a protected private file.
+The current managed TUI source sets that value in the TUI process environment, but whether tool subprocesses can read it remains untested; do not infer either exposure or isolation without process-boundary evidence.
 Source code and a successful read-only preflight do not establish managed session creation, startup placement, continuation or safe sending.
 The parent-routing and startup-command failures were corrected, and a fresh Codex-Qwen managed session completed its exact baseline task using the short protected descriptor and explicit private XDG paths.
 This observed startup case does not qualify every parent route, Hailing delivery or a production API-only send path.
+The after-fix API replay on `9092aef` exercised parent-linked session creation and distinct-worktree relocation with zero model requests; it is metadata-only API evidence, not native startup or inference qualification.
 
 The researcher route has one bounded native read-and-answer case without Pattern Buffer plugin or task-binding arguments.
 Current Pattern Buffer dispatched-task integration supports implementers only; keep researcher configuration separate and do not infer researcher task context from implementer evidence.
@@ -169,6 +180,7 @@ The native pilot observed shared context, the implementer role and initial task 
 A separate managed case resumed a permitted fixture read after compaction and correctly held continuation after task finish without another provider request.
 A later supervised case completed a same-session post-compaction edit; the chief reviewed its unchanged diff and ran four passing behavior tests.
 Qwen itself did not run those tests or issue a native test permission request, and model reception of the finished notice remains unqualified.
+The current OpenCode Pattern Buffer integration still lacks the required pressure warning and compaction telemetry, so context and task reinjection observations do not satisfy that readiness requirement.
 
 Hailing Frequencies currently holds OpenCode delivery while the installed CMUX projection reports composer state `unknown`.
 The historical CMUX parser experiment passed its package and build-only checks but was never installed or launched for a native empty-composer check.

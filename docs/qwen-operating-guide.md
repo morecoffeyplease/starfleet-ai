@@ -5,6 +5,8 @@ The orchestrator performs ordinary project ownership: scope, dependencies, accep
 The workflow does not require a separate policing service or zero human intervention.
 Record assistance and interventions so supervised observations are not presented as autonomous orchestration.
 Use the [OpenCode and local Qwen setup guide](opencode-qwen-setup.md) for the pinned pilot configuration and setup prerequisites.
+Use the [Qwen runtime lifecycle runbook](qwen-runtime-lifecycle.md) for private runtime startup, exact managed dispatch commands, worker scaling and owned shutdown.
+The runbook is gated on the required Pattern Buffer pressure warning and Prime Directive contracts for both Codex-Qwen and Qwen-only; those requirements are not yet integrated into this candidate.
 
 Every Qwen run uses a visible OpenCode tab or pane in the existing CMUX workspace assigned to that same task.
 Keep the task, session, worktree and candidate identity together in that workspace.
@@ -38,6 +40,9 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 
 The active shared profile remains independent of these opt-in examples.
 Check the saved profile against each session's intended profile before launch, and do not globally activate a trial preference.
+The managed TUI source receives the API password in its process environment, but whether tool subprocesses can read it remains untested.
+The source also transfers private XDG paths without explicitly assigning `HOME`, so do not claim child-home isolation until the launched process environment is verified.
+Keep credential isolation and the exact tool process boundary as unqualified; do not test them with real credentials.
 The observed Codex startup and Luna delegation do not establish Qwen orchestrator qualification.
 Use supported stock CMUX only for this workflow.
 The OpenCode 2.2.5 TUI plugin interface has no documented draft accessor or atomic admission lock.
@@ -191,6 +196,7 @@ A human remains the authority for scope changes, approvals, review launches and 
 8. Set the allowed tools, paths and commands in the local interface or sandbox before the worker starts.
 9. Relay dependencies as concise reports with source, candidate identity, results and remaining uncertainty.
 10. Write acceptance commands, timebox, quiet-time check choice, checkpoints and stop conditions into the task card.
+11. Confirm the Pattern Buffer pressure warning and Prime Directive are implemented and accepted for the selected orchestration mode before dispatch; otherwise stop.
 
 Use the highest supported thinking setting exposed for the exact local model, while reserving enough remaining context for completion evidence and a concise report.
 Record the actual setting used.
@@ -199,6 +205,9 @@ Do not guess an effort name or token budget that the local interface does not ex
 Coordinate each meaningful local inference phase through the installed resource scheduler with its actual worker demand and bounded runtime.
 Independent cases may run in parallel when admitted, with distinct private ports, worktrees and process ownership.
 Check those resources before launch; permission to parallelize does not bypass admission or establish a measured throughput benefit.
+Within one Qwen task, multiple worker sessions reuse one owned Ollama process and one OpenCode API server rather than starting a runtime pair for each worker.
+The documented `OLLAMA_NUM_PARALLEL=1` setting serializes Qwen inference, so add workers only when independent work and measured host capacity justify them.
+No worker-count or higher-parallelism recommendation is currently qualified.
 
 ## Task card
 
@@ -440,8 +449,12 @@ Treat borrowed cadence and retry settings as provisional until the relevant Qwen
 
 ## Starfleet references
 
+[Qwen runtime lifecycle](qwen-runtime-lifecycle.md) gives the source-checked setup and owned process commands, with current readiness blockers.
 [Model Preferences](../apps/model-preferences/README.md) describes exact model choices and the limits of saved profiles.
 [Pattern Buffer](../apps/pattern-buffer/README.md) and its [OpenCode guide](../apps/pattern-buffer/docs/opencode.md) describe explicit context installation and exact task binding.
 [Implementer dispatch](../apps/pattern-buffer/docs/implementer-dispatch.md) describes receipt and completion evidence boundaries.
 [Warp-drive](../apps/warp-drive/README.md) describes local CPU reservation controls when those are part of an authorized workflow.
 [Starfleet Markup](../apps/starfleet-markup/README.md) describes requested document reviews, exact ownership, foreground event reception and the current native wake limits.
+
+The Claude-Qwen follow-up starts only after the supporting PR is merged.
+The existing Claude hold remains in effect until its owner explicitly releases it.
