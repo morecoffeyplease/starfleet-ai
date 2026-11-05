@@ -40,7 +40,7 @@ A checkpoint does not change standing context or grant authority.
 Install the user-level adapter once per harness from a Starfleet-AI checkout.
 Reinstalling updates the existing `context_injector_{harness}.py` runtime path and preserves its hook marker and command.
 It also installs the Pattern Buffer CLI aliases without adding another hook or trust identity.
-For events that remain enabled, when one owned handler exists, an upgrade replaces it at its existing group and handler positions while preserving group filters and unrelated handlers.
+For enabled events, an owned-only group is refreshed to canonical group settings in place, while a mixed group updates only the owned handler and preserves shared filters and metadata.
 Duplicate owned handlers retain the existing cleanup behavior.
 Preserving configured positions does not guarantee that a harness will trust or load the hook or deliver its output.
 

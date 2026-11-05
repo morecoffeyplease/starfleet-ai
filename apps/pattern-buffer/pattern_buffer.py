@@ -736,9 +736,12 @@ def reconcile_hook_groups(groups, harness, additions):
         group_index, handler_index = owned_slots[0]
         updated = list(groups)
         group = groups[group_index]
-        handlers = list(group["hooks"])
-        handlers[handler_index] = additions[0]["hooks"][0]
-        updated[group_index] = {**group, "hooks": handlers}
+        if len(group["hooks"]) == 1:
+            updated[group_index] = additions[0]
+        else:
+            handlers = list(group["hooks"])
+            handlers[handler_index] = additions[0]["hooks"][0]
+            updated[group_index] = {**group, "hooks": handlers}
         return updated
 
     # Duplicate cleanup and uninstall retain the existing remove-then-add behavior.

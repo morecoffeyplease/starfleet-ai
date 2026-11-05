@@ -867,6 +867,8 @@ else:
         groups = data["hooks"]["SessionStart"]
         self.assertEqual(len(groups), 1)
         groups[0]["customFilter"] = {"source": "fixture"}
+        groups[0]["hooks"][0]["timeout"] = 1
+        groups[0]["hooks"][0]["additionalContextLimit"] = 16384
         mixed_group_handler = {"type": "command", "command": "echo same-group foreign handler"}
         groups[0]["hooks"].append(mixed_group_handler)
         foreign_after_group = {"matcher": "custom-event", "customGroup": "keep",
@@ -874,6 +876,8 @@ else:
         groups.append(foreign_after_group)
         settings.write_text(json.dumps(data))
         expected_groups = json.loads(settings.read_text())["hooks"]["SessionStart"]
+        expected_groups[0]["hooks"][0]["timeout"] = 5
+        expected_groups[0]["hooks"][0]["additionalContextLimit"] = 0
 
         self.cli("install", *options, "--runtime-dir", str(runtime))
 
@@ -883,6 +887,48 @@ else:
         self.assertEqual(installed_groups[0]["hooks"][1], mixed_group_handler)
         self.assertEqual(installed_groups[0]["customFilter"], {"source": "fixture"})
         self.assertEqual(installed_groups[1], foreign_after_group)
+
+    def test_install_refreshes_owned_only_group_fields_at_the_existing_slot(self):
+        cases = (
+            ("claude", "SessionStart", "startup|resume|compact", "startup|resume|compact|fork|clear"),
+            ("codex", "PreCompact", "legacy-checkpoint-filter", None),
+        )
+        for harness, event, stale_matcher, expected_matcher in cases:
+            with self.subTest(harness=harness, event=event):
+                settings, _, options = self.install_args(harness)
+                old_runtime = self.root.parent / f"{harness} old runtime"
+                new_runtime = self.root.parent / f"{harness} new runtime"
+                self.cli("install", *options, "--runtime-dir", str(old_runtime))
+                data = json.loads(settings.read_text())
+                groups = data["hooks"][event]
+                owned_index = next(index for index, group in enumerate(groups)
+                                   if any(ci.owned(handler, harness) for handler in group["hooks"]))
+                owned_group = groups[owned_index]
+                self.assertEqual(len(owned_group["hooks"]), 1)
+                owned_handler = owned_group["hooks"][0]
+                old_command = owned_handler["command"]
+                owned_handler["timeout"] = 1
+                owned_group["matcher"] = stale_matcher
+                foreign_after_group = {"matcher": "foreign-after-owned", "customGroup": event,
+                                       "hooks": [{"type": "command", "command": "echo later group"}]}
+                groups.insert(owned_index + 1, foreign_after_group)
+                settings.write_text(json.dumps(data))
+
+                self.cli("install", *options, "--runtime-dir", str(new_runtime))
+
+                updated_groups = json.loads(settings.read_text())["hooks"][event]
+                canonical_group = ci.hook_config(harness, new_runtime, True)["hooks"][event][0]
+                self.assertEqual(updated_groups[owned_index], canonical_group)
+                self.assertEqual(updated_groups[owned_index + 1], foreign_after_group)
+                updated_handler = updated_groups[owned_index]["hooks"][0]
+                self.assertTrue(ci.owned(updated_handler, harness))
+                self.assertNotEqual(updated_handler["command"], old_command)
+                self.assertEqual(updated_handler["timeout"], 5)
+                if expected_matcher is None:
+                    self.assertNotIn("matcher", updated_groups[owned_index])
+                    self.assertNotIn("additionalContextLimit", updated_handler)
+                else:
+                    self.assertEqual(updated_groups[owned_index]["matcher"], expected_matcher)
 
     def test_install_preserves_existing_settings_and_is_idempotent(self):
         for harness in ("codex", "claude"):
