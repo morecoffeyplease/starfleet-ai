@@ -116,10 +116,18 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
         self.assertIsNone(result["assignment_sha256"])
         self.assertIn("role: unassigned", result["text"])
         self.assertNotIn("orchestrator context", result["text"])
-        parts = self.plugin_call("ses_unassigned", "ses_parent", cwd=self.owner)
+        parent = self.context(self.parent_session, cwd=self.owner)
+        self.assertIn("role: orchestrator", parent["text"])
+        parts = self.plugin_call("ses_unassigned", self.parent_session, cwd=self.owner)
         self.assertEqual(parts["hooks"], ["compaction", "context"])
-        self.assertEqual([part["text"] for part in parts["system"] if part.get("metadata", {}).get(
-            "starfleet.pattern-buffer") == "v1"], [result["text"]])
+        owned = [part["text"] for part in parts["system"] if part.get("metadata", {}).get(
+            "starfleet.pattern-buffer") == "v1"]
+        self.assertEqual(len(owned), 1)
+        self.assertEqual(owned[0], result["text"] +
+                         "\n\nPattern Buffer pressure status: unknown (checkpoint disabled); "
+                         "no pressure warning was emitted.")
+        self.assertIn("role: unassigned", owned[0])
+        self.assertNotIn("orchestrator context", owned[0])
         self.assertIn("unowned", [part["text"] for part in parts["system"]])
 
     def test_prepare_bind_replay_update_finish_and_immutable_receipt(self):
