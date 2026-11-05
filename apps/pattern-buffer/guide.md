@@ -46,6 +46,21 @@ python3 apps/pattern-buffer/pattern_buffer.py install --harness codex
 python3 apps/pattern-buffer/pattern_buffer.py install --harness claude
 ```
 
+If install refuses an unowned or damaged runtime entrypoint, preserve the existing runtime.
+From a source checkout, use the same settings path and install into a new empty runtime:
+
+```sh
+python3 apps/pattern-buffer/pattern_buffer.py install \
+  --harness codex \
+  --settings /absolute/path/to/codex-settings.json \
+  --runtime-dir /absolute/path/to/new-empty-runtime
+```
+
+Use the matching harness name and settings file for Claude.
+The generated recovery command preserves whether checkpoint hooks were enabled for that settings file.
+This updates only the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
+Review the harness's normal reload and trust controls after the install; installation does not confirm delivery.
+
 The generic `pattern-buffer` launcher goes to `$HOME/.local/bin` for a standard install.
 Add that directory to `PATH` using your usual shell setup if you want the short command.
 No worktree is initialized or enabled by installation.

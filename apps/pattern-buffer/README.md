@@ -24,6 +24,19 @@ It does not change another runtime directory, another harness's settings, or nat
     pattern-buffer install --harness codex
     pattern-buffer install --harness claude
 
+If installation refuses an unowned or damaged runtime entrypoint, preserve that runtime.
+From a source checkout, install the selected harness into a new empty runtime using the same settings file:
+
+    python3 apps/pattern-buffer/pattern_buffer.py install \
+        --harness codex \
+        --settings /absolute/path/to/codex-settings.json \
+        --runtime-dir /absolute/path/to/new-empty-runtime
+
+Use the matching harness name and settings file for Claude.
+The generated recovery command preserves whether checkpoint hooks were enabled for that settings file.
+This updates the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
+Review the harness's normal reload and trust controls after the install; installation does not confirm delivery.
+
 Initialize a directly managed Git worktree with an editable context file.
 
     pattern-buffer --cwd /absolute/path/to/worktree init --default-role orchestrator

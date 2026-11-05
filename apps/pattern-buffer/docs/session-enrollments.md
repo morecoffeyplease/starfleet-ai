@@ -109,6 +109,10 @@ New Claude checkpoints default to 50 minutes, and existing checkpoints remain un
 An armed timer does not prove that its wake was received.
 When the selected hook belongs to another supported runtime, the refusal includes a complete command for an installed compatible CLI only when its bundle and interpreter can be verified locally.
 This command does not install, repair, enroll, restart or change native trust.
+When no compatible entrypoint is available and installation refuses a damaged or unowned file, preserve that runtime and use the reported same-settings recovery command to install into a new empty runtime.
+The recovery command updates the selected harness's owned hook setting while leaving worktree enrollment and checkpoint files in place.
+Review the harness's normal reload and trust controls after changing the hook command.
+The local handoff result still does not prove native hook delivery or model receipt.
 
 ## Reliability history
 

@@ -17,7 +17,10 @@ Task updates do not grant new scope or supersede later user instructions.
 
 If a hook belongs to a different supported installation, dispatch remains refused until the CLI matches that installed bundle.
 When a compatible installed entrypoint is verified, the refusal prints a complete command that preserves the original dispatch arguments.
-Use that command or explicitly update the existing target runtime; the check never redirects hook settings or changes trust.
+Run the reported compatible command when one is available.
+If installation refuses an unowned or damaged entrypoint, preserve that runtime and run the reported same-settings recovery command into a new empty runtime.
+The recovery install updates only the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
+Review the harness's normal reload and trust controls after changing the hook command.
 An orchestrator handoff to an already-installed harness usually needs the [read-only handoff check](session-enrollments.md#read-only-handoff-check), not another installation.
 From this app's directory, install the updated adapter for each harness that needs it:
 

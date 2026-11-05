@@ -367,7 +367,7 @@ class PatternBufferTests(unittest.TestCase):
 
     def test_enrollment_validation_distinguishes_missing_role_section_from_oversize(self):
         self.cli("init")
-        source = self.root.parent / "reviewed-context.md"
+        source = (self.root.parent / "reviewed-context.md").resolve()
         source.write_text("# shared\nApproved mission.\n")
         missing = self.cli("session-enroll", "--harness", "codex", "--session", "validation-missing",
                            "--context-file", str(source), "--role", "orchestrator", success=False)
@@ -756,29 +756,55 @@ else:
     def test_handoff_check_reports_absent_stale_and_malformed_hook_settings(self):
         self.cli("init", "--default-role", "orchestrator")
         settings, runtime, options = self.install_args()
+        recovery_only_options = (*options, "--no-checkpoints")
+        settings.write_text(json.dumps({"unrelated": {"setting": True}, "hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": "echo untouched"}]}]}}))
         absent = self.cli("handoff-check", "--harness", "codex", "--session", "successor",
                           "--settings", str(settings), success=False)
         report = json.loads(absent.stdout)
         self.assertFalse(report["checks"]["hook_runtime"]["ok"])
         self.assertIn("exactly one installed Pattern Buffer hook", report["checks"]["hook_runtime"]["detail"])
 
-        self.cli("install", *options, "--runtime-dir", str(runtime))
-        (runtime / "context_injector_codex.py").write_text("stale runtime")
+        self.cli("install", *recovery_only_options, "--runtime-dir", str(runtime))
+        damaged_entrypoints = [runtime / "context_injector_codex.py", runtime / "pattern_buffer_codex.py",
+                               runtime / "pattern_buffer.py"]
+        for entrypoint in damaged_entrypoints:
+            entrypoint.write_text("stale runtime")
+        damaged_bytes = [entrypoint.read_bytes() for entrypoint in damaged_entrypoints]
         stale = self.cli("handoff-check", "--harness", "codex", "--session", "successor",
                          "--settings", str(settings), success=False)
         report = json.loads(stale.stdout)
         self.assertFalse(report["checks"]["hook_runtime"]["ok"])
         self.assertIn("runtime differs", report["checks"]["hook_runtime"]["detail"])
+        self.assertIn("Same-settings recovery command:", report["checks"]["hook_runtime"]["next_action"])
+        self.assertIn(str(settings), report["checks"]["hook_runtime"]["next_action"])
+        recovery_args = shlex.split(report["checks"]["hook_runtime"]["next_action"].split(
+            "Same-settings recovery command: ", 1)[1])
+        self.assertIn("--no-checkpoints", recovery_args)
 
-        refused = self.cli("install", *options, "--runtime-dir", str(runtime), success=False)
+        settings_before_refusal = settings.read_bytes()
+        refused = self.cli("install", *recovery_only_options, "--runtime-dir", str(runtime), success=False)
         self.assertIn("refusing to update unowned runtime entrypoint", refused.stderr)
+        self.assertIn("Same-settings recovery command:", refused.stderr)
+        self.assertIn("--no-checkpoints", refused.stderr)
+        self.assertEqual(settings.read_bytes(), settings_before_refusal)
+        self.assertEqual([entrypoint.read_bytes() for entrypoint in damaged_entrypoints], damaged_bytes)
 
-        settings = self.root.parent / "fresh codex settings.json"
         runtime = self.root.parent / "fresh runtime with spaces"
-        options = ("--harness", "codex", "--settings", str(settings))
-        self.cli("install", *options, "--runtime-dir", str(runtime))
+        self.assertFalse(runtime.exists())
+        self.cli("install", *recovery_only_options, "--runtime-dir", str(runtime))
+        self.assertNotEqual(settings.read_bytes(), settings_before_refusal)
+        self.assertEqual([entrypoint.read_bytes() for entrypoint in damaged_entrypoints], damaged_bytes)
         data = json.loads(settings.read_text())
+        self.assertEqual(data["unrelated"], {"setting": True})
+        self.assertEqual(data["hooks"]["Stop"], [{"hooks": [{"type": "command", "command": "echo untouched"}]}])
         handler = data["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertIn(str(runtime / "context_injector_codex.py"), handler["command"])
+        recovered = self.cli("handoff-check", "--harness", "codex", "--session", "successor",
+                             "--settings", str(settings))
+        recovered_report = json.loads(recovered.stdout)
+        self.assertTrue(recovered_report["checks"]["hook_runtime"]["ok"])
+        self.assertTrue(recovered_report["configuration_ready"])
         command, marker = handler["command"].rsplit(" # ", 1)
         argv = shlex.split(command)
         argv[0] = str(self.root.parent / "missing-interpreter")
@@ -1345,7 +1371,8 @@ print(json.dumps({{'stdin':sys.stdin.read(),'argv':sys.argv,'context':json.loads
         worker, task_file = self.implementer()
         settings, runtime, options = self.install_args()
         self.cli("install", *options, "--runtime-dir", str(runtime))
-        (runtime / "context_injector_codex.py").write_text("stale runtime")
+        for name in ("context_injector_codex.py", "pattern_buffer_codex.py", "pattern_buffer.py"):
+            (runtime / name).write_text("stale runtime")
         harness = self.root.parent / "codex"
         started = self.root.parent / "harness-started"
         harness.write_text("#!/bin/sh\nprintf launched > " + shlex.quote(str(started)) + "\nexit 99\n")
@@ -1354,6 +1381,13 @@ print(json.dumps({{'stdin':sys.stdin.read(),'argv':sys.argv,'context':json.loads
                           "--task-file", str(task_file), "--settings", str(settings), "--",
                           str(harness), "exec", "-C", str(worker), "-", root=worker, success=False)
         self.assertIn("runtime differs", result.stderr)
+        self.assertIn("Same-settings recovery command:", result.stderr)
+        recovery = shlex.split(result.stderr.split("Same-settings recovery command: ", 1)[1])
+        self.assertIn("--settings", recovery)
+        self.assertEqual(recovery[recovery.index("--settings") + 1], str(settings))
+        recovery_runtime = Path(recovery[recovery.index("--runtime-dir") + 1])
+        self.assertNotEqual(recovery_runtime, runtime)
+        self.assertFalse(recovery_runtime.exists())
         self.assertFalse(started.exists())
         self.assertFalse(json.loads(self.cli("status", root=worker).stdout)["registered"])
 

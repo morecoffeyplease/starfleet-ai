@@ -453,6 +453,35 @@ def settings_path(harness, explicit=None):
     return Path.home() / ".claude" / "settings.json"
 
 
+RECOVERY_GUIDANCE_PREFIX = "Preserve the existing runtime and enrollment/checkpoint files. "
+RECOVERY_COMMAND_MARKER = "Same-settings recovery command: "
+
+
+def recovery_runtime_directory():
+    data_root = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")).expanduser().absolute()
+    runtime = data_root / "starfleet-ai" / f"context-injector-recovery-{uuid.uuid4().hex[:10]}"
+    while runtime.exists() or runtime.is_symlink():
+        runtime = data_root / "starfleet-ai" / f"context-injector-recovery-{uuid.uuid4().hex[:10]}"
+    return runtime
+
+
+def recovery_install_command(harness, explicit_settings, checkpoints=True):
+    settings = settings_path(harness, explicit_settings).expanduser().absolute()
+    candidate = recovery_runtime_directory()
+    command = [sys.executable, str(Path(__file__).resolve()), "install", "--harness", harness,
+               "--settings", str(settings), "--runtime-dir", str(candidate)]
+    if not checkpoints:
+        command.append("--no-checkpoints")
+    return shlex.join(command)
+
+
+def recovery_guidance(harness, explicit_settings, checkpoints=True):
+    command = recovery_install_command(harness, explicit_settings, checkpoints)
+    return (RECOVERY_GUIDANCE_PREFIX + "Install this harness into a new empty runtime with the same settings file. "
+            "Then review its normal reload and trust controls; delivery remains unverified. "
+            + RECOVERY_COMMAND_MARKER + command)
+
+
 def marker(harness):
     return f" # starfleet-context-injector:{harness}:v1"
 
@@ -623,7 +652,13 @@ def prepare_install(args):
         raise ValueError("runtime files must be regular files")
     for script in install_scripts:
         if script.exists():
-            owned_runtime_core(script, other_harness if script in other_aliases else args.harness)
+            try:
+                owned_runtime_core(script, other_harness if script in other_aliases else args.harness)
+            except ValueError as error:
+                if script in (runtime, canonical_runtime, harness_alias) and "unowned runtime entrypoint" in str(error):
+                    guidance = recovery_guidance(args.harness, args.settings, args.checkpoints)
+                    raise ValueError(f"{error}. {guidance}") from error
+                raise
         elif any(path.exists() for path in runtime_bundle_paths(script)[1:]):
             raise ValueError(f"refusing to replace runtime helpers without an owned entrypoint: {script}")
     sources = {
@@ -680,6 +715,17 @@ def owned(handler, harness):
     command = handler.get("command")
     return (handler.get("type") == "command" and isinstance(command, str)
             and command.endswith(marker(harness)))
+
+
+def installed_checkpoints_enabled(data, harness):
+    events = ("PreCompact", "PostToolUse", "UserPromptSubmit")
+    if any(owned(handler, harness) for event in events
+           for group in data.get("hooks", {}).get(event, []) for handler in group["hooks"]):
+        return True
+    status_line = data.get("statusLine")
+    command = status_line.get("command") if isinstance(status_line, dict) else None
+    return (harness == "claude" and isinstance(command, str)
+            and command.endswith(" # starfleet-context-statusline:v1"))
 
 
 def configure_hooks(args):
@@ -1109,9 +1155,10 @@ def check_dispatch_hook(harness, explicit=None):
         if command:
             raise ValueError("installed hook runtime differs from this CLI; dispatch remains refused. "
                              "Run this complete command with the verified compatible installed entrypoint: " + command)
+        guidance = recovery_guidance(harness, explicit, installed_checkpoints_enabled(data, harness))
         raise ValueError("installed hook runtime differs from this CLI; dispatch remains refused. "
                          "No compatible installed entrypoint was verified in its runtime directory; "
-                         "use the package that owns that runtime or update that existing runtime explicitly.")
+                         + guidance)
 
 
 def runtime_bundle_matches(left_script, right_script):
@@ -1391,8 +1438,15 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
         if suggestion_marker in message:
             next_action = message.split(suggestion_marker, 1)[1]
             hook_state = "compatible_alternate_cli"
+        elif RECOVERY_COMMAND_MARKER in message:
+            guidance_index = message.find(RECOVERY_GUIDANCE_PREFIX)
+            next_action = message[guidance_index:] if guidance_index >= 0 else message
+            hook_state = "problem"
         else:
-            next_action = "Use the package that owns this runtime or update that existing runtime explicitly; this check does not change hook settings or trust."
+            next_action = ("Review the selected hook/runtime details and repair only through the supported installer. "
+                           "If it refuses an unowned or damaged entrypoint, preserve that runtime and install into a "
+                           "new empty runtime using the same settings file. This check does not change settings or "
+                           "trust; delivery remains unverified.")
             hook_state = "problem"
         hook_report = {"state": hook_state, "evidence_available": True,
                        "detail": message, "next_action": next_action}
