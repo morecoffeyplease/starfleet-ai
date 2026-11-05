@@ -105,6 +105,12 @@ Started commands remain the agent's responsibility.
 
 ## Hailing Frequencies
 
+New `submit`, `run`, and batch reservations require an exact harness, session, and surface match in the existing local Hailing enrollment.
+The check reads one local snapshot and accepts enrolled idle or busy recipients, including an explicitly delegated parent, without checking prompt readiness or starting a service.
+An identical stable-key retry remains available after enrollment is lost, while changed content or a different owner under the same key remains rejected.
+Correct a rejected tuple to the observed enrolled recipient, or follow `hailing-frequencies guide --print` to enroll the actual intended owner; do not enroll a guessed identity.
+Any later ownership handoff still requires an explicit `warp-drive transfer`.
+
 The helper records completion and a durable pending event.
 The dedicated scheduler resolves the current owner and queues one native CMUX inbox message to that owner's exact Hailing-enrolled surface.
 Its sender surface remains the scheduler terminal, so Hailing's self-message filter can accept same-owner completion.

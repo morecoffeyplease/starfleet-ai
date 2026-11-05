@@ -20,6 +20,11 @@ Run the dedicated scheduler with `--send` to dispatch completion and engineer me
 The scheduler's `CMUX_SURFACE_ID` must identify that terminal and differ from enrolled recipient surfaces.
 This does not start or configure Hailing Frequencies.
 The Hailing worker's own send setting, exact bindings, and human-input guard still determine whether an inbox reminder is submitted.
+Every new `submit`, `run`, and batch item must match one exact harness, session, and surface tuple in the local Hailing enrollment.
+This local snapshot check accepts enrolled idle or busy sessions, including an explicitly delegated parent, without checking prompt readiness or starting a service.
+An identical stable-key retry remains usable after enrollment is lost; changed content or a different owner under that key is still rejected, and a later handoff requires explicit transfer.
+If a tuple is rejected, correct it to the observed enrolled recipient or follow `hailing-frequencies guide --print` to enroll the actual intended owner.
+Do not enroll a guessed or mistyped identity.
 
 ## Start the scheduler
 
@@ -52,6 +57,14 @@ The snapshot is not a FIFO rank, reservation promise or ETA, and a later sample 
 Status and doctor list completed request IDs whose owner lacks an exact Hailing route and give the supported enrollment or owner-authorized transfer action.
 The result remains durable, and the existing sending scheduler retries it after the owner route is available.
 Fresh configuration alone does not prove that a scheduler, prompt, native receipt, or model is active.
+
+## Common mistakes
+
+Use `status` or `inspect` for observation; `attach` is recovery and can replace a waiting helper.
+Foreground attach sends product output to this CLI's stdout, so redirected output can be lost; `attach --detach` appends it to the private request log.
+Count independent workload slots that run simultaneously, not backend threads; one serial GPU inference job is one slot even when its backend uses many CPU threads.
+When reporting a suspected load or admission flake, include the request ID, a `status` or `inspect` snapshot, and relevant command evidence; managed contributors and host samples do not prove which command caused load.
+Do not hold a checkout's only available turn while synchronously waiting for dependent child work that needs the same checkout.
 
 ## Submit and run one request
 

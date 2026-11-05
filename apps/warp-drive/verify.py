@@ -39,11 +39,84 @@ def check(condition, message):
         raise AssertionError(message)
 
 
+def fixture_hailing_path(state):
+    return Path(str(state) + "-hailing")
+
+
+def enroll_fixture_owners(state, owners):
+    directory = fixture_hailing_path(state)
+    directory.mkdir(parents=True, exist_ok=True)
+    config_path = directory / "config.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            config = {}
+    else:
+        config = {}
+    if not isinstance(config, dict) or not isinstance(config.get("targets"), list):
+        config = {"version": 1, "targets": [], "remind_after": 60,
+                  "escalate_after": 120, "cooldown": 30, "interval": 10}
+    known = {(item.get("harness"), item.get("session"), item.get("surface"))
+             for item in config["targets"] if isinstance(item, dict)}
+    for owner in owners:
+        if owner.get("harness") not in ("claude", "codex"):
+            continue
+        try:
+            session = str(uuid.UUID(str(owner["session"]))).upper()
+            surface = str(uuid.UUID(str(owner["surface"]))).upper()
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+        key = (owner["harness"], session, surface)
+        if key in known:
+            continue
+        config["targets"].append({"label": "verify-fixture", "harness": key[0],
+                                  "session": session, "surface": surface,
+                                  "workspace": uuid_text(), "started_at": time.time(),
+                                  "cutoff": time.time() + 3600})
+        known.add(key)
+    if owners:
+        config.setdefault("version", 1)
+        config.setdefault("remind_after", 60)
+        config.setdefault("escalate_after", 120)
+        config.setdefault("cooldown", 30)
+        config.setdefault("interval", 10)
+        config_path.write_text(json.dumps(config))
+    return directory
+
+
+def owners_in_cli_args(args):
+    words = list(map(str, args))
+    if not words:
+        return []
+    if words[0] == "batch":
+        try:
+            file_index = words.index("--file") + 1
+            items = json.loads(Path(words[file_index]).read_text())
+            return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        except (ValueError, IndexError, OSError, json.JSONDecodeError):
+            return []
+    if words[0] not in ("submit", "run"):
+        return []
+    boundary = words.index("--") if "--" in words else len(words)
+    values = words[:boundary]
+    owner = {}
+    for flag in ("--harness", "--session", "--surface"):
+        if flag in values:
+            index = values.index(flag)
+            if index + 1 < len(values):
+                owner[flag[2:]] = values[index + 1]
+    return [owner] if len(owner) == 3 else []
+
+
 def run_cli(state, *args, cwd=None, ok=True, timeout=30, env=None):
     command = [sys.executable, str(ROOT / "warp_drive.py"), "--state-dir", str(state), *map(str, args)]
     process_env = os.environ.copy()
     if env:
         process_env.update(env)
+    if not env or "WARP_DRIVE_HAILING_STATE" not in env:
+        enrollment_dir = enroll_fixture_owners(state, owners_in_cli_args(args))
+        process_env["WARP_DRIVE_HAILING_STATE"] = str(enrollment_dir)
     result = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=timeout, env=process_env)
     if ok and result.returncode != 0:
         raise AssertionError(f"CLI failed ({result.returncode}): {command}\n{result.stdout}\n{result.stderr}")
@@ -163,9 +236,14 @@ def test_product_command_inherits_caller_umask(temp):
         return [sys.executable, str(wrapper), f"{mask:o}", str(ROOT / "warp_drive.py"),
                 "--state-dir", str(state), *map(str, args)]
 
+    def cli_environment(state):
+        result = os.environ.copy()
+        result["WARP_DRIVE_HAILING_STATE"] = str(enroll_fixture_owners(state, [owner]))
+        return result
+
     def cli(mask, state, *args):
         result = subprocess.run(cli_command(mask, state, *args), text=True,
-                                capture_output=True, timeout=30)
+                                capture_output=True, timeout=30, env=cli_environment(state))
         check(result.returncode == 0,
               f"umask CLI failed: {args}\n{result.stdout}\n{result.stderr}")
         return result
@@ -215,7 +293,7 @@ def test_product_command_inherits_caller_umask(temp):
             else:
                 helper = subprocess.Popen(cli_command(mask, state, "run", *request_args,
                     "--", sys.executable, "-c", code), text=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=cli_environment(state))
 
                 def submitted():
                     with contextlib.closing(warp_drive.connect(state)) as db:
@@ -2044,6 +2122,114 @@ def request_object(key, owner, path, command):
             "repo": str(path), "command": command}
 
 
+def test_new_recipient_enrollment_guard(temp):
+    state = temp / "recipient-guard-state"
+    hailing_dir = temp / "recipient-guard-hailing"
+    hailing_dir.mkdir()
+    config_path = hailing_dir / "config.json"
+    env = {"WARP_DRIVE_HAILING_STATE": str(hailing_dir)}
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    parent = {"harness": "claude", "session": uuid_text(), "surface": uuid_text()}
+    worktree = temp / "recipient-guard-worktree"
+    worktree.mkdir()
+    marker = temp / "recipient-guard-command-ran"
+
+    def config_for(owners):
+        targets = [{"label": "verify-recipient", **item, "workspace": uuid_text(),
+                    "started_at": 1.0, "cutoff": 0.0} for item in owners]
+        config_path.write_text(json.dumps({"version": 1, "targets": targets,
+            "remind_after": 60, "escalate_after": 120, "cooldown": 30, "interval": 10}))
+
+    def args_for(recipient, key, command=None, command_name="submit"):
+        return [command_name, "--key", key, "--harness", recipient["harness"],
+                "--session", recipient["session"].lower(), "--surface", recipient["surface"].lower(),
+                "--size", "light", "--family", "verify-recipient", "--workers", "1",
+                "--expected-runtime", "30", "--repo", str(worktree), "--worktree", str(worktree),
+                "--", *(command or ["/bin/true"])]
+
+    run_cli(state, "init", env=env)
+    missing = run_cli(state, *args_for(owner, "recipient-missing"), env=env, ok=False)
+    check(missing.returncode == 2 and "config is missing" in missing.stderr and
+          "hailing-frequencies guide --print" in missing.stderr,
+          "missing Hailing enrollment did not fail with actionable owner guidance")
+    config_path.write_text("{")
+    malformed = run_cli(state, *args_for(owner, "recipient-malformed"), env=env, ok=False)
+    check(malformed.returncode == 2 and "malformed JSON" in malformed.stderr,
+          "malformed Hailing enrollment did not fail with a clear diagnostic")
+    config_path.unlink()
+    config_path.mkdir()
+    unreadable = run_cli(state, *args_for(owner, "recipient-unreadable"), env=env, ok=False)
+    check(unreadable.returncode == 2 and "could not be read" in unreadable.stderr,
+          "unreadable Hailing enrollment did not fail with a clear diagnostic")
+    config_path.rmdir()
+
+    config_for([owner, parent])
+    typo = dict(owner, session=uuid_text())
+    typo_run_args = args_for(typo, "recipient-typo-run", [sys.executable, "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).touch()"], command_name="run")
+    delimiter = typo_run_args.index("--")
+    typo_run_args[delimiter:delimiter] = ["--attach-timeout", "0.1"]
+    typo_run = run_cli(state, *typo_run_args, env=env, ok=False)
+    check(typo_run.returncode == 2 and "No exact Hailing enrollment" in typo_run.stderr and
+          "Correct the tuple" in typo_run.stderr and
+          "hailing-frequencies enroll" not in typo_run.stderr and not marker.exists(),
+          "run accepted an unmatched recipient or launched its product command")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        check(db.execute("SELECT count(*) FROM reservations").fetchone()[0] == 0 and
+              db.execute("SELECT count(*) FROM worktrees").fetchone()[0] == 0,
+              "rejected recipient left a reservation or worktree event behind")
+
+    submitted = parse_json(run_cli(state, *args_for(owner, "recipient-valid"), env=env))
+    check(submitted["created"] is True, "an enrolled recipient with a stale cutoff was rejected")
+    retry_config = {"version": 1, "targets": [], "remind_after": 60,
+                    "escalate_after": 120, "cooldown": 30, "interval": 10}
+    config_path.write_text(json.dumps(retry_config))
+    retry = parse_json(run_cli(state, *args_for(owner, "recipient-valid"), env=env))
+    check(retry["created"] is False and retry["request_id"] == submitted["request_id"],
+          "identical stable-key retry failed after its Hailing enrollment was lost")
+    changed = run_cli(state, *args_for(owner, "recipient-valid", ["/bin/echo", "changed"]),
+                      env=env, ok=False)
+    changed_owner = run_cli(state, *args_for(parent, "recipient-valid"), env=env, ok=False)
+    check(changed.returncode == changed_owner.returncode == 2 and
+          "already names different work" in changed.stderr and
+          "another owner" in changed_owner.stderr,
+          "lost enrollment weakened stable-key content or ownership checks")
+
+    batch_worktree = temp / "recipient-guard-batch-worktree"
+    batch_worktree.mkdir()
+    batch_state = temp / "recipient-guard-batch-state"
+    run_cli(batch_state, "init", env=env)
+    batch_file = temp / "recipient-guard-batch.json"
+    accepted = request_object("recipient-batch-good", owner, batch_worktree, ["/bin/true"])
+    rejected = request_object("recipient-batch-typo", dict(parent, surface=uuid_text()),
+                              batch_worktree, ["/bin/true"])
+    batch_file.write_text(json.dumps([accepted, rejected]))
+    config_for([owner])
+    batch_result = run_cli(batch_state, "batch", "--file", batch_file, env=env, ok=False)
+    check(batch_result.returncode == 2 and "No exact Hailing enrollment" in batch_result.stderr,
+          "batch accepted a member whose completion owner was not enrolled")
+    with contextlib.closing(warp_drive.connect(batch_state)) as db:
+        check(db.execute("SELECT count(*) FROM reservations").fetchone()[0] == 0 and
+              db.execute("SELECT count(*) FROM worktrees").fetchone()[0] == 0,
+              "batch rejection committed a reservation or worktree event")
+
+    config_for([owner, parent])
+    accepted_parent = request_object("recipient-batch-parent", parent, batch_worktree, ["/bin/true"])
+    batch_file.write_text(json.dumps([accepted, accepted_parent]))
+    class BatchArgs:
+        file = str(batch_file)
+    original_read = warp_drive.read_hailing_enrollment_snapshot
+    snapshot_reads = []
+    def counted_read():
+        snapshot_reads.append(1)
+        return original_read()
+    with patch.object(warp_drive, "read_hailing_enrollment_snapshot", side_effect=counted_read), \
+            patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+        warp_drive.command_batch(BatchArgs(), batch_state)
+    check(len(snapshot_reads) == 1,
+          "one batch command read more than one local Hailing enrollment snapshot")
+
+
 def test_cli_reservations(temp):
     state = temp / "state"
     owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
@@ -2872,6 +3058,7 @@ def main():
             test_policy_fixtures()
             test_scheduler_refreshes_policy_version(temp)
             test_explicit_cpu_estimates(temp)
+            test_new_recipient_enrollment_guard(temp)
             test_missed_turn_ordering(temp)
             test_scheduler_startup_pacing_and_escape_limit(temp)
             test_active_escape_preserves_fitting_progress(temp)
