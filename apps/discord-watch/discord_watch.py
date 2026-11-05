@@ -375,6 +375,15 @@ class Watch:
             self.cmux_factory().binding(target)
         return target
 
+    def _receipt_owner(self, session_hint=None):
+        current = self.current_owner(verify=False, session_hint=session_hint)
+        cmux = self.cmux_factory()
+        if current["harness"] == "opencode":
+            cmux.enrollment_binding(current)
+        else:
+            cmux.binding(current)
+        return current
+
     @staticmethod
     def binding_snapshot(target):
         keys = ("harness", "session", "surface", "workspace", "started_at")
@@ -886,7 +895,7 @@ class Watch:
 
     def receive(self, thread_id, message_id=None, output=None, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
-        current = self.current_owner(session_hint=session_hint)
+        current = self._receipt_owner(session_hint=session_hint)
         output = output or sys.stdout
         with contextlib.closing(self.database(create=False)) as db:
             thread = self._thread(db, thread_id, require_open=False)
@@ -917,7 +926,7 @@ class Watch:
             require(written == len(rendered), "Reply output was incomplete; no replies were acknowledged")
             output.flush()
             # Revalidate the exact live owner after the output boundary.
-            latest = self.current_owner(session_hint=session_hint)
+            latest = self._receipt_owner(session_hint=session_hint)
             require(latest == current, "Owner changed during reply output; no replies were acknowledged")
             now = self.clock()
             owner_json = json.dumps(current, separators=(",", ":"))

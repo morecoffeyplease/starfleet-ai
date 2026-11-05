@@ -1,6 +1,8 @@
+import base64
 import contextlib
 import io
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import sys
@@ -70,6 +72,63 @@ class FakeAPI:
             rows = sorted(selected, key=lambda row: int(row["id"]), reverse=True)
             return rows[:limit]
         raise AssertionError(f"Unexpected API path: {path}")
+
+
+class FakeOpenCodeAPI:
+    def __init__(self, session, directory, password):
+        self.session = session
+        self.directory = str(directory)
+        self.password = password
+        self.active = {}
+        self.version = hf.opencode_adapter_module().SUPPORTED_OPENCODE_VERSION
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def respond(self, status, value, headers=None):
+                body = json.dumps(value).encode("utf-8")
+                self.send_response(status)
+                for name, content in (headers or {}).items():
+                    self.send_header(name, content)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                expected = "Basic " + base64.b64encode(
+                    f"opencode:{owner.password}".encode("utf-8")).decode("ascii")
+                if self.headers.get("Authorization") != expected:
+                    self.respond(401, {}, {"WWW-Authenticate": 'Basic realm="OpenCode fixture"'})
+                    return
+                if self.path == "/api/info":
+                    self.respond(200, {"version": owner.version, "pid": os.getpid(), "urls": [],
+                                       "paths": {"tmp": "/tmp/opencode-fixture"}})
+                elif self.path == f"/api/session/{owner.session}":
+                    self.respond(200, {"data": {"id": owner.session, "projectID": "prj_fixture",
+                                                 "location": {"directory": owner.directory},
+                                                 "time": {"archived": None}, "subpath": ""}})
+                elif self.path == "/api/session/active":
+                    self.respond(200, {"data": owner.active})
+                elif self.path in (f"/api/session/{owner.session}/inbox",
+                                   f"/api/session/{owner.session}/permission",
+                                   f"/api/session/{owner.session}/form"):
+                    self.respond(200, {"data": []})
+                else:
+                    self.respond(404, {})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
 
 
 class FakeCmux:
@@ -249,6 +308,129 @@ class DiscordWatchTests(unittest.TestCase):
         os.environ.pop("OPENCODE_SESSION_ID", None)
         with self.assertRaisesRegex(ValueError, "OPENCODE_SESSION_ID"):
             self.app.current_owner(session_hint=opencode_session)
+
+    def _prepare_busy_opencode(self):
+        session = "ses_DiscordWatchReceipt"
+        worktree = self.root / "opencode-worktree"
+        worktree.mkdir()
+        password_file = self.root / "opencode-password"
+        password_file.write_text("synthetic-opencode-password", encoding="utf-8")
+        password_file.chmod(0o600)
+        server = FakeOpenCodeAPI(session, worktree, "synthetic-opencode-password")
+        self.addCleanup(server.close)
+        self.targets = [target(session=session, harness="opencode", api_url=server.url,
+                               password_file=str(password_file), expected_server_pid=os.getpid(),
+                               session_directory=str(worktree), worktree_directory=str(worktree),
+                               parent_task_id="task:discord-watch-fixture")]
+        self._write_hailing()
+
+        hook_directory = self.root / "cmux-hooks"
+        hook_directory.mkdir(mode=0o700)
+        hook_record = {"surfaceId": SURFACE_A, "workspaceId": WORKSPACE_A,
+                       "agentLifecycle": "idle", "startedAt": 1234.5,
+                       "cwd": str(worktree)}
+        hook_path = hook_directory / "opencode-hook-sessions.json"
+
+        def write_hook():
+            hook_path.write_text(json.dumps({"sessions": {session: hook_record}}), encoding="utf-8")
+            hook_path.chmod(0o600)
+
+        write_hook()
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                   "items": [{"placement": {"kind": "local"},
+                              "projections": [{"panel_id": SURFACE_A, "workspace_id": WORKSPACE_A}],
+                              "agents": [{"session_id": session, "kind": "opencode", "state": "idle"}]}]}
+        guard = {"surface_id": SURFACE_A, "workspace_id": WORKSPACE_A, "state": "empty",
+                 "agent": True, "terminal": True, "blocks_typing": False,
+                 "waiting_on_human": False, "lifecycle": "idle"}
+        settings = {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+        cmux = hf.Cmux(hook_directory=hook_directory)
+
+        def native_command(*args):
+            if args[0] == "current":
+                return current
+            if args[0] == "rpc" and args[1] == "surface.input_state":
+                return guard
+            if args[0] == "rpc" and args[1] == "agent.message.settings":
+                return settings
+            raise AssertionError(f"Unexpected CMUX command: {args}")
+
+        cmux.command = native_command
+        self.app.fake_cmux = cmux
+        os.environ["CMUX_AGENT_LAUNCH_KIND"] = "opencode"
+        os.environ["OPENCODE_SESSION_ID"] = session
+        return session, server, hook_record, write_hook, current
+
+    def test_busy_opencode_can_receive_with_identity_binding_while_send_stays_held(self):
+        session, server, hook_record, write_hook, current = self._prepare_busy_opencode()
+        self.app.register(THREAD, session_hint=session)
+        self.api.rows = [message("101", content="busy-session reply")]
+        self.app.scan()
+        self.assertEqual(self.messages()[0][1], "pending")
+
+        server.active[session] = {"type": "running"}
+        current["items"][0]["agents"][0]["state"] = "working"
+        hook_record["agentLifecycle"] = "running"
+        write_hook()
+        report = self.app.scan(send=True)
+        self.assertIn("session_busy", report["threads"][0]["wake_error"])
+        self.assertEqual(self.messages()[0][1:3], ("pending", 0))
+
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.receive(THREAD, "101", io.StringIO(), session_hint="ses_OtherDiscordSession")
+        self.targets[0]["started_at"] += 1
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "generation changed"):
+            self.app.receive(THREAD, "101", io.StringIO(), session_hint=session)
+        self.assertEqual(self.messages()[0][1], "pending")
+
+        self.targets[0]["started_at"] = 1234.5
+        self._write_hailing()
+        output = io.StringIO()
+        result = self.app.receive(THREAD, "101", output, session_hint=session)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("[discord:100:101] Configured user: busy-session reply", output.getvalue())
+        self.assertEqual(self.messages()[0][1], "received")
+
+    def test_receive_output_failure_does_not_record_receipt(self):
+        self.register()
+        self.api.rows = [message("101", content="not acknowledged")]
+        self.app.scan()
+
+        class FailingOutput:
+            def write(self, value):
+                return len(value)
+
+            def flush(self):
+                raise OSError("synthetic stdout flush failure")
+
+        with self.assertRaisesRegex(OSError, "synthetic stdout flush failure"):
+            self.app.receive(THREAD, "101", FailingOutput())
+        self.assertEqual(self.messages()[0][1], "pending")
+
+    def test_receive_rechecks_owner_after_flush_before_recording_receipt(self):
+        self.register()
+        self.api.rows = [message("101", content="owner can change")]
+        self.app.scan()
+
+        class ReplacingOutput(io.StringIO):
+            def flush(inner_self):
+                super().flush()
+                self.targets = [target(SESSION_B, SURFACE_B, WORKSPACE_B)]
+                self._write_hailing()
+
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.receive(THREAD, "101", ReplacingOutput())
+        self.assertEqual(self.messages()[0][1], "pending")
+
+    def test_receive_for_other_harness_still_requires_full_binding(self):
+        self.register()
+        self.api.rows = [message("101")]
+        self.app.scan()
+        self.cmux.fail_binding = "session ended"
+        with self.assertRaisesRegex(ValueError, "session ended"):
+            self.app.receive(THREAD, "101", io.StringIO())
+        self.assertEqual(self.messages()[0][1], "pending")
 
     def test_page_messages_and_cursor_roll_back_together_then_replay_after_restart(self):
         self.register()
@@ -455,7 +637,8 @@ class DiscordWatchTests(unittest.TestCase):
     def test_receive_empty_returns_three_without_stdout(self):
         self.register()
         output = io.StringIO()
-        with mock.patch.object(dw.Watch, "current_owner", return_value=self.app.binding_snapshot(self.targets[0])):
+        with mock.patch.object(dw.Watch, "_receipt_owner",
+                               return_value=self.app.binding_snapshot(self.targets[0])):
             with contextlib.redirect_stdout(output):
                 result = dw.main(["--state-dir", str(self.state), "--hailing-state", str(self.hailing),
                                   "--notify-home", str(self.notify_home), "receive", "--thread", THREAD])
