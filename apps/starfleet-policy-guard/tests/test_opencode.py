@@ -210,5 +210,93 @@ class OpenCodeTest(unittest.TestCase):
         self.assertIn('Candidate or local target changed', stale.stderr)
         self.assertEqual(len(self.f.forwarded.read_text().splitlines()), 2)
 
+    def test_opencode_to_native_handoff_refreshes_pin_and_requires_fresh_report(self):
+        session_id = 'ses_CrossHarnessOpenCode'
+        event = self.event(session_id)
+        self.plan_and_install(event, self.f.repo, self.seat_root)
+        state_path = self.checkout_state_path(self.f.repo)
+        packet = json.loads(self.f.packet.read_text())
+        packet['base_ref'] = 'refs/remotes/origin/main'
+        self.f.packet.write_text(json.dumps(packet))
+        prior_report = self.bridge(event, ['--cwd', self.f.repo, 'record', '--evidence', self.f.packet,
+                                            '--format', 'json'])
+        self.assertEqual(prior_report.returncode, 0, prior_report.stderr)
+        prior_state = json.loads(state_path.read_text())
+        prior_receipt = prior_state['receipt']
+        self.assertEqual(len(prior_state['source_versions']), 9)
+
+        handoff = self.f.call_source(self.source, 'rebind-owner', '--from-harness', 'opencode',
+            '--from-session', session_id, '--confirm-handoff')
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
+        self.assertTrue(json.loads(handoff.stdout)['report_required'])
+        current = json.loads(state_path.read_text())
+        self.assertEqual(current['lane_owner']['harness'], 'codex')
+        self.assertEqual(current['lane_owner']['session_id'], 'inherited-codex-session')
+        self.assertEqual(current['source_versions'], fixtures.lane_runtime.source_versions('codex'))
+        self.assertNotIn('receipt', current)
+        self.assertIn(prior_receipt, current['pr_bindings'][self.f.url]['history'])
+
+        fresh_report = self.f.call_source(self.source, 'record', '--evidence', self.f.packet,
+                                          '--format', 'json')
+        self.assertEqual(fresh_report.returncode, 0, fresh_report.stderr)
+
+    def test_native_to_opencode_handoff_pins_runtime_sources_and_records(self):
+        owner_env = dict(self.f.env, CMUX_AGENT_LAUNCH_KIND='codex',
+                         CODEX_THREAD_ID='codex-fixture-thread')
+        self.f.install_from_source(self.source, owner=self.seat_root, lane=True, env=owner_env)
+        state_path = self.checkout_state_path(self.f.repo)
+        before = json.loads(state_path.read_text())
+        self.assertEqual(len(before['source_versions']), 7)
+
+        session_id = 'ses_CrossHarnessIncomingOpenCode'
+        event = self.event(session_id)
+        handoff = self.bridge(event, ['--cwd', self.f.repo, 'rebind-owner', '--from-harness', 'codex',
+            '--from-session', 'codex-fixture-thread', '--confirm-handoff'])
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
+        current = json.loads(state_path.read_text())
+        self.assertEqual(current['lane_owner']['harness'], 'opencode')
+        self.assertEqual(current['lane_owner']['session_id'], session_id)
+        self.assertEqual(current['source_versions'], fixtures.lane_runtime.source_versions('opencode'))
+
+        packet = json.loads(self.f.packet.read_text())
+        packet['base_ref'] = 'refs/remotes/origin/main'
+        self.f.packet.write_text(json.dumps(packet))
+        fresh_report = self.bridge(event, ['--cwd', self.f.repo, 'record', '--evidence', self.f.packet,
+                                           '--format', 'json'])
+        self.assertEqual(fresh_report.returncode, 0, fresh_report.stderr)
+
+    def test_native_to_opencode_handoff_refuses_missing_or_changed_runtime_source(self):
+        owner_env = dict(self.f.env, CMUX_AGENT_LAUNCH_KIND='codex',
+                         CODEX_THREAD_ID='codex-fixture-thread')
+        self.f.install_from_source(self.source, owner=self.seat_root, lane=True, env=owner_env)
+        state_path = self.checkout_state_path(self.f.repo)
+        before_state = state_path.read_bytes()
+        state = json.loads(before_state)
+        seat_path = Path(state['seat_dir']) / 'seat.json'
+        before_seat = seat_path.read_bytes()
+        plugin_file = self.source / 'opencode-plugin/policy.js'
+        original = plugin_file.read_bytes()
+        session_id = 'ses_CrossHarnessTamperOpenCode'
+
+        try:
+            for mode in ('missing', 'changed'):
+                if mode == 'missing':
+                    plugin_file.unlink()
+                else:
+                    plugin_file.write_bytes(original + b'\n// synthetic tamper\n')
+                event = self.event(session_id)
+                handoff = self.bridge(event, ['--cwd', self.f.repo, 'rebind-owner', '--from-harness', 'codex',
+                    '--from-session', 'codex-fixture-thread', '--confirm-handoff'], ok=False)
+                self.assertEqual(handoff.returncode, 2)
+                expected_error = ('Incoming delivery adapter source is missing' if mode == 'missing' else
+                                  'Permanent seat runtime is changed')
+                self.assertIn(expected_error, handoff.stderr)
+                self.assertEqual(state_path.read_bytes(), before_state)
+                self.assertEqual(seat_path.read_bytes(), before_seat)
+                self.assertNotIn('handoff_journal', json.loads(seat_path.read_text()))
+                plugin_file.write_bytes(original)
+        finally:
+            plugin_file.write_bytes(original)
+
 if __name__ == '__main__':
     unittest.main()

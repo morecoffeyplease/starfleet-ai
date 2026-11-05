@@ -142,6 +142,26 @@ def source_versions(harness=None):
     return {name: delivery_runs.digest(APP / name) for name in names}
 
 
+def permanent_handoff_source_versions(seat, harness):
+    try:
+        incoming = source_versions(harness)
+    except OSError:
+        raise ValueError('Incoming delivery adapter source is missing or unavailable; no owner handoff was recorded') from None
+    runtime = seat.get('runtime') if isinstance(seat, dict) else None
+    if (not isinstance(runtime, dict) or not isinstance(runtime.get('version'), str) or
+            not isinstance(runtime.get('path'), str) or not Path(runtime['path']).is_absolute() or
+            not isinstance(runtime.get('files'), dict)):
+        raise ValueError('Permanent seat runtime metadata is malformed; preserve it and inspect status')
+    try:
+        verified = session_store.recorded_runtime_plan(APP, runtime['files'])
+    except (OSError, TypeError, ValueError):
+        raise ValueError('Permanent seat runtime is changed or unavailable; preserve it and inspect status') from None
+    if (verified['version'] != runtime['version'] or verified['path'] != runtime['path'] or
+            any(runtime['files'].get(name) != digest for name, digest in incoming.items())):
+        raise ValueError('Incoming delivery adapter source differs from the permanent seat runtime; no owner handoff was recorded')
+    return incoming
+
+
 def source_revision(runtime=None):
     try:
         return delivery.value(APP, 'rev-parse', 'HEAD')
@@ -464,6 +484,19 @@ def rebind_owner(args):
                         'authority':'caller explicitly confirms an authorized handoff; not independently authenticated'}
             if seat.get('handoff_journal'):
                 raise ValueError('A previous owner handoff is incomplete; use recover --rollback before another transfer')
+            checkout_rows = session_store.all_checkouts(identifier)
+            outgoing_versions = source_versions(previous['harness'])
+            for item in checkout_rows:
+                state = item.get('state')
+                if not state:
+                    continue
+                state_owner = state.get('lane_owner')
+                if (not isinstance(state_owner, dict) or
+                        {key: state_owner.get(key) for key in ('harness', 'session_id')} != previous):
+                    raise ValueError('Permanent seat and checkout owners differ; preserve history and inspect status')
+                if state.get('source_versions') != outgoing_versions:
+                    raise ValueError('Pinned delivery adapter source changed; restore the reviewed source')
+            incoming_versions = permanent_handoff_source_versions(seat, identity['harness'])
             target_groups=copy.deepcopy(seat.get('groups',{}))
             target_hooks_installed=bool(seat.get('hooks_installed'))
             target_settings=copy.deepcopy(seat.get('settings'))
@@ -516,7 +549,7 @@ def rebind_owner(args):
                     settings_change['backup_path']=str(backup)
                     target_hooks_installed=True
             state_changes=[]
-            for item in session_store.all_checkouts(identifier):
+            for item in checkout_rows:
                 state=item.get('state')
                 if not state:
                     continue
@@ -533,6 +566,7 @@ def rebind_owner(args):
                     owner.pop(key,None)
                 owner.update(identity)
                 owner.update(new_context)
+                pre_state['source_versions'] = copy.deepcopy(incoming_versions)
                 bindings=lane_scope.expand(pre_state)
                 records={}
                 for binding in bindings:
@@ -597,6 +631,9 @@ def rebind_owner(args):
         previous={k:state['lane_owner'][k] for k in ('harness','session_id')}
         if previous!={'harness':args.from_harness,'session_id':args.from_session}:
             raise ValueError('Expected outgoing owner does not match; inspect status before handoff')
+        incoming_versions=source_versions(identity['harness'])
+        if any(state['source_versions'].get(name)!=digest for name,digest in incoming_versions.items()):
+            raise ValueError('Incoming delivery adapter source is not covered by the outgoing pin; review plan --lane and install a permanent seat, then hand off using its installed runtime')
         previous_context={key:state['lane_owner'].get(key) for key in
                           ('session_parent_id','session_project_id','session_directory') if key in state['lane_owner']}
         new_context=lane_scope.native_session_context()
@@ -609,6 +646,7 @@ def rebind_owner(args):
             state['lane_owner'].pop(key,None)
         state['lane_owner'].update(identity)
         state['lane_owner'].update(new_context)
+        state['source_versions']=incoming_versions
         # Keep reusable source verification artifacts, but require this owner to
         # record its own report rather than inheriting an execution receipt.
         bindings=lane_scope.expand(state)
