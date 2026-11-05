@@ -446,13 +446,27 @@ class DiscordWatchTests(unittest.TestCase):
 
     def test_gateway_intake_serializes_with_authorized_owner_transfer(self):
         self.register(after="100")
-        owner_b = target(session=SESSION_B, surface=SURFACE_B, workspace=WORKSPACE_B)
+        owner_b = self.app.binding_snapshot(
+            target(session=SESSION_B, surface=SURFACE_B, workspace=WORKSPACE_B))
         original_database = self.app.database
+        main_connection = None
         transfer_started = threading.Event()
         intake_owner_read = threading.Event()
-        transfer_update_started = threading.Event()
+        transfer_write_attempted = threading.Event()
         transfer_errors = []
         transfer_connection = threading.local()
+
+        class InterleavingCursor:
+            def __init__(self, cursor, after_fetch=None):
+                self.cursor = cursor
+                self.after_fetch = after_fetch
+
+            def fetchone(self):
+                row = self.cursor.fetchone()
+                if self.after_fetch:
+                    self.cursor.close()
+                    self.after_fetch()
+                return row
 
         class InterleavingConnection:
             def __init__(self, connection, transfer=False):
@@ -461,16 +475,16 @@ class DiscordWatchTests(unittest.TestCase):
 
             def execute(self, statement, parameters=()):
                 normalized = " ".join(statement.split())
-                if normalized.startswith("UPDATE threads SET owner_json"):
-                    transfer_update_started.set()
+                if self.transfer and (normalized == "BEGIN IMMEDIATE" or
+                                      normalized.startswith("UPDATE threads SET owner_json")):
+                    transfer_write_attempted.set()
                 cursor = self.connection.execute(statement, parameters)
                 if normalized.startswith("SELECT last_activity_at,initial_cutoff,owner_generation"):
-                    intake_owner_read.set()
-                    if not transfer_update_started.wait(timeout=2):
-                        raise AssertionError("Owner transfer did not reach the intake serialization boundary")
-                if (self.transfer and normalized.startswith("SELECT thread_id,owner_json,cursor,is_open") and
-                        not intake_owner_read.wait(timeout=2)):
-                    raise AssertionError("Intake did not read the pre-transfer owner generation")
+                    def after_owner_read():
+                        intake_owner_read.set()
+                        if not transfer_write_attempted.wait(timeout=2):
+                            raise AssertionError("Owner transfer did not reach the intake serialization boundary")
+                    return InterleavingCursor(cursor, after_owner_read)
                 return cursor
 
             def __getattr__(self, name):
@@ -491,26 +505,42 @@ class DiscordWatchTests(unittest.TestCase):
             if prepared is not None:
                 transfer_connection.connection = None
                 return prepared
-            return InterleavingConnection(original_database(create=create))
+            return main_connection
 
         def transfer():
             try:
                 transfer_connection.connection = InterleavingConnection(
                     original_database(create=False), transfer=True)
                 transfer_started.set()
+                if not intake_owner_read.wait(timeout=2):
+                    raise AssertionError("Gateway intake did not materialize its owner generation")
                 self.app.transfer(THREAD, SESSION_A)
             except BaseException as error:
                 transfer_errors.append(error)
+            finally:
+                connection = getattr(transfer_connection, "connection", None)
+                if connection is not None:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.close()
 
         event = message("101", content="transfer race reply", timestamp=TEST_TIMESTAMP)
         event["channel_id"] = THREAD
-        with mock.patch.object(self.app, "database", side_effect=instrumented_database), \
-                mock.patch.object(self.app, "current_owner", return_value=owner_b):
-            transfer_thread = threading.Thread(target=transfer)
-            transfer_thread.start()
-            self.assertTrue(transfer_started.wait(timeout=2))
-            result = self.app.commit_gateway_dispatch(10, "MESSAGE_CREATE", event, USER_ID)
-            transfer_thread.join(timeout=3)
+        main_connection = InterleavingConnection(original_database(create=False))
+        transfer_thread = threading.Thread(target=transfer)
+        try:
+            with mock.patch.object(self.app, "database", side_effect=instrumented_database), \
+                    mock.patch.object(self.app, "current_owner", return_value=owner_b):
+                transfer_thread.start()
+                self.assertTrue(transfer_started.wait(timeout=2))
+                result = self.app.commit_gateway_dispatch(10, "MESSAGE_CREATE", event, USER_ID)
+                transfer_thread.join(timeout=3)
+        finally:
+            intake_owner_read.set()
+            transfer_write_attempted.set()
+            if transfer_thread.ident is not None:
+                transfer_thread.join(timeout=3)
+            with contextlib.suppress(sqlite3.Error):
+                main_connection.close()
 
         self.assertFalse(transfer_thread.is_alive())
         self.assertEqual(transfer_errors, [])
@@ -532,6 +562,140 @@ class DiscordWatchTests(unittest.TestCase):
             received = self.app.receive(THREAD, output=output)
         self.assertEqual(received["received"], ["101"])
         self.assertIn("transfer race reply", output.getvalue())
+
+    def test_competing_explicit_transfers_from_one_owner_commit_only_one_generation(self):
+        owner_b_full = target(session=SESSION_B, surface=SURFACE_B, workspace=WORKSPACE_B)
+        session_c = "33333333-3333-4333-8333-333333333333"
+        surface_c = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee".upper()
+        workspace_c = "ffffffff-ffff-4fff-8fff-ffffffffffff".upper()
+        owner_c_full = target(session=session_c, surface=surface_c, workspace=workspace_c)
+        owner_b = self.app.binding_snapshot(owner_b_full)
+        owner_c = self.app.binding_snapshot(owner_c_full)
+        self.targets.extend((owner_b_full, owner_c_full))
+        self._write_hailing()
+        self.register()
+        self.gateway("101", "pending through one competing transfer")
+
+        stale_reads = threading.Barrier(2, timeout=2)
+        start_transfers = threading.Event()
+        ready = [threading.Event(), threading.Event()]
+        results = []
+        outcomes = []
+        adapters = [
+            FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
+                      cmux=self.cmux, now=self.clock),
+            FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
+                      cmux=self.cmux, now=self.clock),
+        ]
+        owners = (owner_b, owner_c)
+        database_locals = (threading.local(), threading.local())
+        original_databases = tuple(adapter.database for adapter in adapters)
+
+        class InterleavingCursor:
+            def __init__(self, cursor, wait_for_competitor):
+                self.cursor = cursor
+                self.wait_for_competitor = wait_for_competitor
+
+            def fetchone(self):
+                row = self.cursor.fetchone()
+                self.cursor.close()
+                if self.wait_for_competitor:
+                    stale_reads.wait()
+                return row
+
+        class InterleavingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, statement, parameters=()):
+                normalized = " ".join(statement.split())
+                wait_for_competitor = (
+                    normalized.startswith("SELECT thread_id,owner_json,cursor,is_open") and
+                    not self.connection.in_transaction)
+                cursor = self.connection.execute(statement, parameters)
+                if wait_for_competitor:
+                    return InterleavingCursor(cursor, True)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def __enter__(self):
+                self.connection.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.connection.__exit__(*args)
+
+            def close(self):
+                self.connection.close()
+
+        def database_factory(index, create=True):
+            local = database_locals[index]
+            prepared = local.connection
+            local.connection = None
+            return prepared
+
+        def transfer_worker(index):
+            adapter = adapters[index]
+            local = database_locals[index]
+            try:
+                local.connection = InterleavingConnection(original_databases[index](create=False))
+                ready[index].set()
+                if not start_transfers.wait(timeout=2):
+                    raise AssertionError("Competing transfer start was not released")
+                with mock.patch.object(adapter, "current_owner", return_value=owners[index]):
+                    results.append(adapter.transfer(THREAD, SESSION_A))
+            except BaseException as error:
+                outcomes.append(error)
+            finally:
+                connection = getattr(local, "connection", None)
+                if connection is not None:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.close()
+
+        threads = [threading.Thread(target=transfer_worker, args=(index,)) for index in range(2)]
+        patchers = []
+        try:
+            for index, adapter in enumerate(adapters):
+                patcher = mock.patch.object(adapter, "database",
+                                            side_effect=lambda create=True, i=index: database_factory(i, create))
+                patcher.start()
+                patchers.append(patcher)
+            for thread in threads:
+                thread.start()
+            self.assertTrue(all(event.wait(timeout=3) for event in ready))
+            start_transfers.set()
+            for thread in threads:
+                thread.join(timeout=4)
+        finally:
+            start_transfers.set()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(timeout=4)
+            for patcher in patchers:
+                patcher.stop()
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], ValueError)
+        self.assertIn("--from-session does not match", str(outcomes[0]))
+        self.assertEqual(results[0]["from_session"], SESSION_A)
+        winner = owners[0] if results[0]["to_session"] == owners[0]["session"] else owners[1]
+        with contextlib.closing(self.app.database(create=False)) as db:
+            thread_owner, generation = db.execute(
+                "SELECT owner_json,owner_generation FROM threads WHERE thread_id=?", (THREAD,)).fetchone()
+            events = db.execute(
+                "SELECT from_session,to_session,owner_generation FROM ownership_events WHERE thread_id=?",
+                (THREAD,)).fetchall()
+            message_row = db.execute(
+                "SELECT state,owner_generation,wake_attempts,body FROM messages "
+                "WHERE thread_id=? AND message_id='101'", (THREAD,)).fetchone()
+        self.assertEqual(json.loads(thread_owner), winner)
+        self.assertEqual(generation, 2)
+        self.assertEqual(events, [(SESSION_A, winner["session"], 2)])
+        self.assertEqual(message_row, ("pending", 2, 0, "pending through one competing transfer"))
 
     def test_ready_starts_durable_recovery_for_retained_dormant_threads(self):
         self.register()
@@ -621,7 +785,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertEqual(states, {THREAD: "complete", "200": "queued"})
         status = self.app.status()
         self.assertEqual(status["gateway"]["recovery"]["state"], "pending")
-        self.assertEqual({row["thread_id"] for row in status["threads"]}, {THREAD, "200"})
+        self.assertEqual({row["thread"] for row in status["threads"]}, {THREAD, "200"})
 
     def test_complete_observe_only_scan_covers_its_thread_for_manual_receive(self):
         self.register()
@@ -707,6 +871,123 @@ class DiscordWatchTests(unittest.TestCase):
         received = self.app.receive(THREAD, output=output)
         self.assertEqual(received["received"], ["101", "105"])
         self.assertLess(output.getvalue().index(":101]"), output.getvalue().index(":105]"))
+
+    def test_recovery_commit_serializes_before_or_after_each_group_freeze(self):
+        self.register()
+        epoch_one = self.app.begin_gateway_recovery("synthetic baseline coverage")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE gateway_recovery_work SET state='complete',completed_at=? "
+                           "WHERE epoch=? AND thread_id=?", (self.clock[0], epoch_one, THREAD))
+                self.app._refresh_gateway_recovery_state(db, epoch_one, self.clock[0])
+        self.gateway("105", "frozen before the next recovery epoch")
+
+        original_database = self.app.database
+        main_db = original_database(create=False)
+        recovery_connection = [None]
+        recovery_connection_lock = threading.Lock()
+        recovery_ready = threading.Event()
+        start_recovery = threading.Event()
+        recovery_write_attempted = threading.Event()
+        recovery_errors = []
+
+        class RecoveryConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, statement, parameters=()):
+                normalized = " ".join(statement.split())
+                if normalized == "BEGIN IMMEDIATE":
+                    recovery_write_attempted.set()
+                return self.connection.execute(statement, parameters)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def __enter__(self):
+                self.connection.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.connection.__exit__(*args)
+
+            def close(self):
+                self.connection.close()
+
+        def database_factory(create=True):
+            with recovery_connection_lock:
+                prepared = recovery_connection[0]
+                recovery_connection[0] = None
+            if prepared is not None:
+                return prepared
+            return main_db
+
+        def recover():
+            connection = None
+            try:
+                connection = RecoveryConnection(original_database(create=False))
+                with recovery_connection_lock:
+                    recovery_connection[0] = connection
+                recovery_ready.set()
+                if not start_recovery.wait(timeout=2):
+                    raise AssertionError("Synthetic recovery race was not released")
+                self.app.begin_gateway_recovery("synthetic recovery committed after freeze")
+            except BaseException as error:
+                recovery_errors.append(error)
+            finally:
+                with recovery_connection_lock:
+                    unclaimed = recovery_connection[0] is connection
+                    if unclaimed:
+                        recovery_connection[0] = None
+                if unclaimed and connection is not None:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.close()
+
+        recovery_thread = threading.Thread(target=recover)
+        original_hold = self.app._gateway_recovery_hold_reason
+
+        def start_recovery_after_predicate(db, thread):
+            result = original_hold(db, thread)
+            if thread["thread_id"] == THREAD and result is None:
+                self.assertTrue(db.in_transaction)
+                start_recovery.set()
+                if not recovery_write_attempted.wait(timeout=2):
+                    raise AssertionError("Recovery did not attempt its serialized write")
+            return result
+
+        try:
+            with mock.patch.object(self.app, "database", side_effect=database_factory), \
+                    mock.patch.object(self.app, "_gateway_recovery_hold_reason",
+                                      side_effect=start_recovery_after_predicate):
+                recovery_thread.start()
+                self.assertTrue(recovery_ready.wait(timeout=2))
+                thread = self.app._thread(main_db, THREAD, require_open=False)
+                frozen = self.app._seal_delivery_groups(main_db, thread, self.clock[0],
+                                                        force=True, max_groups=1)
+                recovery_thread.join(timeout=3)
+        finally:
+            start_recovery.set()
+            if recovery_thread.ident is not None:
+                recovery_thread.join(timeout=3)
+            with contextlib.suppress(sqlite3.Error):
+                main_db.close()
+
+        self.assertFalse(recovery_thread.is_alive())
+        self.assertEqual(recovery_errors, [])
+        self.assertEqual(frozen[0]["messages"], ["105"])
+        self.assertEqual(self.app.gateway_session()["recovery_epoch"], epoch_one + 1)
+        self.assertEqual(self.app.gateway_session()["recovery_state"], "pending")
+        self.assertEqual(self.group_members(1), [("105",)])
+        self.assertEqual(self.delivery_groups()[0][2], "eligible")
+
+        self.gateway("106", "held after recovery committed")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            thread = self.app._thread(db, THREAD, require_open=False)
+            held = self.app._seal_delivery_groups(db, thread, self.clock[0], force=True,
+                                                  max_groups=1)
+        self.assertEqual(held[0]["state"], "held")
+        self.assertEqual(held[0]["reason"], "gateway_recovery_incomplete")
+        self.assertEqual(self.delivery_groups(), [(1, 1, "eligible", 0, 0)])
 
     def test_routine_rest_reconciliation_uses_the_thirty_second_due_boundary(self):
         self.register()

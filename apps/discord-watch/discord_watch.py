@@ -658,6 +658,7 @@ class Watch:
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
             with db:
+                db.execute("BEGIN IMMEDIATE")
                 epoch = self._begin_gateway_recovery_tx(db, reason, now)
         return epoch
 
@@ -997,17 +998,25 @@ class Watch:
     def transfer(self, thread_id, from_session):
         thread_id = snowflake(thread_id, "thread ID")
         old_session = hf.identity(from_session)
+        # Resolve and verify the caller before taking the short SQLite write lock.
         current = self.current_owner()
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
-            thread = self._thread(db, thread_id, require_open=False)
-            require(thread["owner"].get("session") == old_session,
-                    "--from-session does not match the registered owner")
-            require(thread["owner"] != current, "Thread already belongs to this exact session")
-            generation = thread["owner_generation"] + 1
             with db:
-                db.execute("UPDATE threads SET owner_json=?,owner_generation=?,updated_at=? WHERE thread_id=?",
-                           (json.dumps(current, separators=(",", ":")), generation, now, thread_id))
+                db.execute("BEGIN IMMEDIATE")
+                thread = self._thread(db, thread_id, require_open=False)
+                require(thread["owner"].get("session") == old_session,
+                        "--from-session does not match the registered owner")
+                require(thread["owner"] != current, "Thread already belongs to this exact session")
+                generation = thread["owner_generation"] + 1
+                stored_owner_json = db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
+                                               (thread_id,)).fetchone()[0]
+                updated = db.execute("UPDATE threads SET owner_json=?,owner_generation=?,updated_at=? "
+                                     "WHERE thread_id=? AND owner_json=? AND owner_generation=?",
+                                     (json.dumps(current, separators=(",", ":")), generation, now,
+                                      thread_id, stored_owner_json, thread["owner_generation"]))
+                require(updated.rowcount == 1,
+                        "Thread owner changed before the explicit transfer could commit")
                 db.execute("INSERT INTO ownership_events(thread_id,from_session,to_session,at,owner_generation) "
                            "VALUES(?,?,?,?,?)", (thread_id, old_session, current["session"], now, generation))
                 db.execute("UPDATE messages SET state='pending',wake_attempts=0,last_wake_at=NULL,submitted_at=NULL "
@@ -1323,69 +1332,91 @@ class Watch:
                    "WHERE gm.group_id=delivery_groups.id AND m.state!='received')", params)
 
     def _seal_delivery_groups(self, db, thread, now, force=False, max_groups=None):
-        if self._catchup_incomplete(thread):
-            return []
-        if not self._generation_chain_valid(db, thread, thread["owner_generation"], thread["owner"]):
-            return [{"state": "held", "reason": "owner_generation_event_chain_invalid"}]
-        candidates = db.execute(
-            "SELECT message_id,author_name,body,attachments_json,ingested_at FROM messages "
-            "WHERE thread_id=? AND groupable=1 AND group_id IS NULL AND state='pending' "
-            "AND owner_generation=? ORDER BY length(message_id),message_id",
-            (thread["thread_id"], thread["owner_generation"])).fetchall()
-        if candidates:
-            with db:
-                self._ensure_gateway_recovery_coverage(db, now)
-            recovery_hold = self._gateway_recovery_hold_reason(db, thread)
-            if recovery_hold:
-                return [{"state": "held", "reason": recovery_hold}]
         formed = []
-        remaining = list(candidates)
-        while remaining:
-            if max_groups is not None and len(formed) >= max_groups:
-                break
-            prefix = []
-            for row in remaining[:MAX_RECEIVE_MESSAGES]:
-                tentative = prefix + [row]
-                rendered = self._render_messages(thread["thread_id"],
-                                                 [item[:4] for item in tentative])
-                if len(rendered.encode("utf-8")) > MAX_RECEIVE_BYTES:
-                    if not prefix:
-                        raise ValueError("A stored reply exceeds the bounded group output size")
-                    break
-                prefix = tentative
-            if not prefix:
-                break
-            first_at = min(row[4] for row in prefix)
-            last_at = max(row[4] for row in prefix)
-            if not force and now - first_at < GROUP_MAX_DELAY and now - last_at < GROUP_QUIET_SECONDS:
-                break
-            ids = [row[0] for row in prefix]
-            with db:
+        while max_groups is None or len(formed) < max_groups:
+            require(not db.in_transaction,
+                    "Group freezing requires a fresh bounded SQLite transaction")
+            db.execute("BEGIN IMMEDIATE")
+            try:
                 latest = self._thread(db, thread["thread_id"], require_open=False)
+                require(latest["owner"] == thread["owner"] and
+                        latest["owner_generation"] == thread["owner_generation"],
+                        "Exact owner changed before a delivery group could be frozen")
+                if self._catchup_incomplete(latest):
+                    db.commit()
+                    return formed
+                if not self._generation_chain_valid(db, latest, latest["owner_generation"],
+                                                    latest["owner"]):
+                    db.commit()
+                    return formed + [{"state": "held", "reason": "owner_generation_event_chain_invalid"}]
+                self._ensure_gateway_recovery_coverage(db, now)
+                candidates = db.execute(
+                    "SELECT message_id,author_name,body,attachments_json,ingested_at FROM messages "
+                    "WHERE thread_id=? AND groupable=1 AND group_id IS NULL AND state='pending' "
+                    "AND owner_generation=? ORDER BY length(message_id),message_id",
+                    (latest["thread_id"], latest["owner_generation"])).fetchall()
+                if not candidates:
+                    db.commit()
+                    return formed
+                recovery_hold = self._gateway_recovery_hold_reason(db, latest)
+                if recovery_hold:
+                    db.commit()
+                    return formed + [{"state": "held", "reason": recovery_hold}]
+                prefix = []
+                for row in candidates[:MAX_RECEIVE_MESSAGES]:
+                    tentative = prefix + [row]
+                    rendered = self._render_messages(latest["thread_id"],
+                                                     [item[:4] for item in tentative])
+                    if len(rendered.encode("utf-8")) > MAX_RECEIVE_BYTES:
+                        if not prefix:
+                            raise ValueError("A stored reply exceeds the bounded group output size")
+                        break
+                    prefix = tentative
+                if not prefix:
+                    db.commit()
+                    return formed
+                first_at = min(row[4] for row in prefix)
+                last_at = max(row[4] for row in prefix)
+                if not force and now - first_at < GROUP_MAX_DELAY and now - last_at < GROUP_QUIET_SECONDS:
+                    db.commit()
+                    return formed
+                # Recheck the barriers immediately before the immutable membership write.
+                latest = self._thread(db, latest["thread_id"], require_open=False)
                 require(latest["owner"] == thread["owner"] and
                         latest["owner_generation"] == thread["owner_generation"],
                         "Exact owner changed while a delivery group was being frozen")
                 require(not self._catchup_incomplete(latest),
                         "REST catch-up began while a delivery group was being frozen")
-                require(self._generation_chain_valid(db, latest, latest["owner_generation"], latest["owner"]),
+                self._ensure_gateway_recovery_coverage(db, now)
+                recovery_hold = self._gateway_recovery_hold_reason(db, latest)
+                if recovery_hold:
+                    db.commit()
+                    return formed + [{"state": "held", "reason": recovery_hold}]
+                require(self._generation_chain_valid(db, latest, latest["owner_generation"],
+                                                     latest["owner"]),
                         "Owner generation changed while a delivery group was being frozen")
+                ids = [row[0] for row in prefix]
                 cursor = db.execute(
                     "INSERT INTO delivery_groups(thread_id,owner_generation,owner_json,status,created_at,"
                     "first_message_id,last_message_id) VALUES(?,?,?,'eligible',?,?,?)",
-                    (thread["thread_id"], thread["owner_generation"],
-                     json.dumps(thread["owner"], separators=(",", ":")), now, ids[0], ids[-1]))
+                    (latest["thread_id"], latest["owner_generation"],
+                     json.dumps(latest["owner"], separators=(",", ":")), now, ids[0], ids[-1]))
                 group_id = cursor.lastrowid
                 for ordinal, row in enumerate(prefix):
                     message_id = row[0]
                     db.execute("INSERT INTO delivery_group_members(group_id,thread_id,message_id,ordinal) "
-                               "VALUES(?,?,?,?)", (group_id, thread["thread_id"], message_id, ordinal))
+                               "VALUES(?,?,?,?)", (group_id, latest["thread_id"], message_id, ordinal))
                     updated = db.execute("UPDATE messages SET group_id=? WHERE thread_id=? AND message_id=? "
                                          "AND group_id IS NULL AND state='pending' AND owner_generation=?",
-                                         (group_id, thread["thread_id"], message_id,
-                                          thread["owner_generation"]))
+                                         (group_id, latest["thread_id"], message_id,
+                                          latest["owner_generation"]))
                     require(updated.rowcount == 1, "Reply changed while a delivery group was being frozen")
+                db.commit()
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
             formed.append({"group": group_id, "messages": ids, "state": "eligible"})
-            remaining = remaining[len(prefix):]
         return formed
 
     def _group_wake_prompt(self, thread_id, group_id, owner):
