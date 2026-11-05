@@ -504,6 +504,53 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertFalse(managed["open"])
         self.assertTrue(managed["remote_closed"])
 
+    def test_register_accepts_current_cursor_without_changing_cutoff_or_queued_reply(self):
+        self.register(after="150")
+        self.api.rows = [message("151")]
+        self.app.scan()
+        activity_before = self.thread_lifecycle()[2]
+        self.assertEqual(self.thread_lifecycle()[4], "151")
+        self.assertEqual(self.thread_lifecycle()[7], "150")
+        self.assertEqual(self.messages()[0][1], "pending")
+        self.clock[0] += 60
+
+        with self.assertRaisesRegex(ValueError, "different initial cutoff or current cursor"):
+            self.app.register(THREAD, after="152")
+        result = self.app.register(THREAD, after="151")
+        self.assertTrue(result["already_registered"])
+        self.assertEqual(result["cursor"], "151")
+        self.assertEqual(self.thread_lifecycle()[2], activity_before)
+        self.assertEqual(self.thread_lifecycle()[4], "151")
+        self.assertEqual(self.thread_lifecycle()[7], "150")
+        self.assertEqual(self.messages()[0][0:2], ("151", "pending"))
+
+    def test_legacy_registration_written_after_cutoff_migration_is_initialized(self):
+        self.register()
+        owner_json = json.dumps(self.app.binding_snapshot(self.targets[0]), separators=(",", ":"))
+        remote_json = json.dumps({"id": "200", "type": 11,
+                                  "thread_metadata": {"archived": False}, "applied_tags": []})
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM meta WHERE key='initial_intake_cutoff_migration_v1'").fetchone())
+            with db:
+                db.execute("INSERT INTO threads(thread_id,owner_json,cursor,is_open,registered_at,updated_at,"
+                           "remote_json) VALUES(?,?,?,1,?,?,?)",
+                           ("200", owner_json, "250", TEST_NOW, TEST_NOW, remote_json))
+            self.assertIsNone(db.execute(
+                "SELECT initial_cutoff FROM threads WHERE thread_id='200'").fetchone()[0])
+
+        handled = message("249")
+        handled["channel_id"] = "200"
+        fresh = message("251")
+        fresh["channel_id"] = "200"
+        self.assertFalse(self.app.ingest_gateway_message("200", handled)["ingested"])
+        self.assertTrue(self.app.ingest_gateway_message("200", fresh)["ingested"])
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertEqual(db.execute("SELECT cursor,initial_cutoff FROM threads WHERE thread_id='200'")
+                             .fetchone(), ("250", "250"))
+            self.assertEqual([row[0] for row in db.execute(
+                "SELECT message_id FROM messages WHERE thread_id='200' ORDER BY message_id")], ["251"])
+
     def test_caller_without_session_env_uses_unique_surface_enrollment_and_binding(self):
         os.environ.pop("CODEX_THREAD_ID", None)
         self.assertEqual(self.register()["owner_session"], SESSION_A)

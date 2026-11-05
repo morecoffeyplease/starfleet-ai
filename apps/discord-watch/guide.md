@@ -69,6 +69,7 @@ When a REST or Gateway message payload supplies `channel_id`, intake requires it
 The legacy agent-notify listener should stop polling a thread after `managed` reports it as managed.
 `managed` succeeds for a retained subscription owned by the exact current session, including a locally closed or dormant registration.
 Reusing `register` from the same exact owner after local closure, a Closed tag, or archiving does not reopen the registration or reset its cursor, cutoff, or owner generation.
+An idempotent repeat of `--after` may use either the immutable initial cutoff or the current committed cursor.
 Its JSON includes worker health, and a stale worker warning does not change ownership or the central managed route.
 
 Only the current registered owner can receive or locally close a thread.

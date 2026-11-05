@@ -372,6 +372,8 @@ class Watch:
         if cutoff_migrated is None:
             db.execute("UPDATE threads SET initial_cutoff=cursor WHERE initial_cutoff IS NULL")
             db.execute("INSERT INTO meta(key,value) VALUES('initial_intake_cutoff_migration_v1','complete')")
+        # Older supported CLI versions can still insert registrations without this column.
+        db.execute("UPDATE threads SET initial_cutoff=cursor WHERE initial_cutoff IS NULL")
         db.commit()
         db.close()
         path.chmod(0o600)
@@ -478,7 +480,8 @@ class Watch:
                 require(existing_owner == owner,
                         "Thread already belongs to another exact session; use transfer explicitly")
                 if after is not None:
-                    require(cursor == existing[2], "Thread is already registered with a different initial cutoff")
+                    require(cursor in (existing[2], existing[1]),
+                            "Thread is already registered with a different initial cutoff or current cursor")
                 with db:
                     db.execute("UPDATE threads SET updated_at=?,remote_json=?,remote_closed=? WHERE thread_id=?",
                                (now, json.dumps(remote, separators=(",", ":")), int(remote_closed), thread_id))
