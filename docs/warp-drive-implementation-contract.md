@@ -16,9 +16,10 @@ There is no network service, broker, process supervisor, benchmark runner, or au
 
 ## Reservation identity and ownership
 
-Each request has a stable key, repository and worktree identity, current owner, workload family, declared size, worker count, expected runtime, eligibility time, priority, and event history.
+Each request has a stable key, repository and worktree identity, current owner, workload family, declared size, independent workload-slot count, optional CPU estimate and basis, expected runtime, eligibility time, priority, and event history.
 Repeated keys attach to the same request only when work contents and checkout identity match.
 A changed command or checkout is a new request.
+Omitting the optional estimate fields preserves the existing fallback behavior and request-key content hash.
 
 Owner identity comes from the observed harness, native session, and surface.
 A reservation can be explicitly transferred to another owner without creating another request.
@@ -31,6 +32,13 @@ Recreating a checkout creates a new worktree identity.
 
 A waiting request needs an attached helper with a fresh heartbeat.
 The scheduler uses fresh host samples, recent CPU observations, memory pressure, and conservative estimates for newly granted work.
+Worker counts describe independent workload slots, not a tool's internal backend threads or the sum of serial phases.
+An explicit CPU estimate and its basis are recorded separately from the workload-slot count and are used consistently for admission and managed-load estimates.
+The estimate is capped by the configured target and does not change the light-work reserve.
+It is an admission signal, not a throttle or peak-use guarantee, and historical averages do not prove a peak bound.
+The scheduler records policy version v7 only when it runs, and clients reject new explicit estimates unless the recorded version is v7.
+Before rollback to an older scheduler, allow active explicit-estimate commands to finish and let waiting requests run under v7 or cancel them.
+Restore the older scheduler only after no waiting or active reservation carries an explicit estimate because the older scheduler uses the generic fallback for those rows.
 These values guide admission and do not throttle commands or impose a hard CPU quota.
 
 The scheduler serves at most one eligible request per worktree in each persisted round.

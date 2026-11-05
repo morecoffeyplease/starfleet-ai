@@ -16,6 +16,7 @@ There is no socket server, message broker, process supervisor, environment manag
 
 Reservations have waiting, reserved, finished, and cancelled states.
 They retain a stable request key, repository and checkout identity, current owner, workload family, size, worker count, expected runtime, eligibility timestamp, earned waiting credit, priority, launch claim, outcome, and events.
+An optional finite positive CPU estimate and nonempty basis may be recorded for a request, while rows without those fields retain the original fallback behavior.
 Worktree identity includes the canonical path and filesystem device/inode, so a recreated checkout receives a new identity.
 Command arguments and local measurements stay in the owner-only state directory.
 Finished events record waited-child CPU seconds and direct-child peak RSS bytes where POSIX child accounting and platform units are supported.
@@ -51,6 +52,17 @@ The recent CPU mean and latest sample, memory pressure, heavy startup spacing, l
 New grants remain included in projected load until a sample arrives at least ten seconds after the helper's recorded start or grant time.
 The default target is 95 percent.
 CPU estimates are not hard quotas, and below-target utilization does not establish a scheduler fault.
+Worker counts describe independent workload execution slots that can run at the same time, while backend thread counts and internal tool parallelism are separate details.
+A browser task with three independent browser workers has three workload slots, a build or test command should use its actual parallel task count, and one serial GPU inference job has one slot even if its backend uses many CPU threads.
+`--cpu-cores` and `--cpu-basis` may be supplied together to declare an optional CPU demand estimate and its evidence or bound basis.
+The scheduler caps the requested estimate at the configured target and preserves the existing heavy-work light-headroom reserve.
+The requested estimate and basis appear in reservation and admission diagnostics, while `estimated_cores` records the effective estimate used by admission and grant telemetry.
+An estimate is an admission signal, not a throttle or a peak-use guarantee, and a measured historical average does not establish a peak bound.
+Without both fields, the light and heavy fallback estimates remain one core per light worker and four cores per heavy worker, capped to the target.
+The compatible scheduler reports policy version v7 after a scheduler pass, and new explicit estimates are rejected while the state reports another or unknown version.
+The client does not change the policy setting or start a scheduler to force compatibility.
+Before rolling back to a scheduler that predates v7, allow active explicit-estimate commands to finish and let waiting requests run under v7 or cancel them.
+Restore the older scheduler only after no waiting or active request has an explicit estimate because that scheduler will use the generic fallback for those rows.
 Unavailable thermal data remains explicitly unavailable.
 
 ## Storage and commands

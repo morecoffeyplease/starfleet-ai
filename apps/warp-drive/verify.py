@@ -3,6 +3,7 @@
 
 import contextlib
 import getpass
+import hashlib
 import importlib
 import importlib.util
 import io
@@ -12,6 +13,7 @@ from pathlib import Path
 import shutil
 import signal
 import stat
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -415,8 +417,326 @@ def test_scheduler_refreshes_policy_version(temp):
     historical = next(data for kind, data in events if kind == "historical_grant")
     latest_grant = next(data for kind, data in reversed(events) if kind == "granted")
     check(historical["policy_version"] == "warp-drive-admission-v1" and
-          latest_grant["policy_version"] == "warp-drive-admission-v6",
+          latest_grant["policy_version"] == policy.POLICY_VERSION,
           "policy label refresh rewrote history or emitted the wrong current event version")
+
+
+def test_explicit_cpu_estimates(temp):
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    owner_flags = owner_args(owner)
+    migration_state = temp / "cpu-migration-state"
+    run_cli(migration_state, "init")
+    migration_path = temp / "cpu-migration-worktree"
+    migration_path.mkdir()
+    with contextlib.closing(warp_drive.connect(migration_state)) as db:
+        with warp_drive.immediate_transaction(db):
+            migration_worktree_id = warp_drive.worktree_identity(db, migration_path)
+            warp_drive.set_setting(db, "policy_version", "warp-drive-admission-v6")
+    migration_content = {"repo": str(migration_path.resolve()),
+        "worktree_path": str(migration_path.resolve()), "size": "light",
+        "family": "verify", "workers": 1, "expected_runtime": 30.0,
+        "command": ["/bin/true"]}
+    migration_digest = hashlib.sha256(warp_drive.json_text(migration_content).encode()).hexdigest()
+    old_schema = sqlite3.connect(migration_state / "warp-drive.sqlite3")
+    old_schema.executescript("""
+        DROP INDEX reservations_waiting;
+        DROP INDEX reservations_worktree;
+        DROP TABLE reservations;
+        CREATE TABLE reservations (
+            id TEXT PRIMARY KEY,
+            request_key TEXT NOT NULL UNIQUE,
+            content_sha256 TEXT NOT NULL,
+            sequence INTEGER NOT NULL UNIQUE,
+            worktree_id TEXT NOT NULL REFERENCES worktrees(id),
+            repo TEXT NOT NULL,
+            worktree_path TEXT NOT NULL,
+            owner_harness TEXT NOT NULL,
+            owner_session TEXT NOT NULL,
+            owner_surface TEXT NOT NULL,
+            size TEXT NOT NULL CHECK(size IN ('light','heavy')),
+            family TEXT NOT NULL,
+            workers INTEGER NOT NULL,
+            expected_runtime REAL NOT NULL,
+            command_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('waiting','reserved','finished','cancelled')),
+            outcome TEXT,
+            created_at REAL NOT NULL,
+            eligible_at REAL,
+            credit_seconds REAL NOT NULL DEFAULT 0,
+            credit_started_at REAL,
+            helper_id TEXT,
+            helper_generation INTEGER NOT NULL DEFAULT 0,
+            heartbeat_at REAL,
+            reservation_claim TEXT,
+            claim_helper_id TEXT,
+            claim_generation INTEGER,
+            granted_at REAL,
+            started_at REAL,
+            launch_intent_at REAL,
+            ended_at REAL,
+            exit_code INTEGER,
+            lease_active INTEGER NOT NULL DEFAULT 0,
+            wait_reason TEXT,
+            priority INTEGER NOT NULL DEFAULT 0,
+            priority_actor TEXT,
+            priority_reason TEXT,
+            wake_status TEXT,
+            wake_detail TEXT
+        );
+        CREATE INDEX reservations_waiting ON reservations(state, eligible_at, sequence);
+        CREATE INDEX reservations_worktree ON reservations(worktree_id, state, priority, sequence);
+    """)
+    old_schema.execute("""INSERT INTO reservations
+        (id,request_key,content_sha256,sequence,worktree_id,repo,worktree_path,
+         owner_harness,owner_session,owner_surface,size,family,workers,expected_runtime,
+         command_json,state,created_at,eligible_at,credit_seconds,wait_reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("legacy-migration-request", "legacy-migration-key", migration_digest, 1,
+         migration_worktree_id, str(migration_path.resolve()), str(migration_path.resolve()),
+         owner["harness"], owner["session"], owner["surface"], "light", "verify", 1,
+         30.0, warp_drive.json_text(["/bin/true"]), "waiting", warp_drive.now(),
+         warp_drive.now(), 12.5, "migration fixture"))
+    old_schema.commit()
+    old_schema.close()
+    with contextlib.closing(warp_drive.connect(migration_state)) as db:
+        migrated = db.execute("SELECT * FROM reservations WHERE id='legacy-migration-request'").fetchone()
+        migrated_columns = {row["name"] for row in db.execute("PRAGMA table_info(reservations)")}
+        check({"requested_cpu_cores", "cpu_basis"} <= migrated_columns and
+              migrated["requested_cpu_cores"] is None and migrated["cpu_basis"] is None and
+              migrated["credit_seconds"] == 12.5 and migrated["content_sha256"] == migration_digest and
+              warp_drive.get_setting(db, "policy_version") == "warp-drive-admission-v6",
+              "v7 schema migration changed a legacy row, hash, credit, or scheduler version")
+    migrated_retry = parse_json(run_cli(migration_state, "submit", "--key", "legacy-migration-key",
+        *owner_flags, "--size", "light", "--family", "verify", "--workers", "1",
+        "--expected-runtime", "30", "--repo", str(migration_path), "--worktree",
+        str(migration_path), "--", "/bin/true"))
+    check(migrated_retry["request_id"] == "legacy-migration-request" and
+          not migrated_retry["created"],
+          "a pre-v7 row did not retain request-key identity after nullable-column migration")
+
+    fallback_state = temp / "cpu-fallback-state"
+    run_cli(fallback_state, "init")
+    with contextlib.closing(warp_drive.connect(fallback_state)) as db:
+        check(warp_drive.get_setting(db, "policy_version") is None,
+              "client initialization marked an unobserved scheduler as policy v7")
+        with warp_drive.immediate_transaction(db):
+            warp_drive.set_setting(db, "policy_version", "warp-drive-admission-v6")
+    path = temp / "cpu-fallback-worktree"
+    path.mkdir()
+    fallback_content = ["submit", "--key", "cpu-fallback", *owner_flags,
+        "--size", "heavy", "--family", "serial-gpu-inference", "--workers", "4",
+        "--expected-runtime", "30", "--repo", str(path), "--worktree", str(path),
+        "--", "/bin/true"]
+    rejected = run_cli(fallback_state, *fallback_content[:-2],
+        "--cpu-cores", "0.5", "--cpu-basis", "synthetic fixture evidence",
+        *fallback_content[-2:], ok=False)
+    check("warp-drive-admission-v7" in rejected.stderr and "coordinator-authorized" in rejected.stderr,
+          "explicit estimate was accepted while the shared state reported old policy v6")
+    with contextlib.closing(warp_drive.connect(fallback_state)) as db:
+        check(warp_drive.get_setting(db, "policy_version") == "warp-drive-admission-v6",
+              "client submission rewrote the persisted scheduler policy version")
+
+    run_fixture_pass(fallback_state, 0.10, cpus=18)
+    fallback = parse_json(run_cli(fallback_state, *fallback_content))
+    with contextlib.closing(warp_drive.connect(fallback_state)) as db:
+        with db:
+            warp_drive.attach_helper(db, fallback["request_id"], owner, str(uuid.uuid4()))
+    fallback_pass = run_fixture_pass(fallback_state, 0.10, cpus=18)
+    check(fallback_pass["granted"] is None,
+          "the four-worker heavy fallback unexpectedly fit the synthetic 18-CPU host")
+    with contextlib.closing(warp_drive.connect(fallback_state)) as db:
+        fallback_candidate = warp_drive.admission_diagnostics(db)["candidates"][0]
+        fallback_row = db.execute("SELECT content_sha256 FROM reservations WHERE id=?",
+                                  (fallback["request_id"],)).fetchone()
+    legacy_content = {"repo": str(path.resolve()), "worktree_path": str(path.resolve()),
+        "size": "heavy", "family": "serial-gpu-inference", "workers": 4,
+        "expected_runtime": 30.0, "command": ["/bin/true"]}
+    legacy_digest = hashlib.sha256(warp_drive.json_text(legacy_content).encode()).hexdigest()
+    check(fallback_candidate["estimated_cores"] == 16 and
+          fallback_candidate["requested_cpu_cores"] is None and
+          fallback_candidate["cpu_basis"] is None and
+          fallback_row["content_sha256"] == legacy_digest,
+          "omitted fields changed legacy fallback estimates or request-key hashing")
+    retry = parse_json(run_cli(fallback_state, *fallback_content))
+    check(retry["request_id"] == fallback["request_id"] and not retry["created"],
+          "an identical legacy request-key retry did not reuse its row")
+    with contextlib.closing(warp_drive.connect(fallback_state)) as db:
+        with warp_drive.immediate_transaction(db):
+            warp_drive.set_setting(db, "policy_version", "warp-drive-admission-v6")
+    old_policy_retry = parse_json(run_cli(fallback_state, *fallback_content))
+    check(old_policy_retry["request_id"] == fallback["request_id"] and
+          not old_policy_retry["created"],
+          "legacy idempotent reuse was blocked under an older scheduler policy")
+    changed_key = run_cli(fallback_state, *fallback_content[:-2],
+        "--cpu-cores", "0.5", "--cpu-basis", "synthetic fixture evidence",
+        *fallback_content[-2:], ok=False)
+    check("already names different work" in changed_key.stderr,
+          "a changed CPU estimate reused a legacy request key as identical work")
+
+    old_policy_batch_paths = [temp / "batch-old-legacy", temp / "batch-old-explicit"]
+    for batch_path in old_policy_batch_paths:
+        batch_path.mkdir()
+    old_policy_items = [{"key": "batch-legacy-under-v6", "harness": owner["harness"],
+        "session": owner["session"], "surface": owner["surface"], "size": "light",
+        "family": "verify", "workers": 1, "expected_runtime": 30,
+        "worktree": str(old_policy_batch_paths[0]), "command": ["/bin/true"]},
+        {"key": "batch-explicit-under-v6", "harness": owner["harness"],
+         "session": owner["session"], "surface": owner["surface"], "size": "heavy",
+         "family": "verify", "workers": 1, "expected_runtime": 30,
+         "worktree": str(old_policy_batch_paths[1]), "command": ["/bin/true"],
+         "cpu_cores": 0.5, "cpu_basis": "synthetic fixture evidence"}]
+    old_policy_batch_file = temp / "old-policy-batch.json"
+    old_policy_batch_file.write_text(json.dumps(old_policy_items))
+    batch_rejected = run_cli(fallback_state, "batch", "--file", str(old_policy_batch_file), ok=False)
+    with contextlib.closing(warp_drive.connect(fallback_state)) as db:
+        inserted_batch_rows = db.execute("SELECT count(*) FROM reservations WHERE request_key LIKE 'batch-%'").fetchone()[0]
+    check("warp-drive-admission-v7" in batch_rejected.stderr and inserted_batch_rows == 0,
+          "old-policy batch inserted a legacy member before rejecting its explicit estimate")
+
+    explicit_state = temp / "cpu-explicit-state"
+    run_cli(explicit_state, "init")
+    explicit_path = temp / "cpu-explicit-worktree"
+    explicit_path.mkdir()
+    run_fixture_pass(explicit_state, 0.10, cpus=18)
+    invalid_batch_path = temp / "cpu-invalid-batch-worktree"
+    invalid_batch_path.mkdir()
+    invalid_batch_item = {"key": "cpu-invalid-batch", "harness": owner["harness"],
+        "session": owner["session"], "surface": owner["surface"], "size": "heavy",
+        "family": "verify", "workers": 1, "expected_runtime": 30,
+        "worktree": str(invalid_batch_path), "command": ["/bin/true"],
+        "cpu_cores": True, "cpu_basis": "JSON booleans are not CPU estimates"}
+    invalid_batch_file = temp / "cpu-invalid-batch.json"
+    invalid_batch_file.write_text(json.dumps([invalid_batch_item]))
+    invalid_batch_result = run_cli(explicit_state, "batch", "--file", str(invalid_batch_file), ok=False)
+    check("finite positive" in invalid_batch_result.stderr,
+          "batch accepted a JSON boolean as a numeric CPU estimate")
+    explicit_content = ["submit", "--key", "cpu-explicit", *owner_flags,
+        "--size", "heavy", "--family", "serial-gpu-inference", "--workers", "4",
+        "--cpu-cores", "0.5", "--cpu-basis", "synthetic low-demand fixture",
+        "--expected-runtime", "30", "--repo", str(explicit_path), "--worktree", str(explicit_path),
+        "--", "/bin/true"]
+    for invalid, reason in (("0", "finite positive"), ("-1", "finite positive"),
+                            ("nan", "finite positive"), ("inf", "finite positive")):
+        invalid_result = run_cli(explicit_state, "submit", "--key", f"invalid-{invalid}",
+            *owner_flags, "--size", "heavy", "--family", "verify", "--workers", "1",
+            "--cpu-cores", invalid, "--cpu-basis", "fixture", "--expected-runtime", "30",
+            "--repo", str(explicit_path), "--worktree", str(explicit_path), "--", "/bin/true",
+            ok=False)
+        check(reason in invalid_result.stderr,
+              f"invalid CLI estimate {invalid!r} was not rejected as nonpositive or nonfinite")
+    missing_basis = run_cli(explicit_state, "submit", "--key", "missing-cpu-basis",
+        *owner_flags, "--size", "heavy", "--family", "verify", "--workers", "1",
+        "--cpu-cores", "0.5", "--expected-runtime", "30", "--repo", str(explicit_path),
+        "--worktree", str(explicit_path), "--", "/bin/true", ok=False)
+    missing_estimate = run_cli(explicit_state, "submit", "--key", "missing-cpu-estimate",
+        *owner_flags, "--size", "heavy", "--family", "verify", "--workers", "1",
+        "--cpu-basis", "fixture", "--expected-runtime", "30", "--repo", str(explicit_path),
+        "--worktree", str(explicit_path), "--", "/bin/true", ok=False)
+    check("provided together" in missing_basis.stderr and
+          "provided together" in missing_estimate.stderr,
+          "CLI did not require cpu estimate and basis together")
+    explicit = parse_json(run_cli(explicit_state, *explicit_content))
+    with contextlib.closing(warp_drive.connect(explicit_state)) as db:
+        with db:
+            warp_drive.attach_helper(db, explicit["request_id"], owner, str(uuid.uuid4()))
+    explicit_pass = run_fixture_pass(explicit_state, 0.10, cpus=18)
+    check(explicit_pass["granted"] == explicit["request_id"],
+          "evidence-backed estimate did not fit the same synthetic host")
+    batch_path = temp / "cpu-explicit-batch-worktree"
+    legacy_batch_path = temp / "cpu-legacy-batch-worktree"
+    batch_path.mkdir()
+    legacy_batch_path.mkdir()
+    batch_items = [{"key": "cpu-explicit-batch", "harness": owner["harness"],
+        "session": owner["session"], "surface": owner["surface"], "size": "heavy",
+        "family": "serial-gpu-inference", "workers": 1, "expected_runtime": 30,
+        "worktree": str(batch_path), "command": ["/bin/true"],
+        "cpu_cores": 0.75, "cpu_basis": "synthetic batch evidence"},
+        {"key": "cpu-legacy-batch", "harness": owner["harness"],
+         "session": owner["session"], "surface": owner["surface"], "size": "light",
+         "family": "verify", "workers": 1, "expected_runtime": 30,
+         "worktree": str(legacy_batch_path), "command": ["/bin/true"]}]
+    batch_file = temp / "cpu-explicit-batch.json"
+    batch_file.write_text(json.dumps(batch_items))
+    batch_result = parse_json(run_cli(explicit_state, "batch", "--file", str(batch_file)))
+    with contextlib.closing(warp_drive.connect(explicit_state)) as db:
+        batch_rows = {row["request_key"]: row for row in db.execute(
+            "SELECT request_key,requested_cpu_cores,cpu_basis FROM reservations WHERE request_key LIKE 'cpu-%-batch'")}
+    check(len(batch_result["requests"]) == 2 and
+          batch_rows["cpu-explicit-batch"]["requested_cpu_cores"] == 0.75 and
+          batch_rows["cpu-explicit-batch"]["cpu_basis"] == "synthetic batch evidence" and
+          batch_rows["cpu-legacy-batch"]["requested_cpu_cores"] is None,
+          "batch did not persist optional per-item estimates alongside unchanged fallback rows")
+    with contextlib.closing(warp_drive.connect(explicit_state)) as db:
+        status = warp_drive.status_data(db)
+        contributor = status["admission"]["host_constraints"]["active_managed_contributors"][0]
+        event_row = db.execute("SELECT data_json FROM events WHERE reservation_id=? AND kind='granted'",
+                               (explicit["request_id"],)).fetchone()
+        grant = json.loads(event_row["data_json"])
+        row = db.execute("SELECT helper_id,helper_generation FROM reservations WHERE id=?",
+                         (explicit["request_id"],)).fetchone()
+    check(contributor["estimated_cores"] == 0.5 and
+          contributor["unreflected_cores"] == 0.5 and
+          contributor["requested_cpu_cores"] == 0.5 and
+          contributor["cpu_basis"] == "synthetic low-demand fixture" and
+          grant["estimated_cores"] == 0.5 and grant["requested_cpu_cores"] == 0.5 and
+          grant["cpu_basis"] == "synthetic low-demand fixture",
+          "active, unreflected, or grant telemetry did not preserve the explicit estimate")
+    waiting_path = temp / "cpu-explicit-diagnostic-worktree"
+    waiting_path.mkdir()
+    waiting = parse_json(run_cli(explicit_state, "submit", "--key", "cpu-explicit-waiting",
+        *owner_flags, "--size", "heavy", "--family", "verify", "--workers", "1",
+        "--cpu-cores", "0.25", "--cpu-basis", "synthetic candidate evidence",
+        "--expected-runtime", "30", "--repo", str(waiting_path), "--worktree",
+        str(waiting_path), "--", "/bin/true"))
+    with contextlib.closing(warp_drive.connect(explicit_state)) as db:
+        with db:
+            warp_drive.attach_helper(db, waiting["request_id"], owner, str(uuid.uuid4()))
+        candidate = warp_drive.admission_diagnostics(db)["candidates"][0]
+    check(candidate["request_id"] == waiting["request_id"] and
+          candidate["estimated_cores"] == 0.25 and
+          candidate["requested_cpu_cores"] == 0.25 and
+          candidate["cpu_basis"] == "synthetic candidate evidence",
+          "candidate diagnostics did not use and expose the explicit CPU estimate")
+    with contextlib.closing(warp_drive.connect(explicit_state)) as db:
+        with warp_drive.immediate_transaction(db):
+            warp_drive.set_setting(db, "policy_version", "warp-drive-admission-v6")
+    resume = run_cli(explicit_state, "attach", explicit["request_id"], *owner_flags, ok=False)
+    check("warp-drive-admission-v7" in resume.stderr,
+          "an explicit request resumed under an incompatible old policy")
+    with contextlib.closing(warp_drive.connect(explicit_state)) as db:
+        after = db.execute("SELECT helper_id,helper_generation FROM reservations WHERE id=?",
+                           (explicit["request_id"],)).fetchone()
+    check(tuple(after) == tuple(row),
+          "a rejected old-policy resume replaced or modified the attached helper")
+
+    capped = policy.request_estimate({"size": "heavy", "workers": 1,
+        "requested_cpu_cores": 100.0}, 8)
+    light_reserve = policy.request_estimate({"size": "heavy", "workers": 1,
+        "requested_cpu_cores": 100.0}, 8, light_ready=True)
+    guarded = policy.admission_decision({"size": "heavy", "workers": 1,
+        "requested_cpu_cores": 0.5}, target_cores=8, projected_cores=0,
+        light_ready=False, pressure="pressure", sample_fresh=True, now=10,
+        last_heavy_grant=None, heavy_wait_seconds=0, active_heavy_cores=0)
+    reserved_admission = policy.admission_decision({"size": "heavy", "workers": 1,
+        "requested_cpu_cores": 100.0}, target_cores=8, projected_cores=0,
+        light_ready=True, pressure="normal", sample_fresh=True, now=10,
+        last_heavy_grant=None, heavy_wait_seconds=0, active_heavy_cores=0)
+    startup_guard = policy.admission_decision({"size": "heavy", "workers": 1,
+        "requested_cpu_cores": 0.5}, target_cores=8, projected_cores=0,
+        light_ready=False, pressure="normal", sample_fresh=True, now=10,
+        last_heavy_grant=8, heavy_wait_seconds=0, active_heavy_cores=0)
+    aged_cap_guard = policy.admission_decision({"size": "heavy", "workers": 1,
+        "requested_cpu_cores": 100.0}, target_cores=8, projected_cores=0.5,
+        light_ready=False, pressure="normal", sample_fresh=True, now=200,
+        last_heavy_grant=None, heavy_wait_seconds=130, active_heavy_cores=20,
+        active_managed_cores=20, active_aged_escape_count=policy.MAX_ACTIVE_AGED_ESCAPES)
+    check(capped == 8 and light_reserve == 7 and not guarded[0] and
+          guarded[1] == "memory pressure observed" and reserved_admission[0] and
+          reserved_admission[2] == 7 and not startup_guard[0] and
+          startup_guard[1] == "heavy startup observation interval" and
+          startup_guard[2] == 0.5 and not aged_cap_guard[0] and
+          aged_cap_guard[1] == "aged escape limit reached",
+          "explicit estimate bypassed the target cap, light reserve, or pressure guard")
 
 
 def test_missed_turn_ordering(temp):
@@ -513,7 +833,7 @@ def test_missed_turn_ordering(temp):
         grant_event = db.execute("SELECT data_json FROM events WHERE reservation_id=? "
                                  "AND kind='granted' ORDER BY id DESC LIMIT 1", (target_id,)).fetchone()
         check(granted["served_round"] == current_round and
-              json.loads(grant_event["data_json"])["policy_version"] == "warp-drive-admission-v6",
+              json.loads(grant_event["data_json"])["policy_version"] == policy.POLICY_VERSION,
               "grant did not preserve the current round or identify the revised measured policy")
 
 
@@ -2453,6 +2773,7 @@ def main():
             test_product_command_inherits_caller_umask(temp)
             test_policy_fixtures()
             test_scheduler_refreshes_policy_version(temp)
+            test_explicit_cpu_estimates(temp)
             test_missed_turn_ordering(temp)
             test_scheduler_startup_pacing_and_escape_limit(temp)
             test_active_escape_preserves_fitting_progress(temp)
