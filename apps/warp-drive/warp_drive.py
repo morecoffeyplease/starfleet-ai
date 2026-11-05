@@ -347,12 +347,12 @@ def require_compatible_cpu_policy(db):
             "Wait for the coordinator-authorized compatible scheduler rollout before submitting or resuming this request.")
 
 
-def submit_one(db, request_key, content, owner):
+def submit_one(db, request_key, content, owner, hailing_snapshot):
     require(request_key and len(request_key) <= 200, "--key must be 1-200 characters")
-    worktree_id = worktree_identity(db, content["worktree_path"])
     digest = hashlib.sha256(json_text(content).encode()).hexdigest()
     existing = db.execute("SELECT * FROM reservations WHERE request_key=?", (request_key,)).fetchone()
     if existing:
+        worktree_id = worktree_identity(db, content["worktree_path"])
         require(existing["worktree_id"] == worktree_id,
                 f"Request key {request_key!r} belongs to a different checkout identity")
         require(existing["content_sha256"] == digest,
@@ -360,6 +360,8 @@ def submit_one(db, request_key, content, owner):
         require(owner_matches(existing, owner),
                 "Request already belongs to another owner; use transfer before attaching")
         return existing["id"], False
+    require_hailing_enrollment(owner, hailing_snapshot)
+    worktree_id = worktree_identity(db, content["worktree_path"])
     if content.get("requested_cpu_cores") is not None:
         require_compatible_cpu_policy(db)
     identifier = str(uuid.uuid4())
@@ -1374,16 +1376,15 @@ def cmux_executable():
 
 
 def read_hailing_targets():
-    path = hailing_state_dir() / "config.json"
-    try:
-        config = json.loads(path.read_text())
-        if not isinstance(config, dict) or config.get("version") != 1 or not isinstance(config.get("targets"), list):
-            return []
-    except (OSError, json.JSONDecodeError):
-        return []
+    return read_hailing_enrollment_snapshot()["targets"]
+
+
+def valid_hailing_targets(config):
     valid = []
+    malformed = 0
     for item in config["targets"]:
         if not isinstance(item, dict):
+            malformed += 1
             continue
         try:
             owner = canonical_owner(item.get("harness"), item.get("session"), item.get("surface"))
@@ -1399,8 +1400,25 @@ def read_hailing_targets():
                     "Hailing target label is invalid")
             valid.append(item)
         except (WarpError, TypeError, ValueError, OverflowError):
-            continue
-    return valid
+            malformed += 1
+    return valid, malformed
+
+
+def read_hailing_enrollment_snapshot():
+    path = hailing_state_dir() / "config.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"targets": [], "problem": "Hailing enrollment config is missing", "malformed": 0}
+    except (OSError, UnicodeError):
+        return {"targets": [], "problem": "Hailing enrollment config could not be read", "malformed": 0}
+    except json.JSONDecodeError:
+        return {"targets": [], "problem": "Hailing enrollment config is malformed JSON", "malformed": 0}
+    if (not isinstance(config, dict) or config.get("version") != 1 or
+            not isinstance(config.get("targets"), list)):
+        return {"targets": [], "problem": "Hailing enrollment config has an invalid format", "malformed": 0}
+    valid, malformed = valid_hailing_targets(config)
+    return {"targets": valid, "problem": None, "malformed": malformed}
 
 
 def hailing_target_for_owner(owner, targets):
@@ -1408,6 +1426,25 @@ def hailing_target_for_owner(owner, targets):
                  if item["harness"] == owner["harness"] and
                  item["session"] == owner["session"] and
                  item["surface"] == owner["surface"]), None)
+
+
+def require_hailing_enrollment(owner, snapshot):
+    if hailing_target_for_owner(owner, snapshot["targets"]) is not None:
+        return
+    enroll = ("hailing-frequencies enroll --harness {harness} --surface {surface} "
+              "--session {session} --label warp-drive-owner").format(**owner)
+    if snapshot["problem"]:
+        detail = snapshot["problem"]
+    elif snapshot["malformed"]:
+        detail = ("Hailing enrollment contains malformed target entries and has no valid exact match "
+                  "for this owner")
+    else:
+        detail = "No exact Hailing enrollment matches this harness, session, and surface"
+    raise WarpError(f"{detail}. Correct the tuple to the observed enrolled recipient, or follow "
+                    "`hailing-frequencies guide --print` to enroll the actual intended owner. "
+                    f"Only after confirming that this is the intended native identity, enroll with: {enroll}. "
+                    "An explicitly delegated parent is accepted when its exact tuple is enrolled; "
+                    "Warp-drive does not enroll recipients or start Hailing services.")
 
 
 def observed_sender_surface():
@@ -1610,9 +1647,10 @@ def cli_submit(args, state_dir, detach=False, product_umask=0o077):
     if command and command[0] == "--":
         command = command[1:]
     content = request_content(args, owner, command)
+    hailing_snapshot = read_hailing_enrollment_snapshot()
     with contextlib.closing(connect(state_dir)) as db:
         with immediate_transaction(db):
-            request_id, created = submit_one(db, args.key, content, owner)
+            request_id, created = submit_one(db, args.key, content, owner, hailing_snapshot)
     print(json.dumps({"request_id": request_id, "request_key": args.key,
                       "created": created, "state": "waiting"}, indent=2))
     if detach:
@@ -1769,6 +1807,7 @@ def command_batch(args, state_dir):
         content = request_content(entry, owner, item["command"])
         prepared.append((item["key"], content, owner))
     require(len({entry[0] for entry in prepared}) == len(prepared), "Batch contains duplicate request keys")
+    hailing_snapshot = read_hailing_enrollment_snapshot()
     results = []
     with contextlib.closing(connect(state_dir)) as db:
         with immediate_transaction(db):
@@ -1779,8 +1818,10 @@ def command_batch(args, state_dir):
                     digest = hashlib.sha256(json_text(content).encode()).hexdigest()
                     require(existing["content_sha256"] == digest and owner_matches(existing, owner),
                             f"Batch conflicts with existing request key {key!r}; no rows inserted")
+                else:
+                    require_hailing_enrollment(owner, hailing_snapshot)
             for key, content, owner in prepared:
-                identifier, created = submit_one(db, key, content, owner)
+                identifier, created = submit_one(db, key, content, owner, hailing_snapshot)
                 results.append({"request_id": identifier, "request_key": key, "created": created})
     print(json.dumps({"requests": results}, indent=2))
     return results
@@ -2002,9 +2043,10 @@ def _main(argv, product_umask):
         owner = owner_from_args(args)
         command = args.command[1:] if args.command and args.command[0] == "--" else args.command
         content = request_content(args, owner, list(command))
+        hailing_snapshot = read_hailing_enrollment_snapshot()
         with contextlib.closing(connect(state_dir)) as db:
             with immediate_transaction(db):
-                request_id, created = submit_one(db, args.key, content, owner)
+                request_id, created = submit_one(db, args.key, content, owner, hailing_snapshot)
         print(json.dumps({"request_id": request_id, "request_key": args.key, "created": created}, indent=2))
         return 0
     if args.command_name == "run":

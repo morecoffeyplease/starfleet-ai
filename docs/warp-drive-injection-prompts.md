@@ -9,7 +9,7 @@ They do not grant authority beyond the operator's existing instructions.
 For CPU-intensive local work, read `warp-drive guide --print` and use its reservation workflow.
 Eligible unserved worktrees are selected by authorized boost, least recently served round, then manual order, with waiting credit and stable request details breaking ties.
 The existing protected aged-target path keeps its earned-credit selection and protected-turn behavior.
-Submit one meaningful CPU phase per reservation and declare the phase's actual simultaneous CPU worker count, workload family, size, and expected runtime.
+Submit one meaningful CPU phase per reservation and count independent workload slots that run simultaneously, not backend threads.
 Do not sum worker counts across serial phases.
 Within one checkout, keep only one CPU-intensive request eligible when commands share generated files, caches, or a database.
 Enable each dependent phase after its predecessor finishes.
@@ -19,16 +19,22 @@ Warp-drive determines order and does not manage setup, teardown, or follow-up wo
 Use the documented helper and completion-wake path.
 Keep the request ID and retry key.
 Use status or inspect for passive observation, and attach only for documented recovery.
+Foreground attach sends product output to the current CLI's stdout, so redirected output can be lost; detached recovery appends output to the private request log.
 An unknown result is not permission to rerun the command.
 
 Use your own observed harness, session, and surface as the completion recipient.
-Use another owner's exact enrolled identity only when that owner explicitly delegates it for this request.
+New submit, run, and batch items require one exact local Hailing enrollment match for the harness, session, and surface.
+This check accepts enrolled idle or busy recipients and explicitly delegated parents without checking prompt readiness or starting a service.
+Correct a rejected tuple to the observed enrolled recipient, or follow the Hailing guide to enroll the actual intended owner; never enroll a guessed or mistyped identity.
+An identical stable-key retry remains usable after enrollment is lost, but changed content or a different owner under the same key remains rejected.
 Change an existing reservation's owner only with an explicit `warp-drive transfer`.
 Only the operator or a person explicitly authorized by the operator may boost work or change manual order.
 Record the reason for an authorized priority change.
 
 Use help, status, and doctor for ordinary questions.
 Send unresolved incidents to the designated Warp-drive responder with the request ID and evidence.
+For a suspected load or admission flake, include the request ID, a status or inspect snapshot, and relevant command evidence.
+Managed contributors and host samples do not prove which command caused load.
 Do not infer a cause from low CPU alone or claim a hard CPU or wait-time guarantee.
 
 ## Additional coordinator guidance
@@ -45,6 +51,7 @@ Do not present the soft fairness target as a hard capacity or wait-time guarante
 
 A batch does not grant extra priority.
 Keep dependent phases under their owner's sequencing control.
+Do not hold a checkout's only available turn while synchronously waiting for dependent child work that needs the same checkout.
 Do not build private admission loops or add environment-management requirements to Warp-drive.
 
 ## Incident responder guidance
