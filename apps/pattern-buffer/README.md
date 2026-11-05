@@ -77,6 +77,8 @@ The CLI does not infer a broader sandbox, role, model or repository permission f
 The task owner can update or finish a task explicitly, and recovery never replays a changed or finished task implicitly.
 The [implementer dispatch guide](docs/implementer-dispatch.md) documents the supported launch, update, recovery and ownership boundaries.
 Use a unique --receipt-file path when an immutable local snapshot is useful; a receipt is not live task status.
+For an exact-session parent or a child already bound to another owner, use the [supported owner and fresh-child route](docs/implementer-dispatch.md#parents-with-exact-session-context).
+Keep existing enrollments, tasks and human holds intact rather than substituting another mission or moving private registration metadata.
 
 ## Storage and event behavior
 

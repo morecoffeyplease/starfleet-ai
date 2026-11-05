@@ -88,6 +88,10 @@ pattern-buffer --cwd /absolute/worktree init --default-role orchestrator
 
 Use `--default-role implementer` or omit the option when appropriate.
 Implementer worktrees should use their parent's dispatch and task replay instead of initializing a separate context copy.
+Dispatch supports implementers only.
+When the parent uses exact-session standing context, keep that enrollment and prepare a dedicated directly initialized owner worktree containing a reviewed copy of the selected standing source.
+Use a fresh unregistered child if an enabled existing child points to another owner; preserve old tasks and do not bypass disabled sources or human holds.
+See [the owner preparation and child reuse guidance](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/pattern-buffer/docs/implementer-dispatch.md#parents-with-exact-session-context) for the supported route.
 For repository-specific instructions, create and review an external JSON profile based on [the example](examples/repository-profile.json), then select it with `--repo-profile-file /absolute/path/to/profile.json`.
 `init` preserves an existing context file and never installs hooks.
 

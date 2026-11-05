@@ -13,6 +13,21 @@ An assigned-item pointer may be updated only when the context owner has granted 
 The orchestrator supplies and explicitly updates task briefs within the work already authorized by the user.
 Task updates do not grant new scope or supersede later user instructions.
 
+## Parents with exact-session context
+
+An exact-session parent must not substitute a different worktree-default mission when dispatch refuses that source.
+Keep its enrollment and checkpoint intact.
+For the next authorized implementer, prepare a dedicated, directly initialized owner Git worktree in the same common repository as the child.
+Read the parent's selected standing source in full, copy that approved text to the dedicated owner's `.context-injector/context.md`, then run `init --default-role orchestrator` and inspect `validate` and `preview` there.
+This is deliberate owner preparation; dispatch itself does not copy or rewrite standing context, and no fake parent session is needed.
+Use that dedicated path as `dispatch --owner-worktree`.
+
+Inspect an existing child's `status` before reuse.
+If it is enabled but bound to a different `context_owner`, use a fresh unregistered child worktree at the intended verified candidate instead of moving its registration.
+Preserve existing tasks, their original owner and completion route; do not replay or retrofit a running or completed worker.
+Distinguish an owner mismatch from a disabled target, and never use a fresh path to bypass intentional disablement or a human hold.
+This route is for implementers; researchers and reviewers retain their configured role and normal launch workflow.
+
 ## Install the updated runtime
 
 If a hook belongs to a different supported installation, dispatch remains refused until the CLI matches that installed bundle.
