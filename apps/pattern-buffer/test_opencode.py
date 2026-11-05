@@ -293,7 +293,8 @@ console.log(JSON.stringify({ hooks: Object.keys(callbacks).sort() }));
         published.write_text("tampered outside checkpoint-save\n")
         context = self.context(self.parent_session, self.owner)["text"]
         self.assertIn("Track ownership", context)
-        self.assertIn("no checkpoint contents were injected", context)
+        self.assertNotIn("tampered outside checkpoint-save", context)
+        self.assertIn("reviewed checkpoint is unavailable or changed", context)
         self.assertIn("Inspect checkpoint-status for this exact session", context)
 
     def test_prepare_rejects_reused_receipt_path_before_creating_another_task(self):
