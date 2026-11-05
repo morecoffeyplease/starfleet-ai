@@ -69,6 +69,10 @@ python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/w
 
 Review the exact plan hash, old and new source fingerprints, and every active checkout listed in the seat-wide preimages before applying it.
 The upgrade updates the active attachments together, archives each receipt in that checkout's PR history, and requires a fresh report from each checkout before covered actions can pass.
+Migration records the target settings mode and immutable runtime pin in each migrated checkout, and preserves the target settings postimage hash even when the seat already owns its hooks.
+For an earlier migrated checkout with missing runtime metadata and a stale settings mode, `upgrade-plan` can propose recovery only when its source path and pinned fingerprints match the owning seat runtime and its live settings path, content hash, and mode match the durable seat metadata.
+Review each `migration_metadata_recovery` entry in the plan, then apply the exact plan hash with `upgrade`.
+For this metadata recovery path, changed settings content or mode, mismatched paths, invalid pins, and malformed runtime metadata remain refused.
 If an interrupted upgrade leaves a journal, use the reviewed source and same product checkout to restore the recorded preimages:
 
 ```sh
