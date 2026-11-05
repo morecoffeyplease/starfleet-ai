@@ -39,6 +39,18 @@ python3 /INSTALLED/SEAT/RUNTIME/lane.py --cwd /another/product/worktree --sessio
 Use `codex` in those commands for a Codex owner.
 Each later attachment reuses the seat hook and entrypoint and adds only checkout data.
 Use `discover` from an attached product checkout after publishing its real PR; covered seat `gh` actions also discover the current branch's published PR before gating.
+You may attach a native-owner lane before a PR exists.
+For an active attachment whose recorded product root and branch match the current checkout, `status` reports `installed_here: true` even when `pr_url` is empty.
+This reports local checkout configuration, not native hook activation or delivery eligibility.
+An inactive attachment or a different checkout root or branch reports `installed_here: false`.
+Use `status` and `coverage --summary` from the owning native session to inspect attachment, owner, activation observations, and PR binding separately:
+
+```sh
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree status --session-id ACTUAL_NATIVE_SESSION_ID
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree coverage --summary
+```
+
+Covered delivery remains PR-bound and requires a real PR binding and a recorded delivery report.
 The plan and install commands do not create a PR, fetch, change branches, run checks, or update GitHub records.
 
 ## OpenCode 2.2.5 prototype server plugin
@@ -119,6 +131,9 @@ If the seat `gh` entrypoint, Claude hook or a non-CLI runtime file is missing wh
 If the installed runtime's `lane.py` or its entire directory is missing, use a clean current source checkout whose runtime fingerprint matches the seat's recorded version, then run those same recovery commands with that source `lane.py`.
 Recovery verifies the exact recorded file hashes before restoring missing files, and changed runtime files fail closed for inspection rather than being overwritten.
 If a legacy per-worktree source checkout or hook is missing, run `migrate-plan` and `migrate` from a clean current source checkout while the existing product Gitdir and state are available.
+Migration accepts an active legacy lane with no PR when its recorded checkout root and branch match the current product checkout.
+The migration plan preserves its existing lane and owner history without creating a PR binding or report.
+It continues to refuse inactive legacy state and a product branch that differs from the recorded branch.
 For a legacy installation without a native owner, include `--confirm-owner` on both commands.
 For a legacy installation owned by another native session, pass `--confirm-handoff --from-harness claude --from-session OUTGOING_SESSION_ID` on both commands, using the exact recorded outgoing harness and session.
 Migration preserves legacy state and requires exact owner confirmation or an authorized handoff when required.

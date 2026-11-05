@@ -31,6 +31,21 @@ Wrapped commands, opaque shell syntax, alternate executables, scripts, APIs, web
 For setup and handoff details, use the printable guide.
 Source and fixture checks do not qualify a native OpenCode runtime or establish a public support claim.
 
+## Inspect a lane before a PR exists
+
+A native-owner lane may be attached before its product branch has a PR.
+In that state, `status` reports `lane_enrolled: true`, `installed_here: true`, and no `pr_url` when the active attachment's product root and branch match the current checkout.
+An inactive state or a different root or branch reports `installed_here: false`, and `coverage` labels the binding `inactive-local-binding`.
+`installed_here` reports checkout configuration only; inspect `current_owner` and `activation` separately because a configured adapter does not prove that the native runtime loaded it.
+Covered delivery remains PR-bound and requires a published PR binding and a recorded delivery report.
+
+Use the owning native session to inspect the attachment and the separate activation observations:
+
+```sh
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree status --session-id ACTUAL_NATIVE_SESSION_ID
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree coverage --summary
+```
+
 ## Report and delivery boundaries
 
 A delivery report records evidence, gaps and its exact candidate revision.

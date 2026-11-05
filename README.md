@@ -46,6 +46,7 @@ Starfleet Markup requires Node.js 22 or newer for its local source workflow.
 The installer for one component does not enroll sessions or activate workers for another component.
 Preserve existing permissions, human-input holds, owned state, and native trust prompts.
 A configured route does not prove a message reached or was read by its intended agent.
+Policy Guard can attach its owner's checkout before a PR exists, while covered delivery actions remain PR-bound and require a report.
 
 ## Discord and human contact
 

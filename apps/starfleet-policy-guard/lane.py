@@ -336,6 +336,15 @@ def active(state, cwd):
         return False
 
 
+def attached_here(state, cwd):
+    """Check active checkout configuration without requiring a PR binding."""
+    try:
+        return bool(state and state.get('phase') == 'active' and
+                    state.get('root') == str(root(cwd)) and state.get('branch') == branch(cwd))
+    except ValueError:
+        return False
+
+
 def require(state, cwd, event=None):
     if state and state.get('lane_owner'):
         lane_scope.check_owner(state,event=event)
@@ -1933,7 +1942,7 @@ def record(args):
 
 def enrollment_help(cwd):
     if (read(cwd) or {}).get('lane_owner'):
-        return 'Lane is enrolled; run lane.py --cwd '+str(root(cwd))+' discover from its owning native session. Preserve old PR bindings and reports; do not reinstall per PR.'
+        return 'Lane is enrolled; after its real PR is published, run lane.py --cwd '+str(root(cwd))+' discover from its owning native session. Preserve old PR bindings and reports; do not reinstall per PR.'
     return ('No active delivery-only installation for this worktree and branch. Coordinate with the lane owner, then run ' +
             shlex.join([sys.executable, str(SELF), '--cwd', str(root(cwd)), '--session-root', '<permanent-owner-seat>',
                         'plan', '--pr-url', '<actual-open-PR-URL>', '--base-ref', '<actual-local-target-ref>']) +
@@ -2014,6 +2023,15 @@ def init_evidence(args):
 def status(cwd, session_id=None, state=None):
     state = read(cwd) if state is None else state
     configured = active(state, cwd)
+    installed_here = attached_here(state, cwd)
+    if installed_here:
+        attachment_state = 'active-here'
+    elif not state:
+        attachment_state = 'not-installed'
+    elif state.get('phase') != 'active':
+        attachment_state = 'inactive'
+    else:
+        attachment_state = 'different-root-or-branch'
     lane_enrolled=bool(state and state.get('lane_owner') and state.get('phase')=='active')
     installed_source = source_pin_status(state or {})
     executing_cli = current_cli_status(state)
@@ -2104,7 +2122,8 @@ def status(cwd, session_id=None, state=None):
                      'journal_path': str(journal_path) if journal_pending else None,
                      'recovery_command': upgrade_recovery_command(cwd) if journal_pending else None}
     return {'lane_enrolled':lane_enrolled,'lane_owner':(state or {}).get('lane_owner'),
-            'owner_history':(state or {}).get('owner_history',[]),'installed_here': configured, 'phase': (state or {}).get('phase'),
+            'owner_history':(state or {}).get('owner_history',[]),'installed_here': installed_here,
+            'attachment_state': attachment_state, 'phase': (state or {}).get('phase'),
             'binding_type': binding_type, 'current_owner': current_owner,
             'executing_cli': executing_cli, 'installed_source': installed_source,
             'upgrade': upgrade_state, 'successor_guidance': successor_guidance,
@@ -2139,12 +2158,12 @@ def coverage(cwd, pr_url=None):
     bound_pr = (state or {}).get('pr_url')
     if not state:
         binding = 'not-installed'
+    elif not detail['installed_here']:
+        binding = 'inactive-local-binding'
     elif not bound_pr:
         binding = 'lane-enrolled-no-pr-binding'
     elif expected_pr and expected_pr.casefold() != bound_pr.casefold():
         binding = 'different-pr-bound'
-    elif not detail['installed_here']:
-        binding = 'inactive-local-binding'
     elif not expected_pr:
         binding = 'local-binding-current-pr-unconfirmed'
     else:
@@ -2162,6 +2181,8 @@ def coverage(cwd, pr_url=None):
     owner_confirmed = bool(owner and identity and all(owner.get(k) == identity[k] for k in ('harness', 'session_id')))
     return {
         'product_root': str(root(cwd)), 'branch': branch(cwd),
+        'installed_here': detail['installed_here'],
+        'attachment_state': detail['attachment_state'],
         'session_root': (state or {}).get('session_root'),
         'native_session': {'actual': identity, 'unavailable_reason': identity_error,
                            'matches_installed_owner': owner_confirmed if owner else None},
@@ -2247,7 +2268,8 @@ def coverage_summary(cwd, detail):
     native = detail['native_session']
     source = detail['installed_source']
     report = detail['delivery_report']['receipt']
-    installed = binding['state'] != 'not-installed'
+    has_state = binding['state'] != 'not-installed'
+    installed_here = detail['installed_here']
     owner = ('unavailable' if native['matches_installed_owner'] is not None and native['actual'] is None else
              'matches' if native['matches_installed_owner'] is True else
              'mismatch' if native['matches_installed_owner'] is False else 'unconfirmed')
@@ -2258,13 +2280,13 @@ def coverage_summary(cwd, detail):
     next_action = 'Continue under repository checks and existing human approvals.'
     if detail['upgrade']['state'] == 'in-progress':
         next_action = 'Recover the interrupted upgrade: ' + detail['upgrade']['recovery_command']
-    elif installed and detail['source_intact'] is not True:
+    elif has_state and detail['source_intact'] is not True:
         next_action = 'Ask the installation owner to inspect source integrity; do not reinstall or reset history.'
     elif owner in ('mismatch', 'unavailable'):
         next_action = 'Confirm the owning native session before using this binding; no automatic handoff.'
     elif binding['state'] in ('different-pr-bound', 'inactive-local-binding'):
         next_action = 'Confirm the product branch and PR with the installation owner; preserve the existing binding.'
-    elif not installed:
+    elif not has_state:
         next_action = 'Standalone reporting needs no enrollment. Start with: ' + shlex.join(standalone)
     elif binding['state'] == 'lane-enrolled-no-pr-binding':
         next_action = 'Once a real PR exists, discover it: ' + shlex.join(lane_command + ['discover'])
@@ -2275,14 +2297,16 @@ def coverage_summary(cwd, detail):
         next_action = 'Record a report from existing evidence before covered delivery; see: ' + shlex.join(
             lane_command + ['record', '--help'])
     observations = detail['delivery_report']['observations']
+    installation = ('delivery-only installation' if installed_here else
+                    'inactive delivery installation' if has_state else 'not installed here')
     return '\n'.join([
-        'Policy Guard: ' + ('delivery-only installation' if installed else 'not installed here'),
+        'Policy Guard: ' + installation,
         'Branch: ' + detail['branch'],
         'PR: declared=' + (binding['declared_current_pr'] or 'unknown') + '; bound=' +
         (binding['installed_pr'] or 'none') + ' (' + binding['state'] + '; hosted identity unchecked)',
         'Owner: ' + owner,
         'Installed source: ' + (str(source.get('revision') or 'unknown') + ' (' + source['integrity'] + ')'
-                                if installed else 'none'),
+                                if has_state else 'none'),
         'Observed paths for current session: native hook=' + observations['native_hook']['state'] +
         '; adapter=' + observations['explicit_adapter']['state'],
         'Report: ' + report['state'] + ' - ' + report['reason'],
@@ -2883,7 +2907,7 @@ def migration_plan(args):
         raise ValueError('This checkout already uses the durable seat registry')
     if legacy.get('phase') != 'active' or legacy.get('root') != str(product):
         raise ValueError('Legacy state is not a recognized installation for the current checkout; preserve it and inspect manually')
-    if not active(legacy, product):
+    if not attached_here(legacy, product):
         raise ValueError('Switch to the recorded legacy product branch before migration; preserve its history')
     if not source_is_immutable_runtime() and delivery.value(APP, 'status', '--porcelain'):
         raise ValueError('Commit and verify the migration source, then use a clean pinned checkout')
@@ -3503,10 +3527,10 @@ def build_parser():
     for action in ('plan', 'install'):
         help_text = ('Review a per-PR or native-owner delivery installation' if action == 'plan' else
                      'Apply a reviewed per-PR installation or native-owner checkout attachment')
-        p = sub.add_parser(action, help=help_text)
+        p = sub.add_parser(action, help=help_text, description=help_text)
         p.add_argument('--pr-url')
         p.add_argument('--base-ref')
-        p.add_argument('--lane', action='store_true', help='Enroll this product and native owner, optionally binding an explicit PR')
+        p.add_argument('--lane', action='store_true', help='Enroll this product and native owner, optionally binding a PR or discovering it later')
         p.add_argument('--owner-harness',choices=('claude','codex','opencode'))
         p.add_argument('--owner-session')
         p.add_argument('--host',default='github.com')
@@ -3524,9 +3548,11 @@ def build_parser():
     p.add_argument('--from-harness',choices=('claude','codex','opencode'),required=True)
     p.add_argument('--from-session',required=True)
     p.add_argument('--confirm-handoff',action='store_true',required=True)
-    p = sub.add_parser('status', help='Inspect local binding, owner, report freshness and activation observations')
+    status_help = 'Inspect checkout attachment, PR binding, owner, report freshness and activation observations'
+    p = sub.add_parser('status', help=status_help, description=status_help)
     p.add_argument('--session-id', help='Actual orchestrator session ID; never inferred from config presence')
-    p = sub.add_parser('coverage', help='Read-only binding, owner and observed-path coverage; no discovery or probes')
+    coverage_help = 'Read-only attachment, binding, owner and observed-path coverage; no discovery or probes'
+    p = sub.add_parser('coverage', help=coverage_help, description=coverage_help)
     p.add_argument('--summary', action='store_true', help='Concise text and next action; default remains detailed JSON')
     p.add_argument('--pr-url', help='Caller-declared current PR; hosted state is not checked')
     sub.add_parser('uninstall', help='Remove or deactivate an installation without deleting its delivery history')
@@ -3553,7 +3579,8 @@ def build_parser():
     recovery_modes.add_argument('--rollback', action='store_true')
     p.add_argument('--plan-sha256')
     sub.add_parser('opencode', help=argparse.SUPPRESS)
-    p = sub.add_parser('migrate-plan', help='Review an existing Gitdir installation for durable seat migration')
+    migration_help = 'Review a legacy installation, including a no-PR lane, for durable seat migration'
+    p = sub.add_parser('migrate-plan', help=migration_help, description=migration_help)
     p.add_argument('--session-root', type=Path)
     p.add_argument('--host', default='github.com')
     p.add_argument('--confirm-owner', action='store_true')
