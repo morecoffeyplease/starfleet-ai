@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import queue
 import sqlite3
 import sys
 import tempfile
@@ -17,6 +18,7 @@ APP_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_DIR))
 
 import discord_watch as dw
+from discord_gateway import GatewayClient
 import hailing_frequencies as hf
 
 
@@ -442,6 +444,95 @@ class DiscordWatchTests(unittest.TestCase):
                                                          USER_ID)["duplicate"])
         self.assertEqual([row[0] for row in self.messages()], ["103"])
 
+    def test_gateway_intake_serializes_with_authorized_owner_transfer(self):
+        self.register(after="100")
+        owner_b = target(session=SESSION_B, surface=SURFACE_B, workspace=WORKSPACE_B)
+        original_database = self.app.database
+        transfer_started = threading.Event()
+        intake_owner_read = threading.Event()
+        transfer_update_started = threading.Event()
+        transfer_errors = []
+        transfer_connection = threading.local()
+
+        class InterleavingConnection:
+            def __init__(self, connection, transfer=False):
+                self.connection = connection
+                self.transfer = transfer
+
+            def execute(self, statement, parameters=()):
+                normalized = " ".join(statement.split())
+                if normalized.startswith("UPDATE threads SET owner_json"):
+                    transfer_update_started.set()
+                cursor = self.connection.execute(statement, parameters)
+                if normalized.startswith("SELECT last_activity_at,initial_cutoff,owner_generation"):
+                    intake_owner_read.set()
+                    if not transfer_update_started.wait(timeout=2):
+                        raise AssertionError("Owner transfer did not reach the intake serialization boundary")
+                if (self.transfer and normalized.startswith("SELECT thread_id,owner_json,cursor,is_open") and
+                        not intake_owner_read.wait(timeout=2)):
+                    raise AssertionError("Intake did not read the pre-transfer owner generation")
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def __enter__(self):
+                self.connection.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.connection.__exit__(*args)
+
+            def close(self):
+                self.connection.close()
+
+        def instrumented_database(create=True):
+            prepared = getattr(transfer_connection, "connection", None)
+            if prepared is not None:
+                transfer_connection.connection = None
+                return prepared
+            return InterleavingConnection(original_database(create=create))
+
+        def transfer():
+            try:
+                transfer_connection.connection = InterleavingConnection(
+                    original_database(create=False), transfer=True)
+                transfer_started.set()
+                self.app.transfer(THREAD, SESSION_A)
+            except BaseException as error:
+                transfer_errors.append(error)
+
+        event = message("101", content="transfer race reply", timestamp=TEST_TIMESTAMP)
+        event["channel_id"] = THREAD
+        with mock.patch.object(self.app, "database", side_effect=instrumented_database), \
+                mock.patch.object(self.app, "current_owner", return_value=owner_b):
+            transfer_thread = threading.Thread(target=transfer)
+            transfer_thread.start()
+            self.assertTrue(transfer_started.wait(timeout=2))
+            result = self.app.commit_gateway_dispatch(10, "MESSAGE_CREATE", event, USER_ID)
+            transfer_thread.join(timeout=3)
+
+        self.assertFalse(transfer_thread.is_alive())
+        self.assertEqual(transfer_errors, [])
+        self.assertTrue(result["ingested"])
+        self.assertEqual(self.app.gateway_session()["sequence"], "10")
+        with contextlib.closing(original_database(create=False)) as db:
+            generation = db.execute("SELECT owner_generation FROM messages WHERE thread_id=? AND message_id='101'",
+                                     (THREAD,)).fetchone()[0]
+            thread_owner, thread_generation, cutoff, activity = db.execute(
+                "SELECT owner_json,owner_generation,initial_cutoff,last_activity_at FROM threads WHERE thread_id=?",
+                (THREAD,)).fetchone()
+        self.assertEqual(generation, 2)
+        self.assertEqual(thread_generation, 2)
+        self.assertEqual(json.loads(thread_owner), owner_b)
+        self.assertEqual(cutoff, "100")
+        self.assertEqual(activity, TEST_NOW)
+        output = io.StringIO()
+        with mock.patch.object(self.app, "current_owner", return_value=owner_b):
+            received = self.app.receive(THREAD, output=output)
+        self.assertEqual(received["received"], ["101"])
+        self.assertIn("transfer race reply", output.getvalue())
+
     def test_ready_starts_durable_recovery_for_retained_dormant_threads(self):
         self.register()
         self.app.close(THREAD)
@@ -469,7 +560,7 @@ class DiscordWatchTests(unittest.TestCase):
 
     def test_status_separates_gateway_failure_from_thread_recovery_and_access(self):
         self.register()
-        self.app.set_gateway_condition("fatal_configuration", "synthetic intent failure")
+        self.app.set_gateway_condition("fatal_configuration", "synthetic invalid Gateway URL")
         epoch = self.app.begin_gateway_recovery("synthetic reconnect")
         with contextlib.closing(self.app.database(create=False)) as db:
             with db:
@@ -479,7 +570,9 @@ class DiscordWatchTests(unittest.TestCase):
         status = self.app.status()
         self.assertEqual(status["gateway"]["condition"], "fatal_configuration")
         self.assertEqual(status["gateway"]["recovery"]["state"], "pending")
-        self.assertIn("intents", status["gateway"]["coordinator_guidance"])
+        self.assertIn("reported Gateway fatal condition", status["gateway"]["coordinator_guidance"])
+        self.assertNotIn("credentials", status["gateway"]["coordinator_guidance"])
+        self.assertNotIn("intents", status["gateway"]["coordinator_guidance"])
         thread = status["threads"][0]
         self.assertEqual(thread["rest_recovery"]["condition"], "inaccessible")
         self.assertIn("access", thread["coordinator_guidance"])
@@ -510,6 +603,110 @@ class DiscordWatchTests(unittest.TestCase):
             self.app._rest_recovery_turn()
         second_threads = [row[0] for row in observed]
         self.assertEqual(second_threads[:2], sorted(set(thread_ids) - set(first_threads)))
+
+    def test_recovery_turn_only_thread_scopes_requests_without_claiming_global_coverage(self):
+        self.register()
+        self.app.register("200")
+        epoch = self.app.begin_gateway_recovery("synthetic reconnect")
+        self.api.calls.clear()
+
+        result = self.app._rest_recovery_turn(only_thread=THREAD)
+
+        self.assertEqual([row["thread"] for row in result["threads"]], [THREAD])
+        self.assertEqual([path for path, _ in self.api.calls],
+                         [f"/channels/{THREAD}", f"/channels/{THREAD}/messages"])
+        with contextlib.closing(self.app.database(create=False)) as db:
+            states = dict(db.execute("SELECT thread_id,state FROM gateway_recovery_work WHERE epoch=?",
+                                     (epoch,)))
+        self.assertEqual(states, {THREAD: "complete", "200": "queued"})
+        status = self.app.status()
+        self.assertEqual(status["gateway"]["recovery"]["state"], "pending")
+        self.assertEqual({row["thread_id"] for row in status["threads"]}, {THREAD, "200"})
+
+    def test_complete_observe_only_scan_covers_its_thread_for_manual_receive(self):
+        self.register()
+        self.app.register("200")
+        epoch = self.app.begin_gateway_recovery("synthetic reconnect")
+        reply = message("101", content="reply recovered by explicit scan", timestamp=TEST_TIMESTAMP)
+        reply["channel_id"] = THREAD
+        self.assertTrue(self.app.commit_gateway_dispatch(1, "MESSAGE_CREATE", reply,
+                                                         USER_ID)["ingested"])
+
+        report = self.app.scan(only_thread=THREAD, send=False)
+
+        self.assertEqual(report["threads"][0]["status"], "polled")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            states = dict(db.execute("SELECT thread_id,state FROM gateway_recovery_work WHERE epoch=?",
+                                     (epoch,)))
+        self.assertEqual(states, {THREAD: "complete", "200": "queued"})
+        self.assertEqual(self.app.gateway_session()["recovery_state"], "pending")
+        output = io.StringIO()
+        result = self.app.receive(THREAD, output=output)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("reply recovered by explicit scan", output.getvalue())
+
+    def test_recovery_order_barrier_holds_gateway_and_manual_pull_per_thread(self):
+        self.register()
+        frozen_reply = message("103", content="Frozen before recovery", timestamp=TEST_TIMESTAMP)
+        frozen_reply["channel_id"] = THREAD
+        self.assertTrue(self.app.commit_gateway_dispatch(1, "MESSAGE_CREATE", frozen_reply,
+                                                         USER_ID)["ingested"])
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.cmux.uncertain = True
+        self.assertEqual(self.wake()["state"], "uncertain")
+        self.cmux.uncertain = False
+        ready = {"session_id": "synthetic-recovery-session",
+                 "resume_gateway_url": "wss://gateway.discord.gg"}
+        self.assertTrue(self.app.commit_gateway_dispatch(
+            2, "READY", ready, USER_ID, validate_resume_url=lambda value: value)["committed"])
+        epoch = self.app.gateway_session()["recovery_epoch"]
+        self.app = FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
+                             cmux=self.cmux, now=self.clock)
+        self.app.register("200")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            recovery_work = dict(db.execute("SELECT thread_id,state FROM gateway_recovery_work WHERE epoch=?",
+                                             (epoch,)))
+            self.assertEqual(recovery_work, {THREAD: "queued", "200": "queued"})
+            with db:
+                db.execute("UPDATE gateway_recovery_work SET state='complete',completed_at=? "
+                           "WHERE epoch=? AND thread_id='200'", (self.clock[0], epoch))
+        unrelated_reply = message("201", content="Covered unrelated thread", timestamp=TEST_TIMESTAMP)
+        unrelated_reply["channel_id"] = "200"
+        self.assertTrue(self.app.ingest_gateway_message("200", unrelated_reply)["ingested"])
+
+        newest = message("105", content="Gateway observed newer reply", timestamp=TEST_TIMESTAMP)
+        newest["channel_id"] = THREAD
+        self.assertTrue(self.app.commit_gateway_dispatch(3, "MESSAGE_CREATE", newest,
+                                                         USER_ID)["ingested"])
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        with self.assertRaisesRegex(ValueError, "gateway_recovery_incomplete"):
+            self.app.receive(THREAD, output=io.StringIO())
+        frozen_output = io.StringIO()
+        frozen_receipt = self.app.receive(THREAD, output=frozen_output, group_id=1)
+        self.assertEqual(frozen_receipt["received"], ["103"])
+        self.assertIn("Frozen before recovery", frozen_output.getvalue())
+        with contextlib.closing(self.app.database(create=False)) as db:
+            pending_group = db.execute("SELECT group_id FROM messages WHERE thread_id=? AND message_id='105'",
+                                       (THREAD,)).fetchone()[0]
+            current = self.app._thread(db, "200", require_open=False)
+            unrelated = self.app._wake_one(db, current, self.clock[0])
+        self.assertIsNone(pending_group)
+        self.assertEqual(unrelated["state"], "awaiting_receipt")
+        self.assertEqual(self.cmux.submit_count, 2)
+        self.assertEqual(self.app.status()["threads"][0]["forming_group"]["hold_reason"],
+                         "gateway_recovery_incomplete")
+
+        earlier = message("101", content="REST recovered older reply", timestamp=TEST_TIMESTAMP)
+        earlier["channel_id"] = THREAD
+        self.api.rows = [newest, earlier]
+        recovered = self.app._rest_recovery_turn(only_thread=THREAD)
+        self.assertEqual(recovered["threads"][0]["status"], "polled")
+        self.assertEqual(self.app.gateway_session()["recovery_state"], "complete")
+        self.assertEqual(self.thread_cursor(), "105")
+        output = io.StringIO()
+        received = self.app.receive(THREAD, output=output)
+        self.assertEqual(received["received"], ["101", "105"])
+        self.assertLess(output.getvalue().index(":101]"), output.getvalue().index(":105]"))
 
     def test_routine_rest_reconciliation_uses_the_thirty_second_due_boundary(self):
         self.register()
@@ -562,58 +759,123 @@ class DiscordWatchTests(unittest.TestCase):
 
     def test_gateway_and_group_sender_progress_while_rest_lane_is_blocked(self):
         self.register()
-        self.gateway("101", "ready while REST is blocked")
-        self.clock[0] += dw.GROUP_QUIET_SECONDS
         rest_entered = threading.Event()
         rest_release = threading.Event()
-        gateway_progress = threading.Event()
+        ready_committed = threading.Event()
+        recovery_complete = threading.Event()
+        message_ingested = threading.Event()
+        heartbeat_sent = threading.Event()
         group_submitted = threading.Event()
         stop_event = threading.Event()
-
-        class LocalGateway:
+        class BlockingAPI(FakeAPI):
             def __init__(self):
-                self.stop_called = False
+                super().__init__()
+                self.block_routine = False
 
-            def run(self, shared_stop):
-                gateway_progress.set()
-                shared_stop.wait(timeout=3)
+            def get(self, path, query=None):
+                if path == "/gateway/bot":
+                    self.calls.append((path, query))
+                    return {"url": "wss://gateway.discord.gg", "session_start_limit": {
+                        "total": 1000, "remaining": 999, "reset_after": 3600000,
+                        "max_concurrency": 1}}
+                if self.block_routine and path == f"/channels/{THREAD}":
+                    self.calls.append((path, query))
+                    rest_entered.set()
+                    rest_release.wait(timeout=8)
+                return super().get(path, query)
 
-            def stop(self):
-                self.stop_called = True
+        class ScriptedSocket:
+            def __init__(self):
+                self.packets = queue.Queue()
+                self.packets.put({"op": 10, "d": {"heartbeat_interval": 1000}})
+                self.packets.put({"op": 0, "s": 1, "t": "READY", "d": {
+                    "session_id": "synthetic-session", "resume_gateway_url": "wss://gateway.discord.gg"}})
+                self.aborted = threading.Event()
 
-        local_gateway = LocalGateway()
+            def receive_packet(self, timeout):
+                try:
+                    packet = self.packets.get(timeout=timeout)
+                except queue.Empty:
+                    return None
+                return packet
 
-        def blocked_rest(*args):
-            rest_entered.set()
-            rest_release.wait(timeout=3)
-            return {"threads": []}
+            def send_packet(self, packet):
+                if packet.get("op") == 1:
+                    heartbeat_sent.set()
+                    self.packets.put({"op": 11})
 
-        original_dispatch = self.app._dispatch_turn
+            def push(self, packet):
+                self.packets.put(packet)
 
-        def tracked_dispatch(*, send=False, only_thread=None):
-            result = original_dispatch(send=send, only_thread=only_thread)
-            if self.cmux.submit_count:
-                group_submitted.set()
+            def abort(self):
+                self.aborted.set()
+                self.packets.put(None)
+
+        api = BlockingAPI()
+        self.app.api = api
+        self.api = api
+        socket = ScriptedSocket()
+        self.cmux.on_submit = group_submitted.set
+        original_rest = self.app._rest_recovery_turn
+        original_commit = self.app.commit_gateway_dispatch
+
+        def tracked_rest(*args, **kwargs):
+            result = original_rest(*args, **kwargs)
+            session = self.app.gateway_session()
+            if (ready_committed.is_set() and result.get("recovery_state") == "complete" and
+                    result.get("recovery_epoch") == session["recovery_epoch"]):
+                recovery_complete.set()
             return result
 
-        with mock.patch.object(self.app, "_rest_recovery_turn", side_effect=blocked_rest), \
-                mock.patch.object(self.app, "_dispatch_turn", side_effect=tracked_dispatch):
-            worker = threading.Thread(target=self.app.serve,
-                                      kwargs={"send": True,
-                                              "gateway_factory": lambda watch: local_gateway,
-                                              "stop_event": stop_event})
-            worker.start()
-            self.assertTrue(rest_entered.wait(timeout=2))
-            self.assertTrue(gateway_progress.wait(timeout=2))
-            self.assertTrue(group_submitted.wait(timeout=2))
-            self.assertFalse(rest_release.is_set())
-            self.assertEqual(self.cmux.submit_count, 1)
-            stop_event.set()
-            rest_release.set()
-            worker.join(timeout=3)
+        def tracked_commit(*args, **kwargs):
+            result = original_commit(*args, **kwargs)
+            event_name = args[1] if len(args) > 1 else kwargs.get("event_name")
+            if event_name == "READY" and result.get("committed"):
+                ready_committed.set()
+            if event_name == "MESSAGE_CREATE" and result.get("ingested"):
+                message_ingested.set()
+            return result
+
+        worker = None
+        worker_started = False
+        with mock.patch.object(self.app, "_rest_recovery_turn", side_effect=tracked_rest), \
+                mock.patch.object(self.app, "commit_gateway_dispatch", side_effect=tracked_commit):
+            worker = threading.Thread(
+                target=self.app.serve,
+                kwargs={"send": True,
+                        "gateway_factory": lambda watch: GatewayClient(
+                            watch, connector=lambda url: socket, clock=lambda: self.clock[0],
+                            random_value=lambda: 0.5),
+                        "stop_event": stop_event})
+            try:
+                worker.start()
+                worker_started = True
+                self.assertTrue(ready_committed.wait(timeout=4))
+                self.assertTrue(recovery_complete.wait(timeout=4))
+                api.block_routine = True
+                self.clock[0] += dw.ROUTINE_REST_INTERVAL
+                self.assertTrue(rest_entered.wait(timeout=4))
+
+                heartbeat_sent.clear()
+                socket.push({"op": 1})
+                self.assertTrue(heartbeat_sent.wait(timeout=2))
+                reply = message("101", content="recovered while REST is blocked",
+                                timestamp=timestamp_at(self.clock[0]))
+                reply["channel_id"] = THREAD
+                socket.push({"op": 0, "s": 2, "t": "MESSAGE_CREATE", "d": reply})
+                self.assertTrue(message_ingested.wait(timeout=3))
+                self.clock[0] += dw.GROUP_QUIET_SECONDS
+                self.assertTrue(group_submitted.wait(timeout=4))
+                self.assertFalse(rest_release.is_set())
+                self.assertEqual(self.cmux.submit_count, 1)
+            finally:
+                stop_event.set()
+                rest_release.set()
+                socket.abort()
+                if worker_started:
+                    worker.join(timeout=dw.LANE_JOIN_TIMEOUT + 2)
 
         self.assertFalse(worker.is_alive())
-        self.assertTrue(local_gateway.stop_called)
         self.assertEqual(self.cmux.submit_count, 1)
 
     def test_rest_channel_mismatch_rolls_back_message_and_cursor_page(self):
@@ -1554,6 +1816,8 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertNotIn("do-not-print-this-token", str(caught.exception))
 
     def test_successful_rate_limit_headers_persist_route_and_global_buckets(self):
+        self.register()
+
         class Response:
             def __init__(self, headers):
                 self.headers = headers

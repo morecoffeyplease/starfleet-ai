@@ -77,7 +77,8 @@ Reusing `register` from the same exact owner after local closure, a Closed tag, 
 An idempotent repeat of `--after` may use either the immutable initial cutoff or the current committed cursor.
 Its JSON includes worker health, and a stale worker warning does not change ownership or the central managed route.
 Previously queued per-message records migrate into singleton frozen groups without resetting message state or attempt evidence.
-New groups are not sealed or submitted while the thread has an incomplete REST catch-up boundary, and newer frozen groups remain held until catch-up completes.
+New groups are not sealed while the thread has an incomplete REST catch-up boundary or incomplete current-epoch Gateway recovery coverage.
+Worker submission and default foreground pulls wait for both per-thread ordering barriers, while explicit frozen-group and exact-message receipts remain available to the exact owner.
 
 Only the current registered owner can receive or locally close a thread.
 To hand a retained registration to a different current enrolled session, run `discord-watch transfer THREAD_ID --from-session OLD_SESSION_UUID` from the new owner's session.
@@ -102,6 +103,7 @@ discord-watch supervise --send
 
 `serve --send` runs the single Gateway receiver, fair REST recovery lane, and native sender.
 Routine REST reconciliation runs every 30 seconds with a bounded request budget and persistent rotation across due threads.
+An explicit scan that completes one thread's full REST catch-up also satisfies that thread's current recovery coverage while unselected threads remain queued.
 The worker also reconciles every retained thread after Gateway disconnects, reconnects, and fresh Identify operations, including dormant subscriptions.
 Recovery can take longer under rate limits, slow API responses, incomplete catch-up, or owner holds, so 30 seconds is a scheduling interval rather than a delivery guarantee.
 `supervise --send` owns one supervisor lock and restarts a crashed worker with bounded backoff.
@@ -126,7 +128,7 @@ discord-watch close THREAD_ID
 The group receive command prints every unread member of the selected frozen group in message ID order and flushes stdout before recording exact member receipts.
 The default receive command selects the oldest frozen group, or freezes the next bounded pending group immediately when none exists.
 This explicit foreground pull does not wait for the native wake quiet window or require a sending worker, and it does not submit a native wake.
-Catch-up, exact-owner, output, and receipt guards still apply to the manual pull, while `--message` retains the exact single-message path.
+REST catch-up, Gateway recovery, exact-owner, output, and receipt guards still apply to the manual pull, while `--message` retains the exact single-message path.
 The receive command prints exact `[discord:THREAD:MESSAGE] author: content` records and flushes stdout before recording a local receipt.
 That flush is a delivery boundary for the CLI and does not prove that the reply was read or understood.
 The private database stores message bodies, attachment filenames, and attachment URLs with owner-only filesystem permissions.

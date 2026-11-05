@@ -174,12 +174,6 @@ def install(runtime_root=None, bin_dir=None, uninstall=False, provisioner=None):
                 stream.flush()
                 os.fsync(stream.fileno())
             target.chmod(0o600)
-        hailing_target = staging / "hailing_frequencies.py"
-        with hailing_target.open("xb") as stream:
-            stream.write(sources["hailing_frequencies.py"])
-            stream.flush()
-            os.fsync(stream.fileno())
-        hailing_target.chmod(0o600)
         vendor_dir = staging / "vendor"
         vendor_dir.mkdir(mode=0o700)
         provision = provisioner or provision_dependency

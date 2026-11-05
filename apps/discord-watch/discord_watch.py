@@ -697,6 +697,7 @@ class Watch:
         inserted = False
         with contextlib.closing(self.database(create=False)) as db:
             with db:
+                db.execute("BEGIN IMMEDIATE")
                 state = db.execute("SELECT sequence FROM gateway_state WHERE id=1").fetchone()
                 current = int(state[0]) if state[0] is not None else -1
                 if int(sequence) <= current:
@@ -933,6 +934,20 @@ class Watch:
     def _catchup_incomplete(thread):
         return thread["catchup_before"] is not None or thread["catchup_max"] is not None
 
+    @staticmethod
+    def _gateway_recovery_hold_reason(db, thread):
+        epoch = db.execute("SELECT recovery_epoch FROM gateway_state WHERE id=1").fetchone()[0]
+        if epoch <= 0:
+            return None
+        work = db.execute("SELECT state FROM gateway_recovery_work WHERE epoch=? AND thread_id=? "
+                          "AND owner_generation=?", (epoch, thread["thread_id"],
+                                                       thread["owner_generation"])).fetchone()
+        if work is None:
+            return "gateway_recovery_coverage_missing"
+        if work[0] not in ("complete", "superseded"):
+            return "gateway_recovery_incomplete"
+        return None
+
     def managed(self, thread_id):
         thread_id = snowflake(thread_id, "thread ID")
         current = self.current_owner()
@@ -972,6 +987,7 @@ class Watch:
         with contextlib.closing(self.database(create=False)) as db:
             self._refresh_dormancy(db, now)
             with db:
+                db.execute("BEGIN IMMEDIATE")
                 inserted = self._ingest_message(db, thread_id, message, self._configured_user_id, now,
                                                 source="gateway")
             message_id = snowflake(message.get("id"), "message ID") if isinstance(message, dict) else None
@@ -1064,8 +1080,9 @@ class Watch:
                            (latest_activity, subscription_state, thread_id))
         return inserted
 
-    def _api_pages(self, api, thread_id, cursor, owner_id, db, max_pages=MAX_CATCHUP_PAGES,
+    def _api_pages(self, api, thread_id, cursor, owner_id, db, max_pages=None,
                    stop_event=None):
+        max_pages = MAX_CATCHUP_PAGES if max_pages is None else max_pages
         pages = 0
         total = 0
         deferred_until = 0.0
@@ -1083,6 +1100,8 @@ class Watch:
                 next_max = None
             else:
                 final_cursor = current_cursor
+            if not db.in_transaction:
+                db.execute("BEGIN IMMEDIATE")
             db.execute("SAVEPOINT discord_watch_page")
             try:
                 seen = set()
@@ -1181,8 +1200,9 @@ class Watch:
                        (json.dumps(record, separators=(",", ":")), next_poll, now, thread_id))
         return record
 
-    def _poll_thread(self, db, thread, api, credentials, now, max_pages=MAX_CATCHUP_PAGES,
+    def _poll_thread(self, db, thread, api, credentials, now, max_pages=None,
                      routine=False, stop_event=None):
+        max_pages = MAX_CATCHUP_PAGES if max_pages is None else max_pages
         thread_id = thread["thread_id"]
         try:
             with self.locked(timeout=0, name=f"poll-{thread_id}.lock"):
@@ -1195,8 +1215,9 @@ class Watch:
                 return {"thread": thread_id, "status": "poll_busy"}
             raise
 
-    def _poll_thread_locked(self, db, thread, api, credentials, now, max_pages=MAX_CATCHUP_PAGES,
+    def _poll_thread_locked(self, db, thread, api, credentials, now, max_pages=None,
                             routine=False, stop_event=None):
+        max_pages = MAX_CATCHUP_PAGES if max_pages is None else max_pages
         thread_id = thread["thread_id"]
         if stop_event is not None and stop_event.is_set():
             return {"thread": thread_id, "status": "stopped"}
@@ -1311,6 +1332,12 @@ class Watch:
             "WHERE thread_id=? AND groupable=1 AND group_id IS NULL AND state='pending' "
             "AND owner_generation=? ORDER BY length(message_id),message_id",
             (thread["thread_id"], thread["owner_generation"])).fetchall()
+        if candidates:
+            with db:
+                self._ensure_gateway_recovery_coverage(db, now)
+            recovery_hold = self._gateway_recovery_hold_reason(db, thread)
+            if recovery_hold:
+                return [{"state": "held", "reason": recovery_hold}]
         formed = []
         remaining = list(candidates)
         while remaining:
@@ -1427,6 +1454,10 @@ class Watch:
                     "groups_formed": formed}
         if self._catchup_incomplete(thread) and not legacy:
             return {"group": group_id, "state": "held", "held": "rest_catchup_incomplete",
+                    "would_wake": False, "groups_formed": formed}
+        recovery_hold = self._gateway_recovery_hold_reason(db, thread)
+        if recovery_hold and not legacy:
+            return {"group": group_id, "state": "held", "held": recovery_hold,
                     "would_wake": False, "groups_formed": formed}
         group_owner = json.loads(group_owner_json)
         if not self._generation_chain_valid(db, thread, generation, group_owner):
@@ -1561,6 +1592,9 @@ class Watch:
                     polled = {"thread": thread_id, "status": "dormant", "poll_skipped": True}
                 else:
                     polled = self._poll_thread(db, thread, api, credentials, now)
+                if polled.get("status") == "polled" and not polled.get("catchup_pending"):
+                    self._mark_gateway_thread_reconciled(db, thread_id, thread["owner_generation"],
+                                                         self.clock())
                 row = {**polled}
                 row["subscription_state"] = thread["subscription_state"]
                 row["pending"] = db.execute(
@@ -1604,6 +1638,20 @@ class Watch:
                 db.execute("UPDATE gateway_state SET recovery_state='pending',recovery_completed_at=NULL,"
                            "updated_at=? WHERE id=1", (now,))
         return epoch
+
+    def _mark_gateway_thread_reconciled(self, db, thread_id, owner_generation, now):
+        epoch = self._ensure_gateway_recovery_coverage(db, now)
+        if epoch <= 0:
+            return
+        with db:
+            current = db.execute("SELECT owner_generation FROM threads WHERE thread_id=?",
+                                 (thread_id,)).fetchone()
+            if current is not None and current[0] == owner_generation:
+                db.execute("UPDATE gateway_recovery_work SET state='complete',updated_at=?,completed_at=?,"
+                           "last_error_json=NULL WHERE epoch=? AND thread_id=? AND owner_generation=? "
+                           "AND state NOT IN ('complete','superseded')",
+                           (now, now, epoch, thread_id, owner_generation))
+            self._refresh_gateway_recovery_state(db, epoch, now)
 
     @staticmethod
     def _refresh_gateway_recovery_state(db, epoch, now):
@@ -1666,6 +1714,8 @@ class Watch:
                         "WHERE w.epoch=? "
                         "AND w.state NOT IN ('complete','superseded') AND t.next_poll_at<=? "
                         "ORDER BY t.registered_at,t.thread_id", (epoch, now)):
+                    if only_thread is not None and thread_id != only_thread:
+                        continue
                     due[thread_id] = {"recovery": True, "generation": generation, "state": state}
             routine_rows = db.execute(
                 "SELECT thread_id,owner_generation FROM threads WHERE subscription_state='active' "
@@ -1877,7 +1927,15 @@ class Watch:
                         "SELECT 1 FROM delivery_groups WHERE thread_id=? AND status!='received' LIMIT 1",
                         (thread_id,)).fetchone()
                     if older_group is None:
-                        self._seal_delivery_groups(db, thread, self.clock(), force=True, max_groups=1)
+                        formed = self._seal_delivery_groups(db, thread, self.clock(), force=True, max_groups=1)
+                        held = next((item for item in formed if item.get("state") == "held"), None)
+                        if held:
+                            pending_groupable = db.execute(
+                                "SELECT 1 FROM messages WHERE thread_id=? AND groupable=1 "
+                                "AND group_id IS NULL AND state='pending' AND owner_generation=? LIMIT 1",
+                                (thread_id, thread["owner_generation"])).fetchone()
+                            if pending_groupable:
+                                raise ValueError("Reply remains held: " + held["reason"])
                 selected_group = None
                 if group_id is not None:
                     require(isinstance(group_id, (str, int)) and not isinstance(group_id, bool) and
@@ -1927,6 +1985,8 @@ class Watch:
                                     "Reply owner generation has no authorized transfer chain")
                             require(not self._catchup_incomplete(thread),
                                     "REST catch-up is incomplete; this reply remains held")
+                            require(self._gateway_recovery_hold_reason(db, thread) is None,
+                                    "Gateway recovery is incomplete; this reply remains held")
                 else:
                     selected_group = db.execute(
                         "SELECT id,owner_generation,owner_json,status,legacy FROM delivery_groups "
@@ -1936,6 +1996,9 @@ class Watch:
                         require(self._generation_chain_valid(db, thread, selected_group[1],
                                                              json.loads(selected_group[2])),
                                 "Delivery group owner generation has no authorized transfer chain")
+                        recovery_hold = self._gateway_recovery_hold_reason(db, thread)
+                        require(not recovery_hold or selected_group[4],
+                                "Reply remains held: " + str(recovery_hold))
                         require(not self._catchup_incomplete(thread) or selected_group[4],
                                 "REST catch-up is incomplete; this new group remains held")
                         rows = db.execute(
@@ -2122,7 +2185,7 @@ class Watch:
                 "last_event_at": gateway_row[8],
                 "last_error": json.loads(gateway_row[9]) if gateway_row[9] else None,
                 "coordinator_guidance": (
-                    "Restore the configured bot credentials and required Gateway intents in the existing application configuration."
+                    "Inspect the reported Gateway fatal condition and correct that specific cause in the existing component configuration."
                     if gateway_row[0] == "fatal_configuration" else (
                         "Restart serve without --rest-only after Gateway configuration is available."
                         if gateway_row[0] == "offline_rest" else None))
@@ -2152,6 +2215,9 @@ class Watch:
                                      "updated_at": recovery_work[2],
                                      "completed_at": recovery_work[3],
                                      "last_error": json.loads(recovery_work[4]) if recovery_work[4] else None}
+                recovery_order_hold = self._gateway_recovery_hold_reason(db, status_thread)
+                if rest_recovery is not None:
+                    rest_recovery["delivery_order_hold"] = recovery_order_hold
                 counts = {state: count for state, count in db.execute(
                     "SELECT state,COUNT(*) FROM messages WHERE thread_id=? GROUP BY state", (thread_id,))}
                 recent = [{"message": message_id, "state": state, "wake_attempts": attempts,
@@ -2176,6 +2242,10 @@ class Watch:
                     elif catchup_incomplete and not legacy and group_state != "received":
                         visible_state = "held"
                         hold_reason = "rest_catchup_incomplete"
+                    elif (recovery_order_hold and not legacy and
+                          group_state in ("eligible", "intent")):
+                        visible_state = "held"
+                        hold_reason = recovery_order_hold
                     elif group_state in ("eligible", "intent") and group_error:
                         error_record = json.loads(group_error)
                         if isinstance(error_record, dict) and "held" in error_record:
@@ -2232,13 +2302,19 @@ class Watch:
                     eligible_at = min(first_at + GROUP_MAX_DELAY, last_at + GROUP_QUIET_SECONDS)
                     generation_valid = self._generation_chain_valid(db, status_thread, generation,
                                                                     status_thread["owner"])
-                    group_state = "held" if catchup_incomplete or not generation_valid else (
+                    group_state = "held" if catchup_incomplete or recovery_order_hold or not generation_valid else (
                         "eligible" if self.clock() >= eligible_at else "forming")
+                    forming_hold_reason = None
+                    if catchup_incomplete:
+                        forming_hold_reason = "rest_catchup_incomplete"
+                    elif recovery_order_hold:
+                        forming_hold_reason = recovery_order_hold
+                    elif not generation_valid:
+                        forming_hold_reason = "owner_generation_event_chain_invalid"
                     forming = {"state": group_state, "messages": [item[0] for item in forming_rows],
                                "next_group_messages": [item[0] for item in prefix],
                                "first_at": first_at, "last_at": last_at, "eligible_at": eligible_at,
-                               "hold_reason": "rest_catchup_incomplete" if catchup_incomplete else (
-                                   "owner_generation_event_chain_invalid" if not generation_valid else None)}
+                               "hold_reason": forming_hold_reason}
                 thread_error_record = json.loads(last_error) if last_error else None
                 recovery_error_record = json.loads(recovery_work[4]) if recovery_work and recovery_work[4] else None
                 rest_condition = self._rest_condition(thread_error_record or recovery_error_record)

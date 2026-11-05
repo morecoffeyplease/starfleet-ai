@@ -30,6 +30,7 @@ Local registration closure and Discord conversation closure are recorded separat
 Closing a registration or observing a Closed tag or archived thread does not unsubscribe it, reset its cursor, or discard its catch-up boundary.
 The worker continues reconciling closed and archived threads while their subscriptions are active, and status reports local `open`, remote `remote_closed`, and `subscription_state` independently.
 Routine active subscriptions become REST-due every 30 seconds, while each worker turn has a bounded page and request budget and rotates fairly across due threads.
+An explicit scan that completes a thread's full REST catch-up also satisfies that thread's current recovery coverage without marking unselected threads complete.
 Dormant subscriptions skip routine REST work but remain in every Gateway reconnect recovery sweep.
 Meaningful activity means a newly stored message from the configured Discord user, using that message's Discord timestamp.
 When no such reply has been recorded, the seven-day window starts at registration time.
@@ -51,7 +52,8 @@ Each group holds at most 20 messages and 256 KiB of the exact rendered UTF-8 rec
 The same renderer checks the byte limit and prints full message bodies plus supported attachment filenames and HTTPS URLs.
 Messages are ordered by numeric Discord message ID, and count or byte overflow is sealed into later ordered groups without dropping or summarizing replies.
 The accepted single-message body and attachment bounds fit inside the receive output bound.
-New groups remain unsealed while REST catch-up is incomplete, and newer frozen groups remain held until catch-up completes.
+New groups remain unsealed while REST catch-up or that thread's current-epoch Gateway recovery is incomplete.
+Worker submission and default foreground pulls preserve per-thread message order across both recovery barriers, while explicit frozen group or exact-message receipts remain available to the exact owner.
 Group membership and a durable attempt intent are stored before guarded native submission.
 The wake contains a command that invokes the active Discord Watch runtime with its qualified Python interpreter and the immutable group ID, without including reply bodies.
 An uncertain submission remains blocked indefinitely, while a confirmed group waits for an explicit receipt without redundant wake submissions.
@@ -60,7 +62,8 @@ Status reports forming groups, held groups, intent or uncertain submissions, con
 
 Discord Watch uses the pinned websocket-client 1.9.2 runtime dependency from a private immutable vendor directory and does not modify system Python packages.
 The Gateway requests the GUILD_MESSAGES and MESSAGE_CONTENT intents needed to receive configured-user message bodies and attachments.
-The application configuration and approved intent access remain prerequisites, and a fatal Gateway configuration condition stays visible while REST reconciliation continues.
+The application configuration and approved intent access remain prerequisites, and a fatal Gateway condition stays visible while REST reconciliation continues.
+Coordinator guidance points to the reported fatal mechanism so the component owner can inspect that specific cause.
 For each thread, registration stores the exact Hailing Frequencies harness, surface, workspace, session, and generation.
 The central worker checks that the same target remains enrolled and validates the current CMUX projection and input guard before each wake.
 It never forces input, reads or clears CMUX messages, launches another agent, or sends a reply body in a wake.
@@ -87,7 +90,7 @@ It then revalidates the exact live owner and atomically receipts only the messag
 An older supported CLI can still receive an exact message using `--message`; the new CLI reconciles those per-message receipts and prints only the remaining unread members of a group.
 Group wake commands invoke the active immutable runtime directly so an older launcher elsewhere on `PATH` cannot receive an unsupported `--group` option.
 Default `receive --thread` is an explicit foreground pull that freezes the next bounded pending group immediately when no older unread group exists, even if the quiet window has not elapsed or no sending worker is running.
-This manual pull does not submit a native wake, and it still observes exact ownership, catch-up, output, and receipt guards.
+This manual pull does not submit a native wake, and it still observes exact ownership, REST catch-up, Gateway recovery, output, and receipt guards.
 Historical attempt rows whose target cannot be recovered keep a null target attribution rather than inheriting the group's original owner.
 This flush is the CLI delivery boundary and is not proof that a person or model read or understood the reply.
 If output fails or the current owner changes before the receipt commit, the reply remains available for another receive.
