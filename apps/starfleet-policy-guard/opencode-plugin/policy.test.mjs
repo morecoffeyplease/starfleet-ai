@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   directShellDenial,
+  directShellResource,
   evaluateCoveredShellPermission,
   isCoveredShellResource,
   pendingAssertionMatches,
@@ -77,7 +78,15 @@ test("covered direct shell is denied while unrelated native effects stay untouch
   assert.equal(otherAction.effect, "allow")
 })
 
-test("the direct shell hook recognizes the covered command prefix", () => {
+test("direct covered shell segments yield a native permission resource before execution", () => {
+  assert.deepEqual(directShellResource({ command: "printf before && gh pr ready 42" }), {
+    resource: "gh pr ready",
+    save: "gh pr ready *",
+  })
+  assert.deepEqual(directShellResource({ command: "echo started; gh pr merge 42 --squash" }), {
+    resource: "gh pr merge",
+    save: "gh pr merge *",
+  })
   assert.match(directShellDenial({ command: "gh pr ready 42" }), /Prime Directive/u)
   assert.match(directShellDenial({ command: "gh pr merge 42 --squash; echo done" }), /Prime Directive/u)
   assert.match(directShellDenial({ command: "echo started; gh pr ready 42" }), /Prime Directive/u)

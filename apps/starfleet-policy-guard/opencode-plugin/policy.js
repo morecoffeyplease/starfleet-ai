@@ -53,9 +53,16 @@ export function evaluateCoveredShellPermission(event, pending) {
   event.message = "Use the Prime Directive GitHub tool for covered readiness and merge actions."
 }
 
-export function directShellDenial(input) {
+export function directShellResource(input) {
   if (!input || typeof input !== "object" || typeof input.command !== "string") return undefined
-  const directCommand = /(?:^|[;&|]+\s*|\n\s*|\(\s*)gh[\t ]+pr[\t ]+(?:ready|merge)(?=$|[\t ;&|)\n])/u
-  if (!directCommand.test(input.command)) return undefined
+  const directCommand = /(?:^|[;&|]+\s*|\n\s*|\(\s*)(gh[\t ]+pr[\t ]+(?:ready|merge))(?=$|[\t ;&|)\n])/u
+  const match = directCommand.exec(input.command)
+  if (!match) return undefined
+  const resource = match[1].replace(/[\t ]+/gu, " ").trim()
+  return { resource, save: `${resource} *` }
+}
+
+export function directShellDenial(input) {
+  if (!directShellResource(input)) return undefined
   return "Use the Prime Directive GitHub tool for covered readiness and merge actions."
 }
