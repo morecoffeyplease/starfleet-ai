@@ -3,6 +3,11 @@
 Discord Watch polls registered agent-notify forum threads for replies from the configured Discord user and keeps those replies in a private local queue.
 With `--send`, one supervised worker sends a guarded wake to the exact Claude or Codex session enrolled for each thread.
 The wake contains the exact `discord-watch receive` command and never contains the reply body.
+New replies are grouped by thread and exact owner generation after three seconds of quiet, with a maximum ten-second delay from the first queued reply.
+Quiet time uses local intake time for unique configured-user messages, while the maximum delay starts at the first message in that pending group.
+Each group contains at most 20 messages and 256 KiB of rendered UTF-8 output, and overflow remains in later ordered groups.
+The output bound fits every accepted single message with its supported attachment references.
+Messages are ordered by numeric Discord message ID and retain their full bodies and supported attachment filenames and HTTPS URLs.
 
 ## Prerequisites
 
@@ -71,12 +76,16 @@ The legacy agent-notify listener should stop polling a thread after `managed` re
 Reusing `register` from the same exact owner after local closure, a Closed tag, or archiving does not reopen the registration or reset its cursor, cutoff, or owner generation.
 An idempotent repeat of `--after` may use either the immutable initial cutoff or the current committed cursor.
 Its JSON includes worker health, and a stale worker warning does not change ownership or the central managed route.
+Previously queued per-message records migrate into singleton frozen groups without resetting message state or attempt evidence.
+New groups are not sealed or submitted while the thread has an incomplete REST catch-up boundary, and newer frozen groups remain held until catch-up completes.
 
 Only the current registered owner can receive or locally close a thread.
 To hand a retained registration to a different current enrolled session, run `discord-watch transfer THREAD_ID --from-session OLD_SESSION_UUID` from the new owner's session.
 Transfer requires the old session ID to match the stored owner and preserves every unreceived reply.
 Transfer can preserve a locally closed registration without reopening it.
-An explicit transfer resets confirmed-but-unreceived wakes for safe delivery to the new owner.
+An explicit transfer preserves frozen group membership and lets the authorized new owner receive unread members through the ownership-event chain.
+Unsealed messages can be assigned to the new generation, while a group never combines messages from different generations.
+An unexplained generation change without a matching ownership-event chain holds the affected groups.
 Uncertain submissions are never retried automatically.
 
 ## Observe, pilot, and supervise
@@ -103,16 +112,23 @@ The recipient can retrieve a reply even when the wake was held, uncertain, or th
 
 ```sh
 discord-watch receive --thread THREAD_ID
+discord-watch receive --thread THREAD_ID --group GROUP_ID
 discord-watch receive --thread THREAD_ID --message MESSAGE_ID
 discord-watch status
 discord-watch close THREAD_ID
 ```
 
+The group receive command prints every unread member of the selected frozen group in message ID order and flushes stdout before recording exact member receipts.
+The default receive command selects the oldest frozen group, while `--message` retains the exact single-message path.
 The receive command prints exact `[discord:THREAD:MESSAGE] author: content` records and flushes stdout before recording a local receipt.
 That flush is a delivery boundary for the CLI and does not prove that the reply was read or understood.
 The private database stores message bodies, attachment filenames, and attachment URLs with owner-only filesystem permissions.
 Receive prints bounded attachment filenames and HTTPS URLs to the exact recipient and does not download files.
-Status distinguishes a confirmed CMUX submit from a recipient receipt and reports held, uncertain, and stalled states without printing reply bodies.
+Status distinguishes forming and eligible groups, holds, durable submission intent, uncertain submissions, confirmed groups awaiting receipt, exact member receipts, and later queued messages without printing reply bodies.
+A confirmed group is not submitted again while awaiting receipt, and uncertain submissions remain blocked indefinitely.
+The wake command invokes the active Discord Watch runtime with its qualified interpreter, so a stale launcher earlier on `PATH` is not used to parse `--group`.
+The new receiver shares `receive.lock` with supported older CLI versions and reconciles older per-message receipts without reprinting received members.
+Older CLI versions do not understand `--group`, while their exact `--message` path remains available during upgrades.
 `close` closes the local registration and preserves the exact owner and unreceived replies.
 It does not unsubscribe the thread, so active retained subscriptions continue polling and queued replies remain eligible for guarded delivery.
 Remote Closed tags and archived state are recorded separately and do not close the local registration or stop reply intake.

@@ -1,5 +1,6 @@
 import contextlib
 from datetime import datetime, timezone
+import inspect
 import io
 import json
 import os
@@ -187,6 +188,26 @@ class DiscordWatchTests(unittest.TestCase):
                               "catchup_before,catchup_max,initial_cutoff FROM threads WHERE thread_id=?",
                               (THREAD,)).fetchone()
 
+    def wake(self):
+        with contextlib.closing(self.app.database(create=False)) as db:
+            thread = self.app._thread(db, THREAD, require_open=False)
+            return self.app._wake_one(db, thread, self.clock[0])
+
+    def gateway(self, message_id, content="reply", attachments=None, author_id=USER_ID):
+        row = message(str(message_id), content=content, attachments=attachments,
+                      author_id=author_id, timestamp=timestamp_at(self.clock[0]))
+        return self.app.ingest_gateway_message(THREAD, row)
+
+    def delivery_groups(self):
+        with contextlib.closing(self.app.database(create=False)) as db:
+            return db.execute("SELECT id,owner_generation,status,attempt_count,legacy FROM delivery_groups "
+                              "WHERE thread_id=? ORDER BY id", (THREAD,)).fetchall()
+
+    def group_members(self, group_id):
+        with contextlib.closing(self.app.database(create=False)) as db:
+            return db.execute("SELECT message_id FROM delivery_group_members WHERE group_id=? "
+                              "ORDER BY ordinal", (group_id,)).fetchall()
+
     def test_legacy_closed_registration_migrates_without_losing_durable_state(self):
         self.state.mkdir(mode=0o700)
         path = self.state / "discord-watch.sqlite3"
@@ -266,6 +287,33 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertFalse(self.app.ingest_gateway_message(THREAD, replay)["ingested"])
         self.assertEqual(self.thread_lifecycle()[2], activity_before_replay)
         self.assertEqual([row[0] for row in self.messages()], ["151", "152"])
+
+    def test_legacy_message_states_become_singleton_groups_without_resetting_attempts(self):
+        self.register()
+        states = (("101", "pending", 0), ("102", "awaiting_receipt", 2),
+                  ("103", "stalled", 3), ("104", "uncertain", 1), ("105", "received", 1))
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                for offset, (message_id, state, attempts) in enumerate(states):
+                    last_wake_at = TEST_NOW - 20 + offset if attempts else None
+                    submitted_at = last_wake_at if state == "awaiting_receipt" else None
+                    received_at = last_wake_at if state == "received" else None
+                    db.execute(
+                        "INSERT INTO messages(thread_id,message_id,author_id,author_name,body,attachments_json,"
+                        "created_at,state,wake_attempts,last_wake_at,submitted_at,received_at,groupable,ingested_at,"
+                        "owner_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,1)",
+                        (THREAD, message_id, USER_ID, "Configured user", f"legacy {state}", "[]",
+                         timestamp_at(TEST_NOW - 30 + offset), state, attempts, last_wake_at,
+                         submitted_at, received_at, TEST_NOW - 30 + offset))
+        groups = self.delivery_groups()
+        self.assertEqual([(row[1], row[2], row[3], row[4]) for row in groups],
+                         [(1, "eligible", 0, 1), (1, "awaiting_receipt", 2, 1),
+                          (1, "stalled", 3, 1), (1, "uncertain", 1, 1)])
+        self.assertEqual([(row[0], row[1], row[2]) for row in self.messages()],
+                         [("101", "pending", 0), ("102", "awaiting_receipt", 2),
+                          ("103", "stalled", 3), ("104", "uncertain", 1), ("105", "received", 1)])
+        self.assertEqual([self.group_members(group[0])[0][0] for group in groups],
+                         ["101", "102", "103", "104"])
 
     def test_poll_and_retry_bookkeeping_do_not_refresh_meaningful_activity(self):
         self.register()
@@ -436,6 +484,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertTrue(self.app.ingest_gateway_message(THREAD, late)["ingested"])
         self.assertEqual(self.thread_lifecycle()[1], "dormant")
         self.api.calls.clear()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         report = self.app.scan(send=True)
         self.assertEqual(report["threads"][0]["status"], "dormant")
         self.assertEqual(report["threads"][0]["wake"]["state"], "awaiting_receipt")
@@ -445,17 +494,17 @@ class DiscordWatchTests(unittest.TestCase):
         self.app.ingest_gateway_message(
             THREAD, message("102", timestamp=timestamp_at(self.clock[0] + 1)))
         self.app.receive(THREAD, "101", io.StringIO())
-        self.clock[0] += 1
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         self.cmux.fail_binding = "stale exact owner projection"
         held = self.app.scan(send=True)
-        self.assertIn("wake_error", held["threads"][0])
+        self.assertEqual(held["threads"][0]["wake"]["state"], "held")
         self.assertEqual(self.cmux.submit_count, 1)
         self.assertEqual(self.messages()[-1][1], "pending")
         self.cmux.fail_binding = None
         self.targets.clear()
         self._write_hailing()
         missing = self.app.scan(send=True)
-        self.assertIn("wake_error", missing["threads"][0])
+        self.assertEqual(missing["threads"][0]["wake"]["state"], "held")
         self.assertEqual(self.cmux.submit_count, 1)
         self.assertEqual(self.messages()[-1][1], "pending")
 
@@ -481,6 +530,12 @@ class DiscordWatchTests(unittest.TestCase):
         self.api.remote["id"] = "200"
         with self.assertRaisesRegex(ValueError, "cannot precede"):
             self.app.register("200", after="199")
+
+    def test_receive_keeps_output_and_session_hint_slots_before_keyword_only_group(self):
+        parameters = inspect.signature(dw.Watch.receive).parameters
+        self.assertEqual(parameters["output"].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        self.assertEqual(parameters["session_hint"].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        self.assertEqual(parameters["group_id"].kind, inspect.Parameter.KEYWORD_ONLY)
 
     def test_register_reuses_closed_same_owner_without_resetting_cursor_or_generation(self):
         self.register(after="150")
@@ -523,6 +578,132 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertEqual(self.thread_lifecycle()[4], "151")
         self.assertEqual(self.thread_lifecycle()[7], "150")
         self.assertEqual(self.messages()[0][0:2], ("151", "pending"))
+
+    def test_group_quiet_uses_unique_messages_and_ignores_duplicate_or_other_author_events(self):
+        self.register()
+        first_at = self.clock[0]
+        self.gateway("102", "later snowflake")
+        self.clock[0] = first_at + 1
+        self.gateway("101", "earlier snowflake")
+        self.clock[0] = first_at + 2
+        duplicate = message("102", content="changed duplicate", timestamp=timestamp_at(first_at + 30))
+        self.assertFalse(self.app.ingest_gateway_message(THREAD, duplicate)["ingested"])
+        self.api.rows = [duplicate]
+        self.app.scan()
+        self.clock[0] = first_at + 3
+        self.assertFalse(self.gateway("103", "unrelated author", author_id="999")["ingested"])
+        self.assertEqual(self.wake()["state"], "forming")
+        self.assertEqual(self.app.status()["threads"][0]["forming_group"]["state"], "forming")
+        self.assertEqual(self.cmux.submit_count, 0)
+        self.clock[0] = first_at + 4
+        result = self.wake()
+        self.assertTrue(result["submitted"])
+        self.assertEqual(self.group_members(1), [("101",), ("102",)])
+        self.assertEqual(self.cmux.submit_count, 1)
+        delivery_status = self.app.status()["threads"][0]["delivery_groups"][0]
+        self.assertEqual(delivery_status["state"], "awaiting_receipt")
+        self.assertEqual([member["state"] for member in delivery_status["members"]],
+                         ["awaiting_receipt", "awaiting_receipt"])
+        output = io.StringIO()
+        self.app.receive(THREAD, output=output, group_id=1)
+        self.assertIn("earlier snowflake", output.getvalue())
+        self.assertIn("later snowflake", output.getvalue())
+        self.assertLess(output.getvalue().index(":101]"), output.getvalue().index(":102]"))
+        self.assertEqual(self.app.status()["threads"][0]["delivery_groups"][0]["state"], "received")
+        self.assertEqual(self.thread_lifecycle()[2], first_at + 1)
+
+    def test_continuous_burst_becomes_eligible_at_first_message_maximum_delay(self):
+        self.register()
+        first_at = self.clock[0]
+        for offset in range(0, 9, 2):
+            self.clock[0] = first_at + offset
+            self.gateway(str(101 + offset), f"reply at {offset}")
+        self.clock[0] = first_at + dw.GROUP_MAX_DELAY - 1
+        self.assertEqual(self.wake()["state"], "forming")
+        self.clock[0] = first_at + dw.GROUP_MAX_DELAY
+        result = self.wake()
+        self.assertTrue(result["submitted"])
+        self.assertEqual(self.group_members(1), [("101",), ("103",), ("105",), ("107",), ("109",)])
+
+    def test_count_overflow_creates_ordered_subsequent_groups_without_loss(self):
+        self.register()
+        with mock.patch.object(dw, "MAX_RECEIVE_MESSAGES", 2):
+            for message_id in ("105", "101", "104", "102", "103"):
+                self.gateway(message_id, f"full body {message_id}")
+            self.clock[0] += dw.GROUP_QUIET_SECONDS
+            result = self.wake()
+            self.assertTrue(result["submitted"])
+            self.assertEqual(self.group_members(1), [("101",), ("102",)])
+            self.assertEqual(self.group_members(2), [("103",), ("104",)])
+            self.assertEqual(self.group_members(3), [("105",)])
+            self.assertEqual(self.cmux.submit_count, 1)
+
+    def test_rendered_utf8_attachment_overflow_splits_without_truncating_a_single_reply(self):
+        self.register()
+        filename = "界" * 170
+        url = "https://example.invalid/" + "u" * 2024
+        attachments = [{"filename": filename, "url": url}]
+        with mock.patch.object(dw, "MAX_RECEIVE_BYTES", 5000):
+            self.gateway("101", "🙂" * 100, attachments)
+            self.gateway("102", "🙂" * 100, attachments)
+            self.clock[0] += dw.GROUP_QUIET_SECONDS
+            result = self.wake()
+            self.assertTrue(result["submitted"])
+            self.assertEqual(self.group_members(1), [("101",)])
+            self.assertEqual(self.group_members(2), [("102",)])
+            with contextlib.closing(self.app.database(create=False)) as db:
+                rows = db.execute("SELECT message_id,author_name,body,attachments_json FROM messages "
+                                  "WHERE thread_id=? ORDER BY message_id", (THREAD,)).fetchall()
+            for row in rows:
+                rendered = dw.Watch._render_messages(THREAD, [row])
+                self.assertLessEqual(len(rendered.encode("utf-8")), dw.MAX_RECEIVE_BYTES)
+                self.assertIn(filename, rendered)
+                self.assertIn(url, rendered)
+
+    def test_largest_accepted_single_reply_fits_the_shared_receive_output_bound(self):
+        self.register()
+        filename = "f" * 512
+        url = "https://example.invalid/" + "u" * (2048 - len("https://example.invalid/"))
+        attachments = [{"filename": filename, "url": url} for _ in range(6)]
+        body = "b" * dw.MAX_MESSAGE_BYTES
+        self.gateway("101", body, attachments)
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        result = self.wake()
+        self.assertTrue(result["submitted"])
+        output = io.StringIO()
+        received = self.app.receive(THREAD, output=output, group_id=1)
+        self.assertEqual(received["received"], ["101"])
+        self.assertLessEqual(len(output.getvalue().encode("utf-8")), dw.MAX_RECEIVE_BYTES)
+        self.assertIn(body, output.getvalue())
+        self.assertEqual(output.getvalue().count("[attachment] " + filename), 6)
+
+    def test_incomplete_rest_catchup_holds_group_formation_and_submission(self):
+        self.register()
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE threads SET catchup_before='180',catchup_max='200' WHERE thread_id=?",
+                           (THREAD,))
+        self.gateway("101", "reply while catch-up is open")
+        self.clock[0] += dw.GROUP_MAX_DELAY + 1
+        result = self.wake()
+        self.assertEqual(result["state"], "held")
+        self.assertEqual(result["held"], "rest_catchup_incomplete")
+        self.assertEqual(self.thread_cursor(), THREAD)
+        self.assertEqual(self.delivery_groups(), [])
+        self.assertEqual(self.messages()[0][1], "pending")
+        output = io.StringIO()
+        self.assertEqual(self.app.receive(THREAD, output=output)["received"], [])
+        self.assertEqual(output.getvalue(), "")
+        with self.assertRaisesRegex(ValueError, "REST catch-up is incomplete"):
+            self.app.receive(THREAD, "101", io.StringIO())
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertIsNone(db.execute("SELECT group_id FROM messages WHERE thread_id=?", (THREAD,)).fetchone()[0])
+            with db:
+                db.execute("UPDATE threads SET catchup_before=NULL,catchup_max=NULL WHERE thread_id=?",
+                           (THREAD,))
+        result = self.wake()
+        self.assertTrue(result["submitted"])
+        self.assertEqual(self.group_members(1), [("101",)])
 
     def test_legacy_registration_written_after_cutoff_migration_is_initialized(self):
         self.register()
@@ -620,13 +801,244 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertIn("[discord:100:101] Configured user: ", output.getvalue())
         self.assertIn("[attachment] screen.png: " + url, output.getvalue())
 
+    def test_exact_message_receipt_reconciles_without_reprinting_group_member(self):
+        self.register()
+        self.gateway("101", "first frozen body")
+        self.gateway("102", "second frozen body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+        first = io.StringIO()
+        self.app.receive(THREAD, "101", first)
+        group_output = io.StringIO()
+        result = self.app.receive(THREAD, output=group_output, group_id=1)
+        self.assertEqual(result["received"], ["102"])
+        self.assertIn("second frozen body", group_output.getvalue())
+        self.assertNotIn("first frozen body", group_output.getvalue())
+        self.assertEqual([row[1] for row in self.messages()], ["received", "received"])
+        self.assertEqual(self.delivery_groups()[0][2], "received")
+
+    def test_new_arrival_during_native_submit_stays_in_a_later_group(self):
+        self.register()
+        self.gateway("101", "frozen before submit")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        output = io.StringIO()
+
+        def receive_frozen_group():
+            self.gateway("102", "arrived during submit")
+            self.app.receive(THREAD, output=output, group_id=1)
+
+        self.cmux.on_submit = receive_frozen_group
+        result = self.wake()
+        self.assertEqual(result["state"], "received")
+        self.assertIn("frozen before submit", output.getvalue())
+        self.assertNotIn("arrived during submit", output.getvalue())
+        self.assertEqual(self.group_members(1), [("101",)])
+        self.assertEqual(self.messages()[1][1], "pending")
+        self.cmux.on_submit = None
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        second = self.wake()
+        self.assertTrue(second["submitted"])
+        self.assertEqual(self.group_members(2), [("102",)])
+
+    def test_new_arrival_during_group_output_remains_unread_and_unassigned(self):
+        self.register()
+        self.gateway("101", "first frozen body")
+        self.gateway("102", "second frozen body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+
+        class ArrivalOutput(io.StringIO):
+            def write(inner_self, text):
+                written = super().write(text)
+                self.gateway("103", "arrived during receive")
+                return written
+
+        output = ArrivalOutput()
+        result = self.app.receive(THREAD, output=output, group_id=1)
+        self.assertEqual(result["received"], ["101", "102"])
+        self.assertNotIn("arrived during receive", output.getvalue())
+        self.assertEqual(self.group_members(1), [("101",), ("102",)])
+        self.assertEqual(self.messages()[-1][0:2], ("103", "pending"))
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertIsNone(db.execute("SELECT group_id FROM messages WHERE thread_id=? AND message_id='103'",
+                                         (THREAD,)).fetchone()[0])
+
+    def test_short_write_or_flush_failure_leaves_every_group_receipt_unchanged(self):
+        self.register()
+        self.gateway("101", "first")
+        self.gateway("102", "second")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+
+        class ShortWriter:
+            def write(self, text):
+                return len(text) - 1
+
+            def flush(self):
+                return None
+
+        class FlushFailure(io.StringIO):
+            def flush(self):
+                raise OSError("synthetic flush failure")
+
+        for output in (ShortWriter(), FlushFailure()):
+            with self.subTest(output=type(output).__name__), self.assertRaises((ValueError, OSError)):
+                self.app.receive(THREAD, output=output, group_id=1)
+            self.assertEqual([row[1] for row in self.messages()], ["awaiting_receipt", "awaiting_receipt"])
+            self.assertNotEqual(self.delivery_groups()[0][2], "received")
+
+    def test_two_receivers_share_one_lock_and_only_one_can_print_group(self):
+        self.register()
+        self.gateway("101", "single output body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+        entered = threading.Event()
+        release = threading.Event()
+        second_output = io.StringIO()
+        outcomes = []
+
+        class BlockingOutput(io.StringIO):
+            def write(inner_self, text):
+                entered.set()
+                release.wait(timeout=3)
+                return super().write(text)
+
+        first_output = BlockingOutput()
+
+        def first_receiver():
+            try:
+                outcomes.append(self.app.receive(THREAD, output=first_output, group_id=1))
+            except Exception as error:
+                outcomes.append(error)
+
+        def second_receiver():
+            try:
+                outcomes.append(self.app.receive(THREAD, output=second_output, group_id=1))
+            except Exception as error:
+                outcomes.append(error)
+
+        first = threading.Thread(target=first_receiver)
+        first.start()
+        self.assertTrue(entered.wait(timeout=2))
+        second = threading.Thread(target=second_receiver)
+        second.start()
+        release.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(sum(isinstance(item, dict) for item in outcomes), 1)
+        self.assertEqual(sum(isinstance(item, ValueError) for item in outcomes), 1)
+        self.assertEqual(first_output.getvalue().count("single output body"), 1)
+        self.assertEqual(second_output.getvalue(), "")
+        self.assertEqual(self.messages()[0][1], "received")
+
+    def test_confirmed_group_is_not_resubmitted_and_later_reply_waits_for_receipt(self):
+        self.register()
+        self.gateway("101", "confirmed body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        first = self.wake()
+        self.assertTrue(first["submitted"])
+        self.assertEqual(self.delivery_groups()[0][2], "awaiting_receipt")
+        self.clock[0] += 600
+        self.gateway("102", "later body")
+        blocked = self.wake()
+        self.assertEqual(blocked["state"], "awaiting_receipt")
+        self.assertEqual(self.cmux.submit_count, 1)
+        self.assertEqual(self.group_members(1), [("101",)])
+        self.assertEqual(self.messages()[1][1], "pending")
+        self.app.receive(THREAD, output=io.StringIO(), group_id=1)
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        later = self.wake()
+        self.assertTrue(later["submitted"])
+        self.assertEqual(self.group_members(2), [("102",)])
+        self.assertEqual(self.cmux.submit_count, 2)
+
+    def test_group_wake_uses_active_runtime_even_when_path_has_an_older_cli(self):
+        self.register()
+        self.gateway("101", "private synthetic body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        with mock.patch.object(dw.shutil, "which", return_value="/older/discord-watch"):
+            result = self.wake()
+        self.assertTrue(result["submitted"])
+        prompt = self.cmux.prompts[0]
+        self.assertIn(sys.executable, prompt)
+        self.assertIn(str(Path(dw.__file__).resolve()), prompt)
+        self.assertIn("--group 1", prompt)
+        self.assertNotIn("/older/discord-watch", prompt)
+        self.assertNotIn("private synthetic body", prompt)
+
+    def test_transferred_frozen_group_and_new_generation_messages_stay_separate(self):
+        self.register()
+        self.gateway("101", "generation one")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+        self.targets.append(target(SESSION_B, SURFACE_B, WORKSPACE_B))
+        self._write_hailing()
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_B
+        os.environ["CODEX_THREAD_ID"] = SESSION_B
+        self.app.transfer(THREAD, SESSION_A)
+        self.gateway("102", "generation two")
+        self.assertEqual(self.group_members(1), [("101",)])
+        output = io.StringIO()
+        self.app.receive(THREAD, output=output, group_id=1)
+        self.assertIn("generation one", output.getvalue())
+        self.assertNotIn("generation two", output.getvalue())
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+        self.assertEqual(self.group_members(2), [("102",)])
+        self.assertEqual(self.delivery_groups()[1][1], 2)
+
+    def test_generation_edit_without_ownership_event_holds_frozen_group(self):
+        self.register()
+        self.gateway("101", "frozen owner body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE threads SET owner_generation=2 WHERE thread_id=?", (THREAD,))
+        output = io.StringIO()
+        with self.assertRaisesRegex(ValueError, "authorized transfer chain"):
+            self.app.receive(THREAD, output=output, group_id=1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(self.messages()[0][1], "awaiting_receipt")
+
+    def test_authorized_transfer_during_output_preserves_receipts_until_new_owner_receives(self):
+        self.register()
+        self.gateway("101", "transfer race body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+        self.targets.append(target(SESSION_B, SURFACE_B, WORKSPACE_B))
+
+        class TransferOutput(io.StringIO):
+            def write(inner_self, text):
+                written = super().write(text)
+                self._write_hailing()
+                os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+                os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_B
+                os.environ["CODEX_THREAD_ID"] = SESSION_B
+                self.app.transfer(THREAD, SESSION_A)
+                return written
+
+        output = TransferOutput()
+        with self.assertRaisesRegex(ValueError, "Owner changed during reply output"):
+            self.app.receive(THREAD, output=output, group_id=1)
+        self.assertIn("transfer race body", output.getvalue())
+        self.assertEqual(self.messages()[0][1], "awaiting_receipt")
+        new_owner_output = io.StringIO()
+        result = self.app.receive(THREAD, output=new_owner_output, group_id=1)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("transfer race body", new_owner_output.getvalue())
+
     def test_held_input_does_not_mark_transport_or_consume_attempt(self):
         self.register()
         self.api.rows = [message("101")]
         self.app.scan()
         self.cmux.hold_submit = "Composer has a human draft"
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         result = self.app.scan(send=True)
-        self.assertEqual(result["threads"][0]["wake"]["state"], "pending")
+        self.assertEqual(result["threads"][0]["wake"]["state"], "held")
         row = self.messages()[0]
         self.assertEqual(row[1:3], ("pending", 0))
         self.assertIn("last_error", self.app.status()["threads"][0]["recent"][0])
@@ -637,11 +1049,13 @@ class DiscordWatchTests(unittest.TestCase):
         self.api.rows = [message("101", content="private reply body")]
         self.app.scan()
         self.cmux.uncertain = True
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         self.app.scan(send=True)
         self.assertEqual(self.messages()[0][1], "uncertain")
         self.assertNotIn("private reply body", self.cmux.prompts[0])
         self.assertIn("--state-dir " + str(self.state), self.cmux.prompts[0])
-        self.assertIn("receive --thread 100 --message 101", self.cmux.prompts[0])
+        self.assertIn("receive --thread 100 --group 1", self.cmux.prompts[0])
+        self.assertIn(str(Path(dw.__file__).resolve()), self.cmux.prompts[0])
         self.cmux.uncertain = False
         self.app.scan(send=True)
         self.assertEqual(self.cmux.submit_count, 1)
@@ -655,6 +1069,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.register()
         self.api.rows = [message("101", content="body")]
         self.app.scan()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         self.cmux.entered = threading.Event()
         self.cmux.release = threading.Event()
         results = []
@@ -673,6 +1088,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.register()
         self.api.rows = [message("101", content="body")]
         self.app.scan()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         output = io.StringIO()
         self.cmux.on_submit = lambda: self.app.receive(THREAD, "101", output)
         result = self.app.scan(send=True)
@@ -688,6 +1104,8 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertTrue(managed["managed"])
         self.assertFalse(managed["open"])
         self.api.rows = [message("101")]
+        self.app.scan()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         report = self.app.scan(send=True)
         self.assertEqual(report["threads"][0]["status"], "polled")
         self.assertTrue(report["threads"][0]["wake"]["submitted"])
@@ -700,10 +1118,14 @@ class DiscordWatchTests(unittest.TestCase):
     def test_remote_archive_is_recorded_without_unsubscribing_or_blocking_late_reply(self):
         self.register()
         self.api.rows = [message("101")]
+        self.app.scan()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         self.app.scan(send=True)
         self.app.receive(THREAD, "101", io.StringIO())
         self.api.remote["thread_metadata"]["archived"] = True
         self.api.rows.append(message("102", content="late archived reply"))
+        self.app.scan()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         report = self.app.scan(send=True)
         self.assertEqual(report["threads"][0]["status"], "polled")
         self.assertTrue(report["threads"][0]["remote_closed"])
@@ -719,6 +1141,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.register()
         self.api.rows = [message("101")]
         self.app.scan()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         self.app.scan(send=True)
         self.app.close(THREAD)
         self.targets.append(target(SESSION_B, SURFACE_B, WORKSPACE_B))
@@ -730,7 +1153,7 @@ class DiscordWatchTests(unittest.TestCase):
             self.app.transfer(THREAD, SESSION_B)
         result = self.app.transfer(THREAD, SESSION_A)
         self.assertEqual(result["to_session"], SESSION_B)
-        self.assertEqual(self.messages()[0][1:3], ("pending", 0))
+        self.assertEqual(self.messages()[0][1:3], ("awaiting_receipt", 1))
         self.assertEqual(self.messages()[0][3], "Configured user reply")
         managed = self.app.managed(THREAD)
         self.assertEqual(managed["owner_session"], SESSION_B)
@@ -741,6 +1164,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.api.rows = [message("101")]
         self.app.scan()
         self.cmux.uncertain = True
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
         self.app.scan(send=True)
         self.assertEqual(self.messages()[0][1], "uncertain")
         self.app.close(THREAD)

@@ -40,10 +40,23 @@ Queued replies remain available for guarded delivery while a subscription is dor
 Use `discord-watch scan --only-thread THREAD_ID` for explicit REST reconciliation of a dormant thread.
 When Gateway intake is in use, reconnect reconciliation must include every retained known thread, including dormant threads, before the integration reports recovery.
 
+New replies for one exact owner generation are grouped after three seconds of quiet, with a maximum ten-second delay from the first queued reply.
+Quiet time uses local intake time for unique configured-user messages, while the maximum delay starts at the first message in that pending group.
+Each group holds at most 20 messages and 256 KiB of the exact rendered UTF-8 receive output.
+The same renderer checks the byte limit and prints full message bodies plus supported attachment filenames and HTTPS URLs.
+Messages are ordered by numeric Discord message ID, and count or byte overflow is sealed into later ordered groups without dropping or summarizing replies.
+The accepted single-message body and attachment bounds fit inside the receive output bound.
+New groups remain unsealed while REST catch-up is incomplete, and newer frozen groups remain held until catch-up completes.
+Group membership and a durable attempt intent are stored before guarded native submission.
+The wake contains a command that invokes the active Discord Watch runtime with its qualified Python interpreter and the immutable group ID, without including reply bodies.
+An uncertain submission remains blocked indefinitely, while a confirmed group waits for an explicit receipt without redundant wake submissions.
+Later replies remain queued and are grouped after the earlier group is received.
+Status reports forming groups, held groups, intent or uncertain submissions, confirmed groups awaiting receipt, each member's receipt, and later queued replies.
+
 For each thread, registration stores the exact Hailing Frequencies harness, surface, workspace, session, and generation.
 The central worker checks that the same target remains enrolled and validates the current CMUX projection and input guard before each wake.
 It never forces input, reads or clears CMUX messages, launches another agent, or sends a reply body in a wake.
-The prompt names one exact `discord-watch receive --thread THREAD --message MESSAGE` command.
+The prompt names one exact `discord-watch receive --thread THREAD --group GROUP` command for the frozen group.
 An empty composer with no human-input obligation is required by Hailing Frequencies' existing `Cmux.submit` guard.
 Attachment filenames and HTTPS URLs are printed to the exact recipient during `receive` without downloading the files.
 
@@ -54,14 +67,17 @@ A global rate limit defers all thread requests until its retry time, while a per
 One thread's API error does not stop polling other registered threads.
 Each request has a finite timeout, response and message sizes are bounded, and catch-up is limited to 50 pages per scan.
 
-A confirmed CMUX submit moves one reply to `awaiting_receipt`.
-Discord Watch waits two minutes before a reminder and caps confirmed submits at three per reply.
-After the third wake remains unreceived for another interval, the reply becomes visibly `stalled`.
+A confirmed CMUX submit moves each unread group member to `awaiting_receipt`.
+A confirmed group is not submitted again while awaiting receipt.
 A transport failure after CMUX begins submission is `uncertain` and is never retried automatically.
-The exact owner can resolve an uncertain, stalled, or held reply by explicitly receiving it.
+Existing stalled, confirmed, uncertain, and per-message attempt evidence remains visible after migration.
+A current exact owner can explicitly receive the remaining members of an uncertain or stalled group, or a held group when the owner guard is available.
 No operator command resets an uncertain send to pending.
 
-`receive` holds the local consumer lock while writing exact records and flushes stdout before saving receipts.
+`receive` holds the shared local consumer lock while writing exact records and flushes stdout before saving receipts.
+It then revalidates the exact live owner and atomically receipts only the message IDs that were written from the selected frozen group.
+An older supported CLI can still receive an exact message using `--message`; the new CLI reconciles those per-message receipts and prints only the remaining unread members of a group.
+Group wake commands invoke the active immutable runtime directly so an older launcher elsewhere on `PATH` cannot receive an unsupported `--group` option.
 This flush is the CLI delivery boundary and is not proof that a person or model read or understood the reply.
 If output fails or the current owner changes before the receipt commit, the reply remains available for another receive.
 `managed` checks exact current ownership of the retained subscription, including locally closed and dormant registrations, and includes the latest worker health report.
@@ -69,7 +85,9 @@ Its success is independent of worker freshness so the caller can retain ownershi
 `close` preserves all queued replies, is idempotent for the caller's exact registration, and closes only its local management state while retaining the reply subscription.
 `transfer` requires an explicit `--from-session` matching the stored owner and must be run from the new exact enrolled session.
 An explicit transfer can change the owner of a locally closed retained subscription without reopening it.
-Transfer preserves unreceived replies and resets confirmed-but-unreceived wakes so the new owner can safely receive them.
+Transfer preserves frozen group membership and lets the explicitly authorized new owner receive its unread members through the recorded ownership-event chain.
+Unsealed messages can be assigned to the new generation, and a group never combines messages from different generations.
+An unexplained generation change without the matching ownership-event chain holds its groups.
 An uncertain send stays uncertain across transfer.
 
 ## Commands
