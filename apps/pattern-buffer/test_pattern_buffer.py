@@ -917,7 +917,7 @@ else:
                 self.cli("install", *options, "--runtime-dir", str(new_runtime))
 
                 updated_groups = json.loads(settings.read_text())["hooks"][event]
-                canonical_group = ci.hook_config(harness, new_runtime, True)["hooks"][event][0]
+                canonical_group = ci.hook_config(harness, new_runtime / f"context_injector_{harness}.py", True)["hooks"][event][0]
                 self.assertEqual(updated_groups[owned_index], canonical_group)
                 self.assertEqual(updated_groups[owned_index + 1], foreign_after_group)
                 updated_handler = updated_groups[owned_index]["hooks"][0]
