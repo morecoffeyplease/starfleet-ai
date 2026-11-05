@@ -112,6 +112,7 @@ assert_contains() { [[ "$1" == *"$2"* ]] || fail "expected output to contain [$2
 assert_not_contains() { [[ "$1" != *"$2"* ]] || fail "unexpected sensitive text [$2]"; }
 line_count() { wc -l <"$1" | tr -d ' '; }
 mode_bits() { python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$1"; }
+command -v grep >/dev/null 2>&1 || fail 'grep is required for portable log assertions'
 
 guide_home="$TMP/uninitialized-home"
 AGENT_NOTIFY_HOME="$TMP/missing-config" HOME="$guide_home" "$TOOL" guide --print >"$TMP/guide.out"
@@ -186,14 +187,27 @@ assert_contains "$(cat "$reply_err")" 'The operator has returned.'
 assert_eq "$(line_count "$THREAD_LOG")" 0
 [ ! -f "$TMP/config/state/$back_id.post.json" ] || fail 'closed attention metadata was not removed'
 
-away_id="$("$TOOL" open --kind Agent --title "$SECRET_TITLE" --issue 842 --body "$SECRET_BODY" 2>"$TMP/away.err")"
+subject_repo="$TMP/subject-budget-fixture-repository"
+subject_worktree="$TMP/linked-worktree-with-a-deliberately-long-name-for-subject-budget"
+mkdir -p "$subject_repo"
+git -C "$subject_repo" init -q
+git -C "$subject_repo" config user.name 'Agent Notify Fixture'
+git -C "$subject_repo" config user.email 'agent-notify-fixture@example.invalid'
+git -C "$subject_repo" commit --allow-empty -q -m 'Subject budget fixture'
+git -C "$subject_repo" worktree add --detach -q "$subject_worktree" HEAD
+subject_where="$(basename "$subject_repo")/$(basename "$subject_worktree")"
+
+away_id="$(cd "$subject_worktree" && "$TOOL" open --kind Agent --title "$SECRET_TITLE" --issue 842 --body "$SECRET_BODY" 2>"$TMP/away.err")"
 assert_eq "$away_id" 900000000000000003
 assert_eq "$(line_count "$OPEN_LOG")" 3
 away_payload="$(sed -n '3p' "$OPEN_LOG")"
-assert_contains "$away_payload" "$SECRET_TITLE"
+away_subject="$(jq -r .thread_name <<<"$away_payload")"
+assert_contains "$away_subject" "$SECRET_TITLE"
+assert_eq "$(printf '%s' "$away_subject" | wc -m | tr -d ' ')" 100
 assert_contains "$away_payload" "$SECRET_ISSUE"
 assert_contains "$away_payload" "$SECRET_BODY"
 assert_contains "$away_payload" '#842'
+assert_contains "$(jq -r .content <<<"$away_payload")" "$subject_where"
 assert_eq "$(line_count "$GH_LOG")" 1
 
 export PRESENCE_MODE=back
@@ -273,7 +287,7 @@ export MANAGED_ENABLED=0
 "$TOOL" close 900000000000000999 <<'EOF'
 Resolved legacy conversation.
 EOF
-if rg -q '^close 900000000000000999$' "$MANAGED_LOG"; then fail 'unmanaged thread attempted local ownership cleanup'; fi
+if grep -Fqx 'close 900000000000000999' "$MANAGED_LOG"; then fail 'unmanaged thread attempted local ownership cleanup'; fi
 unset MANAGED_ENABLED
 export REGISTER_FAIL=1
 failed_registration_id="$("$TOOL" open --delivery discord --kind Agent --title 'Registration failed' --body 'Keep ask visible' 2>"$TMP/managed-registration.err")"
@@ -308,6 +322,6 @@ unset CMUX_SURFACE_ID
 unscoped_opencode_id="$("$TOOL" open --delivery discord --title 'OpenCode unscoped' --body 'Fixture only' 2>"$TMP/opencode-unscoped.err")"
 assert_eq "$unscoped_opencode_id" 900000000000000011
 assert_contains "$(cat "$TMP/opencode-unscoped.err")" 'OpenCode managed-thread registration requires an exact ses_ identity and CMUX workspace/surface scope'
-if rg -q "register $unscoped_opencode_id" "$MANAGED_LOG"; then fail 'unscoped OpenCode owner attempted managed registration'; fi
+if grep -Eq "^register $unscoped_opencode_id([[:space:]]|$)" "$MANAGED_LOG"; then fail 'unscoped OpenCode owner attempted managed registration'; fi
 
 printf '%s\n' 'agent-notify routing tests passed'

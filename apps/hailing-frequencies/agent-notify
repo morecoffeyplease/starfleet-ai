@@ -138,18 +138,41 @@ agent_name() {
 
 # subject KIND WHERE ISSUE ISSUE_TITLE TITLE
 #   [Claude] example-repo/feature-branch #42 Formatting differs: which version should ship?
-# Discord caps a post title at 100 characters, so the issue title is the part
-# that gets shortened or dropped; the full one is always in the body header.
+# Discord caps a post title at 100 characters, so the issue title and location
+# may be shortened before the requested title is truncated.
 subject() {
-  local kind="$1" where="$2" issue="$3" ititle="$4" title="$5" prefix room
-  prefix="[$kind] $where"
+  local kind="$1" where="$2" issue="$3" ititle="$4" title="$5"
+  local kind_prefix="[$kind]" issue_suffix="" prefix room where_room title_room
+  prefix="$kind_prefix $where"
   if [ -n "$issue" ]; then
-    prefix="$prefix #$issue"
+    issue_suffix=" #$issue"
+    prefix="$prefix$issue_suffix"
     room=$(( 100 - ${#prefix} - ${#title} - 3 ))
     if [ -n "$ititle" ] && [ "$room" -ge 12 ]; then
       [ "${#ititle}" -le "$room" ] || ititle="${ititle:0:$((room - 3))}..."
       prefix="$prefix $ititle"
     fi
+  fi
+  if [ $(( ${#prefix} + 2 + ${#title} )) -gt 100 ]; then
+    # Keep the requested title readable by shortening optional project context first.
+    prefix="$kind_prefix$issue_suffix"
+    title_room=$(( 100 - ${#prefix} - 2 ))
+    if [ "${#title}" -gt "$title_room" ]; then
+      if [ "$title_room" -ge 3 ]; then
+        title="${title:0:$((title_room - 3))}..."
+      else
+        title="${title:0:$title_room}"
+      fi
+    fi
+    where_room=$(( 100 - ${#kind_prefix} - 1 - ${#issue_suffix} - 2 - ${#title} ))
+    if [ "${#where}" -gt "$where_room" ]; then
+      if [ "$where_room" -ge 3 ]; then
+        where="${where:0:$((where_room - 3))}..."
+      else
+        where="${where:0:$where_room}"
+      fi
+    fi
+    prefix="$kind_prefix${where:+ $where}$issue_suffix"
   fi
   printf '%s: %s' "$prefix" "$title" | cut -c1-100
 }
