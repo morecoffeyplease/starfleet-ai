@@ -23,6 +23,9 @@ RUNTIME_FILES = (
     'examples/delivery-evidence.json', 'examples/delivery-design-audit.json',
     'guide.md', 'README.md',
 )
+LEGACY_RUNTIME_FILES = tuple(
+    relative for relative in RUNTIME_FILES
+    if relative not in ('opencode-plugin/index.ts', 'opencode-plugin/policy.js'))
 
 
 def _canonical(path):
@@ -251,10 +254,28 @@ def sync_pr_links(manifest, checkout_key, state, *, repository=None, host=None):
 
 
 def runtime_plan(source_root):
+    return _runtime_plan(source_root, RUNTIME_FILES)
+
+
+def recorded_runtime_plan(source_root, recorded_files):
+    if not isinstance(recorded_files, dict):
+        raise ValueError('Recorded Policy Guard runtime file manifest is malformed')
+    recorded_names = set(recorded_files)
+    layout = next((candidate for candidate in (LEGACY_RUNTIME_FILES, RUNTIME_FILES)
+                   if recorded_names == set(candidate)), None)
+    if layout is None:
+        raise ValueError('Recorded Policy Guard runtime file layout is unsupported')
+    plan = _runtime_plan(source_root, layout)
+    if plan['files'] != recorded_files:
+        raise ValueError('Recorded Policy Guard runtime files changed')
+    return plan
+
+
+def _runtime_plan(source_root, files):
     source_root = Path(source_root)
     rows = {}
     digest = hashlib.sha256()
-    for relative in RUNTIME_FILES:
+    for relative in files:
         path = source_root / relative
         data = path.read_bytes()
         fingerprint = _digest(data)

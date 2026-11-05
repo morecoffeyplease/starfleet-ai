@@ -1282,13 +1282,14 @@ def migration_runtime_metadata_matches(state, seat_manifest):
         return False
     if source_revision not in (manifest_revision, canonical_runtime_revision) and not valid_git_revision:
         return False
-    if set(pinned) != set(source_versions(harness)):
+    expected_source_files = set(source_versions(harness)) & set(files)
+    if set(pinned) != expected_source_files:
         return False
     if not all(isinstance(name, str) and isinstance(digest, str) and files.get(name) == digest
                for name, digest in pinned.items()):
         return False
     try:
-        recorded_runtime = session_store.runtime_plan(Path(path))
+        recorded_runtime = session_store.recorded_runtime_plan(Path(path), files)
     except (OSError, ValueError):
         return False
     return recorded_runtime['version'] == version and recorded_runtime['files'] == files
