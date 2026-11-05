@@ -76,7 +76,7 @@ class CheckpointTests(unittest.TestCase):
         context = output['hookSpecificOutput']['additionalContext']
         self.assertTrue(context.startswith('Take action immediately, compaction imminent. '), context)
         self.assertEqual(context.count('Refresh this as a current snapshot.'), 1)
-        self.assertIn('Keep current decisions and relevant rejected approaches', context)
+        self.assertIn('Keep the next action and active work, current decisions and relevant rejected approaches', context)
         self.assertIn('Link useful history instead of repeating it.', context)
         return context
 

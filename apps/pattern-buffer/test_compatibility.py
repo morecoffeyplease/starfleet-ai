@@ -71,6 +71,53 @@ class RenameCompatibilityTests(unittest.TestCase):
             self.assertEqual(codex_settings.read_bytes(), old_codex_settings)
             self.assertTrue(claude_settings.exists())
 
+    def test_install_upgrades_recognized_legacy_singleton_and_remains_repeatable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            runtime = folder / "runtime"
+            codex_settings = folder / "codex.json"
+            claude_settings = folder / "claude.json"
+            env = {**os.environ, "HOME": str(folder), "XDG_DATA_HOME": str(folder / "data"),
+                   "CODEX_HOME": str(folder / ".codex")}
+            first = subprocess.run([sys.executable, str(CURRENT_CLI), "install", "--harness", "codex",
+                                    "--settings", str(codex_settings), "--runtime-dir", str(runtime)],
+                                   capture_output=True, text=True, env=env)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+
+            for path in runtime.glob("pattern_buffer_codex*.py"):
+                path.unlink()
+            for name in ("context_injector_codex_sessions.py", "context_injector_codex_reliability.py"):
+                (runtime / name).unlink()
+            checkpoint = runtime / "context_injector_codex_checkpoint.py"
+            checkpoint.write_text(checkpoint.read_text().replace(
+                "Checkpoint support for Pattern Buffer.", "Checkpoint support for Context Injector."))
+            old_codex_settings = codex_settings.read_bytes()
+
+            for attempt in range(2):
+                installed = subprocess.run([sys.executable, str(CURRENT_CLI), "install", "--harness", "claude",
+                                            "--settings", str(claude_settings), "--runtime-dir", str(runtime)],
+                                           capture_output=True, text=True, env=env)
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                self.assertEqual(codex_settings.read_bytes(), old_codex_settings)
+                if attempt == 0:
+                    self.assertTrue((runtime / "pattern_buffer_codex.py").is_file())
+
+            sources = {
+                "context_injector_codex.py": CURRENT_CLI,
+                "pattern_buffer_codex.py": CURRENT_CLI,
+                "context_injector_codex_checkpoint.py": CURRENT_CLI.with_name("pattern_buffer_checkpoint.py"),
+                "pattern_buffer_codex_checkpoint.py": CURRENT_CLI.with_name("pattern_buffer_checkpoint.py"),
+                "context_injector_codex_enrollment.py": CURRENT_CLI.with_name("pattern_buffer_enrollment.py"),
+                "pattern_buffer_codex_enrollment.py": CURRENT_CLI.with_name("pattern_buffer_enrollment.py"),
+                "context_injector_codex_sessions.py": CURRENT_CLI.with_name("pattern_buffer_sessions.py"),
+                "pattern_buffer_codex_sessions.py": CURRENT_CLI.with_name("pattern_buffer_sessions.py"),
+                "context_injector_codex_reliability.py": CURRENT_CLI.with_name("pattern_buffer_reliability.py"),
+                "pattern_buffer_codex_reliability.py": CURRENT_CLI.with_name("pattern_buffer_reliability.py"),
+            }
+            for name, source in sources.items():
+                with self.subTest(path=name):
+                    self.assertEqual((runtime / name).read_bytes(), source.read_bytes())
+
     def test_install_refusal_preflights_alias_symlinks_without_writing_runtime_or_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)

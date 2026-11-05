@@ -60,7 +60,7 @@ else:
         self.assertIn("50m", self.calls()[0])
         message = self.calls()[0][self.calls()[0].index("--message") + 1]
         self.assertEqual(message.count("Refresh this as a current snapshot."), 1)
-        self.assertIn("Keep current decisions and relevant rejected approaches", message)
+        self.assertIn("Keep the next action and active work, current decisions and relevant rejected approaches", message)
         self.assertIn("Link useful history instead of repeating it.", message)
         self.prompt("Continue the authorized work")
         self.assertEqual(len(self.calls()), 2)

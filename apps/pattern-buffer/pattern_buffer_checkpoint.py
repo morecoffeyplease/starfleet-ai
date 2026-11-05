@@ -23,9 +23,9 @@ SECTIONS = ("Current state", "Next action", "Decisions and uncertainty",
             "Active work", "Evidence", "Holds and guidance")
 SNAPSHOT_PRUNING = (
     "Refresh this as a current snapshot. Replace outdated state rather than append. "
-    "Remove completed work, superseded decisions and obsolete commands. Keep current decisions and relevant "
-    "rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence "
-    "pointers, uncertainties and human holds. "
+    "Remove completed work, superseded decisions and obsolete commands. Keep the next action and active work, "
+    "current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, "
+    "active job IDs, evidence pointers, uncertainties and human holds. "
     "Link useful history instead of repeating it."
 )
 

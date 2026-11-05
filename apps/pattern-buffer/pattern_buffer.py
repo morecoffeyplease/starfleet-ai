@@ -473,12 +473,14 @@ def runtime_bundle_paths(script):
 
 
 def existing_owned_aliases(base, harness):
-    """Return both supported entrypoint aliases only when their installed bundle is coherent."""
+    """Return only a verified supported alias bundle in this runtime."""
     aliases = [base / f"context_injector_{harness}.py", base / f"pattern_buffer_{harness}.py"]
     present = [path.exists() or path.is_symlink() for path in aliases]
     if not any(present):
         return []
     if not all(present):
+        if present == [True, False]:
+            return existing_owned_legacy_singleton(base, harness, aliases[0])
         raise ValueError(f"refusing to update an incomplete {harness} runtime alias bundle")
     first, second = (owned_runtime_core(path, harness) for path in aliases)
     if first != second:
@@ -496,6 +498,42 @@ def existing_owned_aliases(base, harness):
             if any(not path.is_file() for path in paired) or bounded(paired[0], 256 * 1024) != bounded(paired[1], 256 * 1024):
                 raise ValueError(f"refusing to update unverified {harness} runtime helpers")
     return aliases
+
+
+def existing_owned_legacy_singleton(base, harness, alias):
+    """Recognize the historical Context Injector-only bundle without guessing partial layouts."""
+    if alias.is_symlink() or not alias.is_file():
+        raise ValueError(f"refusing to update an unsafe {harness} runtime alias bundle")
+    owned_runtime_core(alias, harness)
+
+    legacy_helpers = {
+        "checkpoint": ("Checkpoint support for Pattern Buffer. Standard library only.",
+                       "Checkpoint support for Context Injector. Standard library only.",
+                       "def _state_path(", "def handle_cli("),
+        "enrollment": ("Self-service checkpoint enrollment and conservative native restart preparation.",
+                       "def enroll("),
+    }
+    for name, markers in legacy_helpers.items():
+        path = auxiliary_source(name, alias)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"refusing to update an incomplete {harness} legacy runtime alias bundle")
+        text = bounded(path, 256 * 1024)
+        if name == "checkpoint":
+            owned = (any(marker_text in text for marker_text in markers[:2]) and
+                     all(marker_text in text for marker_text in markers[2:]))
+        else:
+            owned = all(marker_text in text for marker_text in markers)
+        if not owned:
+            raise ValueError(f"refusing to update unowned runtime helper: {path}")
+
+    for prefix in ("context_injector", "pattern_buffer"):
+        for name in RUNTIME_HELPERS:
+            if name in legacy_helpers and prefix == "context_injector":
+                continue
+            path = base / f"{prefix}_{harness}_{name}.py"
+            if path.exists() or path.is_symlink():
+                raise ValueError(f"refusing to update an incomplete {harness} runtime alias bundle")
+    return [alias, base / f"pattern_buffer_{harness}.py"]
 
 
 def owned_runtime_core(path, harness):
@@ -759,7 +797,8 @@ def current_context_budgets(root, gitdir, harness, session, agent="", binding=_B
             hashlib.sha256(raw.encode("utf-8")).hexdigest() != enrolled.source_sha256):
         raise ValueError("registered context file is missing, unsafe, or changed outside reviewed publication")
     content = sections_text(raw)
-    report = standing_context_budgets(root, source, harness, session, agent, origin, content)
+    report = standing_context_budgets(root, source, harness, session, agent, origin, content,
+                                      include_unassigned=role is None)
     return {
         "ok": all(budget.get("ok", False) for budget in report["roles"].values()),
         "worktree": str(root),
@@ -864,6 +903,12 @@ def list_owner_tasks(owner_cwd, status=None):
     return {"owner_worktree": str(owner_root), "tasks": tasks, "errors": errors}
 
 
+def preflight_dispatch_standing(root, source, harness, content):
+    # The native session is created by the harness, so reserve its exact UUID-sized header here.
+    render_standing(root, source, harness, "00000000-0000-4000-8000-000000000000", "",
+                    "implementer", "session assignment", content)
+
+
 def prepare_dispatch(root, gitdir, args):
     owner_root, owner_gitdir = checkout(args.owner_worktree)
     owner_config, source = load(owner_root, owner_gitdir)
@@ -909,6 +954,12 @@ def prepare_dispatch(root, gitdir, args):
                 "session_id": None, "brief_sha256": digest}
         atomic(path, json.dumps(data, indent=2))
     return task_id
+
+
+def preflight_dispatch_context(root, harness):
+    root, gitdir = checkout(root)
+    _config, source = load(root, gitdir)
+    preflight_dispatch_standing(root, source, harness, sections(source))
 
 
 def bind_dispatch(root, gitdir, harness, session, task_id):
@@ -1054,7 +1105,17 @@ def check_handoff_interpreter(harness, explicit=None):
     return executable
 
 
-def checkpoint_handoff_report(root, gitdir, harness, session, role):
+def checkpoint_handoff_report(root, gitdir, harness, session, role, role_source=None):
+    owner = {"worktree": str(root), "gitdir": str(gitdir), "harness": harness, "session": session}
+    if role is None and role_source is None:
+        command = shlex.join(["pattern-buffer", "--cwd", str(root), "checkpoint-status",
+                              "--harness", harness, "--session", session])
+        return {
+            "state": "unknown", "required": False, "owner": owner,
+            "ownership_verified": False,
+            "detail": "The exact-session role could not be resolved, so checkpoint ownership cannot be determined.",
+            "next_action": "Use this supported command from the exact owner session: " + command,
+        }
     if role != "orchestrator":
         return {
             "state": "not_applicable", "required": False,
@@ -1064,7 +1125,6 @@ def checkpoint_handoff_report(root, gitdir, harness, session, role):
         }
     helper = checkpoints()
     state_path = helper._state_path(gitdir, harness, session)
-    owner = {"worktree": str(root), "gitdir": str(gitdir), "harness": harness, "session": session}
     if state_path.is_symlink():
         return {"state": "invalid", "required": False, "owner": owner,
                 "detail": "The exact-session checkpoint metadata path is a symlink.",
@@ -1271,7 +1331,8 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
                                   "next_action": next_action}
 
     configuration_ready = all(check["ok"] for check in checks.values())
-    checkpoint = checkpoint_handoff_report(root, gitdir, harness, session, resolved_role.get("role"))
+    checkpoint = checkpoint_handoff_report(root, gitdir, harness, session, resolved_role.get("role"),
+                                           resolved_role.get("source"))
     native_binding = {
         "state": "unknown", "evidence_available": False,
         "detail": "A command-line session ID and settings file do not prove the live native session, worktree, hook loading or trust.",
@@ -1398,18 +1459,21 @@ def render_standing_details(root, source, harness, session, agent, role, origin,
     return header + selected, standing_budget(header, selected)
 
 
-def standing_context_budgets(root, source, harness, session, agent, origin, content):
+def standing_context_budgets(root, source, harness, session, agent, origin, content,
+                             include_unassigned=False):
     roles = {}
-    for role in ROLES:
+    selected_roles = ROLES + ((None,) if include_unassigned else ())
+    for role in selected_roles:
+        label = role or "unassigned"
         try:
             _text, budget = render_standing_details(root, source, harness, session, agent, role, origin, content)
             budget["detail"] = (
                 f"Header {budget['header_bytes']} bytes; content {budget['content_bytes']} / "
                 f"{budget['usable_content_bytes']} usable bytes; {budget['remaining_bytes']} bytes remaining."
             )
-            roles[role] = budget
+            roles[label] = budget
         except (OSError, ValueError, TypeError, UnicodeError) as error:
-            roles[role] = {"ok": False, "detail": str(error)}
+            roles[label] = {"ok": False, "detail": str(error)}
     return {"limit_bytes": LIMIT, "source": str(source), "roles": roles}
 
 
@@ -1434,7 +1498,7 @@ def context_validator(root, harness, session):
         errors = [f"{selected}: {budget['detail']}" for selected, budget in report["roles"].items()
                   if not budget["ok"]]
         if errors:
-            raise ValueError("standing context exceeds its exact rendered UTF-8 byte budget: " + "; ".join(errors))
+            raise ValueError("standing context validation failed: " + "; ".join(errors))
         return {"valid": True, "budgets": report}
     validate.last_report = None
     return validate
@@ -1974,8 +2038,7 @@ def main():
                 print(json.dumps({"task_id": task_id, "environment": {DISPATCH_ENV: task_id}}))
             else:
                 _, brief = read_task(root, gitdir, task_id)
-                # Preflight complete context size before the harness can do work.
-                render(root, args.harness, "dispatch-validation", forced_role="implementer")
+                preflight_dispatch_context(root, args.harness)
                 print(f"Pattern Buffer dispatch {task_id}; task retained for explicit update/finish.", file=sys.stderr, flush=True)
                 snapshot = task_path(gitdir, task_id).parent / f"{hashlib.sha256(brief.encode()).hexdigest()}.txt"
                 with snapshot.open("rb") as handle:

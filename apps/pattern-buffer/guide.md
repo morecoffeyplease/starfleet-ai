@@ -29,10 +29,9 @@ It contains the approved mission, authoritative tracker, assignment, durable rul
 Change it only within its approval requirements.
 
 **The checkpoint** is the current implementation snapshot for your future self.
-Keep the next action, active work, relevant decisions, worker or job identity, evidence links, uncertainty and human holds.
+Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
 Refresh it as a current snapshot and replace outdated state rather than appending.
 Remove completed work, superseded decisions and obsolete commands.
-Keep current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
 Link useful history instead of repeating it.
 A checkpoint does not change standing context or grant authority.
 

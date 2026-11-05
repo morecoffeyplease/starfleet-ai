@@ -10,7 +10,7 @@ Update it after a meaningful decision, worker result, verification outcome, bloc
 Batch related changes into one update; do not rewrite it after every tool call or unchanged feedback message.
 Refresh it as a current snapshot and replace outdated state rather than appending.
 Remove completed work, superseded decisions and obsolete commands.
-Keep current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
+Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
 Link useful history instead of repeating it.
 
 ## Pilot and installation authority
@@ -222,7 +222,7 @@ These are reminder-configuration percentages, not a guarantee of the exact nativ
 The configured token window can differ from actual boundary usage; idle, manual or early compaction can occur before a percentage reminder.
 Runtime Claude environment/telemetry takes precedence over enrollment fallback, and status identifies its source.
 A status-line display by itself does not prompt the model; an eligible conversational hook delivers the reminder.
-Pressure and idle reminders ask: "Refresh this as a current snapshot. Replace outdated state rather than append. Remove completed work, superseded decisions and obsolete commands. Keep current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds. Link useful history instead of repeating it."
+Pressure and idle reminders ask: "Refresh this as a current snapshot. Replace outdated state rather than append. Remove completed work, superseded decisions and obsolete commands. Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds. Link useful history instead of repeating it."
 Only an eligible verified pressure warning begins with "Take action immediately, compaction imminent." Enrollment, recovery, publication and ordinary checkpoint maintenance output stay neutral.
 The urgency line signals configured context pressure, not proof of exact native compaction timing or coverage of idle compaction.
 For an eligible pressure episode, the hook makes one bounded attention attempt through the installed Hailing Frequencies launcher when the canonical session UUID and current CMUX surface are available; Hailing Frequencies must already enroll the session and applies its own current binding and human-input guards.

@@ -364,6 +364,24 @@ class PatternBufferTests(unittest.TestCase):
         # The active implementer still fits; lint must catch the other role too.
         self.assertIn("implementer:", result.stdout)
 
+    def test_enrollment_validation_distinguishes_missing_role_section_from_oversize(self):
+        self.cli("init")
+        source = self.root.parent / "reviewed-context.md"
+        source.write_text("# shared\nApproved mission.\n")
+        missing = self.cli("session-enroll", "--harness", "codex", "--session", "validation-missing",
+                           "--context-file", str(source), "--role", "orchestrator", success=False)
+        self.assertIn("standing context validation failed", missing.stderr)
+        self.assertIn("missing section for assigned role: orchestrator", missing.stderr)
+        self.assertNotIn("exceeds its exact rendered UTF-8 byte budget", missing.stderr)
+
+        source.write_text("# shared\n" + "x" * 9000 +
+                          "\n# implementer\ny\n# orchestrator\nz\n")
+        oversized = self.cli("session-enroll", "--harness", "codex", "--session", "validation-oversized",
+                             "--context-file", str(source), "--role", "orchestrator", success=False)
+        self.assertIn("standing context validation failed", oversized.stderr)
+        self.assertIn("content", oversized.stderr)
+        self.assertRegex(oversized.stderr, r"-\d+ bytes remaining")
+
     def test_exact_budget_matches_render_for_both_harnesses_with_long_unicode_paths(self):
         long_root = self.root.parent / ("worktree-" + "x" * 96 + "é" * 55) / "nested" / "checkout"
         self.create_repo(long_root)
@@ -399,6 +417,73 @@ class PatternBufferTests(unittest.TestCase):
                 future_budget = validation["budgets"]["roles"]["orchestrator"]
                 self.assertEqual(future_budget["header_bytes"], len(future_header.encode("utf-8")))
                 self.assertNotEqual(future, source)
+
+    def test_unassigned_budget_validation_and_render_agree_for_both_harnesses(self):
+        self.cli("init")
+        source = self.root / ".context-injector/context.md"
+        session = "unassigned-budget-check"
+
+        for harness in ("codex", "claude"):
+            with self.subTest(harness=harness):
+                seed = "# shared\nseed\n# implementer\ny\n# orchestrator\nz\n"
+                content = ci.sections_text(seed)
+                assigned_header = ci.standing_parts(
+                    self.root.resolve(), source.resolve(), harness, session, "",
+                    "orchestrator", "unassigned", content)[0]
+                shared_bytes = ci.LIMIT - len(assigned_header.encode("utf-8")) - len("\n\nz".encode("utf-8"))
+                source.write_text("# shared\n" + "x" * shared_bytes +
+                                  "\n# implementer\ny\n# orchestrator\nz\n")
+                unassigned_header = ci.standing_parts(
+                    self.root.resolve(), source.resolve(), harness, session, "",
+                    None, "unassigned", ci.sections_text(source.read_text()))[0]
+                expected_unassigned_bytes = len(unassigned_header.encode("utf-8")) + shared_bytes
+
+                validation = self.cli("validate", "--harness", harness, "--session", session, success=False)
+                self.assertIn("implementer: 8191 / 8192 bytes", validation.stdout)
+                self.assertIn("orchestrator: 8192 / 8192 bytes", validation.stdout)
+                self.assertIn("unassigned:", validation.stderr)
+                self.assertIn("remaining", validation.stderr)
+                doctor = self.cli("doctor", "--harness", harness, "--session", session, success=False)
+                self.assertIn("unassigned:", doctor.stderr)
+
+                status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
+                budgets = status["standing_context_budgets"]
+                self.assertFalse(budgets["ok"])
+                self.assertEqual(set(budgets["roles"]), {"implementer", "orchestrator", "unassigned"})
+                self.assertFalse(budgets["roles"]["unassigned"]["ok"])
+                self.assertEqual(budgets["roles"]["unassigned"]["bytes_used"], expected_unassigned_bytes)
+
+                preview = self.cli("preview", "--harness", harness, "--session", session, success=False)
+                self.assertEqual(preview.stdout, "")
+                self.assertIn(f"unassigned context uses {expected_unassigned_bytes} / 8192 bytes", preview.stderr)
+
+    def test_enrolled_session_budgets_still_match_preview_for_both_harnesses(self):
+        self.cli("init")
+        source = self.root.parent / "approved-standing-context.md"
+        source.write_text("# shared\nApproved mission.\n# implementer\nImplement assigned work.\n"
+                          "# orchestrator\nPreserve current authority and holds.\n")
+        sessions = {
+            "codex": "11111111-1111-4111-8111-111111111111",
+            "claude": "22222222-2222-4222-8222-222222222222",
+        }
+
+        for harness, session in sessions.items():
+            with self.subTest(harness=harness):
+                enrolled = json.loads(self.cli(
+                    "session-enroll", "--harness", harness, "--session", session,
+                    "--context-file", str(source.resolve()), "--role", "orchestrator").stdout)
+                expected = enrolled["standing_context_budgets"]["roles"]["orchestrator"]["bytes_used"]
+                self.assertNotIn("unassigned", enrolled["standing_context_budgets"]["roles"])
+
+                preview = self.cli("preview", "--harness", harness, "--session", session)
+                self.assertEqual(len(preview.stdout.encode("utf-8")), expected)
+                status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
+                budgets = status["standing_context_budgets"]
+                self.assertEqual(budgets["role"], "orchestrator")
+                self.assertEqual(budgets["source"], enrolled["path"])
+                self.assertEqual(budgets["roles"]["orchestrator"]["bytes_used"], expected)
+                self.assertNotIn("unassigned", budgets["roles"])
+                self.cli("validate", "--harness", harness, "--session", session)
 
     def test_install_preflights_missing_helper_source_before_creating_settings_or_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -588,6 +673,9 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("binding could not be read", report["checks"]["resolved_role"]["detail"])
         self.assertFalse(report["checks"]["context"]["ok"])
         self.assertEqual(report["standing_context"]["enrollment_binding"]["state"], "unknown")
+        self.assertEqual(report["checkpoint"]["state"], "unknown")
+        self.assertFalse(report["checkpoint"]["required"])
+        self.assertIn("checkpoint-status", report["checkpoint"]["next_action"])
         self.assertFalse(report["configuration_ready"])
 
     def test_handoff_check_reports_existing_claude_idle_warning_disabled_without_changing_it(self):
@@ -634,6 +722,9 @@ else:
         self.assertFalse(report["configuration_ready"])
         self.assertFalse(report["checks"]["registration"]["ok"])
         self.assertIn("No Pattern Buffer registration", report["checks"]["registration"]["detail"])
+        self.assertEqual(report["checkpoint"]["state"], "unknown")
+        self.assertFalse(report["checkpoint"]["required"])
+        self.assertIn("checkpoint-status", report["checkpoint"]["next_action"])
 
         self.cli("init", "--default-role", "orchestrator")
         self.cli("disable")
@@ -649,6 +740,7 @@ else:
         self.assertFalse(report["checks"]["resolved_role"]["ok"])
         self.assertEqual(report["resolved_role"], {"role": "implementer", "source": "session assignment"})
         self.assertIn("expected orchestrator", report["checks"]["resolved_role"]["detail"])
+        self.assertEqual(report["checkpoint"]["state"], "not_applicable")
 
         self.assign("successor", "orchestrator")
         source = self.root / ".context-injector/context.md"
@@ -983,6 +1075,43 @@ else:
         self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
                  "--task-file", str(task_file), "--prepare-only", root=worker, success=False)
         self.assertFalse((worker / ".context-injector").exists())
+
+    def test_dispatch_preflights_uuid_session_assignment_budget_before_launch(self):
+        worker, task_file = self.implementer()
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        source = self.root / ".context-injector/context.md"
+        source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\nz\n")
+        session = "11111111-1111-4111-8111-111111111111"
+        content = ci.sections_text(source.read_text())
+        preview_header = ci.standing_parts(
+            worker.resolve(), source.resolve(), "codex", "dispatch-validation", "",
+            "implementer", "preview override", content)[0]
+        shared_bytes = ci.LIMIT - len(preview_header.encode("utf-8")) - len("\n\ny".encode("utf-8"))
+        source.write_text("# shared\n" + "x" * shared_bytes +
+                          "\n# implementer\ny\n# orchestrator\nz\n")
+        content = ci.sections_text(source.read_text())
+        old_text, old_budget = ci.render_standing_details(
+            worker.resolve(), source.resolve(), "codex", "dispatch-validation", "",
+            "implementer", "preview override", content)
+        self.assertEqual(len(old_text.encode("utf-8")), ci.LIMIT)
+        self.assertEqual(old_budget["bytes_used"], ci.LIMIT)
+        _actual_text, actual_budget = ci.render_standing_details(
+            worker.resolve(), source.resolve(), "codex", session, "",
+            "implementer", "session assignment", content)
+        self.assertEqual(actual_budget["bytes_used"] - ci.LIMIT, 19)
+
+        started = self.root.parent / "codex-started"
+        harness = self.root.parent / "codex"
+        harness.write_text("#!" + sys.executable + "\nfrom pathlib import Path\n" +
+                           f"Path({str(started)!r}).write_text('started')\n")
+        harness.chmod(0o700)
+        rejected = self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
+                            "--task-file", str(task_file), "--settings", str(settings), "--",
+                            str(harness), "exec", "-C", str(worker), "-", root=worker, success=False)
+        self.assertIn(f"{actual_budget['bytes_used']} / 8192 bytes", rejected.stderr)
+        self.assertFalse(started.exists())
+        self.assertTrue(self.registration(worker).exists())
 
     def test_dispatch_exec_preserves_path_shim_arguments_and_exact_stdin(self):
         worker, task_file = self.implementer("The exact original task.\n")
