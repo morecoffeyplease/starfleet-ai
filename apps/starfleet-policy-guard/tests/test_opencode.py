@@ -53,6 +53,9 @@ class OpenCodeTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
+    def checkout_state_path(self, checkout):
+        return Path(fixtures.lane_runtime.directory(checkout)) / 'state.json'
+
     def plan_and_install(self, event, checkout, seat_root):
         prefix = ['--cwd', checkout, '--session-root', seat_root]
         scope = ['--lane', '--host', 'fixture.invalid', '--owner-harness', 'opencode',
@@ -119,7 +122,7 @@ class OpenCodeTest(unittest.TestCase):
         for relative in ('opencode-plugin/index.ts', 'opencode-plugin/policy.js'):
             self.assertIn(relative, runtime_files)
             self.assertTrue((Path(parent_manifest['runtime']['path']) / relative).is_file())
-        parent_state = json.loads(self.f.checkout_state_path(self.f.repo).read_text())
+        parent_state = json.loads(self.checkout_state_path(self.f.repo).read_text())
         self.assertEqual(parent_state['source_versions'], fixtures.lane_runtime.source_versions('opencode'))
         self.assertEqual(fixtures.lane_runtime.source_pin_status(parent_state)['integrity'], 'intact')
 
@@ -136,7 +139,14 @@ class OpenCodeTest(unittest.TestCase):
         report = self.bridge(record_event, ['--cwd', self.f.repo, 'record', '--evidence', self.f.packet,
                                              '--format', 'json'])
         self.assertEqual(report.returncode, 0, report.stderr)
-        prior_receipt = json.loads(self.f.checkout_state_path(self.f.repo).read_text())['receipt']
+        prior_receipt = json.loads(self.checkout_state_path(self.f.repo).read_text())['receipt']
+
+        unattached_target = self.event(parent_id, tool='prime_directive_gh')
+        unattached = self.bridge(unattached_target, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready',
+            'https://fixture.invalid/other/repository/pull/902'], ok=False)
+        self.assertEqual(unattached.returncode, 2)
+        self.assertIn('requires an attached checkout', unattached.stderr)
+        self.assertFalse(self.f.forwarded.exists())
 
         approved = self.event(parent_id, tool='prime_directive_gh')
         forwarded = self.bridge(approved, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url])
@@ -168,7 +178,7 @@ class OpenCodeTest(unittest.TestCase):
             '--from-harness', 'opencode', '--from-session', parent_id, '--confirm-handoff'])
         self.assertEqual(transferred.returncode, 0, transferred.stderr)
         self.assertTrue(json.loads(transferred.stdout)['report_required'])
-        state_path = self.f.checkout_state_path(self.f.repo)
+        state_path = self.checkout_state_path(self.f.repo)
         state = json.loads(state_path.read_text())
         self.assertEqual(state['lane_owner']['session_id'], handoff_id)
         self.assertEqual(state['lane_owner']['session_parent_id'], parent_id)

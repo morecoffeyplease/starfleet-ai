@@ -2546,7 +2546,7 @@ def seat_action(seat_identifier, cwd, argv, *, event=None, published=False):
     return state, argv, True, probe
 
 
-def seat_gh(args):
+def seat_gh(args, *, require_coverage=False):
     argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
     _, action, probe = parse_action(argv)
     covered=bool(action and not action.get('exempt'))
@@ -2559,6 +2559,8 @@ def seat_gh(args):
                 trace(failed['root'], {'hook_event_name':'Adapter',
                       'session_id':lane_scope.native_identity()['session_id']}, action, probe, 'deny', str(error))
             raise
+        if require_coverage and (not checked or not state):
+            raise ValueError('The OpenCode GitHub tool requires an attached checkout and a fresh Policy Guard report before forwarding')
     else:
         state, forwarded, checked = None, argv, False
     if checked:
@@ -3630,30 +3632,28 @@ def opencode_bridge(args):
                 any(not isinstance(value,str) or '\0' in value for value in request['argv']):
             raise ValueError('OpenCode bridge request must contain a native tool event and string argv')
         event=request.get('native_event')
-        identity=lane_scope.native_identity(event=event)
-        tool=event.get('tool')
-        if tool not in ('prime_directive_manage','prime_directive_gh'):
-            raise ValueError('OpenCode bridge is available only to the native Prime Directive tools')
         nested=build_parser().parse_args(request['argv'])
-        if nested.action not in ('plan','install','discover','rebind-owner','status','coverage','registrations','record','gh'):
-            raise ValueError('OpenCode bridge request is outside the supported native Policy Guard operations')
-        if nested.action=='opencode' or nested.installation or nested.seat_id:
-            raise ValueError('OpenCode bridge does not accept nested bridges, legacy installations, or caller-selected seats')
-        if tool=='prime_directive_gh':
-            _,action,probe=parse_action(nested.argv[1:] if nested.argv[:1]==['--'] else nested.argv) \
-                if nested.action=='gh' else (None,None,False)
-            if (nested.action!='gh' or not action or action.get('exempt') or probe or
-                    action.get('action') not in ('ready','merge')):
-                raise ValueError('The OpenCode GitHub tool accepts only covered readiness or merge actions')
-        elif nested.action=='gh':
-            raise ValueError('Use the dedicated OpenCode GitHub tool for covered readiness and merge actions')
-        if nested.action in ('plan','install'):
-            if (not nested.lane or nested.owner_harness!='opencode' or
-                    nested.owner_session!=identity['session_id'] or not nested.session_root):
-                raise ValueError('OpenCode enrollment must use the actual session API identity and an explicit permanent seat')
-        with lane_scope.native_event_scope(event):
+        with lane_scope.native_event_scope(event) as identity:
+            tool=event['tool']
+            if nested.action not in ('plan','install','discover','rebind-owner','status','coverage','registrations','record','gh'):
+                raise ValueError('OpenCode bridge request is outside the supported native Policy Guard operations')
+            if nested.action=='opencode' or nested.installation or nested.seat_id:
+                raise ValueError('OpenCode bridge does not accept nested bridges, legacy installations, or caller-selected seats')
+            if tool=='prime_directive_gh':
+                _,action,probe=parse_action(nested.argv[1:] if nested.argv[:1]==['--'] else nested.argv) \
+                    if nested.action=='gh' else (None,None,False)
+                if (nested.action!='gh' or not action or action.get('exempt') or probe or
+                        action.get('action') not in ('ready','merge')):
+                    raise ValueError('The OpenCode GitHub tool accepts only covered readiness or merge actions')
+            elif nested.action=='gh':
+                raise ValueError('Use the dedicated OpenCode GitHub tool for covered readiness and merge actions')
+            if nested.action in ('plan','install'):
+                if (not nested.lane or nested.owner_harness!='opencode' or
+                        nested.owner_session!=identity['session_id'] or not nested.session_root):
+                    raise ValueError('OpenCode enrollment must use the actual session API identity and an explicit permanent seat')
             if nested.action=='gh':
                 nested.seat_id=selected_seat_id(nested)
+                return seat_gh(nested, require_coverage=True)
             return dispatch(nested)
     except Exception as error:
         print('starfleet-policy-guard delivery lane: ' + str(error), file=sys.stderr)
