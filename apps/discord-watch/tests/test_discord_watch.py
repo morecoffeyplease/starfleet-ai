@@ -280,6 +280,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertEqual(owner["session"], opencode_session)
         self.assertEqual(owner["harness"], "opencode")
         self.assertEqual(owner["expected_server_pid"], 12345)
+        self.assertEqual(owner["delivery_policy"], "native_empty_composer")
         self.assertEqual(self.register()["owner_session"], opencode_session)
         managed = self.app.managed(THREAD)
         self.assertTrue(managed["managed"])
@@ -315,6 +316,27 @@ class DiscordWatchTests(unittest.TestCase):
         os.environ.pop("OPENCODE_SESSION_ID", None)
         with self.assertRaisesRegex(ValueError, "OPENCODE_SESSION_ID"):
             self.app.current_owner(session_hint=opencode_session)
+
+    def test_binding_snapshot_normalizes_policy_only_for_opencode(self):
+        opencode_fields = {"api_url": "http://127.0.0.1:4096",
+                           "password_file": str(self.root / "password"),
+                           "expected_server_pid": 12345,
+                           "session_directory": str(self.root),
+                           "worktree_directory": str(self.root),
+                           "parent_task_id": "task:fixture"}
+        defaulted = self.app.binding_snapshot(target(session="ses_PolicyFixture", harness="opencode",
+                                                       **opencode_fields))
+        self.assertEqual(defaulted["delivery_policy"], "native_empty_composer")
+        explicit = self.app.binding_snapshot(target(session="ses_PolicyFixture", harness="opencode",
+                                                      delivery_policy="api_sidechannel", **opencode_fields))
+        self.assertEqual(explicit["delivery_policy"], "api_sidechannel")
+        with self.assertRaisesRegex(ValueError, "delivery policy"):
+            self.app.binding_snapshot(target(session="ses_PolicyFixture", harness="opencode",
+                                               delivery_policy="future_policy", **opencode_fields))
+
+        for harness in ("claude", "codex"):
+            snapshot = self.app.binding_snapshot(target(harness=harness, delivery_policy="api_sidechannel"))
+            self.assertNotIn("delivery_policy", snapshot)
 
     def _prepare_busy_opencode(self):
         session = "ses_DiscordWatchReceipt"
@@ -470,6 +492,57 @@ class DiscordWatchTests(unittest.TestCase):
             self.app.managed(THREAD, session_hint=session)
         settings["receiving"] = True
         self.assertTrue(self.app.managed(THREAD, session_hint=session)["managed"])
+
+    def test_opencode_policy_is_persisted_and_live_policy_change_holds(self):
+        session, _server, _hook, _write_hook, _current, _settings = self._prepare_busy_opencode()
+        self.targets[0]["delivery_policy"] = "api_sidechannel"
+        self._write_hailing()
+        self.app.register(THREAD, session_hint=session)
+        self.api.rows = [message("101", content="policy remains bound")]
+        self.app.scan()
+        with contextlib.closing(self.app.database(create=False)) as db:
+            original_json = db.execute("SELECT owner_json FROM threads WHERE thread_id=?", (THREAD,)).fetchone()[0]
+        original_owner = json.loads(original_json)
+        self.assertEqual(original_owner["delivery_policy"], "api_sidechannel")
+
+        self.targets[0]["delivery_policy"] = "native_empty_composer"
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "Registered owner is no longer enrolled"):
+            with contextlib.closing(self.app.database(create=False)) as db:
+                thread = self.app._thread(db, THREAD)
+            self.app.validate_registered_owner(thread["owner"])
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.managed(THREAD, session_hint=session)
+        with self.assertRaisesRegex(ValueError, "Only the registered current owner"):
+            self.app.close(THREAD, session_hint=session)
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.register(THREAD, session_hint=session)
+        report = self.app.scan(send=True)
+        self.assertIn("Registered owner is no longer enrolled", report["threads"][0]["wake_error"])
+        self.assertEqual(self.messages()[0][1:3], ("pending", 0))
+        with contextlib.closing(self.app.database(create=False)) as db:
+            stored_json = db.execute("SELECT owner_json FROM threads WHERE thread_id=?", (THREAD,)).fetchone()[0]
+        self.assertEqual(stored_json, original_json)
+
+    def test_legacy_opencode_owner_without_policy_fails_closed_without_rewrite(self):
+        session, _server, _hook, _write_hook, _current, _settings = self._prepare_busy_opencode()
+        self.app.register(THREAD, session_hint=session)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            raw_owner = json.loads(db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
+                                              (THREAD,)).fetchone()[0])
+            raw_owner.pop("delivery_policy")
+            with db:
+                db.execute("UPDATE threads SET owner_json=? WHERE thread_id=?",
+                           (json.dumps(raw_owner, separators=(",", ":")), THREAD))
+
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.managed(THREAD, session_hint=session)
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.register(THREAD, session_hint=session)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            stored_owner = json.loads(db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
+                                                 (THREAD,)).fetchone()[0])
+        self.assertNotIn("delivery_policy", stored_owner)
 
     def test_lifecycle_commands_reject_foreign_owner_and_preserve_existing_registration(self):
         self.register()

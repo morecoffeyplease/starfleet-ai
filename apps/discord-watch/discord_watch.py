@@ -392,7 +392,10 @@ class Watch:
             keys += ("api_url", "password_file", "expected_server_pid", "session_directory",
                      "worktree_directory", "parent_task_id")
         require(all(key in target for key in keys), "Hailing Frequencies owner binding is incomplete")
-        return {key: target[key] for key in keys}
+        snapshot = {key: target[key] for key in keys}
+        if target.get("harness") == "opencode":
+            snapshot["delivery_policy"] = hf.opencode_delivery_policy(target)
+        return snapshot
 
     def validate_registered_owner(self, target, verify=True):
         config = self.hailing_config()
