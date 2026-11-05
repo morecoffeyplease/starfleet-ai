@@ -14,9 +14,22 @@ python3 apps/starfleet-policy-guard/lane.py guide --print
 ```
 
 The guide documents the read-only plan, explicit install, checkout attachment, owner handoff, recovery and cleanup commands.
-Use the exact current native Claude or Codex session identity; never infer ownership from a title.
+Use the exact current native Claude or Codex session identity in those CLI flows; never infer ownership from a title.
 Installation preserves native trust requirements and existing settings outside the owned hook.
 It does not start a service or create GitHub records.
+
+## OpenCode 2.2.5 prototype
+
+The local prototype targets only the OpenCode 2.2.5 server plugin API and the dedicated `prime_directive_manage` and `prime_directive_gh` tools.
+The plugin binds identity from the actual server tool context and OpenCode session API result, including the exact session, parent, project and location.
+An `OPENCODE_SESSION_ID` environment value does not enroll a native owner.
+Configure the immutable plugin directory returned by `plan` or `install` as a local directory in the OpenCode `plugins` setting.
+The dedicated GitHub tool first requests OpenCode's native `shell` permission for the equivalent command resource, then checks the owner, checkout, PR, source and fresh report immediately before forwarding.
+Configured native asks and denies remain effective.
+Direct plain-shell `gh pr ready` and `gh pr merge` commands are refused.
+Wrapped commands, opaque shell syntax, alternate executables, scripts, APIs, web and other tools remain outside this bounded coverage.
+For setup and handoff details, use the printable guide.
+Source and fixture checks do not qualify a native OpenCode runtime or establish a public support claim.
 
 ## Report and delivery boundaries
 

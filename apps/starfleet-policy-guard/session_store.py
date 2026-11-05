@@ -18,6 +18,7 @@ SCHEMA = 1
 RUNTIME_FILES = (
     'lane.py', 'lane_scope.py', 'delivery.py', 'delivery_runs.py',
     'github_records.py', 'session_store.py', 'cleanup.py', 'guard.py', 'hook.sh',
+    'opencode-plugin/index.ts', 'opencode-plugin/policy.js',
     'config/delivery-checklist.json', 'config/default-policy.json',
     'examples/delivery-evidence.json', 'examples/delivery-design-audit.json',
     'guide.md', 'README.md',

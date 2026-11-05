@@ -134,9 +134,12 @@ def locked(cwd):
             session_store.save_seat(manifest)
 
 
-def source_versions():
-    return {name: delivery_runs.digest(APP / name) for name in
-            ('lane.py', 'lane_scope.py', 'delivery.py', 'delivery_runs.py', 'github_records.py', 'session_store.py', 'cleanup.py')}
+def source_versions(harness=None):
+    names = ['lane.py', 'lane_scope.py', 'delivery.py', 'delivery_runs.py',
+             'github_records.py', 'session_store.py', 'cleanup.py']
+    if harness == 'opencode':
+        names.extend(('opencode-plugin/index.ts', 'opencode-plugin/policy.js'))
+    return {name: delivery_runs.digest(APP / name) for name in names}
 
 
 def source_revision(runtime=None):
@@ -220,11 +223,21 @@ def source_pin_status(state):
     changed = []
     source_root = Path(source)
     for name, expected_hash in sorted(expected.items()):
-        if not isinstance(name, str) or Path(name).name != name or name in ('', '.', '..'):
+        relative = Path(name) if isinstance(name, str) else None
+        if (relative is None or not name or not relative.parts or relative.is_absolute() or '\\' in name or
+                any(part in ('.', '..') for part in relative.parts)):
             files[str(name)] = {'expected_sha256': expected_hash, 'actual_sha256': None, 'state': 'invalid-name'}
             changed.append(str(name))
             continue
-        path = source_root / name
+        path = source_root
+        symlinked = path.is_symlink()
+        for part in relative.parts:
+            path = path / part
+            symlinked = symlinked or path.is_symlink()
+        if symlinked:
+            files[name] = {'expected_sha256': expected_hash, 'actual_sha256': None, 'state': 'symlink'}
+            changed.append(name)
+            continue
         try:
             actual_hash = delivery_runs.digest(path)
         except FileNotFoundError:
@@ -248,7 +261,7 @@ def source_pin_status(state):
 
 def current_cli_status(state):
     installed = state.get('source_versions') if isinstance(state, dict) else None
-    current = source_versions()
+    current = source_versions((state or {}).get('lane_owner', {}).get('harness'))
     match = bool(isinstance(installed, dict) and installed == current)
     try:
         revision = delivery.value(APP, 'rev-parse', 'HEAD')
@@ -329,7 +342,7 @@ def require(state, cwd, event=None):
         check_lane_scope(state, cwd)
     if not active(state, cwd):
         raise ValueError(enrollment_help(cwd))
-    if state['source_versions'] != source_versions():
+    if state['source_versions'] != source_versions(state.get('lane_owner', {}).get('harness')):
         raise ValueError('Pinned delivery adapter source changed; restore the reviewed source')
     try:
         report=delivery_runs.check(state.get('receipt'),cwd,state['pr_url'])
@@ -372,7 +385,7 @@ def check_lane_identity(state, cwd):
 
 def check_lane_scope(state, cwd):
     check_lane_identity(state, cwd)
-    if state['source_versions']!=source_versions(): raise ValueError('Pinned delivery adapter source changed')
+    if state['source_versions']!=source_versions(state.get('lane_owner', {}).get('harness')): raise ValueError('Pinned delivery adapter source changed')
 
 
 def discover(cwd):
@@ -433,9 +446,12 @@ def rebind_owner(args):
             previous={'harness':seat['owner'].get('harness'),'session_id':seat['owner'].get('session_id')}
             if previous!={'harness':args.from_harness,'session_id':args.from_session}:
                 raise ValueError('Expected outgoing owner does not match the permanent seat; inspect status before handoff')
-            if identity==previous:
+            previous_context=copy.deepcopy(seat.get('owner_context',{}))
+            new_context=lane_scope.native_session_context()
+            if identity==previous and previous_context==new_context:
                 return {'rebound':False,'reason':'same native owner','history_preserved':True}
-            transition={'from':previous,'to':identity,'at':time.time(),
+            transition={'from':previous,'to':identity,'from_context':previous_context,
+                        'to_context':new_context,'at':time.time(),
                         'authority':'caller explicitly confirms an authorized handoff; not independently authenticated'}
             if seat.get('handoff_journal'):
                 raise ValueError('A previous owner handoff is incomplete; use recover --rollback before another transfer')
@@ -503,7 +519,11 @@ def rebind_owner(args):
                 pre_state=copy.deepcopy(state)
                 current_pr=pre_state.get('pr_url')
                 pre_state.setdefault('owner_history',[]).append(transition)
-                pre_state.setdefault('lane_owner',{}).update(identity)
+                owner=pre_state.setdefault('lane_owner',{})
+                for key in ('session_parent_id','session_project_id','session_directory'):
+                    owner.pop(key,None)
+                owner.update(identity)
+                owner.update(new_context)
                 bindings=lane_scope.expand(pre_state)
                 records={}
                 for binding in bindings:
@@ -544,6 +564,7 @@ def rebind_owner(args):
             seat=session_store.load_seat(identifier)
             seat.setdefault('owner_history',[]).append(transition)
             seat['owner']=identity
+            seat['owner_context']=new_context
             seat['groups']=target_groups
             seat['hooks_installed']=target_hooks_installed
             seat['settings']=target_settings
@@ -567,10 +588,18 @@ def rebind_owner(args):
         previous={k:state['lane_owner'][k] for k in ('harness','session_id')}
         if previous!={'harness':args.from_harness,'session_id':args.from_session}:
             raise ValueError('Expected outgoing owner does not match; inspect status before handoff')
-        if identity==previous: return {'rebound':False,'reason':'same native owner','history_preserved':True}
-        state.setdefault('owner_history',[]).append({'from':previous,'to':identity,'at':time.time(),
+        previous_context={key:state['lane_owner'].get(key) for key in
+                          ('session_parent_id','session_project_id','session_directory') if key in state['lane_owner']}
+        new_context=lane_scope.native_session_context()
+        if identity==previous and previous_context==new_context:
+            return {'rebound':False,'reason':'same native owner','history_preserved':True}
+        state.setdefault('owner_history',[]).append({'from':previous,'to':identity,
+                'from_context':previous_context,'to_context':new_context,'at':time.time(),
                 'authority':'caller explicitly confirms an authorized handoff; not independently authenticated'})
+        for key in ('session_parent_id','session_project_id','session_directory'):
+            state['lane_owner'].pop(key,None)
         state['lane_owner'].update(identity)
+        state['lane_owner'].update(new_context)
         # Keep reusable source verification artifacts, but require this owner to
         # record its own report rather than inheriting an execution receipt.
         bindings=lane_scope.expand(state)
@@ -680,7 +709,8 @@ def plan(args):
             seat=session_store.load_seat(previous['seat_id'])
             actual=lane_scope.native_identity()
             if not seat or seat.get('owner')!=actual or previous.get('lane_owner',{}).get('session_id')!=actual['session_id'] or \
-                    previous.get('lane_owner',{}).get('harness')!=actual['harness']:
+                    previous.get('lane_owner',{}).get('harness')!=actual['harness'] or \
+                    (actual['harness']=='opencode' and lane_scope.native_session_context()!=seat.get('owner_context')):
                 raise ValueError('Reattaching a recreated checkout requires the exact current seat owner')
             reattach_same_root=True
         else:
@@ -706,6 +736,9 @@ def plan(args):
         seat = session_store.seat_manifest(seat_identifier)
         if seat and seat.get('owner') != identity:
             raise ValueError('This permanent seat belongs to another native session. Use an explicitly authorized rebind-owner handoff.')
+        owner_context=lane_scope.native_session_context()
+        if identity['harness']=='opencode' and seat and seat.get('owner_context')!=owner_context:
+            raise ValueError('This permanent seat belongs to a different OpenCode session API project or location. Use an explicitly authorized rebind-owner handoff.')
         runtime = session_store.runtime_plan(APP)
         if seat and seat.get('runtime', {}).get('version') != runtime['version']:
             raise ValueError('The permanent seat has a different immutable runtime version. Use its supported source-upgrade or recovery path before attaching another checkout.')
@@ -715,6 +748,7 @@ def plan(args):
                           seat_root=str(owner),
                           product_gitdir=delivery.value(cwd,'rev-parse','--absolute-git-dir'),
                           seat_gitdir=delivery.value(owner,'rev-parse','--absolute-git-dir'))
+        lane_owner.update(lane_scope.native_session_context())
         ref={'url':None}
         if args.pr_url:
             ref, _ = remote_pr(cwd, args.pr_url, args.base_ref, args.head_branch)
@@ -761,6 +795,13 @@ def plan(args):
     adapter = str(session_store.seat_dir(seat_identifier) / 'bin/gh') if args.lane else str(directory(cwd) / 'bin/gh')
     adapter_body = adapter_script(cwd, seat_identifier=seat_identifier,
                                    runtime_cli=runtime_cli, real_gh=captured['path']) if args.lane else adapter_script(cwd)
+    if lane_owner and lane_owner['harness'] == 'opencode':
+        boundary = ('OpenCode 2.2.5 server plugin prototype, native permission assertion, and covered readiness/merge tool only; '
+                    'plain direct shell command segments are refused, while alternate APIs and opaque shell routes remain outside coverage')
+    elif manages_claude_hooks:
+        boundary = 'Claude lane-local delivery hooks and gh adapter only; no Git/Codex/CPU hooks or fix-round enrollment'
+    else:
+        boundary = 'Private seat delivery gh adapter only; no native hooks, resource hooks or fix-round enrollment'
     result = {'root': str(cwd), 'session_root': str(owner), 'branch': branch(cwd),
               'head_branch': args.head_branch or branch(cwd), 'pr_url': ref['url'], 'base_ref': args.base_ref,
               'settings': str(path), 'settings_sha256': hashlib.sha256(raw.encode()).hexdigest(),
@@ -772,16 +813,18 @@ def plan(args):
               'reattach_same_root':reattach_same_root,
               'real_gh': captured['path'], 'real_gh_identity':captured,
               'source': str(Path(runtime['path']) if args.lane else APP),
-              'source_revision': source_revision(runtime['version'] if runtime else None), 'source_versions': source_versions(),
+              'source_revision': source_revision(runtime['version'] if runtime else None),
+              'source_versions': source_versions(lane_owner.get('harness') if lane_owner else None),
               'adapter': adapter,
               'adapter_sha256': hashlib.sha256(adapter_body.encode()).hexdigest(),
-              'boundary': ('Claude lane-local delivery hooks and gh adapter only; no Git/Codex/CPU hooks or fix-round enrollment' if manages_claude_hooks else
-                           'Private seat delivery gh adapter only; no native hooks, resource hooks or fix-round enrollment')}
+              'boundary': boundary}
     if lane_owner:
         result.update(lane_owner=lane_owner,pr_bindings={},owner_history=[],seat_id=seat_identifier,
                       seat_dir=str(session_store.seat_dir(seat_identifier)),
                       checkout_id=session_store.checkout_id(cwd),runtime=runtime,
                       seat_runtime_path=runtime['path'])
+        if lane_owner['harness'] == 'opencode':
+            result['opencode_plugin_path'] = str(Path(runtime['path']) / 'opencode-plugin')
         if ref['url']:
             lane_scope.select_binding(result, {key: result[key] for key in (
                 'branch', 'head_branch', 'pr_url', 'base_ref')})
@@ -794,6 +837,8 @@ def install_seat(proposed):
     seat_location = session_store.seat_dir(seat_identifier)
     runtime = session_store.install_runtime(APP, proposed['runtime'])
     identity = {key: proposed['lane_owner'][key] for key in ('harness', 'session_id')}
+    owner_context = {key: proposed['lane_owner'][key] for key in
+                    ('session_parent_id', 'session_project_id', 'session_directory') if key in proposed['lane_owner']}
     with session_store.locked_seat(seat_identifier):
         seat = session_store.load_seat(seat_identifier)
         seat_preimage = copy.deepcopy(seat)
@@ -801,6 +846,8 @@ def install_seat(proposed):
         if seat:
             if seat['owner'] != identity:
                 raise ValueError('This permanent seat belongs to another native session; use an explicitly authorized handoff')
+            if identity['harness'] == 'opencode' and seat.get('owner_context') != owner_context:
+                raise ValueError('This permanent seat belongs to a different OpenCode session API project or location; use an explicitly authorized handoff')
             if seat.get('runtime', {}).get('version') != proposed['runtime']['version']:
                 raise ValueError('The seat runtime changed after planning; review a fresh source upgrade plan')
         else:
@@ -921,6 +968,7 @@ def install_seat(proposed):
         state['runtime'] = {'version': proposed['runtime']['version'], 'path': str(runtime),
                             'files': proposed['runtime']['files']}
         seat['groups'] = groups
+        seat['owner_context'] = owner_context
         seat['adapter'] = proposed['adapter']
         seat['adapter_sha256'] = proposed['adapter_sha256']
         seat['real_gh'] = proposed['real_gh_identity']
@@ -983,10 +1031,13 @@ def install_seat(proposed):
         cleanup_notice = 'Opportunistic cleanup was skipped: ' + str(error)
     return {'installed': True, 'adapter': proposed['adapter'], 'settings': proposed['settings'],
             'seat_id': seat_identifier, 'seat_runtime': str(runtime),
+            'opencode_plugin_path': (str(runtime / 'opencode-plugin')
+                                     if identity['harness'] == 'opencode' else None),
             'attached_checkouts': len(session_store.all_checkouts(seat_identifier)),
             'terminal_records_cleaned':cleaned, 'cleanup_notice':cleanup_notice,
             'history_notice': 'This checkout is attached to the durable seat ledger; existing per-PR history is retained. No manual count or receipt is inferred.',
             'activation': ('Verify the one installed hook and seat gh entrypoint in the actual Claude session; a file write is not proof of activation' if proposed['manages_claude_hooks'] else
+                           'Configure the returned immutable OpenCode plugin path, then verify its actual session and permission events' if identity['harness'] == 'opencode' else
                            'Use and verify the seat gh entrypoint explicitly; no native Codex hook was installed')}
 
 
@@ -1208,7 +1259,7 @@ def build_upgrade_plan(cwd):
     if delivery.value(APP, 'status', '--porcelain'):
         raise ValueError('Commit the new installer source, then review a fresh upgrade plan')
     new_revision = delivery.value(APP, 'rev-parse', 'HEAD')
-    new_versions = source_versions()
+    new_versions = source_versions(state.get('lane_owner', {}).get('harness'))
     old_pin = source_pin_status(state)
     if old_pin['integrity'] != 'intact':
         raise ValueError('Installed source pin is ' + old_pin['integrity'] +
@@ -1871,7 +1922,7 @@ def record(args):
                 raise ValueError('Lane owner or PR binding changed during report preparation; retry as the current owner')
         if not active(state, args.cwd):
             raise ValueError(enrollment_help(args.cwd))
-        if state['source_versions'] != source_versions():
+        if state['source_versions'] != source_versions(state.get('lane_owner', {}).get('harness')):
             raise ValueError('Pinned source changed')
         receipt = delivery_runs.run(args.cwd, state['base_ref'], state['pr_url'], args.evidence, args.policy)
         if state.get('receipt'):
@@ -2028,9 +2079,16 @@ def status(cwd, session_id=None, state=None):
         try:
             actual_owner = lane_scope.native_identity()
             mismatch = actual_owner != {key: owner.get(key) for key in ('harness', 'session_id')}
+            if actual_owner.get('harness')=='opencode':
+                mismatch = mismatch or lane_scope.native_session_context() != {
+                    key: owner.get(key) for key in ('session_parent_id','session_project_id','session_directory')}
             current_owner = {'state': 'mismatch' if mismatch else 'matches', 'mismatch': mismatch,
                              'expected': {key: owner.get(key) for key in ('harness', 'session_id')},
-                             'actual': actual_owner}
+                             'expected_context': {key: owner.get(key) for key in
+                                                  ('session_parent_id','session_project_id','session_directory')
+                                                  if key in owner},
+                             'actual': actual_owner,
+                             'actual_context': lane_scope.native_session_context()}
         except ValueError as error:
             current_owner = {'state': 'unavailable', 'mismatch': None, 'reason': str(error),
                              'expected': {key: owner.get(key) for key in ('harness', 'session_id')}}
@@ -2131,10 +2189,13 @@ def seat_status(identifier):
         raise ValueError('Permanent Policy Guard seat registry is missing; preserve history and use recover --inspect')
     try:
         actual=lane_scope.native_identity()
-        owner_matches=actual==seat.get('owner')
+        actual_context=lane_scope.native_session_context()
+        owner_matches=(actual==seat.get('owner') and
+                       (actual.get('harness')!='opencode' or actual_context==seat.get('owner_context',{})))
         identity_error=None
     except ValueError as error:
         actual=None
+        actual_context={}
         owner_matches=False
         identity_error=str(error)
     runtime=seat.get('runtime',{})
@@ -2168,7 +2229,8 @@ def seat_status(identifier):
                 ({state['pr_url']} if state.get('pr_url') else set())),
             'last_updated_at':state.get('updated_at')})
     return {'seat_id':identifier,'seat_root':seat['seat_root'],'owner':seat['owner'],
-        'actual_native_identity':actual,'owner_matches':owner_matches,'identity_error':identity_error,
+        'owner_context':seat.get('owner_context',{}),'actual_native_identity':actual,
+        'actual_session_context':actual_context,'owner_matches':owner_matches,'identity_error':identity_error,
         'hooks_installed':bool(seat.get('hooks_installed')),'adapter':seat.get('adapter'),
         'adapter_state':adapter_state,'runtime':{'version':runtime.get('version'),
             'path':str(runtime_path),'files':runtime_files},'checkouts':checkouts,
@@ -2387,6 +2449,8 @@ def seat_action(seat_identifier, cwd, argv, *, event=None, published=False):
     actual = lane_scope.native_identity(event=event)
     if actual != seat.get('owner'):
         raise ValueError('This Policy Guard seat belongs to another native session. Use an explicitly authorized rebind-owner handoff.')
+    if actual['harness']=='opencode' and lane_scope.native_session_context(event)!=seat.get('owner_context',{}):
+        raise ValueError('This Policy Guard seat belongs to a different OpenCode session API project or location. Use an explicitly authorized rebind-owner handoff.')
     if seat.get('install_journal') or seat.get('migration_journal') or seat.get('handoff_journal'):
         raise ValueError('Policy Guard seat installation or migration is incomplete; preserve the journal and use recover --inspect')
     attached, current_root, current_repo, checkout = seat_repository(seat, cwd, action)
@@ -2674,7 +2738,7 @@ def trace(cwd, event, action, probe, outcome, reason):
            'installation_at': state.get('installed_at'),
            'activation_generation': state.get('activation_generation'),
            'source_path': str(APP),
-           'source_versions': source_versions()}
+           'source_versions': source_versions(state.get('lane_owner', {}).get('harness'))}
     # One append preserves concurrent event boundaries; never log full commands or approval content.
     fd = os.open(path, os.O_APPEND | os.O_WRONLY | os.O_CREAT, 0o600)
     try:
@@ -2872,7 +2936,8 @@ def migration_plan(args):
     migrated.update(seat_id=identifier, checkout_id=session_store.checkout_id(product),
                     seat_dir=str(session_store.seat_dir(identifier)), session_root=str(seat_root),
                     lane_owner=lane_owner, source=str(Path(runtime['path'])),
-                    source_revision=source_revision(runtime['version']), source_versions=source_versions(),
+                    source_revision=source_revision(runtime['version']),
+                    source_versions=source_versions(identity['harness']),
                     adapter=str(session_store.seat_dir(identifier) / 'bin/gh'),
                     adapter_sha256=hashlib.sha256(adapter_script(product, seat_identifier=identifier,
                         runtime_cli=runtime_cli,real_gh=real_gh['path']).encode()).hexdigest(), real_gh=real_gh['path'],
@@ -3387,7 +3452,7 @@ def selected_seat_id(args):
     raise ValueError('Use an attached product checkout or pass --seat-id for the permanent orchestrator seat')
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cwd', type=Path, default=Path.cwd())
     parser.add_argument('--installation', type=Path, help=argparse.SUPPRESS)
@@ -3401,7 +3466,7 @@ def main():
         p.add_argument('--pr-url')
         p.add_argument('--base-ref')
         p.add_argument('--lane', action='store_true', help='Enroll this product and native owner, optionally binding an explicit PR')
-        p.add_argument('--owner-harness',choices=('claude','codex'))
+        p.add_argument('--owner-harness',choices=('claude','codex','opencode'))
         p.add_argument('--owner-session')
         p.add_argument('--host',default='github.com')
         p.add_argument('--head-branch', help='Explicit published head-branch mapping when different from the local branch')
@@ -3415,7 +3480,7 @@ def main():
                    help='Explicitly restore the previous source pin and owned files')
     sub.add_parser('discover',help='Read the published PR for this enrolled product branch and preserve per-PR report history')
     p = sub.add_parser('rebind-owner',help='Explicitly authorized native-session handoff; no implicit inheritance')
-    p.add_argument('--from-harness',choices=('claude','codex'),required=True)
+    p.add_argument('--from-harness',choices=('claude','codex','opencode'),required=True)
     p.add_argument('--from-session',required=True)
     p.add_argument('--confirm-handoff',action='store_true',required=True)
     p = sub.add_parser('status', help='Inspect local binding, owner, report freshness and activation observations')
@@ -3446,6 +3511,7 @@ def main():
     recovery_modes.add_argument('--apply', action='store_true')
     recovery_modes.add_argument('--rollback', action='store_true')
     p.add_argument('--plan-sha256')
+    sub.add_parser('opencode', help=argparse.SUPPRESS)
     p = sub.add_parser('migrate-plan', help='Review an existing Gitdir installation for durable seat migration')
     p.add_argument('--session-root', type=Path)
     p.add_argument('--host', default='github.com')
@@ -3473,7 +3539,10 @@ def main():
     p.add_argument('--pr-url',required=True)
     p = sub.add_parser('unpin', help='Remove a local PR retention pin')
     p.add_argument('--pr-url',required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def dispatch(args):
     try:
         if args.action == 'plan':
             print(json.dumps(plan(args), indent=2))
@@ -3552,6 +3621,50 @@ def main():
     except Exception as error:
         print('starfleet-policy-guard delivery lane: ' + str(error), file=sys.stderr)
         return 2
+
+
+def opencode_bridge(args):
+    try:
+        request=json.load(sys.stdin)
+        if not isinstance(request,dict) or not isinstance(request.get('argv'),list) or \
+                any(not isinstance(value,str) or '\0' in value for value in request['argv']):
+            raise ValueError('OpenCode bridge request must contain a native tool event and string argv')
+        event=request.get('native_event')
+        identity=lane_scope.native_identity(event=event)
+        tool=event.get('tool')
+        if tool not in ('prime_directive_manage','prime_directive_gh'):
+            raise ValueError('OpenCode bridge is available only to the native Prime Directive tools')
+        nested=build_parser().parse_args(request['argv'])
+        if nested.action not in ('plan','install','discover','rebind-owner','status','coverage','registrations','record','gh'):
+            raise ValueError('OpenCode bridge request is outside the supported native Policy Guard operations')
+        if nested.action=='opencode' or nested.installation or nested.seat_id:
+            raise ValueError('OpenCode bridge does not accept nested bridges, legacy installations, or caller-selected seats')
+        if tool=='prime_directive_gh':
+            _,action,probe=parse_action(nested.argv[1:] if nested.argv[:1]==['--'] else nested.argv) \
+                if nested.action=='gh' else (None,None,False)
+            if (nested.action!='gh' or not action or action.get('exempt') or probe or
+                    action.get('action') not in ('ready','merge')):
+                raise ValueError('The OpenCode GitHub tool accepts only covered readiness or merge actions')
+        elif nested.action=='gh':
+            raise ValueError('Use the dedicated OpenCode GitHub tool for covered readiness and merge actions')
+        if nested.action in ('plan','install'):
+            if (not nested.lane or nested.owner_harness!='opencode' or
+                    nested.owner_session!=identity['session_id'] or not nested.session_root):
+                raise ValueError('OpenCode enrollment must use the actual session API identity and an explicit permanent seat')
+        with lane_scope.native_event_scope(event):
+            if nested.action=='gh':
+                nested.seat_id=selected_seat_id(nested)
+            return dispatch(nested)
+    except Exception as error:
+        print('starfleet-policy-guard delivery lane: ' + str(error), file=sys.stderr)
+        return 2
+
+
+def main(argv=None):
+    args=build_parser().parse_args(argv)
+    if args.action=='opencode':
+        return opencode_bridge(args)
+    return dispatch(args)
 
 
 if __name__ == '__main__':

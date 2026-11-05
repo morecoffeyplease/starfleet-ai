@@ -8,7 +8,8 @@ It does not run audits or verification, classify prompts, grant readiness author
 
 Use Python 3.10 or later, Git, and the GitHub CLI `gh` on PATH.
 Use a clean Starfleet source checkout for the first reviewed installation.
-The owner harness and session ID must come from the actual Claude or Codex runtime.
+The owner harness and session ID must come from the actual Claude or Codex runtime, or from the OpenCode server plugin context described below.
+The OpenCode prototype targets only version 2.2.5 and its server plugin API.
 
 ## Install one seat and attach a checkout
 
@@ -39,6 +40,41 @@ Use `codex` in those commands for a Codex owner.
 Each later attachment reuses the seat hook and entrypoint and adds only checkout data.
 Use `discover` from an attached product checkout after publishing its real PR; covered seat `gh` actions also discover the current branch's published PR before gating.
 The plan and install commands do not create a PR, fetch, change branches, run checks, or update GitHub records.
+
+## OpenCode 2.2.5 prototype server plugin
+
+This prototype targets the server plugin tools from an actual OpenCode 2.2.5 server session.
+For the first enrollment, configure the clean committed source checkout's `opencode-plugin` directory in the project's `opencode.jsonc` or the intended OpenCode config:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["/CLEAN/SOURCE/apps/starfleet-policy-guard/opencode-plugin"]
+}
+```
+
+OpenCode local plugin entries must point to a directory; the plugin loader finds `index.ts` inside that directory.
+Use the `prime_directive_manage` tool with `operation: "plan"`, the product checkout, and permanent seat root.
+Review the plan and its exact `plan_sha256`, then use `operation: "install"` with that same hash.
+The install result returns an immutable `opencode_plugin_path` directory under the seat runtime.
+Configure that returned directory for later sessions and restart or reload the OpenCode server as needed for its config loader.
+Use the same actual OpenCode session and session API project/location for later seat operations.
+
+The plugin reads `sessionID`, agent, message ID and call ID from the actual server tool context, then calls the OpenCode session API for the session's exact ID, parent ID, project ID and location directory.
+The `OPENCODE_SESSION_ID` shell environment variable is not an owner identity and cannot enroll a seat.
+The native server plugin is the supported caller of the internal `lane.py opencode` bridge; manually supplied bridge JSON and arbitrary local scripts remain outside this coverage.
+The root session and every child session are distinct owners, and a child does not inherit a parent's seat.
+Use `prime_directive_manage` with `operation: "rebind-owner"` from the incoming actual session for an explicit owner-authorized handoff.
+The handoff preserves seat and PR history, archives the old owner's receipt, and requires a new report from the incoming owner.
+
+Use `prime_directive_gh` only for supported `ready` and `merge` actions.
+It asks OpenCode for the native `shell` permission using the equivalent plain `gh pr ready` or `gh pr merge` resource before Policy Guard checks the owner, checkout, branch, PR, source and fresh report immediately before forwarding.
+An OpenCode native `ask` still waits for the operator, and a configured native `deny` remains final.
+The plugin refuses plain `gh pr ready` and `gh pr merge` command segments at the start of a shell command or after a command-list operator before shell execution.
+Wrapped commands, opaque shell syntax, alternate executables, scripts, API and web requests, MCP tools and external processes remain outside this bounded coverage.
+This does not claim an arbitrary shell sandbox or complete interception of every GitHub delivery route.
+The plugin source and local fixtures alone do not prove that a native OpenCode server loaded the plugin or preserved a real user's permission decision.
+Do not claim OpenCode support qualification until the actual native pilot and Policy Guard owner acceptance are complete.
 
 Codex currently uses the seat's explicit `gh` entrypoint for covered readiness and merge actions.
 Claude's installed hook covers the supported direct `gh pr ready` and `gh pr merge` command forms in attached repositories.
