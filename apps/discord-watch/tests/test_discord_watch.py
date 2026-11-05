@@ -1275,8 +1275,8 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertEqual(status["attempts"][1]["state"], "uncertain")
 
         self.targets.append(target("33333333-3333-4333-8333-333333333333",
-                                   "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-                                   "ffffffff-ffff-4fff-8fff-ffffffffffff"))
+                                   "EEEEEEEE-EEEE-4EEE-8EEE-EEEEEEEEEEEE",
+                                   "FFFFFFFF-FFFF-4FFF-8FFF-FFFFFFFFFFFF"))
         self._write_hailing()
         owner_c = self.app.binding_snapshot(self.targets[2])
         os.environ["CMUX_SURFACE_ID"] = owner_c["surface"]
