@@ -2761,7 +2761,7 @@ def migration_settings_change(path, remove_groups, add_groups):
         raise ValueError('Unsupported existing Claude settings shape during migration')
     updated = copy.deepcopy(value)
     hooks = updated.setdefault('hooks', {})
-    for event in set(remove_groups) | set(add_groups):
+    for event in sorted(set(remove_groups) | set(add_groups)):
         if not isinstance(hooks.get(event, []), list):
             raise ValueError('Existing hook groups must be lists')
         groups = hooks.setdefault(event, [])
@@ -2938,7 +2938,7 @@ def migrate_legacy(args):
                  'legacy_adapter_mode':Path(proposed['legacy_adapter']).stat().st_mode & 0o777
                     if proposed['legacy_adapter_text'] is not None else None,
                  'settings_changes':proposed['settings_changes'],
-                 'seat_preimage':seat,'new_state_path':str(session_store.seat_dir(identifier)/'checkouts'/
+                 'seat_preimage':copy.deepcopy(seat),'new_state_path':str(session_store.seat_dir(identifier)/'checkouts'/
                     session_store.checkout_id(proposed['migrated_state']['root'])/'state.json'),
                  'new_adapter_path':proposed['migrated_state']['adapter'],
                  'new_adapter_sha256':proposed['migrated_state']['adapter_sha256'],
