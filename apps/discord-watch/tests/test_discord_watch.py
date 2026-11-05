@@ -184,7 +184,8 @@ class DiscordWatchTests(unittest.TestCase):
     def thread_lifecycle(self):
         with contextlib.closing(self.app.database(create=False)) as db:
             return db.execute("SELECT is_open,subscription_state,last_activity_at,remote_closed,cursor,"
-                              "catchup_before,catchup_max FROM threads WHERE thread_id=?", (THREAD,)).fetchone()
+                              "catchup_before,catchup_max,initial_cutoff FROM threads WHERE thread_id=?",
+                              (THREAD,)).fetchone()
 
     def test_legacy_closed_registration_migrates_without_losing_durable_state(self):
         self.state.mkdir(mode=0o700)
@@ -236,24 +237,35 @@ class DiscordWatchTests(unittest.TestCase):
             thread = migrated.execute(
                 "SELECT owner_json,cursor,is_open,registered_at,updated_at,last_poll_at,next_poll_at,"
                 "catchup_before,catchup_max,last_error_json,owner_generation,subscription_state,"
-                "last_activity_at,remote_closed FROM threads WHERE thread_id=?", (THREAD,)).fetchone()
+                "last_activity_at,remote_closed,initial_cutoff FROM threads WHERE thread_id=?",
+                (THREAD,)).fetchone()
             messages = migrated.execute(
                 "SELECT message_id,body,attachments_json,state,wake_attempts,last_wake_at,submitted_at,"
                 "received_at,last_error_json FROM messages WHERE thread_id=? ORDER BY message_id", (THREAD,)).fetchall()
         self.assertEqual(thread[:11], (owner_json, "150", 0, TEST_NOW - 500, TEST_NOW - 10,
                                        TEST_NOW - 20, TEST_NOW + 5, "180", "220",
                                        json.dumps({"error": "preserved"}), 4))
-        self.assertEqual(thread[11:], ("active", TEST_NOW - 25, 1))
+        self.assertEqual(thread[11:], ("active", TEST_NOW - 25, 1, "150"))
         self.assertEqual(messages[0][0:4], ("151", "already received", "[]", "received"))
         self.assertEqual(messages[1][0:5], ("152", "uncertain body", attachments, "uncertain", 2))
         self.assertEqual(messages[1][5:8], (TEST_NOW - 20, None, None))
         self.assertEqual(json.loads(messages[1][8]), {"uncertain": "preserved"})
         self.api.fail = dw.DiscordAPIError(403, "synthetic migrated-thread probe", code=50001)
         report = self.app.scan()
+        self.assertEqual(report["threads"][0]["status"], "backoff")
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.thread_lifecycle()[4:], ("150", "180", "220", "150"))
+        self.clock[0] = TEST_NOW + 5
+        report = self.app.scan()
         self.assertEqual(report["threads"][0]["status"], "error")
         self.assertEqual(self.api.calls[0][0], f"/channels/{THREAD}")
-        self.assertEqual(self.thread_lifecycle()[4:], ("150", "180", "220"))
+        self.assertEqual(self.thread_lifecycle()[4:], ("150", "180", "220", "150"))
         self.assertEqual([row[1] for row in self.messages()], ["received", "uncertain"])
+        activity_before_replay = self.thread_lifecycle()[2]
+        replay = message("149", timestamp=timestamp_at(self.clock[0] + 100))
+        self.assertFalse(self.app.ingest_gateway_message(THREAD, replay)["ingested"])
+        self.assertEqual(self.thread_lifecycle()[2], activity_before_replay)
+        self.assertEqual([row[0] for row in self.messages()], ["151", "152"])
 
     def test_poll_and_retry_bookkeeping_do_not_refresh_meaningful_activity(self):
         self.register()
@@ -283,33 +295,35 @@ class DiscordWatchTests(unittest.TestCase):
         self.register(after="150")
         with contextlib.closing(self.app.database(create=False)) as db:
             with db:
-                db.execute("UPDATE threads SET catchup_before='175',catchup_max='190' WHERE thread_id=?",
+                db.execute("UPDATE threads SET cursor='180',catchup_before='185',catchup_max='190' "
+                           "WHERE thread_id=?",
                            (THREAD,))
         first_at = TEST_NOW + 24 * 60 * 60
         self.clock[0] = first_at
-        first = message("160", timestamp=timestamp_at(first_at))
+        first = message("170", timestamp=timestamp_at(first_at))
         self.assertTrue(self.app.ingest_gateway_message(THREAD, first)["ingested"])
-        self.assertEqual(self.thread_lifecycle()[4:], ("150", "175", "190"))
+        self.assertEqual(self.thread_lifecycle()[4:], ("180", "185", "190", "150"))
         self.assertEqual(self.thread_lifecycle()[2], first_at)
 
-        replay = message("160", timestamp=timestamp_at(first_at + 5 * 24 * 60 * 60))
+        replay = message("170", timestamp=timestamp_at(first_at + 5 * 24 * 60 * 60))
         self.assertFalse(self.app.ingest_gateway_message(THREAD, replay)["ingested"])
-        older = message("149", timestamp=timestamp_at(first_at - 24 * 60 * 60))
+        older = message("160", timestamp=timestamp_at(first_at - 24 * 60 * 60))
         self.assertTrue(self.app.ingest_gateway_message(THREAD, older)["ingested"])
         self.assertEqual(self.thread_lifecycle()[2], first_at)
-        self.assertEqual(self.thread_cursor(), "150")
-        self.assertEqual([row[0] for row in self.messages()], ["149", "160"])
+        self.assertEqual(self.thread_cursor(), "180")
+        self.assertEqual([row[0] for row in self.messages()], ["160", "170"])
 
         second_at = first_at + 6 * 24 * 60 * 60
         self.clock[0] = second_at
-        second = message("170", timestamp=timestamp_at(second_at))
+        second = message("175", timestamp=timestamp_at(second_at))
         self.assertTrue(self.app.ingest_gateway_message(THREAD, second)["ingested"])
         self.assertEqual(self.thread_lifecycle()[2], second_at)
         restarted = FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
                               cmux=self.cmux, now=self.clock)
         self.app = restarted
         self.assertEqual(self.thread_lifecycle()[2], second_at)
-        self.assertEqual([row[0] for row in self.messages()], ["149", "160", "170"])
+        self.assertEqual(self.thread_lifecycle()[7], "150")
+        self.assertEqual([row[0] for row in self.messages()], ["160", "170", "175"])
         self.clock[0] = second_at + dw.DORMANT_AFTER
         self.app.scan()
         self.assertEqual(self.thread_lifecycle()[1], "active")
@@ -324,9 +338,15 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertFalse(filtered["ingested"])
         with self.assertRaisesRegex(ValueError, "not registered"):
             self.app.ingest_gateway_message("999", message("102"))
+        mismatched = message("102")
+        mismatched["channel_id"] = "200"
+        with self.assertRaisesRegex(ValueError, "channel ID does not match"):
+            self.app.ingest_gateway_message(THREAD, mismatched)
+        self.assertEqual(self.messages(), [])
         url = "https://cdn.discordapp.com/attachments/100/103/late.png"
         gateway_event = message("103", content="gateway body",
                                 attachments=[{"filename": "late.png", "url": url}])
+        gateway_event["channel_id"] = THREAD
         received = self.app.ingest_gateway_message(THREAD, gateway_event)
         self.assertTrue(received["ingested"])
         self.assertFalse(received["rest_cursor_advanced"])
@@ -339,6 +359,75 @@ class DiscordWatchTests(unittest.TestCase):
         self.app.receive(THREAD, "103", output)
         self.assertIn("gateway body", output.getvalue())
         self.assertIn("[attachment] late.png: " + url, output.getvalue())
+
+    def test_rest_channel_mismatch_rolls_back_message_and_cursor_page(self):
+        self.register()
+        mismatched = message("101")
+        mismatched["channel_id"] = "200"
+        self.api.rows = [mismatched]
+        report = self.app.scan()
+        self.assertEqual(report["threads"][0]["status"], "error")
+        self.assertEqual(self.thread_cursor(), THREAD)
+        self.assertEqual(self.messages(), [])
+        self.assertIsNone(self.thread_lifecycle()[2])
+
+        self.clock[0] += dw.POLL_INTERVAL + 1
+        matching = message("101")
+        matching["channel_id"] = THREAD
+        self.api.rows = [matching]
+        report = self.app.scan()
+        self.assertEqual(report["threads"][0]["status"], "polled")
+        self.assertEqual(self.thread_cursor(), "101")
+        self.assertEqual([row[0] for row in self.messages()], ["101"])
+
+    def test_gateway_cutoff_ignores_handled_replay_but_accepts_later_out_of_order_event(self):
+        self.register(after="150")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE threads SET cursor='200' WHERE thread_id=?", (THREAD,))
+        self.clock[0] = TEST_NOW + dw.DORMANT_AFTER + 1
+        handled_replay = message("149", timestamp=timestamp_at(self.clock[0]))
+        ignored = self.app.ingest_gateway_message(THREAD, handled_replay)
+        self.assertFalse(ignored["ingested"])
+        self.assertEqual(self.thread_lifecycle()[1:3], ("dormant", None))
+        self.assertEqual(self.messages(), [])
+
+        fresh_at = self.clock[0]
+        later_out_of_order = message("175", timestamp=timestamp_at(fresh_at))
+        accepted = self.app.ingest_gateway_message(THREAD, later_out_of_order)
+        self.assertTrue(accepted["ingested"])
+        self.assertEqual(self.thread_lifecycle()[1:3], ("active", fresh_at))
+        self.assertEqual(self.thread_lifecycle()[4], "200")
+        self.assertEqual(self.thread_lifecycle()[7], "150")
+        self.assertEqual([row[0] for row in self.messages()], ["175"])
+
+    def test_new_gateway_reply_reactivates_dormancy_and_starts_a_fresh_window_again(self):
+        self.register()
+        self.clock[0] = TEST_NOW + dw.DORMANT_AFTER + 1
+        self.app.scan()
+        self.assertEqual(self.thread_lifecycle()[1], "dormant")
+
+        first_at = self.clock[0]
+        first = message("101", timestamp=timestamp_at(first_at))
+        self.assertTrue(self.app.ingest_gateway_message(THREAD, first)["ingested"])
+        self.assertEqual(self.thread_lifecycle()[1:3], ("active", first_at))
+        self.clock[0] = first_at + dw.DORMANT_AFTER
+        self.app.scan()
+        self.assertEqual(self.thread_lifecycle()[1], "active")
+        self.clock[0] += 1
+        self.app.scan()
+        self.assertEqual(self.thread_lifecycle()[1], "dormant")
+
+        second_at = self.clock[0]
+        second = message("102", timestamp=timestamp_at(second_at))
+        self.assertTrue(self.app.ingest_gateway_message(THREAD, second)["ingested"])
+        self.assertEqual(self.thread_lifecycle()[1:3], ("active", second_at))
+        self.clock[0] = second_at + dw.DORMANT_AFTER
+        self.app.scan()
+        self.assertEqual(self.thread_lifecycle()[1], "active")
+        self.clock[0] += 1
+        self.app.scan()
+        self.assertEqual(self.thread_lifecycle()[1], "dormant")
 
     def test_dormant_pending_reply_skips_rest_and_still_uses_exact_owner_guard(self):
         self.register()
@@ -378,6 +467,7 @@ class DiscordWatchTests(unittest.TestCase):
         result = self.register()
         self.assertEqual(result["cursor"], THREAD)
         self.assertEqual(result["cursor_source"], "thread-created")
+        self.assertEqual(self.thread_lifecycle()[7], THREAD)
         self.targets[0]["label"] = "renamed harmlessly"
         self.targets[0]["cutoff"] = 9999
         self._write_hailing()
@@ -387,9 +477,32 @@ class DiscordWatchTests(unittest.TestCase):
         result = self.register(after="150")
         self.assertEqual(result["cursor"], "150")
         self.assertEqual(result["cursor_source"], "explicit")
+        self.assertEqual(self.thread_lifecycle()[7], "150")
         self.api.remote["id"] = "200"
         with self.assertRaisesRegex(ValueError, "cannot precede"):
             self.app.register("200", after="199")
+
+    def test_register_reuses_closed_same_owner_without_resetting_cursor_or_generation(self):
+        self.register(after="150")
+        self.app.close(THREAD)
+        self.app.close(THREAD)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE threads SET cursor='200',catchup_before='210',catchup_max='220' "
+                           "WHERE thread_id=?", (THREAD,))
+        self.api.remote["thread_metadata"]["archived"] = True
+        result = self.app.register(THREAD, after="150")
+        self.assertTrue(result["already_registered"])
+        self.assertEqual(result["cursor"], "200")
+        self.assertEqual(self.thread_lifecycle()[:2], (0, "active"))
+        self.assertEqual(self.thread_lifecycle()[4:], ("200", "210", "220", "150"))
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertEqual(db.execute("SELECT owner_generation FROM threads WHERE thread_id=?",
+                                         (THREAD,)).fetchone()[0], 1)
+        managed = self.app.managed(THREAD)
+        self.assertTrue(managed["managed"])
+        self.assertFalse(managed["open"])
+        self.assertTrue(managed["remote_closed"])
 
     def test_caller_without_session_env_uses_unique_surface_enrollment_and_binding(self):
         os.environ.pop("CODEX_THREAD_ID", None)
@@ -522,7 +635,11 @@ class DiscordWatchTests(unittest.TestCase):
     def test_local_close_retains_subscription_and_allows_guarded_reply_delivery(self):
         self.register()
         self.app.close(THREAD)
+        self.app.close(THREAD)
         self.assertEqual(self.thread_lifecycle()[:2], (0, "active"))
+        managed = self.app.managed(THREAD)
+        self.assertTrue(managed["managed"])
+        self.assertFalse(managed["open"])
         self.api.rows = [message("101")]
         report = self.app.scan(send=True)
         self.assertEqual(report["threads"][0]["status"], "polled")
@@ -532,8 +649,6 @@ class DiscordWatchTests(unittest.TestCase):
         output = io.StringIO()
         self.app.receive(THREAD, "101", output)
         self.assertIn("Configured user reply", output.getvalue())
-        with self.assertRaisesRegex(ValueError, "closed"):
-            self.app.managed(THREAD)
 
     def test_remote_archive_is_recorded_without_unsubscribing_or_blocking_late_reply(self):
         self.register()
@@ -558,6 +673,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.api.rows = [message("101")]
         self.app.scan()
         self.app.scan(send=True)
+        self.app.close(THREAD)
         self.targets.append(target(SESSION_B, SURFACE_B, WORKSPACE_B))
         self._write_hailing()
         os.environ["CMUX_SURFACE_ID"] = SURFACE_B
@@ -569,7 +685,33 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertEqual(result["to_session"], SESSION_B)
         self.assertEqual(self.messages()[0][1:3], ("pending", 0))
         self.assertEqual(self.messages()[0][3], "Configured user reply")
-        self.assertEqual(self.app.managed(THREAD)["owner_session"], SESSION_B)
+        managed = self.app.managed(THREAD)
+        self.assertEqual(managed["owner_session"], SESSION_B)
+        self.assertFalse(managed["open"])
+
+    def test_closed_transfer_preserves_uncertain_submission_and_exact_generation(self):
+        self.register()
+        self.api.rows = [message("101")]
+        self.app.scan()
+        self.cmux.uncertain = True
+        self.app.scan(send=True)
+        self.assertEqual(self.messages()[0][1], "uncertain")
+        self.app.close(THREAD)
+        self.targets.append(target(SESSION_B, SURFACE_B, WORKSPACE_B))
+        self._write_hailing()
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_B
+        os.environ["CODEX_THREAD_ID"] = SESSION_B
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.app.transfer(THREAD, SESSION_B)
+        self.app.transfer(THREAD, SESSION_A)
+        self.assertEqual(self.messages()[0][1:3], ("uncertain", 1))
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertEqual(db.execute("SELECT owner_generation,is_open FROM threads WHERE thread_id=?",
+                                         (THREAD,)).fetchone(), (2, 0))
+        managed = self.app.managed(THREAD)
+        self.assertEqual(managed["owner_session"], SESSION_B)
+        self.assertFalse(managed["open"])
 
     def test_api_rate_limit_details_are_retained_without_token_leak(self):
         import io as io_module

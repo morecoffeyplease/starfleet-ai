@@ -58,17 +58,23 @@ discord-watch managed THREAD_ID
 
 Registration uses the current session's exact Hailing Frequencies enrollment.
 It refuses a thread already owned by a different session.
-For a new or existing thread, the default starting cursor is the thread creation ID so older replies are replayed safely.
+For a new thread, the default starting cursor is the thread creation ID so older replies are replayed safely.
 An existing agent-notify cursor records messages fetched by the old listener, not replies proven handled by its owner.
 Pass `--after LAST_ACTUALLY_HANDLED_ID` only when the owner has confirmed that every earlier reply was handled.
 An explicit cursor must be at or after the thread creation ID.
+The initial intake cutoff is immutable and is set to the thread creation ID by default or to the explicit `--after` value.
+Gateway replays at or below the cutoff are ignored, while a later unseen message can be ingested out of order below the advancing REST cursor.
+Existing registrations migrate with their committed REST cursor as the conservative cutoff, without changing queued replies, cursors, or catch-up boundaries.
+When a REST or Gateway message payload supplies `channel_id`, intake requires it to match the selected registered thread.
 The legacy agent-notify listener should stop polling a thread after `managed` reports it as managed.
-`managed` succeeds only for an open registration owned by the exact current session.
-Its JSON includes worker health, and a stale worker warning does not change ownership.
+`managed` succeeds for a retained subscription owned by the exact current session, including a locally closed or dormant registration.
+Reusing `register` from the same exact owner after local closure, a Closed tag, or archiving does not reopen the registration or reset its cursor, cutoff, or owner generation.
+Its JSON includes worker health, and a stale worker warning does not change ownership or the central managed route.
 
 Only the current registered owner can receive or locally close a thread.
-To hand an open registration to a different current enrolled session, run `discord-watch transfer THREAD_ID --from-session OLD_SESSION_UUID` from the new owner's session.
+To hand a retained registration to a different current enrolled session, run `discord-watch transfer THREAD_ID --from-session OLD_SESSION_UUID` from the new owner's session.
 Transfer requires the old session ID to match the stored owner and preserves every unreceived reply.
+Transfer can preserve a locally closed registration without reopening it.
 An explicit transfer resets confirmed-but-unreceived wakes for safe delivery to the new owner.
 Uncertain submissions are never retried automatically.
 

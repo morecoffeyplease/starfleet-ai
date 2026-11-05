@@ -285,6 +285,7 @@ class Watch:
           thread_id TEXT PRIMARY KEY,
           owner_json TEXT NOT NULL,
           cursor TEXT NOT NULL,
+          initial_cutoff TEXT,
           is_open INTEGER NOT NULL DEFAULT 1,
           registered_at REAL NOT NULL,
           updated_at REAL NOT NULL,
@@ -338,6 +339,8 @@ class Watch:
             db.execute("ALTER TABLE threads ADD COLUMN last_activity_at REAL")
         if "remote_closed" not in thread_columns:
             db.execute("ALTER TABLE threads ADD COLUMN remote_closed INTEGER NOT NULL DEFAULT 0")
+        if "initial_cutoff" not in thread_columns:
+            db.execute("ALTER TABLE threads ADD COLUMN initial_cutoff TEXT")
         message_columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         if "attachments_json" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'")
@@ -364,6 +367,11 @@ class Watch:
                 db.execute("UPDATE threads SET last_activity_at=?,subscription_state='active',remote_closed=? "
                            "WHERE thread_id=?", (activity_at, int(remote_closed), thread_id))
             db.execute("INSERT INTO meta(key,value) VALUES('meaningful_activity_migration_v1','complete')")
+        cutoff_migrated = db.execute(
+            "SELECT 1 FROM meta WHERE key='initial_intake_cutoff_migration_v1'").fetchone()
+        if cutoff_migrated is None:
+            db.execute("UPDATE threads SET initial_cutoff=cursor WHERE initial_cutoff IS NULL")
+            db.execute("INSERT INTO meta(key,value) VALUES('initial_intake_cutoff_migration_v1','complete')")
         db.commit()
         db.close()
         path.chmod(0o600)
@@ -455,8 +463,7 @@ class Watch:
         owner = self.current_owner()
         credentials, api = self.read_credentials()
         remote = self.remote_thread(api, thread_id)
-        require(not self.thread_closed(remote, credentials["closed_tag"]),
-                "Discord thread is archived or tagged Closed")
+        remote_closed = self.thread_closed(remote, credentials["closed_tag"])
         if after is not None:
             cursor = snowflake(after, "after cursor")
         else:
@@ -464,24 +471,24 @@ class Watch:
         require(id_order(cursor) >= id_order(thread_id), "Cursor cannot precede thread creation")
         now = self.clock()
         with contextlib.closing(self.database()) as db:
-            existing = db.execute("SELECT owner_json,cursor,is_open FROM threads WHERE thread_id=?",
+            existing = db.execute("SELECT owner_json,cursor,initial_cutoff FROM threads WHERE thread_id=?",
                                   (thread_id,)).fetchone()
             if existing is not None:
                 existing_owner = json.loads(existing[0])
                 require(existing_owner == owner,
                         "Thread already belongs to another exact session; use transfer explicitly")
-                require(bool(existing[2]), "Thread registration is closed")
                 if after is not None:
-                    require(cursor == existing[1], "Thread is already registered with a different cursor")
+                    require(cursor == existing[2], "Thread is already registered with a different initial cutoff")
                 with db:
-                    db.execute("UPDATE threads SET updated_at=?,remote_json=?,remote_closed=0 WHERE thread_id=?",
-                               (now, json.dumps(remote, separators=(",", ":")), thread_id))
+                    db.execute("UPDATE threads SET updated_at=?,remote_json=?,remote_closed=? WHERE thread_id=?",
+                               (now, json.dumps(remote, separators=(",", ":")), int(remote_closed), thread_id))
                 return {"thread": thread_id, "registered": True, "already_registered": True,
                         "owner_session": owner["session"], "cursor": existing[1]}
+            require(not remote_closed, "Discord thread is archived or tagged Closed")
             with db:
-                db.execute("INSERT INTO threads(thread_id,owner_json,cursor,is_open,registered_at,updated_at,remote_json) "
-                           "VALUES(?,?,?,1,?,?,?)",
-                           (thread_id, json.dumps(owner, separators=(",", ":")), cursor, now, now,
+                db.execute("INSERT INTO threads(thread_id,owner_json,cursor,initial_cutoff,is_open,registered_at,"
+                           "updated_at,remote_json) VALUES(?,?,?,?,1,?,?,?)",
+                           (thread_id, json.dumps(owner, separators=(",", ":")), cursor, cursor, now, now,
                             json.dumps(remote, separators=(",", ":"))))
         return {"thread": thread_id, "registered": True, "already_registered": False,
                 "owner_session": owner["session"], "cursor": cursor,
@@ -491,14 +498,14 @@ class Watch:
         thread_id = snowflake(thread_id, "thread ID")
         row = db.execute("SELECT thread_id,owner_json,cursor,is_open,registered_at,updated_at,last_poll_at,"
                          "next_poll_at,catchup_before,catchup_max,last_error_json,remote_json,owner_generation,"
-                         "subscription_state,last_activity_at,remote_closed "
+                         "subscription_state,last_activity_at,remote_closed,initial_cutoff "
                          "FROM threads WHERE thread_id=?",
                          (thread_id,)).fetchone()
         require(row is not None, "Thread is not registered")
         result = dict(zip(("thread_id", "owner_json", "cursor", "is_open", "registered_at", "updated_at",
                            "last_poll_at", "next_poll_at", "catchup_before", "catchup_max",
                            "last_error_json", "remote_json", "owner_generation", "subscription_state",
-                           "last_activity_at", "remote_closed"), row))
+                           "last_activity_at", "remote_closed", "initial_cutoff"), row))
         result["owner"] = json.loads(result.pop("owner_json"))
         result["last_error"] = json.loads(result["last_error_json"]) if result["last_error_json"] else None
         result["remote"] = json.loads(result.pop("remote_json"))
@@ -517,7 +524,7 @@ class Watch:
         thread_id = snowflake(thread_id, "thread ID")
         current = self.current_owner()
         with contextlib.closing(self.database(create=False)) as db:
-            thread = self._thread(db, thread_id)
+            thread = self._thread(db, thread_id, require_open=False)
             require(thread["owner"] == current,
                     "Thread belongs to another exact session; use explicit transfer")
             active = db.execute("SELECT state,COUNT(*) FROM messages WHERE thread_id=? GROUP BY state",
@@ -525,6 +532,8 @@ class Watch:
             counts = {state: count for state, count in active}
             status = self._health(db, thread_id)
         return {"thread": thread_id, "managed": True, "owner_session": current["session"],
+                "open": bool(thread["is_open"]), "subscription_state": thread["subscription_state"],
+                "remote_closed": bool(thread["remote_closed"]),
                 "queue": counts, "worker_health": status}
 
     def close(self, thread_id):
@@ -532,7 +541,7 @@ class Watch:
         current = self.current_owner()
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
-            thread = self._thread(db, thread_id)
+            thread = self._thread(db, thread_id, require_open=False)
             require(thread["owner"] == current,
                     "Only the registered current owner can close this Discord Watch registration")
             with db:
@@ -550,7 +559,8 @@ class Watch:
         with contextlib.closing(self.database(create=False)) as db:
             self._refresh_dormancy(db, now)
             with db:
-                inserted = self._ingest_message(db, thread_id, message, self._configured_user_id, now)
+                inserted = self._ingest_message(db, thread_id, message, self._configured_user_id, now,
+                                                source="gateway")
             message_id = snowflake(message.get("id"), "message ID") if isinstance(message, dict) else None
         return {"thread": thread_id, "message": message_id, "ingested": inserted,
                 "rest_cursor_advanced": False}
@@ -561,8 +571,7 @@ class Watch:
         current = self.current_owner()
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
-            thread = self._thread(db, thread_id)
-            require(thread["is_open"], "Thread registration is closed")
+            thread = self._thread(db, thread_id, require_open=False)
             require(thread["owner"].get("session") == old_session,
                     "--from-session does not match the registered owner")
             require(thread["owner"] != current, "Thread already belongs to this exact session")
@@ -597,17 +606,25 @@ class Watch:
                 "Discord attachment metadata exceeds the bounded storage size")
         return encoded
 
-    def _ingest_message(self, db, thread_id, row, configured_user_id, now):
+    def _ingest_message(self, db, thread_id, row, configured_user_id, now, source="rest"):
         thread_id = snowflake(thread_id, "thread ID")
         require(isinstance(row, dict), "Discord returned a malformed message")
         message_id = snowflake(row.get("id"), "message ID")
-        thread = db.execute("SELECT last_activity_at FROM threads WHERE thread_id=?",
+        require(source in ("rest", "gateway"), "Unknown Discord message source")
+        thread = db.execute("SELECT last_activity_at,initial_cutoff FROM threads WHERE thread_id=?",
                             (thread_id,)).fetchone()
         require(thread is not None, "Thread is not registered")
+        channel_id = row.get("channel_id")
+        if channel_id is not None:
+            require(snowflake(channel_id, "message channel ID") == thread_id,
+                    "Discord message channel ID does not match the selected thread")
         author = row.get("author") if isinstance(row.get("author"), dict) else {}
         author_id = str(author.get("id", ""))
         if (author_id != snowflake(configured_user_id, "configured Discord user ID") or
                 author.get("bot", False) or row.get("webhook_id") is not None):
+            return False
+        if source == "gateway" and id_order(message_id) <= id_order(
+                snowflake(thread[1], "initial intake cutoff")):
             return False
         body = row.get("content", "")
         require(isinstance(body, str), "Discord message content is not text")
@@ -1116,10 +1133,11 @@ class Watch:
         with contextlib.closing(self.database(create=False)) as db:
             threads = []
             for row in db.execute("SELECT thread_id,owner_json,cursor,is_open,registered_at,last_poll_at,next_poll_at,"
-                                  "last_error_json,owner_generation,subscription_state,last_activity_at,remote_closed "
+                                  "last_error_json,owner_generation,subscription_state,last_activity_at,remote_closed,"
+                                  "initial_cutoff "
                                   "FROM threads ORDER BY registered_at,thread_id"):
                 (thread_id, owner_json, cursor, is_open, registered_at, last_poll_at, next_poll_at,
-                 last_error, generation, subscription_state, last_activity_at, remote_closed) = row
+                 last_error, generation, subscription_state, last_activity_at, remote_closed, initial_cutoff) = row
                 counts = {state: count for state, count in db.execute(
                     "SELECT state,COUNT(*) FROM messages WHERE thread_id=? GROUP BY state", (thread_id,))}
                 recent = [{"message": message_id, "state": state, "wake_attempts": attempts,
@@ -1134,6 +1152,7 @@ class Watch:
                                 "subscription_state": subscription_state,
                                 "last_activity_at": last_activity_at,
                                 "remote_closed": bool(remote_closed),
+                                "initial_cutoff": initial_cutoff,
                                 "last_poll_at": last_poll_at, "next_poll_at": next_poll_at,
                                 "last_error": json.loads(last_error) if last_error else None,
                                 "owner_generation": generation, "queue": counts, "recent": recent})

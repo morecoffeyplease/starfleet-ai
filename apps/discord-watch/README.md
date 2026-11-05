@@ -21,6 +21,9 @@ The committed cursor advances only after that gap is complete, and the durable c
 Each page is sorted in ascending snowflake order before it is committed.
 The implementation follows Discord's [Get Channel Messages](https://discord.com/developers/docs/resources/message#get-channel-messages) ordering and [rate-limit guidance](https://discord.com/developers/docs/topics/rate-limits).
 Duplicate `(thread, message)` pairs are ignored.
+Each registration also keeps an immutable initial intake cutoff, set to the thread creation ID by default or to the explicit `--after` ID.
+Gateway replays at or below that cutoff are ignored, while later unseen messages can still be ingested out of order even below the advancing REST cursor.
+The upgrade migration uses each existing registration's committed cursor as its conservative initial cutoff without changing queued rows or cursor state.
 
 Local registration closure and Discord conversation closure are recorded separately from reply-subscription eligibility.
 Closing a registration or observing a Closed tag or archived thread does not unsubscribe it, reset its cursor, or discard its catch-up boundary.
@@ -32,6 +35,7 @@ Polls, retries, reminders, and worker heartbeats do not change the activity time
 An inserted reply at least as recent as the latest activity reactivates the subscription and starts its seven-day window from that timestamp.
 Duplicate IDs and older replays remain ineligible to extend the activity window.
 The narrow `Watch.ingest_gateway_message` method uses the same validation, filtering, attachment storage, and deduplication path as REST intake, and does not advance the REST cursor.
+When a payload supplies `channel_id`, intake requires it to match the selected registered thread.
 Queued replies remain available for guarded delivery while a subscription is dormant, and missing or stale exact owners continue to hold delivery.
 Use `discord-watch scan --only-thread THREAD_ID` for explicit REST reconciliation of a dormant thread.
 When Gateway intake is in use, reconnect reconciliation must include every retained known thread, including dormant threads, before the integration reports recovery.
@@ -60,10 +64,11 @@ No operator command resets an uncertain send to pending.
 `receive` holds the local consumer lock while writing exact records and flushes stdout before saving receipts.
 This flush is the CLI delivery boundary and is not proof that a person or model read or understood the reply.
 If output fails or the current owner changes before the receipt commit, the reply remains available for another receive.
-`managed` checks exact current ownership and open registration and includes the latest worker health report.
+`managed` checks exact current ownership of the retained subscription, including locally closed and dormant registrations, and includes the latest worker health report.
 Its success is independent of worker freshness so the caller can retain ownership while diagnosing a stale worker.
-`close` preserves all queued replies and closes only the caller's own exact local registration while retaining its reply subscription.
+`close` preserves all queued replies, is idempotent for the caller's exact registration, and closes only its local management state while retaining the reply subscription.
 `transfer` requires an explicit `--from-session` matching the stored owner and must be run from the new exact enrolled session.
+An explicit transfer can change the owner of a locally closed retained subscription without reopening it.
 Transfer preserves unreceived replies and resets confirmed-but-unreceived wakes so the new owner can safely receive them.
 An uncertain send stays uncertain across transfer.
 
