@@ -933,7 +933,8 @@ def check_opencode_cli(binary: str | None = None) -> str:
 
 
 def require_native_dispatch_binding(*, expected_workspace: str, expected_surface: str,
-                                    expected_session: str, current: dict) -> dict:
+                                    expected_session: str, current: dict,
+                                    allow_startup_unknown: bool = False) -> dict:
     """Accept only one exact native OpenCode session binding in its created surface."""
     if not all(isinstance(value, str) and value for value in (expected_workspace, expected_surface, expected_session)):
         raise OpenCodeDispatchError("native_binding_expectations_required")
@@ -995,10 +996,13 @@ def require_native_dispatch_binding(*, expected_workspace: str, expected_surface
     exact = matches[0]
     if exact.get("state") not in ("working", "idle", "needs_input", "unknown"):
         raise OpenCodeDispatchError("native_session_state_unknown")
-    if exact.get("state") == "unknown" and exact.get("lifecycle") != "idle":
-        raise OpenCodeDispatchError("native_session_state_unknown")
     if exact.get("freshness") != "current":
         raise OpenCodeDispatchError("native_session_observation_stale")
+    if exact.get("state") == "unknown" and exact.get("lifecycle") != "idle":
+        if (allow_startup_unknown and exact.get("lifecycle") == "running"
+                and exact.get("input_state") in (None, "unknown", "empty")):
+            return exact
+        raise OpenCodeDispatchError("native_session_state_unknown")
     return exact
 
 

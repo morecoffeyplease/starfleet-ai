@@ -101,7 +101,8 @@ class FakeAPIState:
                  "time": {"created": 10}},
                 {"id": "msg_startupAssistant123", "type": "assistant", "agent": "build",
                  "model": {"providerID": PROVIDER, "id": MODEL, "variant": "max"},
-                 "time": {"created": 11, "completed": 12}, "finish": "stop", "content": []}]
+                 "time": {"created": 11, "completed": 12}, "finish": "stop",
+                 "content": [{"type": "text", "text": "BOOTSTRAP-READY"}]}]
 
 
 class FakeHandler(http.server.BaseHTTPRequestHandler):
@@ -1536,7 +1537,39 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "response_too_large")
         self.assertNotIn(CANARY, str(raised.exception))
 
-    def test_initial_dispatch_waits_for_delayed_prompt_admission_before_accepting_idle_state(self):
+    def test_startup_unknown_opt_in_requires_exact_current_native_identity_without_human_input(self):
+        workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+        item = {"lifecycle": "running", "placement": {"kind": "local"},
+                "freshness": {"state": "current"},
+                "projections": [{"workspace_id": workspace, "panel_id": surface}],
+                "agents": [{"kind": "opencode", "session_id": SESSION,
+                            "state": "unknown", "input_state": "unknown"}]}
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                   "items": [item]}
+        binding = dispatch.require_native_dispatch_binding(
+            expected_workspace=workspace, expected_surface=surface, expected_session=SESSION,
+            current=current, allow_startup_unknown=True)
+        self.assertEqual(binding["state"], "unknown")
+        self.assertEqual(binding["lifecycle"], "running")
+
+        held = (
+            ({**item, "agents": [{**item["agents"][0], "input_state": "needs_input"}]},
+             "native_session_state_unknown"),
+            ({**item, "freshness": {"state": "stale"}}, "native_session_observation_stale"),
+            ({**item, "projections": [{"workspace_id": workspace, "panel_id": str(uuid.uuid4())}]},
+             "native_session_visible_on_other_surface"),
+            ({**item, "lifecycle": "backgroundWorkPending"}, "native_session_state_unknown"),
+        )
+        for altered, code in held:
+            with self.subTest(code=code), self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+                dispatch.require_native_dispatch_binding(
+                    expected_workspace=workspace, expected_surface=surface, expected_session=SESSION,
+                    current={**current, "items": [altered]}, allow_startup_unknown=True)
+            self.assertEqual(raised.exception.code, code)
+
+    def dispatch_initial_native_observation(self, *, native_states, hook_after_poll=None,
+                                           timeout_seconds=180, delay_startup_messages=False,
+                                           wrong_surface=False, hook_arrives_during_check=False):
         manifest = json.loads(self.manifest.read_text())
         manifest["delivery_policy"] = "api_sidechannel"
         self.manifest.write_text(json.dumps(manifest)); self.manifest.chmod(0o600)
@@ -1555,12 +1588,16 @@ class OpenCodeDispatchTest(unittest.TestCase):
         choice = mp.resolve(mp.selection(config), "implementer", None)
         workspace, caller_surface, pane = str(uuid.uuid4()), str(uuid.uuid4()), "pane-fixture"
         opened_surface = str(uuid.uuid4())
-        current_surface = opened_surface
+        current_surface = str(uuid.uuid4()) if wrong_surface else opened_surface
         hook_path = self.root / "hook-sessions.json"
-        self.state.delay_startup_messages = True
+        self.state.delay_startup_messages = delay_startup_messages
+        self.state.messages = []
+        current_polls = 0
+        cmux_calls = []
 
         def cmux(argv, stdin=None):
-            nonlocal current_surface
+            nonlocal current_polls
+            cmux_calls.append(argv)
             if "identify" in argv:
                 return {"caller": {"workspace_id": workspace, "surface_id": caller_surface}}
             if "tree" in argv:
@@ -1578,16 +1615,24 @@ class OpenCodeDispatchTest(unittest.TestCase):
                     "launch_id": get("launch-id"), "session_id": get("session"),
                     "workspace_uuid": workspace, "surface_uuid": opened_surface,
                     "cmux_socket_path": None, "cmux_socket_capability": CMUX_CANARY})
-                dispatch.write_private_json(hook_path, {"sessions": {SESSION: {
-                    "workspaceId": workspace, "surfaceId": opened_surface, "startedAt": 123.0,
-                    "agentLifecycle": "idle", "cwd": str(repo)}}})
+                if hook_after_poll == 0:
+                    dispatch.write_private_json(hook_path, {"sessions": {SESSION: {
+                        "workspaceId": workspace, "surfaceId": opened_surface, "startedAt": 123.0,
+                        "agentLifecycle": "idle", "cwd": str(repo)}}})
                 return {"workspace_id": workspace, "surface_id": opened_surface}
             if "current" in argv:
+                current_polls += 1
+                if hook_after_poll is not None and current_polls >= hook_after_poll and not hook_path.exists():
+                    dispatch.write_private_json(hook_path, {"sessions": {SESSION: {
+                        "workspaceId": workspace, "surfaceId": opened_surface, "startedAt": 123.0,
+                        "agentLifecycle": "idle", "cwd": str(repo)}}})
+                state = native_states[min(current_polls - 1, len(native_states) - 1)]
                 return {"truncated": False, "owner_availability": {"agent_sessions": "available"},
-                    "items": [{"lifecycle": "idle", "placement": {"kind": "local"},
+                    "items": [{"lifecycle": "running", "placement": {"kind": "local"},
                     "freshness": {"state": "current"},
                     "projections": [{"workspace_id": workspace, "panel_id": current_surface}],
-                    "agents": [{"kind": "opencode", "session_id": SESSION, "state": "idle"}]}]}
+                    "agents": [{"kind": "opencode", "session_id": SESSION, "state": state,
+                                "input_state": "unknown" if state == "unknown" else None}]}]}
             if "rpc" in argv:
                 method = argv[argv.index("rpc") + 1]
                 params = json.loads(argv[-1])
@@ -1601,13 +1646,49 @@ class OpenCodeDispatchTest(unittest.TestCase):
 
         args = SimpleNamespace(role="implementer", opencode_manifest=str(self.manifest), context_injector=None,
                                owner_worktree=None, receipt_file=None, task_file=str(task_file), slot=None)
-        with patch.object(mp, "run_json", side_effect=cmux), \
-                patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
-                patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"):
-            result = mp.dispatch_opencode(app, args, config, choice, repo, brief)
-        launch = app.state(f"launches/{result['launch']}", None)
+        fake_time = {"now": 0}
+        original_hook_binding = mp.opencode_dispatch.require_native_hook_binding
+        hook_checks = {"count": 0}
+
+        def hook_binding_with_arrival(**kwargs):
+            hook_checks["count"] += 1
+            if hook_arrives_during_check and hook_checks["count"] == 1:
+                dispatch.write_private_json(hook_path, {"sessions": {SESSION: {
+                    "workspaceId": workspace, "surfaceId": opened_surface, "startedAt": 123.0,
+                    "agentLifecycle": "idle", "cwd": str(repo)}}})
+                raise mp.opencode_dispatch.OpenCodeDispatchError("native_hook_session_unavailable")
+            return original_hook_binding(**kwargs)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(mp, "run_json", side_effect=cmux))
+            stack.enter_context(patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path))
+            stack.enter_context(patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"))
+            if hook_arrives_during_check:
+                stack.enter_context(patch.object(mp.opencode_dispatch, "require_native_hook_binding",
+                                                 side_effect=hook_binding_with_arrival))
+            stack.enter_context(patch.object(mp, "NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS", timeout_seconds))
+            stack.enter_context(patch.object(mp, "_native_startup_clock", side_effect=lambda: fake_time["now"]))
+            stack.enter_context(patch.object(mp, "_native_startup_pause",
+                                             side_effect=lambda: fake_time.__setitem__("now", fake_time["now"] + 1)))
+            try:
+                result = mp.dispatch_opencode(app, args, config, choice, repo, brief)
+                failure = None
+            except mp.PreferenceError as error:
+                result = None
+                failure = str(error)
+        records = list((state_dir / "launches").glob("*.json"))
+        launch = json.loads(records[0].read_text()) if len(records) == 1 else None
+        return {"result": result, "failure": failure, "launch": launch,
+                "workspace": workspace, "surface": opened_surface, "state_dir": state_dir,
+                "hook_path": hook_path, "current_polls": current_polls, "cmux_calls": cmux_calls}
+
+    def test_initial_dispatch_waits_for_delayed_prompt_admission_before_accepting_idle_state(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["idle"], hook_after_poll=0, delay_startup_messages=True)
+        result, launch = observed["result"], observed["launch"]
+        self.assertIsNone(observed["failure"])
         self.assertEqual(result["session"], SESSION)
-        self.assertEqual(result["cmux_surface_uuid"], opened_surface)
+        self.assertEqual(result["cmux_surface_uuid"], observed["surface"])
         self.assertEqual(result["execution_result"], "turn_idle")
         self.assertEqual(result["delivery_readiness"], "ready")
         self.assertEqual(launch["native_started_at"], 123.0)
@@ -1616,18 +1697,98 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(launch["parent_task_id"], "task-parent-fixture")
         self.assertEqual(launch["delivery_policy"], "api_sidechannel")
         self.assertEqual(launch["expected_server_pid"], 4242)
-        self.assertEqual(launch["cmux_workspace_uuid"], workspace)
-        self.assertEqual(launch["cmux_surface_uuid"], opened_surface)
+        self.assertEqual(launch["cmux_workspace_uuid"], observed["workspace"])
+        self.assertEqual(launch["cmux_surface_uuid"], observed["surface"])
         self.assertEqual(self.state.environment["variables"]["CMUX_AGENT_LAUNCH_KIND"], "opencode")
         self.assertEqual(self.state.environment["variables"]["OPENCODE_SESSION_ID"], SESSION)
         self.assertEqual(self.state.environment["variables"]["CMUX_SOCKET_CAPABILITY"], CMUX_CANARY)
         self.assertFalse(any(path.name.endswith(".handshake.json") for path in
-                             (state_dir / "opencode-launches").glob("*")))
+                             (observed["state_dir"] / "opencode-launches").glob("*")))
         self.assertNotIn(CANARY, json.dumps(launch))
         self.assertNotIn(CMUX_CANARY, json.dumps(launch))
         self.assertNotIn(CANARY, json.dumps(self.state.environment))
         self.assertNotIn(CMUX_CANARY, json.dumps(launch))
         self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
+
+    def test_initial_dispatch_waits_for_unknown_native_idle_and_late_exact_hook(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["unknown", "unknown", "idle"], hook_after_poll=5,
+            delay_startup_messages=True, timeout_seconds=12)
+        result, launch = observed["result"], observed["launch"]
+        self.assertIsNone(observed["failure"])
+        self.assertEqual(result["execution_result"], "turn_idle")
+        self.assertEqual(result["delivery_readiness"], "ready")
+        self.assertEqual(observed["current_polls"], 5)
+        self.assertEqual(launch["startup_readiness_observation"]["state"], "ready")
+        self.assertEqual(launch["native_started_at"], 123.0)
+        self.assertEqual(sum(method == "POST" and path == "/api/session"
+                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(sum("new-surface" in argv for argv in observed["cmux_calls"]), 1)
+        self.assertEqual(self.state.sent_prompts, [])
+        self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
+
+    def test_initial_dispatch_repolls_when_exact_hook_arrives_during_binding_check(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["idle"], hook_arrives_during_check=True, timeout_seconds=5)
+        self.assertIsNone(observed["failure"])
+        self.assertEqual(observed["result"]["delivery_readiness"], "ready")
+        self.assertEqual(observed["current_polls"], 2)
+        self.assertEqual(observed["launch"]["startup_readiness_observation"]["state"], "ready")
+        self.assertEqual(observed["launch"]["native_started_at"], 123.0)
+        self.assertEqual(sum(method == "POST" and path == "/api/session"
+                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(sum("new-surface" in argv for argv in observed["cmux_calls"]), 1)
+        self.assertEqual(self.state.sent_prompts, [])
+        self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
+
+    def test_persistent_missing_exact_hook_times_out_with_uncertain_evidence_and_no_replay(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["idle"], hook_after_poll=None, timeout_seconds=3)
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_binding_timeout", observed["failure"])
+        self.assertEqual(observed["current_polls"], 3)
+        launch = observed["launch"]
+        self.assertEqual(launch["status"], "uncertain")
+        self.assertEqual(launch["error_code"], "native_binding_timeout")
+        self.assertEqual(launch["startup_readiness_observation"]["reason"], "native_hook_record_missing")
+        self.assertEqual(sum(method == "POST" and path == "/api/session"
+                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(sum("new-surface" in argv for argv in observed["cmux_calls"]), 1)
+        self.assertEqual(self.state.sent_prompts, [])
+        self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
+
+    def test_completed_startup_with_working_native_state_holds_without_retry(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["working"], hook_after_poll=0, timeout_seconds=3)
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_session_state_unknown", observed["failure"])
+        self.assertEqual(observed["current_polls"], 1)
+        self.assertEqual(observed["launch"]["status"], "uncertain")
+        self.assertEqual(sum(method == "POST" and path == "/api/session"
+                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(self.state.sent_prompts, [])
+
+    def test_completed_startup_with_needs_input_holds_without_retry(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["needs_input"], hook_after_poll=0, timeout_seconds=3)
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_session_state_unknown", observed["failure"])
+        self.assertEqual(observed["current_polls"], 1)
+        self.assertEqual(observed["launch"]["status"], "uncertain")
+        self.assertEqual(sum(method == "POST" and path == "/api/session"
+                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(self.state.sent_prompts, [])
+
+    def test_unknown_native_state_on_a_different_surface_remains_an_immediate_hold(self):
+        observed = self.dispatch_initial_native_observation(
+            native_states=["unknown"], hook_after_poll=0, timeout_seconds=3, wrong_surface=True)
+        self.assertIsNone(observed["result"])
+        self.assertIn("native_session_visible_on_other_surface", observed["failure"])
+        self.assertEqual(observed["current_polls"], 1)
+        self.assertEqual(observed["launch"]["status"], "uncertain")
+        self.assertEqual(sum(method == "POST" and path == "/api/session"
+                             for method, path, _ in self.state.calls), 1)
+        self.assertEqual(self.state.sent_prompts, [])
 
     def test_initial_dispatch_wrong_surface_is_uncertain_and_never_falls_back(self):
         config_dir, state_dir = self.root / "wrong-config", self.root / "wrong-state"
