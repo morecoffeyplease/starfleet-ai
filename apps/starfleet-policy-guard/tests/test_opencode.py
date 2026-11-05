@@ -127,7 +127,7 @@ class OpenCodeTest(unittest.TestCase):
         self.assertEqual(fixtures.lane_runtime.source_pin_status(parent_state)['integrity'], 'intact')
 
         missing_report = self.event(parent_id, tool='prime_directive_gh')
-        denied = self.bridge(missing_report, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url])
+        denied = self.bridge(missing_report, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url], ok=False)
         self.assertEqual(denied.returncode, 2)
         self.assertIn('No recorded delivery report run', denied.stderr)
         self.assertFalse(self.f.forwarded.exists())
@@ -167,7 +167,7 @@ class OpenCodeTest(unittest.TestCase):
 
         cross_seat = self.event(child_id, parent_id=parent_id, directory=child_checkout,
                                 tool='prime_directive_gh')
-        cross_denial = self.bridge(cross_seat, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url])
+        cross_denial = self.bridge(cross_seat, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url], ok=False)
         self.assertEqual(cross_denial.returncode, 2)
         self.assertIn('belongs to another native session', cross_denial.stderr)
         self.assertEqual(len(self.f.forwarded.read_text().splitlines()), 1)
@@ -186,11 +186,11 @@ class OpenCodeTest(unittest.TestCase):
         self.assertIn(prior_receipt, state['pr_bindings'][self.f.url]['history'])
 
         old_owner = self.event(parent_id, tool='prime_directive_gh')
-        old_denial = self.bridge(old_owner, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url])
+        old_denial = self.bridge(old_owner, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url], ok=False)
         self.assertEqual(old_denial.returncode, 2)
         self.assertIn('belongs to another native session', old_denial.stderr)
         new_owner = self.event(handoff_id, parent_id=parent_id, tool='prime_directive_gh')
-        new_denial = self.bridge(new_owner, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url])
+        new_denial = self.bridge(new_owner, ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url], ok=False)
         self.assertEqual(new_denial.returncode, 2)
         self.assertIn('No recorded delivery report run', new_denial.stderr)
         self.assertEqual(len(self.f.forwarded.read_text().splitlines()), 1)
@@ -205,7 +205,7 @@ class OpenCodeTest(unittest.TestCase):
 
         self.f.git('commit', '--allow-empty', '-m', 'make the child report stale')
         stale = self.bridge(self.event(handoff_id, parent_id=parent_id, tool='prime_directive_gh'),
-            ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url])
+            ['--cwd', self.f.repo, 'gh', '--', 'pr', 'ready', self.f.url], ok=False)
         self.assertEqual(stale.returncode, 2)
         self.assertIn('Candidate or local target changed', stale.stderr)
         self.assertEqual(len(self.f.forwarded.read_text().splitlines()), 2)
