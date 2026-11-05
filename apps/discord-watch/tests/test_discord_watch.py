@@ -1043,6 +1043,7 @@ class DiscordWatchTests(unittest.TestCase):
         rest_entered = threading.Event()
         rest_release = threading.Event()
         ready_committed = threading.Event()
+        rest_turn_completed = threading.Event()
         recovery_complete = threading.Event()
         message_ingested = threading.Event()
         heartbeat_sent = threading.Event()
@@ -1106,6 +1107,7 @@ class DiscordWatchTests(unittest.TestCase):
             if (ready_committed.is_set() and result.get("recovery_state") == "complete" and
                     result.get("recovery_epoch") == session["recovery_epoch"]):
                 recovery_complete.set()
+            rest_turn_completed.set()
             return result
 
         def tracked_commit(*args, **kwargs):
@@ -1132,6 +1134,13 @@ class DiscordWatchTests(unittest.TestCase):
                 worker.start()
                 worker_started = True
                 self.assertTrue(ready_committed.wait(timeout=4))
+                self.assertTrue(rest_turn_completed.wait(timeout=4))
+                if not recovery_complete.is_set():
+                    # READY can queue recovery behind the first poll's scheduled interval.
+                    with contextlib.closing(self.app.database(create=False)) as db:
+                        next_poll_at = db.execute(
+                            "SELECT next_poll_at FROM threads WHERE thread_id=?", (THREAD,)).fetchone()[0]
+                    self.clock[0] = max(self.clock[0], next_poll_at)
                 self.assertTrue(recovery_complete.wait(timeout=4))
                 api.block_routine = True
                 self.clock[0] += dw.ROUTINE_REST_INTERVAL
