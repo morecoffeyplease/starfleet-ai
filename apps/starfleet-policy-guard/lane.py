@@ -323,6 +323,15 @@ def active(state, cwd):
         return False
 
 
+def attached_here(state, cwd):
+    """Check active checkout configuration without requiring a PR binding."""
+    try:
+        return bool(state and state.get('phase') == 'active' and
+                    state.get('root') == str(root(cwd)) and state.get('branch') == branch(cwd))
+    except ValueError:
+        return False
+
+
 def require(state, cwd, event=None):
     if state and state.get('lane_owner'):
         lane_scope.check_owner(state,event=event)
@@ -1196,6 +1205,99 @@ def validate_upgrade_scope(state, cwd):
     return product, seat
 
 
+def migration_runtime_metadata_matches(state, seat_manifest):
+    """Return whether the durable seat can restore runtime metadata omitted by legacy migration."""
+    runtime = seat_manifest.get('runtime') if isinstance(seat_manifest, dict) else None
+    if not isinstance(runtime, dict):
+        return False
+    version = runtime.get('version')
+    path = runtime.get('path')
+    files = runtime.get('files')
+    source_revision = state.get('source_revision') if isinstance(state, dict) else None
+    manifest_revision = runtime.get('source_revision')
+    pinned = state.get('source_versions') if isinstance(state, dict) else None
+    if (not isinstance(version, str) or not version or not isinstance(path, str) or not Path(path).is_absolute() or
+            not isinstance(files, dict) or not isinstance(manifest_revision, str) or not manifest_revision or
+            not isinstance(pinned, dict) or not pinned or state.get('source') != path):
+        return False
+    canonical_runtime_revision = 'runtime:' + version
+    valid_git_revision = (isinstance(source_revision, str) and len(source_revision) in (40, 64) and
+                          all(character in '0123456789abcdef' for character in source_revision))
+    valid_manifest_git_revision = (len(manifest_revision) in (40, 64) and
+                                   all(character in '0123456789abcdef' for character in manifest_revision))
+    if manifest_revision != canonical_runtime_revision and not valid_manifest_git_revision:
+        return False
+    if source_revision not in (manifest_revision, canonical_runtime_revision) and not valid_git_revision:
+        return False
+    if set(pinned) != set(source_versions()):
+        return False
+    if not all(isinstance(name, str) and isinstance(digest, str) and files.get(name) == digest
+               for name, digest in pinned.items()):
+        return False
+    try:
+        recorded_runtime = session_store.runtime_plan(Path(path))
+    except (OSError, ValueError):
+        return False
+    return recorded_runtime['version'] == version and recorded_runtime['files'] == files
+
+
+def validate_upgrade_seat_runtime(state, seat_manifest, seat):
+    runtime = seat_manifest.get('runtime') if isinstance(seat_manifest, dict) else None
+    if not isinstance(runtime, dict) or not isinstance(runtime.get('version'), str) or \
+            not isinstance(runtime.get('path'), str) or not Path(runtime['path']).is_absolute() or \
+            not isinstance(runtime.get('files'), dict) or not isinstance(runtime.get('source_revision'), str) or \
+            not runtime['source_revision']:
+        raise ValueError('Permanent seat runtime metadata is malformed; preserve it and inspect status')
+    expected_owner = {key: state.get('lane_owner', {}).get(key) for key in ('harness', 'session_id')}
+    if (seat_manifest.get('owner') != expected_owner or seat_manifest.get('seat_root') != str(seat) or
+            seat_manifest.get('seat_gitdir') != delivery.value(seat, 'rev-parse', '--absolute-git-dir')):
+        raise ValueError('Permanent seat runtime or owner changed; inspect status and review a fresh upgrade plan')
+    current = state.get('runtime')
+    if isinstance(current, dict) and current.get('version') == runtime['version']:
+        return False
+    if 'runtime' not in state and migration_runtime_metadata_matches(state, seat_manifest):
+        return True
+    raise ValueError('Permanent seat runtime or owner changed; inspect status and review a fresh upgrade plan')
+
+
+def migrated_settings_mode_repair(state, seat_manifest, runtime_missing, settings_before):
+    if not runtime_missing or not state.get('manages_claude_hooks', True):
+        return None
+    settings_info = seat_manifest.get('settings') if isinstance(seat_manifest, dict) else None
+    if not isinstance(seat_manifest, dict) or not seat_manifest.get('hooks_installed') or \
+            not isinstance(settings_info, dict):
+        raise ValueError('Permanent seat settings metadata is malformed; preserve it and inspect status')
+    path = settings_info.get('path')
+    mode = settings_info.get('mode')
+    if (not isinstance(path, str) or not Path(path).is_absolute() or path != state.get('settings') or
+            path != settings_before.get('path') or isinstance(mode, bool) or not isinstance(mode, int) or
+            mode < 0 or mode > 0o777):
+        raise ValueError('Permanent seat settings path or mode is malformed; preserve it and inspect status')
+    if 'settings_mode' not in state:
+        raise ValueError('Migrated checkout settings mode is missing; preserve it and inspect status')
+    recorded_mode = state['settings_mode']
+    if isinstance(recorded_mode, bool) or not isinstance(recorded_mode, int) or recorded_mode < 0 or recorded_mode > 0o777:
+        raise ValueError('Migrated checkout settings mode is malformed; preserve it and inspect status')
+    if not settings_before.get('exists') or settings_before['mode'] != mode:
+        raise ValueError('Claude settings mode changed since installation; coordinate the settings writer before upgrade')
+    if recorded_mode != mode:
+        recorded_hash = state.get('settings_sha256')
+        if not isinstance(recorded_hash, str) or settings_before.get('sha256') != recorded_hash:
+            raise ValueError('Claude settings changed since migration; preserve them and inspect status before upgrade')
+        return mode
+    return None
+
+
+def validate_checkout_runtime(state, seat_manifest):
+    runtime = seat_manifest.get('runtime', {})
+    current = state.get('runtime')
+    if isinstance(current, dict) and current.get('version') == runtime.get('version'):
+        return False
+    if 'runtime' not in state and migration_runtime_metadata_matches(state, seat_manifest):
+        return True
+    raise ValueError('Active seat checkouts do not share one runtime version; preserve history and inspect the seat')
+
+
 def build_upgrade_plan(cwd):
     product = root(cwd)
     ensure_no_upgrade_journal(product)
@@ -1214,6 +1316,13 @@ def build_upgrade_plan(cwd):
         raise ValueError('Installed source pin is ' + old_pin['integrity'] +
                          '; restore its exact files before planning a recoverable upgrade')
     runtime_plan = session_store.runtime_plan(APP) if state.get('seat_id') else None
+    seat_manifest_before = None
+    selected_runtime_missing = False
+    if runtime_plan:
+        seat_manifest_before = session_store.load_seat(state['seat_id'])
+        if not seat_manifest_before:
+            raise ValueError('Permanent seat registry is missing; preserve checkout history and inspect recovery')
+        selected_runtime_missing = validate_upgrade_seat_runtime(state, seat_manifest_before, seat)
     new_source = {'source': runtime_plan['path'] if runtime_plan else str(APP),
                   'source_revision': ('runtime:' + runtime_plan['version']) if runtime_plan else new_revision,
                   'source_versions': new_versions}
@@ -1245,6 +1354,7 @@ def build_upgrade_plan(cwd):
     settings_after_text = None
     settings_after_exists = None
     settings_after_mode = None
+    selected_settings_mode_repair = None
     if manages_hooks:
         settings_path, settings_text, settings_value = settings(seat)
         if str(settings_path) != state.get('settings'):
@@ -1252,7 +1362,12 @@ def build_upgrade_plan(cwd):
         settings_before = capture_text(settings_path, state.get('settings_mode', 0o600))
         if settings_before['text'] != settings_text:
             raise ValueError('Claude settings changed during planning; retry at the coordinated single-writer checkpoint')
-        if settings_before['mode'] != state.get('settings_mode', 0o600):
+        if selected_runtime_missing:
+            selected_settings_mode_repair = migrated_settings_mode_repair(
+                state, seat_manifest_before, selected_runtime_missing, settings_before)
+        expected_settings_mode = (selected_settings_mode_repair if selected_settings_mode_repair is not None
+                                  else state.get('settings_mode', 0o600))
+        if settings_before['mode'] != expected_settings_mode:
             raise ValueError('Claude settings mode changed since installation; coordinate the settings writer before upgrade')
         if old_groups:
             available_groups = (hook_groups(product,seat,seat_identifier=state['seat_id'],
@@ -1273,14 +1388,9 @@ def build_upgrade_plan(cwd):
 
     new_state = upgraded_state(state, new_source, new_groups, new_adapter_hash)
     new_state['phase'] = 'active'
-    seat_manifest_before=None
+    metadata_repairs = []
     seat_manifest_after=None
     if runtime_plan:
-        seat_manifest_before=session_store.load_seat(state['seat_id'])
-        expected_owner={key:state['lane_owner'].get(key) for key in ('harness','session_id')}
-        if (not seat_manifest_before or seat_manifest_before.get('owner')!=expected_owner or
-                seat_manifest_before.get('runtime',{}).get('version')!=state.get('runtime',{}).get('version')):
-            raise ValueError('Permanent seat runtime or owner changed; inspect status and review a fresh upgrade plan')
         seat_manifest_after=copy.deepcopy(seat_manifest_before)
         seat_manifest_after['runtime']={'version':runtime_plan['version'],'path':runtime_plan['path'],
             'files':runtime_plan['files'],'source_revision':'runtime:'+runtime_plan['version']}
@@ -1310,12 +1420,25 @@ def build_upgrade_plan(cwd):
                 raise ValueError('An active seat checkout is unavailable or on another branch; preserve it and resolve that checkout before upgrading the seat')
             lane_scope.check_owner(prior)
             check_lane_identity(prior,product_path)
-            if prior.get('runtime',{}).get('version')!=state.get('runtime',{}).get('version'):
-                raise ValueError('Active seat checkouts do not share one runtime version; preserve history and inspect the seat')
+            prior_runtime_missing = validate_checkout_runtime(prior, seat_manifest_before)
             if source_pin_status(prior)['integrity']!='intact':
                 raise ValueError('An active seat checkout source pin is unavailable; preserve it and recover before upgrade')
             next_state=upgraded_state(prior,new_source,new_groups,new_adapter_hash)
             next_state['phase']='active'
+            if prior_runtime_missing:
+                metadata_repairs.append({'checkout':str(product_path),'field':'runtime',
+                    'before':None,'after':{'version':runtime_plan['version'],'path':runtime_plan['path']}})
+                prior_mode_repair = None
+                if prior.get('manages_claude_hooks', True):
+                    prior_settings_path = prior.get('settings')
+                    if not settings_before or prior_settings_path != settings_before['path']:
+                        raise ValueError('Migrated checkout settings path differs from the permanent seat; preserve it and inspect status')
+                    prior_mode_repair = migrated_settings_mode_repair(
+                        prior, seat_manifest_before, prior_runtime_missing, settings_before)
+                    if prior_mode_repair is not None:
+                        next_state['settings_mode'] = prior_mode_repair
+                        metadata_repairs.append({'checkout':str(product_path),'field':'settings_mode',
+                            'before':prior.get('settings_mode',0o600),'after':prior_mode_repair})
             next_state['runtime']={'version':runtime_plan['version'],'path':runtime_plan['path'],
                                    'files':runtime_plan['files']}
             installing=copy.deepcopy(next_state)
@@ -1398,7 +1521,8 @@ def build_upgrade_plan(cwd):
                     if seat_manifest_after else None}},
         'recovery': {'journal_path': str(upgrade_journal_path(product)),
                      'command': upgrade_recovery_command(product),
-                     'strategy': 'Keep the journal guard until exact owned preimages are restored.'}}
+                     'strategy': 'Keep the journal guard until exact owned preimages are restored.'},
+        'migration_metadata_recovery': metadata_repairs}
     review['plan_sha256'] = text_digest(json.dumps(review, sort_keys=True, separators=(',', ':')))
     payload = {'root': str(product), 'state': state, 'state_path': str(state_path),
                'state_before': state_file, 'state_installing_text': installing_state_text,
@@ -1882,7 +2006,7 @@ def record(args):
 
 def enrollment_help(cwd):
     if (read(cwd) or {}).get('lane_owner'):
-        return 'Lane is enrolled; run lane.py --cwd '+str(root(cwd))+' discover from its owning native session. Preserve old PR bindings and reports; do not reinstall per PR.'
+        return 'Lane is enrolled; after its real PR is published, run lane.py --cwd '+str(root(cwd))+' discover from its owning native session. Preserve old PR bindings and reports; do not reinstall per PR.'
     return ('No active delivery-only installation for this worktree and branch. Coordinate with the lane owner, then run ' +
             shlex.join([sys.executable, str(SELF), '--cwd', str(root(cwd)), '--session-root', '<permanent-owner-seat>',
                         'plan', '--pr-url', '<actual-open-PR-URL>', '--base-ref', '<actual-local-target-ref>']) +
@@ -1963,6 +2087,15 @@ def init_evidence(args):
 def status(cwd, session_id=None, state=None):
     state = read(cwd) if state is None else state
     configured = active(state, cwd)
+    installed_here = attached_here(state, cwd)
+    if installed_here:
+        attachment_state = 'active-here'
+    elif not state:
+        attachment_state = 'not-installed'
+    elif state.get('phase') != 'active':
+        attachment_state = 'inactive'
+    else:
+        attachment_state = 'different-root-or-branch'
     lane_enrolled=bool(state and state.get('lane_owner') and state.get('phase')=='active')
     installed_source = source_pin_status(state or {})
     executing_cli = current_cli_status(state)
@@ -2046,7 +2179,8 @@ def status(cwd, session_id=None, state=None):
                      'journal_path': str(journal_path) if journal_pending else None,
                      'recovery_command': upgrade_recovery_command(cwd) if journal_pending else None}
     return {'lane_enrolled':lane_enrolled,'lane_owner':(state or {}).get('lane_owner'),
-            'owner_history':(state or {}).get('owner_history',[]),'installed_here': configured, 'phase': (state or {}).get('phase'),
+            'owner_history':(state or {}).get('owner_history',[]),'installed_here': installed_here,
+            'attachment_state': attachment_state, 'phase': (state or {}).get('phase'),
             'binding_type': binding_type, 'current_owner': current_owner,
             'executing_cli': executing_cli, 'installed_source': installed_source,
             'upgrade': upgrade_state, 'successor_guidance': successor_guidance,
@@ -2081,12 +2215,12 @@ def coverage(cwd, pr_url=None):
     bound_pr = (state or {}).get('pr_url')
     if not state:
         binding = 'not-installed'
+    elif not detail['installed_here']:
+        binding = 'inactive-local-binding'
     elif not bound_pr:
         binding = 'lane-enrolled-no-pr-binding'
     elif expected_pr and expected_pr.casefold() != bound_pr.casefold():
         binding = 'different-pr-bound'
-    elif not detail['installed_here']:
-        binding = 'inactive-local-binding'
     elif not expected_pr:
         binding = 'local-binding-current-pr-unconfirmed'
     else:
@@ -2104,6 +2238,8 @@ def coverage(cwd, pr_url=None):
     owner_confirmed = bool(owner and identity and all(owner.get(k) == identity[k] for k in ('harness', 'session_id')))
     return {
         'product_root': str(root(cwd)), 'branch': branch(cwd),
+        'installed_here': detail['installed_here'],
+        'attachment_state': detail['attachment_state'],
         'session_root': (state or {}).get('session_root'),
         'native_session': {'actual': identity, 'unavailable_reason': identity_error,
                            'matches_installed_owner': owner_confirmed if owner else None},
@@ -2185,7 +2321,8 @@ def coverage_summary(cwd, detail):
     native = detail['native_session']
     source = detail['installed_source']
     report = detail['delivery_report']['receipt']
-    installed = binding['state'] != 'not-installed'
+    has_state = binding['state'] != 'not-installed'
+    installed_here = detail['installed_here']
     owner = ('unavailable' if native['matches_installed_owner'] is not None and native['actual'] is None else
              'matches' if native['matches_installed_owner'] is True else
              'mismatch' if native['matches_installed_owner'] is False else 'unconfirmed')
@@ -2196,13 +2333,13 @@ def coverage_summary(cwd, detail):
     next_action = 'Continue under repository checks and existing human approvals.'
     if detail['upgrade']['state'] == 'in-progress':
         next_action = 'Recover the interrupted upgrade: ' + detail['upgrade']['recovery_command']
-    elif installed and detail['source_intact'] is not True:
+    elif has_state and detail['source_intact'] is not True:
         next_action = 'Ask the installation owner to inspect source integrity; do not reinstall or reset history.'
     elif owner in ('mismatch', 'unavailable'):
         next_action = 'Confirm the owning native session before using this binding; no automatic handoff.'
     elif binding['state'] in ('different-pr-bound', 'inactive-local-binding'):
         next_action = 'Confirm the product branch and PR with the installation owner; preserve the existing binding.'
-    elif not installed:
+    elif not has_state:
         next_action = 'Standalone reporting needs no enrollment. Start with: ' + shlex.join(standalone)
     elif binding['state'] == 'lane-enrolled-no-pr-binding':
         next_action = 'Once a real PR exists, discover it: ' + shlex.join(lane_command + ['discover'])
@@ -2213,14 +2350,16 @@ def coverage_summary(cwd, detail):
         next_action = 'Record a report from existing evidence before covered delivery; see: ' + shlex.join(
             lane_command + ['record', '--help'])
     observations = detail['delivery_report']['observations']
+    installation = ('delivery-only installation' if installed_here else
+                    'inactive delivery installation' if has_state else 'not installed here')
     return '\n'.join([
-        'Policy Guard: ' + ('delivery-only installation' if installed else 'not installed here'),
+        'Policy Guard: ' + installation,
         'Branch: ' + detail['branch'],
         'PR: declared=' + (binding['declared_current_pr'] or 'unknown') + '; bound=' +
         (binding['installed_pr'] or 'none') + ' (' + binding['state'] + '; hosted identity unchecked)',
         'Owner: ' + owner,
         'Installed source: ' + (str(source.get('revision') or 'unknown') + ' (' + source['integrity'] + ')'
-                                if installed else 'none'),
+                                if has_state else 'none'),
         'Observed paths for current session: native hook=' + observations['native_hook']['state'] +
         '; adapter=' + observations['explicit_adapter']['state'],
         'Report: ' + report['state'] + ' - ' + report['reason'],
@@ -2737,7 +2876,7 @@ def migration_settings_change(path, remove_groups, add_groups):
         raise ValueError('Unsupported existing Claude settings shape during migration')
     updated = copy.deepcopy(value)
     hooks = updated.setdefault('hooks', {})
-    for event in set(remove_groups) | set(add_groups):
+    for event in sorted(set(remove_groups) | set(add_groups)):
         if not isinstance(hooks.get(event, []), list):
             raise ValueError('Existing hook groups must be lists')
         groups = hooks.setdefault(event, [])
@@ -2778,7 +2917,7 @@ def migration_plan(args):
         raise ValueError('This checkout already uses the durable seat registry')
     if legacy.get('phase') != 'active' or legacy.get('root') != str(product):
         raise ValueError('Legacy state is not a recognized installation for the current checkout; preserve it and inspect manually')
-    if not active(legacy, product):
+    if not attached_here(legacy, product):
         raise ValueError('Switch to the recorded legacy product branch before migration; preserve its history')
     if not source_is_immutable_runtime() and delivery.value(APP, 'status', '--porcelain'):
         raise ValueError('Commit and verify the migration source, then use a clean pinned checkout')
@@ -2827,6 +2966,8 @@ def migration_plan(args):
     runtime_cli = Path(runtime['path']) / 'lane.py'
     new_groups = hook_groups(product, seat_root, seat_identifier=identifier,
                              runtime_cli=runtime_cli) if manages_hooks else {}
+    target_settings_mode = None
+    target_settings_raw = None
     if seat and seat.get('hooks_installed'):
         new_groups = copy.deepcopy(seat.get('groups', {}))
     old_settings = legacy.get('settings') if old_groups else None
@@ -2837,6 +2978,17 @@ def migration_plan(args):
         if not isinstance(stored_settings, dict) or not stored_settings.get('path'):
             raise ValueError('Permanent seat settings metadata is malformed; preserve it and inspect recovery')
         target_settings = str(stored_settings['path'])
+        if manages_hooks:
+            settings_path, target_settings_raw, current_settings = settings(seat_root)
+            stored_mode = stored_settings.get('mode')
+            if (str(settings_path) != target_settings or isinstance(stored_mode, bool) or
+                    not isinstance(stored_mode, int) or stored_mode < 0 or stored_mode > 0o777 or
+                    not settings_path.exists() or (settings_path.stat().st_mode & 0o777) != stored_mode):
+                raise ValueError('Permanent seat settings path or mode changed; preserve it and inspect recovery')
+            for event, group in new_groups.items():
+                if current_settings.get('hooks', {}).get(event, []).count(group) != 1:
+                    raise ValueError('Installed permanent seat hook is missing or changed; use recover --inspect')
+            target_settings_mode = stored_mode
     else:
         target_settings = str(seat_root / '.claude/settings.local.json')
     changes_by_path = {}
@@ -2848,6 +3000,9 @@ def migration_plan(args):
         item['add'] = {event: [group] for event, group in new_groups.items()}
     changes = [migration_settings_change(path, action['remove'], action['add'])
                for path, action in sorted(changes_by_path.items())]
+    target_settings_change = next((change for change in changes if change['path'] == target_settings), None)
+    target_settings_postimage = (target_settings_change['updated'] if target_settings_change else
+                                 target_settings_raw)
     binding_rows = lane_scope.expand(legacy) if old_owner else [copy.deepcopy(legacy)]
     migrated = copy.deepcopy(legacy)
     pr_bindings = {}
@@ -2873,13 +3028,19 @@ def migration_plan(args):
                     seat_dir=str(session_store.seat_dir(identifier)), session_root=str(seat_root),
                     lane_owner=lane_owner, source=str(Path(runtime['path'])),
                     source_revision=source_revision(runtime['version']), source_versions=source_versions(),
+                    runtime={'version':runtime['version'],'path':str(runtime['path']),'files':runtime['files']},
                     adapter=str(session_store.seat_dir(identifier) / 'bin/gh'),
                     adapter_sha256=hashlib.sha256(adapter_script(product, seat_identifier=identifier,
                         runtime_cli=runtime_cli,real_gh=real_gh['path']).encode()).hexdigest(), real_gh=real_gh['path'],
                     real_gh_identity=real_gh, manages_claude_hooks=manages_hooks,
                     groups=new_groups, settings=target_settings if manages_hooks else None,
-                    settings_sha256=hashlib.sha256((next((item['updated'] for item in changes
-                        if item['path']==target_settings), '')).encode()).hexdigest(), phase='installing')
+                    settings_sha256=hashlib.sha256((target_settings_postimage or '').encode()).hexdigest(),
+                    phase='installing')
+    if manages_hooks:
+        if target_settings_change:
+            migrated['settings_mode'] = target_settings_change['mode']
+        elif target_settings_mode is not None:
+            migrated['settings_mode'] = target_settings_mode
     plan = {'legacy_state_path':str(legacy_path), 'legacy_state_sha256':hashlib.sha256(legacy_raw.encode()).hexdigest(),
             'legacy_state':legacy, 'legacy_state_text':legacy_raw, 'legacy_adapter':str(old_adapter),
             'legacy_adapter_sha256':hashlib.sha256(old_adapter_text.encode()).hexdigest() if old_adapter_text is not None else None,
@@ -2914,7 +3075,7 @@ def migrate_legacy(args):
                  'legacy_adapter_mode':Path(proposed['legacy_adapter']).stat().st_mode & 0o777
                     if proposed['legacy_adapter_text'] is not None else None,
                  'settings_changes':proposed['settings_changes'],
-                 'seat_preimage':seat,'new_state_path':str(session_store.seat_dir(identifier)/'checkouts'/
+                 'seat_preimage':copy.deepcopy(seat),'new_state_path':str(session_store.seat_dir(identifier)/'checkouts'/
                     session_store.checkout_id(proposed['migrated_state']['root'])/'state.json'),
                  'new_adapter_path':proposed['migrated_state']['adapter'],
                  'new_adapter_sha256':proposed['migrated_state']['adapter_sha256'],
@@ -3397,10 +3558,10 @@ def main():
     for action in ('plan', 'install'):
         help_text = ('Review a per-PR or native-owner delivery installation' if action == 'plan' else
                      'Apply a reviewed per-PR installation or native-owner checkout attachment')
-        p = sub.add_parser(action, help=help_text)
+        p = sub.add_parser(action, help=help_text, description=help_text)
         p.add_argument('--pr-url')
         p.add_argument('--base-ref')
-        p.add_argument('--lane', action='store_true', help='Enroll this product and native owner, optionally binding an explicit PR')
+        p.add_argument('--lane', action='store_true', help='Enroll this product and native owner, optionally binding a PR or discovering it later')
         p.add_argument('--owner-harness',choices=('claude','codex'))
         p.add_argument('--owner-session')
         p.add_argument('--host',default='github.com')
@@ -3418,9 +3579,11 @@ def main():
     p.add_argument('--from-harness',choices=('claude','codex'),required=True)
     p.add_argument('--from-session',required=True)
     p.add_argument('--confirm-handoff',action='store_true',required=True)
-    p = sub.add_parser('status', help='Inspect local binding, owner, report freshness and activation observations')
+    status_help = 'Inspect checkout attachment, PR binding, owner, report freshness and activation observations'
+    p = sub.add_parser('status', help=status_help, description=status_help)
     p.add_argument('--session-id', help='Actual orchestrator session ID; never inferred from config presence')
-    p = sub.add_parser('coverage', help='Read-only binding, owner and observed-path coverage; no discovery or probes')
+    coverage_help = 'Read-only attachment, binding, owner and observed-path coverage; no discovery or probes'
+    p = sub.add_parser('coverage', help=coverage_help, description=coverage_help)
     p.add_argument('--summary', action='store_true', help='Concise text and next action; default remains detailed JSON')
     p.add_argument('--pr-url', help='Caller-declared current PR; hosted state is not checked')
     sub.add_parser('uninstall', help='Remove or deactivate an installation without deleting its delivery history')
@@ -3446,7 +3609,8 @@ def main():
     recovery_modes.add_argument('--apply', action='store_true')
     recovery_modes.add_argument('--rollback', action='store_true')
     p.add_argument('--plan-sha256')
-    p = sub.add_parser('migrate-plan', help='Review an existing Gitdir installation for durable seat migration')
+    migration_help = 'Review a legacy installation, including a no-PR lane, for durable seat migration'
+    p = sub.add_parser('migrate-plan', help=migration_help, description=migration_help)
     p.add_argument('--session-root', type=Path)
     p.add_argument('--host', default='github.com')
     p.add_argument('--confirm-owner', action='store_true')
