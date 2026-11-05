@@ -20,7 +20,7 @@ _NATIVE_EVENT = contextvars.ContextVar('policy_guard_native_event', default=None
 
 def _opencode_identity(event):
     if not isinstance(event, dict) or event.get('native_source') != OPENCODE_EVENT_SOURCE:
-        raise ValueError('An actual OpenCode server tool context is required; environment session IDs do not enroll OpenCode')
+        raise ValueError('An actual native OpenCode server tool context is required; environment session IDs do not enroll OpenCode')
     context = event.get('tool_context')
     session = event.get('session')
     tool = event.get('tool')
