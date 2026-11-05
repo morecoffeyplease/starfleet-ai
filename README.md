@@ -15,7 +15,7 @@ The repository does not promise publication to npm, PyPI, Homebrew, or another p
 | [Agent Notify](apps/hailing-frequencies/agent-notify-guide.md) | Opens one Discord forum post per conversation and can register the thread for its exact enrolled owner. |
 | [Discord Watch](apps/discord-watch/README.md) | Uses one reply worker to queue responses from registered Discord threads for their exact enrolled owners. |
 | [Away Mode](apps/away-mode/README.md) | Records explicit availability and routes human contact through the configured Discord workflow. |
-| [Pattern Buffer](apps/pattern-buffer/README.md) | Restores worktree context for Claude Code and Codex sessions. |
+| [Pattern Buffer](apps/pattern-buffer/README.md) | Restores worktree context for Claude Code and Codex sessions, with opt-in OpenCode context and checkpoint support. |
 | [Model Preferences](apps/model-preferences/README.md) | Saves local model preferences for supported agent roles. |
 | [Warp-drive](apps/warp-drive/README.md) | Reserves local CPU capacity for agent-owned commands. |
 | [Starfleet Policy Guard](apps/starfleet-policy-guard/README.md) | Records local delivery evidence and provides separately scoped workflow tools. |

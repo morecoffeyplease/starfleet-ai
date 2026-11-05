@@ -56,6 +56,8 @@ _LIFECYCLE_EVENTS = {
     "note.published",
     "note.rejected",
     "compaction.observed",
+    "compaction.attempted",
+    "compaction.failed",
     "compaction.unknown",
     "standing.injection_emitted",
     "standing.injection_failed",
@@ -493,8 +495,8 @@ def emit(root, event, *, harness=None, session=None, enrollment_id=None,
     try:
         if not isinstance(event, str) or not _EVENT_NAME.fullmatch(event):
             raise _ReliabilityError("invalid_event", "event must be a short lowercase event name")
-        if harness not in (None, "claude", "codex"):
-            raise _ReliabilityError("invalid_harness", "harness must be claude or codex")
+        if harness not in (None, "claude", "codex", "opencode"):
+            raise _ReliabilityError("invalid_harness", "harness must be claude, codex, or opencode")
         session = _identifier(session, "session")
         enrollment_id = _identifier(enrollment_id, "enrollment_id")
         correlation_id = _identifier(correlation_id, "correlation_id")
@@ -606,7 +608,7 @@ def _clean_record(value, worktree_id):
         item = value.get(field)
         if item is not None:
             if field == "harness":
-                if item not in ("claude", "codex"):
+                if item not in ("claude", "codex", "opencode"):
                     return None
             elif not isinstance(item, str) or not _SAFE_TOKEN.fullmatch(item):
                 return None

@@ -31,7 +31,10 @@ It launches a bounded local Python process without passing the OpenCode process 
 OpenCode context recomputation covers both primary agent calls and the separate compaction model request.
 The plugin throws when a bound child lacks its exact task/session state or when rendering fails.
 Pinned v2.2.5 source awaits these callbacks before returning the prepared provider request, but the native pilot must still verify that a failed callback produces zero provider requests.
-Checkpoint pressure detection, compaction telemetry, native session recovery evidence, and native delivery confirmation are not implemented here.
+OpenCode checkpoint enrollment, successful tool-completion publication, context recovery guidance and compaction lifecycle observations use the shared Pattern Buffer checkpoint state and publication rules.
+Pressure warnings remain unqualified and disabled until exact same-session provider usage, usable context window and active compaction settings are reviewed.
+The OpenCode event stream has no replay guarantee, so observed successful compaction events do not establish a complete generation count.
+The context callback asks the model to read the exact published note, but callback completion does not prove that the model read or reconciled it.
 The existing synthetic trial evidence proves only its own candidate fixture, denied actions, API call, tests, and rollback.
 A separate N1 human-assisted visible-session continuation on `084faeee` completed a real Agent Notify roundtrip in the same persisted Qwen session.
 That assisted legacy CLI result does not establish automatic Pattern Buffer native recovery, global native-hook restoration or model reception of the finished-task notice.
@@ -54,6 +57,37 @@ python3 apps/pattern-buffer/pattern_buffer.py uninstall --harness opencode --set
 Restart or reload OpenCode according to its own configuration behavior after editing settings.
 Review and trust the plugin through the controls of the exact OpenCode version in use.
 Installation and a configured plugin entry do not prove that the hook runs or that the provider receives its output.
+
+## OpenCode checkpoint enrollment
+
+Assign each OpenCode orchestrator explicitly before enrolling its checkpoint because OpenCode sessions do not inherit a worktree default role.
+
+```sh
+python3 apps/pattern-buffer/pattern_buffer.py --cwd /absolute/path/to/worktree assign \
+  --harness opencode --session ses_EXACT_NATIVE_ID --role orchestrator
+python3 apps/pattern-buffer/pattern_buffer.py --cwd /absolute/path/to/worktree checkpoint-enroll \
+  --harness opencode --session ses_EXACT_NATIVE_ID --file /absolute/private/working-checkpoint.md
+```
+
+The input note must be durable private storage outside temporary directories and tracked or unignored worktree paths.
+Enrollment reuses Pattern Buffer's exact session ownership, validated six-heading note, atomic publication, previous-version retention and ignored editable draft.
+It does not install the OpenCode plugin or change its settings or trust records.
+The result reports `pressure_qualified: false`, `hooks_loaded: unverified` and `recovery_observed: false`.
+OpenCode rejects `--compact-at`, `--reminders on` and lead configuration while pressure evidence remains unqualified.
+
+The context plugin adds the exact checkpoint path and recovery instructions to the enrolled session's context callback.
+Read the published note with OpenCode's normal file-reading tool, then reconcile its claims with current evidence.
+The callback and its configured plugin entry do not prove model reception or a completed recovery read.
+
+After a successful OpenCode tool completion, the plugin publishes a changed valid editable draft through the shared atomic publisher.
+An invalid draft leaves the last good publication in place and gives one advisory for that content version on the next context callback.
+The compaction `started` event records an attempt, `ended` records successful completion and increments the observed count, and `failed` never increments it.
+The event stream has no replay guarantee, so status retains explicit uncertainty about missed compactions.
+
+In OpenCode v2.2.5, automatic compaction checks whether compaction is due and emits `session.compaction.started` before building the compaction model request.
+The `session.compaction` context callback is therefore too late to qualify a warning before that decision.
+The current integration sends no pressure warning and makes no advance-warning timing claim.
+Keep it disabled until the owner verifies same-session context usage, its exact provider/model/variant/agent, the usable model window and active compaction settings.
 
 ## Two-phase task binding
 

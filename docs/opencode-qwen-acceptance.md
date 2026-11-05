@@ -270,6 +270,14 @@ A Qwen-led C5 preparation stopped before model dispatch because its private wrap
 
 ## Native ownership and composer gaps
 
+The Pattern Buffer OpenCode checkpoint adapter now has source coverage for explicit session enrollment, successful tool-completion publication, checkpoint recovery guidance and compaction lifecycle accounting.
+Its context plugin uses the shared atomic publisher and retains an invalid-draft advisory until that draft content changes.
+Compaction attempts and failures do not increment the observed successful-completion count, and duplicate or foreign-session events are rejected.
+The event stream has no replay guarantee, so generation coverage remains uncertain.
+The current context callback is too late to warn before v2.2.5 automatic compaction decides to compact.
+Pressure warnings remain disabled because exact same-session usage and the runtime/window/config descriptor have not qualified this candidate.
+This source change has not been installed or exercised in a native OpenCode session; the offline controls and canonical verification remain separate evidence.
+
 Passively opening an API-created session did not initially register a native CMUX agent identity.
 A subsequent actual startup task produced OpenCode lifecycle events and a native session record.
 With two interactive clients attached to the same API/project, the native projection associated the session with the earlier passive tab rather than the newly opened startup tab.

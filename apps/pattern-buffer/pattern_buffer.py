@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pattern Buffer restores approved worktree context for Claude and Codex."""
+"""Pattern Buffer restores approved worktree context for Claude, Codex, and OpenCode."""
 import argparse
 import datetime
 from dataclasses import asdict
@@ -1389,6 +1389,11 @@ def opencode_context(root, gitdir, session):
                 or saved.get("role") != "implementer" or not saved.get("task_id")):
             raise ValueError("linked OpenCode worktree session is not bound to its prepared implementer task")
     text = render(root, "opencode", session)
+    checkpoint = checkpoints().opencode_recovery_context(sys.modules[__name__], root, gitdir, session)
+    if checkpoint:
+        text += "\n\n" + checkpoint
+        if len(text.encode()) > INJECTION_LIMIT:
+            raise ValueError("standing context and checkpoint recovery guidance exceed the 24 KiB injection limit")
     assignment = state_path(gitdir, "opencode", session)
     assignment_sha256 = (hashlib.sha256(bounded(assignment, FILE_LIMIT).encode("utf-8")).hexdigest()
                          if assignment.exists() or assignment.is_symlink() else None)
@@ -1857,22 +1862,22 @@ def main():
     guide = sub.add_parser("guide", help="print the operational guide without reading worktree state")
     guide.add_argument("--print", action="store_true", dest="print_guide",
                        help="print the guide (the default when using this command)")
-    cmd = sub.add_parser("checkpoint-enroll", help="self-service briefing, note adoption and hook preparation; no separate human approval")
-    cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+    cmd = sub.add_parser("checkpoint-enroll", help="self-service briefing, note adoption and supported integration preparation; no separate human approval")
+    cmd.add_argument("--harness", choices=("claude", "codex", "opencode"), required=True)
     cmd.add_argument("--session", help="defaults to this harness's inherited native session ID")
     cmd.add_argument("--compact-at", type=float, help="confirmed percentage when native runtime detection is unavailable")
-    cmd.add_argument("--lead-points", type=float, default=5)
+    cmd.add_argument("--lead-points", type=float)
     cmd.add_argument("--file", help="reviewed private note; omit to show the take-stock briefing without changes")
     cmd.add_argument("--settings", help="explicit harness settings JSON; defaults to user-level settings")
     cmd.add_argument("--runtime-dir", help="explicit installed runtime directory")
     cmd.add_argument("--prepare-restart", action="store_true", help="prepare removal of legacy native hook copies without changing an existing checkpoint")
     for name in ("checkpoint-init", "checkpoint-config", "checkpoint-save", "checkpoint-status", "checkpoint-read"):
         cmd = sub.add_parser(name, help="manage a private orchestrator checkpoint; see docs/checkpoints.md")
-        cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+        cmd.add_argument("--harness", choices=HARNESS_CHOICES, required=True)
         cmd.add_argument("--session", required=True, help="exact native orchestrator session ID")
         if name in ("checkpoint-init", "checkpoint-config"):
             cmd.add_argument("--compact-at", type=float, help="operator-confirmed compaction percentage on this harness's usage scale")
-            cmd.add_argument("--lead-points", type=float, default=5 if name == "checkpoint-init" else None)
+            cmd.add_argument("--lead-points", type=float)
         if name == "checkpoint-init":
             cmd.add_argument("--path", help="reuse an explicitly owned, durable private checkpoint file")
         if name == "checkpoint-config":
@@ -1882,6 +1887,12 @@ def main():
                              help="Claude idle warning delay, default 50; 0 disables future arming")
         if name == "checkpoint-save":
             cmd.add_argument("--file", required=True, help="reviewed Markdown input; no automatic summarization")
+    cmd = sub.add_parser("opencode-checkpoint-event", help=argparse.SUPPRESS)
+    cmd.add_argument("--session", required=True)
+    cmd.add_argument("--event", choices=("tool-completed", "compaction-started", "compaction-ended", "compaction-failed"), required=True)
+    cmd.add_argument("--event-id")
+    cmd.add_argument("--aggregate-id")
+    cmd.add_argument("--event-sequence", type=int)
     cmd = sub.add_parser("statusline", help=argparse.SUPPRESS)
     cmd.add_argument("--delegate-json", default="null")
     cmd = sub.add_parser("compaction-settings", help="save Claude's auto-compaction percentage without restarting sessions")
@@ -1943,6 +1954,11 @@ def main():
             print(json.dumps(session_command(root, gitdir, args), indent=2, default=str))
         elif args.command == "checkpoint-enroll":
             print(json.dumps(self_enroll(root, gitdir, args), indent=2))
+        elif args.command == "opencode-checkpoint-event":
+            result = checkpoints().opencode_event(sys.modules[__name__], root, gitdir, args.session,
+                                                  args.event, args.event_id, args.aggregate_id,
+                                                  args.event_sequence)
+            print(json.dumps(result, ensure_ascii=False))
         elif args.command.startswith("checkpoint-"):
             print(json.dumps(checkpoints().handle_cli(sys.modules[__name__], root, gitdir, args), indent=2))
         elif args.command == "dispatch":

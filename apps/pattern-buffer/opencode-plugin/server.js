@@ -27,17 +27,13 @@ function failContext(event, prior, code) {
   throw new Error(`Pattern Buffer OpenCode context failed (${code}).`);
 }
 
-function invoke(directory, sessionID) {
+function invokeCommand(directory, arguments_) {
   const python = "python3";
-  const result = spawnSync(python, [
+  return spawnSync(python, [
     SCRIPT,
     "--cwd",
     directory,
-    "context",
-    "--harness",
-    "opencode",
-    "--session",
-    sessionID,
+    ...arguments_,
   ], {
     cwd: directory,
     env: {
@@ -45,6 +41,7 @@ function invoke(directory, sessionID) {
       HOME: process.env.HOME || directory,
       LANG: process.env.LANG || "C.UTF-8",
       LC_ALL: process.env.LC_ALL || "C.UTF-8",
+      ...(process.env.XDG_STATE_HOME ? { XDG_STATE_HOME: process.env.XDG_STATE_HOME } : {}),
       PYTHONDONTWRITEBYTECODE: "1",
       GIT_OPTIONAL_LOCKS: "0",
     },
@@ -53,6 +50,9 @@ function invoke(directory, sessionID) {
     shell: false,
     timeout: TIMEOUT_MS,
   });
+}
+
+function parsePayload(result, directory, sessionID) {
   if (result.error || result.status !== 0) {
     return { status: "blocked", code: result.error?.code || `exit_${result.status ?? "unknown"}` };
   }
@@ -66,6 +66,13 @@ function invoke(directory, sessionID) {
       payload.worktree !== directory) {
     return { status: "blocked", code: "identity_mismatch" };
   }
+  return payload;
+}
+
+function invoke(directory, sessionID) {
+  const result = invokeCommand(directory, ["context", "--harness", "opencode", "--session", sessionID]);
+  const payload = parsePayload(result, directory, sessionID);
+  if (payload.status === "blocked") return payload;
   if (["unregistered", "disabled"].includes(payload.status)) {
     return { status: payload.status };
   }
@@ -73,6 +80,15 @@ function invoke(directory, sessionID) {
     return { status: "blocked", code: "invalid_context" };
   }
   return { status: "context", text: payload.text };
+}
+
+function invokeLifecycle(directory, sessionID, eventType, eventID, aggregateID, eventSequence) {
+  const args = ["opencode-checkpoint-event", "--session", sessionID, "--event", eventType];
+  if (eventID) args.push("--event-id", eventID);
+  if (aggregateID) args.push("--aggregate-id", aggregateID);
+  if (Number.isInteger(eventSequence)) args.push("--event-sequence", String(eventSequence));
+  const result = invokeCommand(directory, args);
+  return parsePayload(result, directory, sessionID);
 }
 
 export default {
@@ -101,7 +117,61 @@ export default {
         event.system = prior;
       }
     };
-    await ctx.session.hook("context", refresh);
-    await ctx.session.hook("compaction", refresh);
+    const registrations = [];
+    registrations.push(await ctx.session.hook("context", refresh));
+    registrations.push(await ctx.session.hook("compaction", refresh));
+    if (ctx.tool?.hook) {
+      registrations.push(await ctx.tool.hook("execute.after", async (event) => {
+        if (event?.status !== "completed" || typeof event.sessionID !== "string" ||
+            !SESSION_ID.test(event.sessionID)) return;
+        const directory = ctx.location?.directory;
+        if (typeof directory !== "string" || !path.isAbsolute(directory)) return;
+        let currentDirectory;
+        try {
+          currentDirectory = realpathSync(directory);
+        } catch {
+          return;
+        }
+        invokeLifecycle(currentDirectory, event.sessionID, "tool-completed");
+      }));
+    }
+    const controller = new AbortController();
+    let eventTask;
+    if (ctx.event?.subscribe) {
+      eventTask = (async () => {
+        const types = ["session.compaction.started", "session.compaction.ended", "session.compaction.failed"];
+        try {
+          for await (const event of ctx.event.subscribe({ types, signal: controller.signal })) {
+            const eventType = {
+              "session.compaction.started": "compaction-started",
+              "session.compaction.ended": "compaction-ended",
+              "session.compaction.failed": "compaction-failed",
+            }[event?.type];
+            const data = event?.data;
+            if (!eventType || !data || typeof data.sessionID !== "string" ||
+                !SESSION_ID.test(data.sessionID)) continue;
+            const directory = ctx.location?.directory;
+            if (typeof directory !== "string" || !path.isAbsolute(directory)) continue;
+            let currentDirectory;
+            try {
+              currentDirectory = realpathSync(directory);
+            } catch {
+              continue;
+            }
+            invokeLifecycle(currentDirectory, data.sessionID, eventType, event.id,
+              event.durable?.aggregateID, event.durable?.seq);
+          }
+        } catch {
+          // Event history is live-only, so a lost subscription leaves generation coverage uncertain.
+        }
+      })();
+    }
+    return async () => {
+      controller.abort();
+      for (const registration of registrations) {
+        await registration?.dispose?.();
+      }
+      await eventTask;
+    };
   },
 };

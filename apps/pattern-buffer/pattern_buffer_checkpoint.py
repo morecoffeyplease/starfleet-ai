@@ -21,6 +21,8 @@ ATTENTION_TIMEOUT_SECONDS = 3
 ATTENTION_DETAIL_LIMIT = 512
 SECTIONS = ("Current state", "Next action", "Decisions and uncertainty",
             "Active work", "Evidence", "Holds and guidance")
+OPENCODE_SESSION_ID = re.compile(r"^ses_[A-Za-z0-9]+$")
+OPENCODE_EVENT_TYPES = {"compaction-started", "compaction-ended", "compaction-failed"}
 
 
 def _now():
@@ -478,6 +480,9 @@ def _draft_digest(state):
 
 
 def _generation_text(state):
+    if state.get("identity", {}).get("harness") == "opencode":
+        return (f"Observed {state.get('observed_generation', 0)} successful OpenCode compaction completion event(s) "
+                "since enrollment; complete event coverage remains uncertain.")
     if state.get("generation_uncertain") or state.get("pending_compact_boundary"):
         return "Compaction count not yet confirmed. This does not mean no compaction occurred."
     return f"Observed compaction generation since enrollment: {state.get('observed_generation', 0)}."
@@ -696,7 +701,31 @@ def _load_state(ci, root, gitdir, harness, session):
                    for value in state["draft_signature"][:2])
             or not isinstance(state["draft_signature"][2], str)):
         raise ValueError("checkpoint draft metadata is invalid")
-    _validate_settings(state["compact_at"], state["lead_points"])
+    pressure_qualified = state.get("pressure_qualified", harness != "opencode")
+    if not isinstance(pressure_qualified, bool):
+        raise ValueError("checkpoint pressure qualification metadata is invalid")
+    if harness == "opencode":
+        if (pressure_qualified or state["compact_at"] is not None or state["lead_points"] is not None
+                or state["reminders"]):
+            raise ValueError("OpenCode pressure must remain unqualified until native usage evidence is reviewed")
+        recent = state.get("recent_compaction_event_ids", [])
+        if (not isinstance(recent, list) or len(recent) > 64 or
+                any(not isinstance(item, dict) or set(item) != {"event_id", "event_type"}
+                    or not isinstance(item.get("event_id"), str)
+                    or not re.fullmatch(r"evt_[A-Za-z0-9]+", item["event_id"])
+                    or item.get("event_type") not in OPENCODE_EVENT_TYPES for item in recent)):
+            raise ValueError("OpenCode compaction event metadata is invalid")
+        sequence = state.get("last_compaction_event_sequence")
+        if sequence is not None and (isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0):
+            raise ValueError("OpenCode compaction event sequence is invalid")
+        for key in ("invalid_draft_sha256", "advised_draft_sha256"):
+            value = state.get(key)
+            if value is not None and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)):
+                raise ValueError("OpenCode draft advisory metadata is invalid")
+    else:
+        if not pressure_qualified:
+            raise ValueError("pressure qualification metadata is invalid for this harness")
+        _validate_settings(state["compact_at"], state["lead_points"])
     note_path = Path(state["checkpoint_path"])
     previous_path = Path(state["previous_path"])
     if not state["external"] and note_path != _dir(gitdir, harness, session) / "checkpoint.md":
@@ -717,6 +746,8 @@ def _load_state(ci, root, gitdir, harness, session):
 
 
 def _effective_threshold(state, harness):
+    if not state.get("pressure_qualified", harness != "opencode"):
+        return None, None, "unqualified; live pressure warnings disabled"
     compact = state["compact_at"]
     source = state.get("threshold_source", "operator configuration")
     if harness == "claude":
@@ -739,6 +770,7 @@ def _report(ci, root, gitdir, harness, session, state, include_note=False):
     note, warning = _read_note(state, ci)
     revision = ci.git(root, "rev-parse", "HEAD")
     compact, reminder_threshold, effective_source = _effective_threshold(state, harness)
+    pressure_qualified = state.get("pressure_qualified", harness != "opencode")
     elapsed = None
     if state.get("reviewed_at"):
         try:
@@ -749,6 +781,8 @@ def _report(ci, root, gitdir, harness, session, state, include_note=False):
     result = {"initialized": True, "checkpoint_path": state["checkpoint_path"],
               "identity": state.get("identity"), "enabled": state.get("enabled", False),
               "reminders": state.get("reminders", False),
+              "pressure_qualified": pressure_qualified,
+              "pressure_status": ("qualified" if pressure_qualified else "unqualified; live warnings disabled"),
               "reviewed_at": state.get("reviewed_at"), "saved_revision": state.get("saved_revision"),
               "published_at": state.get("published_at"),
               "seconds_since_review": elapsed,
@@ -801,8 +835,10 @@ def _report(ci, root, gitdir, harness, session, state, include_note=False):
 
 def handle_cli(ci, root, gitdir, args):
     harness, session, command = args.harness, args.session, args.command
-    if harness not in ("claude", "codex") or not session:
+    if harness not in ("claude", "codex", "opencode") or not session:
         raise ValueError("checkpoint commands require a supported harness and session")
+    if harness == "opencode" and not OPENCODE_SESSION_ID.fullmatch(session):
+        raise ValueError("OpenCode checkpoints require the exact case-sensitive ses_ session ID")
     _primary(ci, root, gitdir, harness, session)
     state_path = _state_path(gitdir, harness, session)
     if command == "checkpoint-init":
@@ -815,12 +851,17 @@ def handle_cli(ci, root, gitdir, args):
                 raise ValueError("checkpoint is already initialized")
             compact = args.compact_at
             source = "operator configuration"
-            if compact is None:
+            if harness == "opencode":
+                if compact is not None or args.lead_points is not None:
+                    raise ValueError("OpenCode pressure is unqualified; do not supply compact-at or lead values")
+                source = "unqualified; verified provider usage, usable window, and active compaction settings are required"
+            elif compact is None:
                 if harness == "codex":
                     raise ValueError("Codex requires explicit --compact-at because its runtime threshold is unknown")
                 compact, source = 60.0, "operator fallback 60; runtime override is honored"
-            lead = args.lead_points
-            _validate_settings(compact, lead)
+            lead = args.lead_points if args.lead_points is not None else 5.0
+            if harness != "opencode":
+                _validate_settings(compact, lead)
             folder = state_path.parent
             folder.mkdir(parents=True, exist_ok=True, mode=0o700)
             note_path = folder / "checkpoint.md"
@@ -856,16 +897,26 @@ def handle_cli(ci, root, gitdir, args):
                 raise ValueError(draft_error)
             state = {"version": 1, "identity": owner, "checkpoint_path": str(note_path),
                      "previous_path": str(previous_path),
-                     "compact_at": float(compact), "lead_points": float(lead),
-                     "threshold_source": source, "reminders": True, "enabled": True,
+                     "compact_at": float(compact) if compact is not None else None,
+                     "lead_points": float(lead) if harness != "opencode" else None,
+                     "threshold_source": source, "pressure_qualified": harness != "opencode",
+                     "reminders": harness != "opencode", "enabled": True,
                      "reviewed_at": None, "saved_revision": None, "note_sha256": None,
                      "saved_generation": None, "external": bool(args.path),
                      "observed_generation": 0, "generation_uncertain": True,
-                     "generation_scope": "since enrollment",
-                     "uncertainty": "no transcript provenance observed yet", "transcript": None,
+                     "generation_scope": ("observed completion events; event coverage uncertain"
+                                          if harness == "opencode" else "since enrollment"),
+                     "uncertainty": ("native compaction completion events may be missed while the plugin is inactive"
+                                     if harness == "opencode" else "no transcript provenance observed yet"),
+                     "transcript": None,
                      "reminded_generation": None, "usage": None,
                      "draft_path": str(draft), "draft_signature": draft_signature,
                      "published_at": None}
+            if harness == "opencode":
+                state["recent_compaction_event_ids"] = []
+                state["last_compaction_event_sequence"] = None
+                state["invalid_draft_sha256"] = None
+                state["advised_draft_sha256"] = None
             state["idle_warning_minutes"] = 50 if harness == "claude" else 0
             _arm_idle_timer(state, harness, session, "enrollment", ci)
             _write_json(state_path, state, ci)
@@ -874,6 +925,9 @@ def handle_cli(ci, root, gitdir, args):
             return result
         _, state = _load_state(ci, root, gitdir, harness, session)
         if command == "checkpoint-config":
+            if harness == "opencode" and (args.reminders is not None or args.compact_at is not None
+                                           or args.lead_points is not None or args.idle_warning_minutes is not None):
+                raise ValueError("OpenCode pressure and reminders remain disabled until exact native usage evidence is reviewed")
             if args.idle_warning_minutes is not None:
                 minutes = args.idle_warning_minutes
                 if harness != "claude" or not 0 <= minutes <= 1440:
@@ -884,7 +938,8 @@ def handle_cli(ci, root, gitdir, args):
                 state["threshold_source"] = "operator configuration"
             if args.lead_points is not None:
                 state["lead_points"] = args.lead_points
-            _validate_settings(state["compact_at"], state["lead_points"])
+            if harness != "opencode":
+                _validate_settings(state["compact_at"], state["lead_points"])
             if args.reminders is not None:
                 state["reminders"] = args.reminders == "on"
             if args.enabled is not None:
@@ -914,6 +969,159 @@ def handle_cli(ci, root, gitdir, args):
         if command == "checkpoint-read":
             return _report(ci, root, gitdir, harness, session, state, True)
     raise ValueError("unknown checkpoint command")
+
+
+def _opencode_checkpoint_owner(ci, root, gitdir, session):
+    if not isinstance(session, str) or not OPENCODE_SESSION_ID.fullmatch(session):
+        raise ValueError("OpenCode checkpoints require the exact case-sensitive ses_ session ID")
+    config_path = gitdir / "context-injector" / "config.json"
+    if not config_path.exists():
+        return False
+    config, _ = ci.load(root, gitdir)
+    if not ci.enabled(config):
+        return False
+    role, _, binding = ci.resolve_role(root, gitdir, config, "opencode", session)
+    return role == "orchestrator" and not binding.get("task_id")
+
+
+def opencode_recovery_context(ci, root, gitdir, session):
+    """Return exact-session recovery guidance from the shared checkpoint state."""
+    if not _opencode_checkpoint_owner(ci, root, gitdir, session):
+        return ""
+    state_path = _state_path(gitdir, "opencode", session)
+    if not state_path.exists():
+        return ""
+    with ci.locked(_lock_path(state_path)):
+        try:
+            _, state = _load_state(ci, root, gitdir, "opencode", session)
+        except (OSError, ValueError, UnicodeError, TypeError, KeyError):
+            return ("Pattern Buffer checkpoint recovery for this exact OpenCode session.\n"
+                    "WARNING: Checkpoint metadata failed integrity checks; no checkpoint contents were injected. "
+                    "Inspect checkpoint-status for this exact session and repair its reviewed publication before relying on recovery.\n"
+                    "This advisory does not change standing context, task authority, or human holds.")
+        if not state.get("enabled"):
+            return ""
+        note, warning = _read_note(state, ci)
+        draft = Path(state["draft_path"])
+        draft_notice = None
+        if not draft.exists():
+            draft_notice = "The editable draft is missing; recreate it from the reviewed note before updating."
+        else:
+            draft_text, signature, draft_error = _draft_snapshot(draft)
+            if not draft_error and signature != state["draft_signature"]:
+                try:
+                    _validate_note(draft_text)
+                except ValueError as error:
+                    draft_error = str(error)
+            if draft_error:
+                if (signature != state["draft_signature"] and
+                        state.get("invalid_draft_sha256") != signature[2]):
+                    state["invalid_draft_sha256"] = signature[2]
+                    _write_json(state_path, state, ci)
+            elif signature != state["draft_signature"]:
+                draft_notice = "The editable draft has unpublished changes; reconcile it with the published note."
+        lines = ["Pattern Buffer checkpoint recovery for this exact OpenCode session.",
+                 "Read the reviewed current-state checkpoint before resuming: " + state["checkpoint_path"],
+                 "Reconcile its claims with live evidence, preserve its human holds, and do not adopt another session's note.",
+                 "Maintain the separate editable draft as a pruned current snapshot: " + state["draft_path"],
+                 "A successful OpenCode tool-completion callback publishes a changed valid draft atomically.",
+                 _generation_text(state),
+                 "OpenCode pressure warnings remain unqualified and disabled; no occupancy percentage or warning lead is available."]
+        if note is None:
+            lines.append("WARNING: The reviewed checkpoint is unavailable or changed outside checkpoint-save; no note contents are injected. Inspect checkpoint-status for this exact session before relying on recovery.")
+        if draft_notice:
+            lines.append("WARNING: " + draft_notice)
+        elif warning:
+            lines.append("WARNING: " + warning)
+        invalid_digest = state.get("invalid_draft_sha256")
+        if invalid_digest and invalid_digest != state.get("advised_draft_sha256"):
+            lines.append("WARNING: The latest changed draft was rejected or is invalid; the last good checkpoint remains published. Review and correct the draft before further substantial work.")
+            state["advised_draft_sha256"] = invalid_digest
+            _write_json(state_path, state, ci)
+        lines.append("This checkpoint records current state. It does not grant authority or prove model reception.")
+        return "\n".join(lines)
+
+
+def opencode_event(ci, root, gitdir, session, event_type, event_id=None, aggregate_id=None,
+                   event_sequence=None):
+    """Apply native OpenCode lifecycle observations through shared checkpoint publication semantics."""
+    if event_type not in ("tool-completed", *OPENCODE_EVENT_TYPES):
+        raise ValueError("unsupported OpenCode checkpoint lifecycle event")
+    if not _opencode_checkpoint_owner(ci, root, gitdir, session):
+        return {"status": "not_checkpoint_owner", "harness": "opencode", "session_id": session,
+                "worktree": str(root)}
+    state_path = _state_path(gitdir, "opencode", session)
+    if not state_path.exists():
+        return {"status": "not_enrolled", "harness": "opencode", "session_id": session,
+                "worktree": str(root)}
+    with ci.locked(_lock_path(state_path)):
+        _, state = _load_state(ci, root, gitdir, "opencode", session)
+        if not state.get("enabled"):
+            result = "disabled"
+        elif event_type == "tool-completed":
+            draft = _verify_draft(ci, root, gitdir, "opencode", session, state, missing_ok=True)
+            if not draft.exists():
+                result = "draft_missing"
+            else:
+                draft_text, signature, draft_error = _draft_snapshot(draft)
+                if signature == state["draft_signature"]:
+                    result = "unchanged"
+                else:
+                    digest = signature[2]
+                    state["draft_signature"] = signature
+                    _record(ci, root, state, "note.draft_changed", "changed", digest,
+                            {"bytes": len(draft_text.encode()) if draft_text else 0, "source": "opencode"})
+                    if draft_error:
+                        state["invalid_draft_sha256"] = digest
+                        _record(ci, root, state, "note.rejected", "invalid", digest, {"source": "opencode"})
+                        _write_json(state_path, state, ci)
+                        result = "rejected"
+                    else:
+                        try:
+                            note = _publish(ci, root, state, draft_text, _signature_time(signature))
+                        except ValueError:
+                            state["invalid_draft_sha256"] = digest
+                            _record(ci, root, state, "note.rejected", "invalid", digest, {"source": "opencode"})
+                            _write_json(state_path, state, ci)
+                            result = "rejected"
+                        else:
+                            state["invalid_draft_sha256"] = None
+                            _write_json(state_path, state, ci)
+                            result = "published"
+        else:
+            if (not isinstance(event_id, str) or not re.fullmatch(r"evt_[A-Za-z0-9]+", event_id)
+                    or aggregate_id != session or isinstance(event_sequence, bool)
+                    or not isinstance(event_sequence, int) or event_sequence < 0):
+                return {"status": "unknown_identity", "harness": "opencode", "session_id": session,
+                        "worktree": str(root)}
+            recent = state.get("recent_compaction_event_ids", [])
+            last_sequence = state.get("last_compaction_event_sequence")
+            if (any(item["event_id"] == event_id for item in recent) or
+                    last_sequence is not None and event_sequence <= last_sequence):
+                result = "duplicate"
+            else:
+                recent.append({"event_id": event_id, "event_type": event_type})
+                state["recent_compaction_event_ids"] = recent[-64:]
+                state["last_compaction_event_sequence"] = event_sequence
+                if event_type == "compaction-ended":
+                    state["observed_generation"] += 1
+                    state["generation_uncertain"] = True
+                    state["uncertainty"] = "OpenCode event subscription has no replay guarantee; completion coverage may be incomplete"
+                    _record(ci, root, state, "compaction.observed", "completed", event_id,
+                            {"generation": state["observed_generation"], "generation_uncertain": True,
+                             "trigger": "opencode"})
+                    result = "completed"
+                elif event_type == "compaction-failed":
+                    _record(ci, root, state, "compaction.failed", "failed", event_id, {"trigger": "opencode"})
+                    result = "failed"
+                else:
+                    _record(ci, root, state, "compaction.attempted", "started", event_id,
+                            {"trigger": "opencode"})
+                    result = "attempted"
+                _write_json(state_path, state, ci)
+    return {"status": result, "harness": "opencode", "session_id": session,
+            "worktree": str(root), "pressure_qualified": False,
+            "observed_generation": state.get("observed_generation", 0)}
 
 
 def _transcript_identity(ci, root, harness, session, payload):

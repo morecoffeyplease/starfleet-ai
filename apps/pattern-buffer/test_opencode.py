@@ -13,6 +13,14 @@ import uuid
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 PLUGIN = Path(__file__).parent / "opencode-plugin/server.js"
 NODE = shutil.which("node")
+CHECKPOINT_NOTE = "# Working checkpoint\n\n" + "\n\n".join(
+    "## " + title + "\n" + body for title, body in [
+        ("Current state", "The exact OpenCode checkpoint fixture is published."),
+        ("Next action", "Read the published note before continuing."),
+        ("Decisions and uncertainty", "Pressure qualification remains unknown."),
+        ("Active work", "No active work is owned by this fixture."),
+        ("Evidence", "Only synthetic offline callback evidence exists."),
+        ("Holds and guidance", "Preserve the explicit hold and do not infer model reception.")]) + "\n"
 
 
 @unittest.skipUnless(NODE, "Node.js is required for the synthetic plugin callback fixture")
@@ -40,6 +48,7 @@ class OpenCodePatternBufferTests(unittest.TestCase):
                     "OPENCODE_SESSION_ID": self.parent_session,
                     "CMUX_SURFACE_ID": self.surface_id,
                     "CMUX_WORKSPACE_ID": self.workspace_id,
+                    "XDG_STATE_HOME": str(self.base / "state"),
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         self.call(self.owner, "assign", "--harness", "opencode", "--session", self.parent_session,
                   "--role", "orchestrator")
@@ -78,6 +87,11 @@ class OpenCodePatternBufferTests(unittest.TestCase):
     def context(self, session="ses_unassigned", cwd=None):
         return json.loads(self.call(cwd or self.child, "context", "--harness", "opencode",
                                     "--session", session).stdout)
+
+    def enroll_checkpoint(self, note_path):
+        note_path.write_text(CHECKPOINT_NOTE)
+        return json.loads(self.call(self.owner, "checkpoint-enroll", "--harness", "opencode",
+                                    "--session", self.parent_session, "--file", str(note_path)).stdout)
 
     def plugin_call(self, session, parent_id=None, cwd=None, hook_name="context"):
         fixture = r'''import plugin from %s;
@@ -174,6 +188,113 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
     def test_context_requires_exact_case_sensitive_native_session_id(self):
         result = self.call(self.child, "context", "--harness", "opencode", "--session", "SEs_abc", success=False)
         self.assertIn("case-sensitive ses_", result.stderr)
+
+    def test_checkpoint_enrollment_recovery_and_pressure_stay_separate(self):
+        folder = tempfile.TemporaryDirectory(dir=Path.home(), prefix=".opencode-pb-checkpoint-")
+        self.addCleanup(folder.cleanup)
+        note_path = Path(folder.name) / "working-checkpoint.md"
+        enrolled = self.enroll_checkpoint(note_path)
+        self.assertEqual(enrolled["state"], "prepared")
+        self.assertEqual(enrolled["harness"], "opencode")
+        self.assertFalse(enrolled["pressure_qualified"])
+        self.assertEqual(enrolled["pressure_status"], "unqualified; live warnings disabled")
+        report = enrolled["checkpoint"]
+        self.assertIsNone(report["compact_at"])
+        self.assertIsNone(report["reminder_threshold"])
+        self.assertFalse(report["reminders"])
+        self.assertFalse(report["pressure_qualified"])
+        self.assertIn("OpenCode pressure warnings remain unqualified and disabled", self.context(self.parent_session, self.owner)["text"])
+        self.assertIn(str(note_path), self.context(self.parent_session, self.owner)["text"])
+        self.call(self.owner, "checkpoint-config", "--harness", "opencode", "--session",
+                  self.parent_session, "--reminders", "on", success=False)
+        pressure_session = "ses_pressure012345"
+        self.call(self.owner, "assign", "--harness", "opencode", "--session", pressure_session,
+                  "--role", "orchestrator")
+        rejected = self.call(self.owner, "checkpoint-init", "--harness", "opencode", "--session",
+                             pressure_session, "--compact-at", "90", success=False)
+        self.assertIn("pressure is unqualified", rejected.stderr)
+        rejected_lead = self.call(self.owner, "checkpoint-init", "--harness", "opencode", "--session",
+                                  pressure_session, "--lead-points", "5", success=False)
+        self.assertIn("do not supply compact-at or lead values", rejected_lead.stderr)
+
+    def test_tool_completion_publishes_and_compaction_completion_is_deduplicated(self):
+        folder = tempfile.TemporaryDirectory(dir=Path.home(), prefix=".opencode-pb-checkpoint-")
+        self.addCleanup(folder.cleanup)
+        note_path = Path(folder.name) / "working-checkpoint.md"
+        enrolled = self.enroll_checkpoint(note_path)
+        draft = Path(enrolled["edit_this_file"])
+        draft.write_text(CHECKPOINT_NOTE.replace("exact OpenCode checkpoint fixture", "updated OpenCode checkpoint fixture"))
+        event_session = self.parent_session
+        fixture = r'''import plugin from %s;
+const callbacks = {};
+const sessionID = %s;
+const event = (type, id, seq, eventSession = sessionID) => ({ id, type,
+  durable: { aggregateID: sessionID, seq }, data: { sessionID: eventSession } });
+const events = [
+  event("session.compaction.started", "evt_attempt0001", 10),
+  event("session.compaction.ended", "evt_completed001", 11),
+  event("session.compaction.ended", "evt_completed001", 11),
+  event("session.compaction.failed", "evt_failed0001", 12),
+  event("session.compaction.ended", "evt_foreign0001", 13, "ses_other012345"),
+];
+const ctx = {
+  location: { directory: %s },
+  session: { hook: async (name, fn) => { callbacks[name] = fn; return { dispose: async () => {} }; } },
+  tool: { hook: async (name, fn) => { callbacks[name] = fn; return { dispose: async () => {} }; } },
+  event: { subscribe: () => (async function* () { yield* events; })() },
+};
+const cleanup = await plugin.setup(ctx);
+await callbacks["execute.after"]({ status: "completed", sessionID });
+await cleanup();
+console.log(JSON.stringify({ hooks: Object.keys(callbacks).sort() }));
+''' % (json.dumps(PLUGIN.as_uri()), json.dumps(event_session), json.dumps(str(self.owner)))
+        result = subprocess.run([NODE, "--input-type=module", "-e", fixture], capture_output=True,
+                                text=True, env=self.env, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("execute.after", json.loads(result.stdout)["hooks"])
+        published = Path(enrolled["published_copy"]).read_text()
+        self.assertIn("updated OpenCode checkpoint fixture", published)
+        self.assertIn("session: \"" + self.parent_session + "\"", published)
+        context = self.context(self.parent_session, self.owner)["text"]
+        self.assertIn("Observed 1 successful OpenCode compaction completion event", context)
+        self.assertIn("complete event coverage remains uncertain", context)
+        self.assertIn("Read the reviewed current-state checkpoint before resuming", context)
+        report = json.loads(self.call(self.owner, "checkpoint-status", "--harness", "opencode",
+                                      "--session", self.parent_session).stdout)
+        self.assertEqual(report["observed_generation"], 1)
+        self.assertTrue(report["generation_uncertain"])
+        self.assertFalse(report["pressure_qualified"])
+
+    def test_invalid_opencode_draft_keeps_last_good_note_and_advises_once(self):
+        folder = tempfile.TemporaryDirectory(dir=Path.home(), prefix=".opencode-pb-checkpoint-")
+        self.addCleanup(folder.cleanup)
+        note_path = Path(folder.name) / "working-checkpoint.md"
+        enrolled = self.enroll_checkpoint(note_path)
+        published = Path(enrolled["published_copy"])
+        original = published.read_bytes()
+        draft = Path(enrolled["edit_this_file"])
+        draft.write_text("## Current state\nMissing the other required sections.\n")
+        result = self.call(self.owner, "opencode-checkpoint-event", "--session", self.parent_session,
+                           "--event", "tool-completed")
+        self.assertEqual(json.loads(result.stdout)["status"], "rejected")
+        self.assertEqual(published.read_bytes(), original)
+        first = self.context(self.parent_session, self.owner)["text"]
+        second = self.context(self.parent_session, self.owner)["text"]
+        self.assertIn("latest changed draft was rejected", first)
+        self.assertNotIn("latest changed draft was rejected", second)
+        self.assertEqual(published.read_bytes(), original)
+
+    def test_corrupt_published_note_is_advisory_and_does_not_replace_standing_context(self):
+        folder = tempfile.TemporaryDirectory(dir=Path.home(), prefix=".opencode-pb-checkpoint-")
+        self.addCleanup(folder.cleanup)
+        note_path = Path(folder.name) / "working-checkpoint.md"
+        enrolled = self.enroll_checkpoint(note_path)
+        published = Path(enrolled["published_copy"])
+        published.write_text("tampered outside checkpoint-save\n")
+        context = self.context(self.parent_session, self.owner)["text"]
+        self.assertIn("Track ownership", context)
+        self.assertIn("no checkpoint contents were injected", context)
+        self.assertIn("Inspect checkpoint-status for this exact session", context)
 
     def test_prepare_rejects_reused_receipt_path_before_creating_another_task(self):
         self.prepare()

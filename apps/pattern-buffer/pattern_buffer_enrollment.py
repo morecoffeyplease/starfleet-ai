@@ -269,7 +269,8 @@ def _activation(ci, checkpoints, root, gitdir, args, session, pid, argv, observe
 
 def enroll(ci, checkpoints, root, gitdir, args):
     harness = args.harness
-    env_name = "CODEX_THREAD_ID" if harness == "codex" else "CLAUDE_SESSION_ID"
+    env_name = ("CODEX_THREAD_ID" if harness == "codex" else
+                "OPENCODE_SESSION_ID" if harness == "opencode" else "CLAUDE_SESSION_ID")
     inherited = os.environ.get(env_name)
     session = args.session or inherited
     if not session:
@@ -281,9 +282,14 @@ def enroll(ci, checkpoints, root, gitdir, args):
     config, _ = ci.load(root, gitdir)
     if not ci.enabled(config):
         raise ValueError("Pattern Buffer is disabled; self-enrollment does not override that hold")
-    pid, argv = _native(harness)
+    if harness == "opencode" and args.prepare_restart:
+        raise ValueError("OpenCode context plugins do not use native hook restart preparation")
+    if harness == "opencode" and (args.compact_at is not None or args.lead_points is not None):
+        raise ValueError("OpenCode pressure is unqualified; do not supply compact-at or lead values")
+    pid, argv = (None, None) if harness == "opencode" else _native(harness)
     observed = _codex_runtime(session, pid) if harness == "codex" else {}
     compact = args.compact_at if args.compact_at is not None else observed.get("compact_at")
+    lead_points = args.lead_points if args.lead_points is not None else 5.0
     if harness == "claude" and compact is None:
         override = os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
         compact = float(override) if override else 60.0
@@ -291,9 +297,10 @@ def enroll(ci, checkpoints, root, gitdir, args):
               "approval_required": False, "briefing": BRIEFING.format(note_budget_bytes=checkpoints.NOTE_LIMIT),
               "note_budget_bytes": checkpoints.NOTE_LIMIT,
               "template": checkpoints._template(), "compact_at": compact,
-              "threshold_source": "explicit confirmation" if args.compact_at is not None else
+              "threshold_source": ("unqualified; live OpenCode pressure warnings are disabled"
+                  if harness == "opencode" else "explicit confirmation" if args.compact_at is not None else
                   "same-session native runtime" if observed.get("compact_at") is not None else
-                  "Claude environment or fallback" if harness == "claude" else "unknown",
+                  "Claude environment or fallback" if harness == "claude" else "unknown"),
               "native_pid": pid, "state": "briefing", "recovery_observed": False,
               "guide": "apps/pattern-buffer/docs/checkpoints.md"}
     state_path = checkpoints._state_path(gitdir, harness, session)
@@ -308,9 +315,10 @@ def enroll(ci, checkpoints, root, gitdir, args):
     if not args.file:
         result["next_action"] = "Take stock, write or review a private note, then repeat with --file PATH. No files or hooks changed."
         return result
-    if compact is None:
+    if compact is None and harness != "opencode":
         raise ValueError("Codex threshold is unknown; provide confirmed --compact-at on the context-usage scale")
-    checkpoints._validate_settings(compact, args.lead_points)
+    if harness != "opencode":
+        checkpoints._validate_settings(compact, lead_points)
     note_path = Path(args.file).expanduser().absolute()
     note = ci.bounded(note_path, checkpoints.NOTE_LIMIT)
     checkpoints._validate_note(note)
@@ -321,7 +329,13 @@ def enroll(ci, checkpoints, root, gitdir, args):
     owner = Path(str(note_path) + ".owner.json")
     if owner.exists() and checkpoints._json(owner, ci) != checkpoints._identity(root, gitdir, harness, session):
         raise ValueError("external checkpoint path is claimed by another session")
-    activation = _activation(ci, checkpoints, root, gitdir, args, session, pid, argv, observed)
+    if harness == "opencode":
+        activation = {"plugin_setup": "requires the existing opt-in OpenCode context plugin",
+                      "hooks_loaded": "unverified", "recovery_observed": False,
+                      "pressure_qualified": False,
+                      "pressure_status": "unqualified; live warnings disabled"}
+    else:
+        activation = _activation(ci, checkpoints, root, gitdir, args, session, pid, argv, observed)
     folder = checkpoints._dir(gitdir, harness, session)
     checkpoints._ensure_directory_chain(folder)
     with ci.locked(folder / "enrollment.lock"):
@@ -329,12 +343,18 @@ def enroll(ci, checkpoints, root, gitdir, args):
             raise ValueError("session was enrolled concurrently; rerun to inspect its existing registration")
         checkpoints.handle_cli(ci, root, gitdir, argparse.Namespace(
             command="checkpoint-init", harness=harness, session=session,
-            compact_at=compact, lead_points=args.lead_points, path=str(note_path)))
+            compact_at=compact, lead_points=lead_points if harness != "opencode" else None,
+            path=str(note_path)))
         report = checkpoints.handle_cli(ci, root, gitdir, argparse.Namespace(
             command="checkpoint-save", harness=harness, session=session, file=str(note_path)))
-    result.update(activation, state="prepared", checkpoint=report,
-                  hook_installation=["Reusing stable installed hooks; no definitions or trust records changed."],
-                  next_action="Read the activation instructions, preserve native trust and existing jobs, and confirm real hook reception during ordinary work.")
+    result.update(activation, state="prepared", checkpoint=report)
+    if harness == "opencode":
+        result["next_action"] = ("Use the exact OpenCode context plugin in the same session. "
+                                 "Pressure warnings remain disabled until native usage and runtime settings are reviewed.")
+    else:
+        result["hook_installation"] = ["Reusing stable installed hooks; no definitions or trust records changed."]
+        result["next_action"] = ("Read the activation instructions, preserve native trust and existing jobs, and "
+                                 "confirm real hook reception during ordinary work.")
     return _authoring_result(result, report)
 
 

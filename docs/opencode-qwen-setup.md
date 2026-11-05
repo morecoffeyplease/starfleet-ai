@@ -162,6 +162,9 @@ The researcher route has one bounded native read-and-answer case without Pattern
 Current Pattern Buffer dispatched-task integration supports implementers only; keep researcher configuration separate and do not infer researcher task context from implementer evidence.
 
 Read the maintained [Pattern Buffer OpenCode guide](../apps/pattern-buffer/docs/opencode.md) for explicit plugin installation, two-phase task binding and exact session identity.
+The same guide documents opt-in orchestrator checkpoint enrollment, successful tool-completion publication, recovery instructions and uncertain compaction observations.
+OpenCode pressure warnings remain disabled until exact same-session usage, provider/model/variant/agent identity, usable context window and active compaction settings are verified.
+The context callback runs after the v2.2.5 automatic compaction decision and is not a supported advance-warning point.
 The native pilot observed shared context, the implementer role and initial task text in a primary request, an updated task in completed compaction, and a broken-bound-context failure that resulted in zero provider requests.
 A separate managed case resumed a permitted fixture read after compaction and correctly held continuation after task finish without another provider request.
 A later supervised case completed a same-session post-compaction edit; the chief reviewed its unchanged diff and ran four passing behavior tests.
