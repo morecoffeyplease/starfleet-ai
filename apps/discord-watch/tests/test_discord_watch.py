@@ -677,6 +677,64 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertIn(body, output.getvalue())
         self.assertEqual(output.getvalue().count("[attachment] " + filename), 6)
 
+    def test_default_receive_freezes_and_reads_unsealed_intake_without_a_sender(self):
+        self.register()
+        self.api.rows = [message("101", content="observe-only durable reply")]
+        report = self.app.scan()
+        self.assertEqual(report["threads"][0]["status"], "polled")
+        self.assertEqual(self.messages()[0][1], "pending")
+        self.assertEqual(self.cmux.submit_count, 0)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_groups WHERE thread_id=?",
+                                        (THREAD,)).fetchone()[0], 0)
+
+        output = io.StringIO()
+        result = self.app.receive(THREAD, output=output)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("observe-only durable reply", output.getvalue())
+        self.assertEqual(self.cmux.submit_count, 0)
+        self.assertEqual(self.messages()[0][1], "received")
+        self.assertEqual(self.group_members(1), [("101",)])
+
+    def test_default_receive_output_failure_keeps_its_new_frozen_group_unread(self):
+        self.register()
+        self.api.rows = [message("101", content="retryable manual output")]
+        self.app.scan()
+
+        class ShortWriter:
+            def write(self, text):
+                return len(text) - 1
+
+            def flush(self):
+                return None
+
+        with self.assertRaisesRegex(ValueError, "output was incomplete"):
+            self.app.receive(THREAD, output=ShortWriter())
+        self.assertEqual(self.messages()[0][1], "pending")
+        self.assertEqual(self.group_members(1), [("101",)])
+        self.assertEqual(self.delivery_groups()[0][2], "eligible")
+        output = io.StringIO()
+        result = self.app.receive(THREAD, output=output)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("retryable manual output", output.getvalue())
+
+    def test_default_receive_finishes_older_frozen_group_before_unsealed_replies(self):
+        self.register()
+        self.gateway("101", "older frozen group")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.wake()
+        self.gateway("102", "later unsealed reply")
+        output = io.StringIO()
+        result = self.app.receive(THREAD, output=output)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("older frozen group", output.getvalue())
+        self.assertNotIn("later unsealed reply", output.getvalue())
+        self.assertEqual(self.messages()[1][1], "pending")
+        self.assertEqual(self.group_members(1), [("101",)])
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertIsNone(db.execute("SELECT group_id FROM messages WHERE thread_id=? AND message_id='102'",
+                                         (THREAD,)).fetchone()[0])
+
     def test_incomplete_rest_catchup_holds_group_formation_and_submission(self):
         self.register()
         with contextlib.closing(self.app.database(create=False)) as db:
@@ -1183,6 +1241,92 @@ class DiscordWatchTests(unittest.TestCase):
         managed = self.app.managed(THREAD)
         self.assertEqual(managed["owner_session"], SESSION_B)
         self.assertFalse(managed["open"])
+
+    def test_each_attempt_preserves_its_exact_target_across_a_to_b_uncertain_to_c(self):
+        self.register()
+        self.gateway("101", "attempt attribution body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        self.cmux.hold_submit = "synthetic guarded hold"
+        first = self.wake()
+        self.assertEqual(first["state"], "held")
+        self.assertEqual(self.cmux.submit_count, 0)
+        self.assertEqual(self.delivery_groups()[0][2], "eligible")
+
+        owner_a = self.app.binding_snapshot(self.targets[0])
+        self.targets.append(target(SESSION_B, SURFACE_B, WORKSPACE_B))
+        self._write_hailing()
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_B
+        os.environ["CODEX_THREAD_ID"] = SESSION_B
+        self.app.transfer(THREAD, SESSION_A)
+        owner_b = self.app.binding_snapshot(self.targets[1])
+        self.cmux.hold_submit = None
+        self.cmux.uncertain = True
+        second = self.wake()
+        self.assertEqual(second["state"], "uncertain")
+        self.assertEqual(self.cmux.submit_count, 1)
+        status = self.app.status()["threads"][0]["delivery_groups"][0]
+        self.assertEqual(status["owner_generation"], 1)
+        self.assertEqual(status["attempts"][0]["target_owner"], owner_a)
+        self.assertEqual(status["attempts"][0]["target_owner_generation"], 1)
+        self.assertEqual(status["attempts"][0]["state"], "held")
+        self.assertEqual(status["attempts"][1]["target_owner"], owner_b)
+        self.assertEqual(status["attempts"][1]["target_owner_generation"], 2)
+        self.assertEqual(status["attempts"][1]["state"], "uncertain")
+
+        self.targets.append(target("33333333-3333-4333-8333-333333333333",
+                                   "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                                   "ffffffff-ffff-4fff-8fff-ffffffffffff"))
+        self._write_hailing()
+        owner_c = self.app.binding_snapshot(self.targets[2])
+        os.environ["CMUX_SURFACE_ID"] = owner_c["surface"]
+        os.environ["CMUX_WORKSPACE_ID"] = owner_c["workspace"]
+        os.environ["CODEX_THREAD_ID"] = owner_c["session"]
+        self.app.transfer(THREAD, SESSION_B)
+        self.cmux.uncertain = False
+        blocked = self.wake()
+        self.assertEqual(blocked["state"], "uncertain")
+        self.assertEqual(self.cmux.submit_count, 1)
+        output = io.StringIO()
+        result = self.app.receive(THREAD, output=output, group_id=1)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("attempt attribution body", output.getvalue())
+
+        self.app = FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
+                             cmux=self.cmux, now=self.clock)
+        resumed = self.app.status()["threads"][0]["delivery_groups"][0]
+        self.assertEqual(resumed["state"], "received")
+        self.assertEqual([item["target_owner"] for item in resumed["attempts"]], [owner_a, owner_b])
+        self.assertEqual([item["target_owner_generation"] for item in resumed["attempts"]], [1, 2])
+        self.assertEqual(self.cmux.submit_count, 1)
+
+    def test_migrated_attempt_history_keeps_unknown_target_as_null(self):
+        self.register()
+        self.gateway("101", "legacy attempt body")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        result = self.wake()
+        self.assertTrue(result["submitted"])
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("ALTER TABLE delivery_group_attempts RENAME TO delivery_group_attempts_new")
+                db.execute("""CREATE TABLE delivery_group_attempts (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  group_id INTEGER NOT NULL REFERENCES delivery_groups(id),
+                  state TEXT NOT NULL,
+                  created_at REAL NOT NULL,
+                  transport_started_at REAL,
+                  submitted_at REAL,
+                  last_error_json TEXT
+                )""")
+                db.execute("INSERT INTO delivery_group_attempts(id,group_id,state,created_at,"
+                           "transport_started_at,submitted_at,last_error_json) "
+                           "SELECT id,group_id,state,created_at,transport_started_at,submitted_at,last_error_json "
+                           "FROM delivery_group_attempts_new")
+                db.execute("DROP TABLE delivery_group_attempts_new")
+        migrated = self.app.status()["threads"][0]["delivery_groups"][0]["attempts"][0]
+        self.assertEqual(migrated["state"], "confirmed")
+        self.assertEqual(migrated["target_owner"], None)
+        self.assertEqual(migrated["target_owner_generation"], None)
 
     def test_api_rate_limit_details_are_retained_without_token_leak(self):
         import io as io_module

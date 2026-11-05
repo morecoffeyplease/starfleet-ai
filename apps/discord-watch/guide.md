@@ -119,12 +119,15 @@ discord-watch close THREAD_ID
 ```
 
 The group receive command prints every unread member of the selected frozen group in message ID order and flushes stdout before recording exact member receipts.
-The default receive command selects the oldest frozen group, while `--message` retains the exact single-message path.
+The default receive command selects the oldest frozen group, or freezes the next bounded pending group immediately when none exists.
+This explicit foreground pull does not wait for the native wake quiet window or require a sending worker, and it does not submit a native wake.
+Catch-up, exact-owner, output, and receipt guards still apply to the manual pull, while `--message` retains the exact single-message path.
 The receive command prints exact `[discord:THREAD:MESSAGE] author: content` records and flushes stdout before recording a local receipt.
 That flush is a delivery boundary for the CLI and does not prove that the reply was read or understood.
 The private database stores message bodies, attachment filenames, and attachment URLs with owner-only filesystem permissions.
 Receive prints bounded attachment filenames and HTTPS URLs to the exact recipient and does not download files.
 Status distinguishes forming and eligible groups, holds, durable submission intent, uncertain submissions, confirmed groups awaiting receipt, exact member receipts, and later queued messages without printing reply bodies.
+It also reports each attempt's exact target owner binding and generation when available, while historical attempts with unknown targets remain unattributed.
 A confirmed group is not submitted again while awaiting receipt, and uncertain submissions remain blocked indefinitely.
 The wake command invokes the active Discord Watch runtime with its qualified interpreter, so a stale launcher earlier on `PATH` is not used to parse `--group`.
 The new receiver shares `receive.lock` with supported older CLI versions and reconciles older per-message receipts without reprinting received members.

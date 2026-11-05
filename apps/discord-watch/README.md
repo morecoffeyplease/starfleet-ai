@@ -51,7 +51,7 @@ Group membership and a durable attempt intent are stored before guarded native s
 The wake contains a command that invokes the active Discord Watch runtime with its qualified Python interpreter and the immutable group ID, without including reply bodies.
 An uncertain submission remains blocked indefinitely, while a confirmed group waits for an explicit receipt without redundant wake submissions.
 Later replies remain queued and are grouped after the earlier group is received.
-Status reports forming groups, held groups, intent or uncertain submissions, confirmed groups awaiting receipt, each member's receipt, and later queued replies.
+Status reports forming groups, held groups, intent or uncertain submissions, confirmed groups awaiting receipt, each member's receipt, later queued replies, and each attempt's exact target binding and generation when known.
 
 For each thread, registration stores the exact Hailing Frequencies harness, surface, workspace, session, and generation.
 The central worker checks that the same target remains enrolled and validates the current CMUX projection and input guard before each wake.
@@ -78,6 +78,9 @@ No operator command resets an uncertain send to pending.
 It then revalidates the exact live owner and atomically receipts only the message IDs that were written from the selected frozen group.
 An older supported CLI can still receive an exact message using `--message`; the new CLI reconciles those per-message receipts and prints only the remaining unread members of a group.
 Group wake commands invoke the active immutable runtime directly so an older launcher elsewhere on `PATH` cannot receive an unsupported `--group` option.
+Default `receive --thread` is an explicit foreground pull that freezes the next bounded pending group immediately when no older unread group exists, even if the quiet window has not elapsed or no sending worker is running.
+This manual pull does not submit a native wake, and it still observes exact ownership, catch-up, output, and receipt guards.
+Historical attempt rows whose target cannot be recovered keep a null target attribution rather than inheriting the group's original owner.
 This flush is the CLI delivery boundary and is not proof that a person or model read or understood the reply.
 If output fails or the current owner changes before the receipt commit, the reply remains available for another receive.
 `managed` checks exact current ownership of the retained subscription, including locally closed and dormant registrations, and includes the latest worker health report.

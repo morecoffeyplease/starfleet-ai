@@ -361,7 +361,9 @@ class Watch:
           created_at REAL NOT NULL,
           transport_started_at REAL,
           submitted_at REAL,
-          last_error_json TEXT
+          last_error_json TEXT,
+          target_owner_json TEXT,
+          target_owner_generation INTEGER
         );
         CREATE TRIGGER IF NOT EXISTS delivery_group_members_no_update
         BEFORE UPDATE ON delivery_group_members BEGIN
@@ -379,6 +381,11 @@ class Watch:
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         db.execute("BEGIN IMMEDIATE")
+        attempt_columns = {row[1] for row in db.execute("PRAGMA table_info(delivery_group_attempts)")}
+        if "target_owner_json" not in attempt_columns:
+            db.execute("ALTER TABLE delivery_group_attempts ADD COLUMN target_owner_json TEXT")
+        if "target_owner_generation" not in attempt_columns:
+            db.execute("ALTER TABLE delivery_group_attempts ADD COLUMN target_owner_generation INTEGER")
         thread_columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
         if "catchup_before" not in thread_columns:
             db.execute("ALTER TABLE threads ADD COLUMN catchup_before TEXT")
@@ -957,7 +964,7 @@ class Watch:
                    "ON m.thread_id=gm.thread_id AND m.message_id=gm.message_id "
                    "WHERE gm.group_id=delivery_groups.id AND m.state!='received')", params)
 
-    def _seal_delivery_groups(self, db, thread, now):
+    def _seal_delivery_groups(self, db, thread, now, force=False, max_groups=None):
         if self._catchup_incomplete(thread):
             return []
         if not self._generation_chain_valid(db, thread, thread["owner_generation"], thread["owner"]):
@@ -970,6 +977,8 @@ class Watch:
         formed = []
         remaining = list(candidates)
         while remaining:
+            if max_groups is not None and len(formed) >= max_groups:
+                break
             prefix = []
             for row in remaining[:MAX_RECEIVE_MESSAGES]:
                 tentative = prefix + [row]
@@ -984,10 +993,18 @@ class Watch:
                 break
             first_at = min(row[4] for row in prefix)
             last_at = max(row[4] for row in prefix)
-            if now - first_at < GROUP_MAX_DELAY and now - last_at < GROUP_QUIET_SECONDS:
+            if not force and now - first_at < GROUP_MAX_DELAY and now - last_at < GROUP_QUIET_SECONDS:
                 break
             ids = [row[0] for row in prefix]
             with db:
+                latest = self._thread(db, thread["thread_id"], require_open=False)
+                require(latest["owner"] == thread["owner"] and
+                        latest["owner_generation"] == thread["owner_generation"],
+                        "Exact owner changed while a delivery group was being frozen")
+                require(not self._catchup_incomplete(latest),
+                        "REST catch-up began while a delivery group was being frozen")
+                require(self._generation_chain_valid(db, latest, latest["owner_generation"], latest["owner"]),
+                        "Owner generation changed while a delivery group was being frozen")
                 cursor = db.execute(
                     "INSERT INTO delivery_groups(thread_id,owner_generation,owner_json,status,created_at,"
                     "first_message_id,last_message_id) VALUES(?,?,?,'eligible',?,?,?)",
@@ -999,8 +1016,9 @@ class Watch:
                     db.execute("INSERT INTO delivery_group_members(group_id,thread_id,message_id,ordinal) "
                                "VALUES(?,?,?,?)", (group_id, thread["thread_id"], message_id, ordinal))
                     updated = db.execute("UPDATE messages SET group_id=? WHERE thread_id=? AND message_id=? "
-                                         "AND group_id IS NULL AND state='pending'",
-                                         (group_id, thread["thread_id"], message_id))
+                                         "AND group_id IS NULL AND state='pending' AND owner_generation=?",
+                                         (group_id, thread["thread_id"], message_id,
+                                          thread["owner_generation"]))
                     require(updated.rowcount == 1, "Reply changed while a delivery group was being frozen")
             formed.append({"group": group_id, "messages": ids, "state": "eligible"})
             remaining = remaining[len(prefix):]
@@ -1094,8 +1112,10 @@ class Watch:
             if state == "intent":
                 db.execute("UPDATE delivery_group_attempts SET state='abandoned_before_transport' "
                            "WHERE group_id=? AND state='intent'", (group_id,))
-            attempt = db.execute("INSERT INTO delivery_group_attempts(group_id,state,created_at) "
-                                 "VALUES(?,'intent',?)", (group_id, now))
+            attempt = db.execute(
+                "INSERT INTO delivery_group_attempts(group_id,state,created_at,target_owner_json,"
+                "target_owner_generation) VALUES(?,'intent',?,?,?)",
+                (group_id, now, owner_json, thread["owner_generation"]))
             attempt_id = attempt.lastrowid
             updated = db.execute("UPDATE delivery_groups SET status='intent',last_error_json=NULL "
                                  "WHERE id=? AND status IN ('eligible','intent') AND EXISTS ("
@@ -1282,7 +1302,11 @@ class Watch:
                 require(thread["owner"] == current,
                         "Only the registered current owner can receive this thread's replies")
                 if message_id is None and group_id is None:
-                    self._seal_delivery_groups(db, thread, self.clock())
+                    older_group = db.execute(
+                        "SELECT 1 FROM delivery_groups WHERE thread_id=? AND status!='received' LIMIT 1",
+                        (thread_id,)).fetchone()
+                    if older_group is None:
+                        self._seal_delivery_groups(db, thread, self.clock(), force=True, max_groups=1)
                 selected_group = None
                 if group_id is not None:
                     require(isinstance(group_id, (str, int)) and not isinstance(group_id, bool) and
@@ -1545,6 +1569,19 @@ class Watch:
                                    "SELECT m.message_id,m.state,m.received_at FROM delivery_group_members gm "
                                    "JOIN messages m ON m.thread_id=gm.thread_id AND m.message_id=gm.message_id "
                                    "WHERE gm.group_id=? ORDER BY gm.ordinal", (group_id,))]
+                    group_attempts = [{"attempt": attempt_id, "state": attempt_state,
+                                       "created_at": created_at,
+                                       "transport_started_at": transport_started_at,
+                                       "submitted_at": attempt_submitted_at,
+                                       "target_owner": json.loads(target_owner_json) if target_owner_json else None,
+                                       "target_owner_generation": target_owner_generation,
+                                       "last_error": json.loads(attempt_error) if attempt_error else None}
+                                      for attempt_id, attempt_state, created_at, transport_started_at,
+                                      attempt_submitted_at, target_owner_json, target_owner_generation,
+                                      attempt_error in db.execute(
+                                          "SELECT id,state,created_at,transport_started_at,submitted_at,"
+                                          "target_owner_json,target_owner_generation,last_error_json "
+                                          "FROM delivery_group_attempts WHERE group_id=? ORDER BY id", (group_id,))]
                     delivery_groups.append({"group": group_id, "owner_generation": group_generation,
                                             "state": visible_state, "stored_state": group_state,
                                             "created_at": group_created_at,
@@ -1553,7 +1590,7 @@ class Watch:
                                             "submitted_at": submitted_at,
                                             "last_error": json.loads(group_error) if group_error else None,
                                             "legacy": bool(legacy), "hold_reason": hold_reason,
-                                            "members": members})
+                                            "members": members, "attempts": group_attempts})
                 forming_rows = db.execute(
                     "SELECT message_id,author_name,body,attachments_json,ingested_at FROM messages "
                     "WHERE thread_id=? AND groupable=1 "
