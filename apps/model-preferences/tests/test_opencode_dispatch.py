@@ -77,6 +77,9 @@ class FakeAPIState:
         self.model_settings_by_directory = {}
         self.catalog_response_directories = {}
         self.provider_response_directories = {}
+        self.plugins = []
+        self.plugin_response = None
+        self.plugin_response_directories = {}
         self.location_requests = []
         self.session_directory = str(root)
         self.session_model = {"providerID": PROVIDER, "id": MODEL, "variant": "max"}
@@ -209,6 +212,14 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
                 "variants": [{"id": "max", "settings": self.state.variant_settings,
                               "body": self.state.variant_body}],
                 "limit": {"context": 131072, "output": self.state.model_output}}]})
+        if path == "/api/plugin":
+            selected_directory = self.requested_directory()
+            self.state.location_requests.append({"path": path, "query": urlsplit(self.path).query,
+                                                 "header": self.headers.get("x-opencode-directory")})
+            response_directory = self.state.plugin_response_directories.get(
+                selected_directory, selected_directory)
+            data = self.state.plugins if self.state.plugin_response is None else self.state.plugin_response
+            return self.respond(200, {"location": {"directory": response_directory}, "data": data})
         if path == "/api/session/active":
             return self.respond(200, {"data": self.state.active_sessions})
         if path.startswith("/api/session/"):
@@ -349,6 +360,34 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.manifest.chmod(0o600)
         self.choice = {"harness": "opencode", "provider_id": PROVIDER, "model": MODEL,
                        "effort": "max", "selection": "a" * 64}
+
+    def preflight_args(self, *, required_plugins=(), role="implementer"):
+        config_dir = self.root / "preflight-config"
+        state_dir = self.root / "preflight-state"
+        config = mp.example_config()
+        config["active"] = "Codex-Qwen"
+        mp.write(config_dir / "profiles.json", config)
+        worktree = self.root / "preflight-worktree"
+        worktree.mkdir()
+        subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+        self.state.server_directory = str(worktree)
+        argv = ["--config-dir", str(config_dir), "--state-dir", str(state_dir), "preflight",
+                "--role", role, "--cwd", str(worktree), "--opencode-manifest", str(self.manifest)]
+        for plugin_id in required_plugins:
+            argv.extend(["--require-plugin", plugin_id])
+        return mp.parser().parse_args(argv), worktree
+
+    def invoke_preflight_main(self, args):
+        argv = ["--config-dir", args.config_dir, "--state-dir", args.state_dir, "preflight",
+                "--role", args.role, "--cwd", args.cwd, "--opencode-manifest", args.opencode_manifest]
+        if args.slot is not None:
+            argv.extend(["--slot", str(args.slot)])
+        for plugin_id in args.require_plugin:
+            argv.extend(["--require-plugin", plugin_id])
+        with contextlib.redirect_stdout(io.StringIO()) as stdout, patch.object(
+                mp.sys, "argv", ["model-preferences", *argv]):
+            exit_code = mp.main()
+        return exit_code, json.loads(stdout.getvalue())
 
     def tui_descriptor(self):
         return {
@@ -633,6 +672,141 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(self.state.environment["variables"]["MODEL_PREFERENCES_TASK_ID"], "task-child-fixture")
         self.assertNotIn("/prompt", [path for _, path, _ in self.state.calls])
         self.assertNotIn(CANARY, repr(connection))
+
+    def test_preflight_cli_checks_exact_saved_role_and_active_api_plugin_without_inference(self):
+        self.state.plugins = [{
+            "id": "fixture-pattern-buffer",
+            "source": {"type": "local", "path": "/fixture/plugins/pattern-buffer"},
+            "features": {"server": True},
+            "state": {"status": "active", "error": None, "ref": None},
+        }]
+        args, worktree = self.preflight_args(required_plugins=("fixture-pattern-buffer",))
+        with patch.object(mp, "run_json") as cmux:
+            exit_code, result = self.invoke_preflight_main(args)
+        cmux.assert_not_called()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["kind"], "opencode_preflight")
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["profile"], "Codex-Qwen")
+        self.assertEqual(result["role"], "implementer")
+        self.assertEqual(result["worktree"], str(worktree))
+        self.assertEqual(result["metadata"]["provider_id"], PROVIDER)
+        self.assertEqual(result["metadata"]["model_id"], MODEL)
+        self.assertEqual(result["required_reading"]["purpose"], [
+            "OpenCode harness preparation", "parent/child task-brief relay",
+        ])
+        self.assertTrue(result["required_reading"]["relay_to_children_before_brief_snapshot"])
+        self.assertFalse(result["required_reading"]["comprehension_verified"])
+        self.assertIn("inference-and-test-observer-preflight", result["required_reading"]["guide_url"])
+        self.assertEqual(result["required_plugins"], [{
+            "id": "fixture-pattern-buffer", "source_type": "local",
+            "source_path_basename": "pattern-buffer", "server_feature": True,
+            "status": "active", "error_summary": None, "ref": None,
+        }])
+        self.assertFalse(result["native_proof"])
+        self.assertEqual(result["operations"]["api_request_methods_allowed"], ["GET"])
+        self.assertFalse(result["operations"]["preferences_written"])
+        self.assertFalse(result["operations"]["session_created"])
+        self.assertFalse(result["operations"]["surface_created"])
+        self.assertFalse(result["operations"]["prompt_submitted"])
+        self.assertFalse(result["operations"]["model_inference_requested"])
+        self.assertTrue(all(method == "GET" for method, _, _ in self.state.calls))
+        self.assertNotIn("/api/session", [urlsplit(path).path for _, path, _ in self.state.calls])
+        self.assertIn("/api/plugin", [urlsplit(path).path for _, path, _ in self.state.calls])
+        self.assertTrue(all(
+            parse_qs(request["query"]).get("location[directory]") == [str(worktree)]
+            and urllib.parse.unquote(request["header"]) == str(worktree)
+            for request in self.state.location_requests
+        ))
+        self.assertEqual(self.state.sent_prompts, [])
+        self.assertEqual(self.state.session_create_payloads, [])
+        self.assertEqual(self.state.move_payloads, [])
+        self.assertFalse(Path(args.state_dir).exists())
+        self.assertFalse((Path(args.config_dir) / ".lock").exists())
+
+    def test_preflight_fails_when_required_local_plugin_has_no_api_id(self):
+        self.state.plugins = [{
+            "source": {"type": "local", "path": "/fixture/plugins/prime-directive"},
+            "features": {"server": True},
+            "state": {"status": "failed", "error": "Plugin failed to load", "ref": "err_fixture123"},
+        }]
+        args, _ = self.preflight_args(required_plugins=("fixture-prime-directive",))
+        exit_code, result = self.invoke_preflight_main(args)
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["status"], "held")
+        self.assertEqual(result["error"]["code"], "required_plugin_not_active")
+        details = result["error"]["details"]
+        self.assertEqual(details["plugin_id"], "fixture-prime-directive")
+        self.assertIsNone(details["observed"])
+        self.assertEqual(details["unidentified_failed_local_plugins"], [{
+            "source_type": "local", "source_path_basename": "prime-directive",
+            "status": "failed", "error_summary": "Plugin failed to load", "ref": "err_fixture123",
+        }])
+        self.assertIn("API omitted its id", result["error"]["remediation"])
+        self.assertTrue(all(method == "GET" for method, _, _ in self.state.calls))
+        self.assertEqual(self.state.sent_prompts, [])
+        self.assertEqual(self.state.session_create_payloads, [])
+
+    def test_preflight_rejects_unknown_plugin_shape_and_wrong_plugin_location(self):
+        self.state.plugin_response = {"unexpected": []}
+        args, worktree = self.preflight_args(required_plugins=("fixture-plugin",))
+        result = mp.execute(args)
+        self.assertEqual(result["error"]["code"], "unsupported_plugin_schema")
+        self.assertIn("GET /api/plugin", result["error"]["remediation"])
+
+        self.state.calls.clear()
+        self.state.plugin_response = None
+        self.state.plugins = [{
+            "id": "fixture-plugin",
+            "source": {"type": "local", "path": "/fixture/plugins/example"},
+            "features": {"server": False},
+            "state": {"status": "active", "error": None, "ref": None},
+        }]
+        self.state.plugin_response_directories[str(worktree)] = str(self.root)
+        result = mp.execute(args)
+        self.assertEqual(result["error"]["code"], "plugin_status_location_mismatch")
+        self.assertNotIn("required_plugins", result["metadata"] or {})
+
+    def test_preflight_authentication_error_has_private_manifest_remediation(self):
+        self.state.challenge = False
+        args, _ = self.preflight_args()
+        exit_code, result = self.invoke_preflight_main(args)
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["error"]["code"], "authenticated_api_challenge_required")
+        self.assertIn("private manifest", result["error"]["remediation"])
+        self.assertIn("do not change global credentials", result["error"]["remediation"])
+        self.assertEqual(self.state.sent_prompts, [])
+        self.assertEqual(self.state.session_create_payloads, [])
+
+    def test_preflight_holds_non_opencode_roles_and_worktree_subdirectories_before_api_reads(self):
+        args, worktree = self.preflight_args()
+        args.role = "orchestrator"
+        result = mp.execute(args)
+        self.assertEqual(result["error"]["code"], "selected_role_not_opencode")
+        self.assertIn("cannot override or activate a profile", result["error"]["remediation"])
+        self.assertEqual(self.state.calls, [])
+
+        args.role = "implementer"
+        subdirectory = worktree / "nested"
+        subdirectory.mkdir()
+        args.cwd = str(subdirectory)
+        result = mp.execute(args)
+        self.assertEqual(result["error"]["code"], "preflight_worktree_root_required")
+        self.assertEqual(self.state.calls, [])
+
+    def test_preflight_help_separates_metadata_from_native_proof_and_links_observer_guide(self):
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            with self.assertRaises(SystemExit) as raised:
+                mp.parser().parse_args(["preflight", "--help"])
+        self.assertEqual(raised.exception.code, 0)
+        help_text = stdout.getvalue()
+        self.assertIn("metadata/config evidence", help_text)
+        self.assertIn("not proof of native TUI behavior", help_text)
+        self.assertIn("Use --config-dir and --state-dir for an existing isolated pilot profile", help_text)
+        self.assertIn("never activates or overrides a profile", help_text)
+        self.assertIn("Required reading before OpenCode harness preparation or parent/child task-brief relay", help_text)
+        self.assertIn("https://github.com/morecoffeyplease/starfleet-ai/blob/main/docs/qwen-operating-guide.md#inference-and-test-observer-preflight", help_text)
+        self.assertIn("Relay this guide and applicable checks before a child brief is snapshotted", help_text)
 
     def test_cold_provider_registry_is_initialized_by_model_catalog_read(self):
         self.state.lazy_provider_registry = True

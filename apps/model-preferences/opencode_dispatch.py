@@ -50,8 +50,9 @@ _MISSING = object()
 class OpenCodeDispatchError(ValueError):
     """A bounded, non-sensitive OpenCode preflight failure code."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, details: dict | None = None):
         self.code = code
+        self.details = details or {}
         super().__init__(code)
 
 
@@ -499,6 +500,98 @@ def preflight(manifest_path: str | Path | Connection, choice: dict, *, directory
         tools=True,
         local_provider_origin=local_origin,
     )
+
+
+def preflight_plugins(connection: Connection, *, directory: str | Path,
+                      required_plugin_ids: list[str]) -> list[dict]:
+    """Require server-reported active project plugins using read-only API metadata."""
+    if not isinstance(required_plugin_ids, list):
+        raise OpenCodeDispatchError("invalid_required_plugin_ids")
+    required = []
+    for plugin_id in required_plugin_ids:
+        if (not isinstance(plugin_id, str) or not plugin_id or plugin_id != plugin_id.strip()
+                or len(plugin_id) > 256 or any(ord(char) < 32 for char in plugin_id)):
+            raise OpenCodeDispatchError("invalid_required_plugin_id")
+        if plugin_id not in required:
+            required.append(plugin_id)
+    if not required:
+        return []
+
+    expected_directory = _expected_directory(directory)
+    client = _Client(connection)
+    value = _json(*client.get(
+        _location_query("/api/plugin", expected_directory), location_directory=expected_directory),
+        operation="plugin_status")
+    _require_response_directory(value, expected_directory, operation="plugin_status")
+    rows = value.get("data")
+    if not isinstance(rows, list):
+        raise OpenCodeDispatchError("unsupported_plugin_schema")
+
+    parsed = []
+    unidentified_failed_local = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise OpenCodeDispatchError("unsupported_plugin_schema")
+        source = row.get("source")
+        features = row.get("features")
+        state = row.get("state")
+        if (not isinstance(source, dict) or not isinstance(source.get("type"), str)
+                or not source["type"] or not isinstance(source.get("path"), str) or not source["path"]
+                or not isinstance(features, dict) or type(features.get("server")) is not bool
+                or not isinstance(state, dict) or not isinstance(state.get("status"), str)
+                or not state["status"]):
+            raise OpenCodeDispatchError("unsupported_plugin_schema")
+        if ("error" in state and state["error"] is not None and not isinstance(state["error"], str)):
+            raise OpenCodeDispatchError("unsupported_plugin_schema")
+        if "ref" in state and state["ref"] is not None and not isinstance(state["ref"], str):
+            raise OpenCodeDispatchError("unsupported_plugin_schema")
+        error_summary = (" ".join(state["error"].split())[:240]
+                         if isinstance(state.get("error"), str) and state["error"].strip() else None)
+        state_ref = state.get("ref")
+        if isinstance(state_ref, str) and not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", state_ref):
+            state_ref = None
+        plugin_id = row.get("id")
+        if plugin_id is None:
+            if source["type"] != "local" or state["status"] not in ("failed", "error"):
+                raise OpenCodeDispatchError("unsupported_plugin_schema")
+            unidentified_failed_local.append({
+                "source_type": source["type"],
+                "source_path_basename": Path(source["path"]).name,
+                "status": state["status"],
+                "error_summary": error_summary,
+                "ref": state_ref,
+            })
+            continue
+        if (not isinstance(plugin_id, str) or not plugin_id or plugin_id != plugin_id.strip()
+                or len(plugin_id) > 256 or any(ord(char) < 32 for char in plugin_id)):
+            raise OpenCodeDispatchError("unsupported_plugin_schema")
+        parsed.append({
+            "id": plugin_id,
+            "source_type": source["type"],
+            "source_path_basename": Path(source["path"]).name,
+            "server_feature": features["server"],
+            "status": state["status"],
+            "error_summary": error_summary,
+            "ref": state_ref,
+        })
+
+    required_rows = []
+    for plugin_id in required:
+        matches = [row for row in parsed if row["id"] == plugin_id]
+        if len(matches) > 1:
+            raise OpenCodeDispatchError("required_plugin_status_ambiguous", {
+                "plugin_id": plugin_id,
+                "observed_rows": matches,
+            })
+        if not matches or matches[0]["status"] != "active":
+            observed = matches[0] if matches else None
+            raise OpenCodeDispatchError("required_plugin_not_active", {
+                "plugin_id": plugin_id,
+                "observed": observed,
+                "unidentified_failed_local_plugins": unidentified_failed_local,
+            })
+        required_rows.append(matches[0])
+    return required_rows
 
 
 def _get_session(connection: Connection, session_id: str) -> dict:

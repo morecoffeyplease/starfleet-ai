@@ -83,6 +83,10 @@ def locked(directory):
 
 
 ROLES = ("orchestrator", "implementer", "researcher", "standard_review", "advanced_review")
+QWEN_OBSERVER_GUIDE_URL = (
+    "https://github.com/morecoffeyplease/starfleet-ai/blob/main/docs/qwen-operating-guide.md"
+    "#inference-and-test-observer-preflight"
+)
 DELEGATION = ("Ask your parent orchestrator for additional agents, including research and review, unless this task explicitly delegates that authority. "
               "Explicit delegation still follows current role choices, reviewer count and advanced-review permission.")
 
@@ -528,6 +532,24 @@ def parser():
     sub.add_parser("list")
     sub.add_parser("status")
     startup = sub.add_parser("startup"); startup.add_argument("--expect-profile")
+    preflight = sub.add_parser(
+        "preflight",
+        help="Check a saved OpenCode role with read-only API metadata requests.",
+        description="Check the active profile's exact role, worktree and OpenCode API configuration without creating a session, surface, prompt or model inference request.",
+        epilog=("This is metadata/config evidence, not proof of native TUI behavior or task success. "
+                "Optional --require-plugin checks the API server's exact project plugin row for state.status=active.\n"
+                "Use --config-dir and --state-dir for an existing isolated pilot profile; this command never activates or overrides a profile.\n"
+                "Required reading before OpenCode harness preparation or parent/child task-brief relay:\n"
+                f"{QWEN_OBSERVER_GUIDE_URL}\n"
+                "Relay this guide and applicable checks before a child brief is snapshotted; do not rewrite an existing brief."),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    preflight.add_argument("--role", choices=ROLES, required=True)
+    preflight.add_argument("--slot", type=int, choices=(1, 2))
+    preflight.add_argument("--cwd", required=True, help="Exact Git worktree root whose OpenCode config should be checked.")
+    preflight.add_argument("--opencode-manifest", required=True, help="Private loopback OpenCode connection manifest.")
+    preflight.add_argument("--require-plugin", action="append", default=[], metavar="ID",
+                           help="Require this exact API-reported project plugin ID to have state.status=active; repeatable.")
     sub.add_parser("validate")
     show = sub.add_parser("show"); show.add_argument("profile")
     for name in ("activate", "notify"):
@@ -607,6 +629,168 @@ def resolve(snapshot, role, slot):
     else:
         require(slot is None, "--slot applies only to reviewer groups.")
     return {"profile": snapshot["profile"], "selection": snapshot["selection"], "role": role, **choice}
+
+
+def preflight_remediation(code, details=None):
+    messages = {
+        "profile_config_missing": "Pass the intended existing pilot configuration with --config-dir and its matching isolated path with --state-dir; this command does not create or activate profiles.",
+        "profile_config_invalid": "Repair the intended isolated Model Preferences configuration and confirm it with `model-preferences --config-dir PATH validate`.",
+        "active_profile_required": "Pass an existing config with the intended active profile using --config-dir and its matching isolated --state-dir; this command never activates or overrides profiles.",
+        "selected_role_not_opencode": "Use --config-dir and --state-dir for the intended isolated pilot choices, then inspect it with `model-preferences --config-dir CONFIG --state-dir STATE resolve --role ROLE`; this command cannot override or activate a profile.",
+        "invalid_role_slot": "Use --slot only for a configured reviewer group and select an existing slot.",
+        "preflight_worktree_unavailable": "Pass an existing Git worktree root for the intended task.",
+        "preflight_worktree_root_required": "Pass the exact Git worktree root, not a subdirectory.",
+        "invalid_loopback_url": "Use the exact authenticated OpenCode API origin in the private manifest, with an HTTP loopback IP address and no embedded credentials.",
+        "loopback_ip_literal_required": "Bind the private manifest to the intended loopback IP address; do not use a hostname or remote provider.",
+        "private_manifest_required": "Check the private loopback connection manifest and its mode-0600 owner-only password file; do not change global credentials.",
+        "invalid_private_password_file": "Check that the private owner-only password file matches the intended API server; do not change global credentials.",
+        "private_password_file_required": "Check the private loopback connection manifest and its mode-0600 owner-only password file; do not change global credentials.",
+        "invalid_manifest_json": "Repair the private connection manifest JSON and keep its API URL, expected PID and password-file path explicit.",
+        "authenticated_api_challenge_required": "Check that the private manifest origin and password file match the intended authenticated OpenCode server; do not change global credentials.",
+        "invalid_expected_server_pid": "Set the expected server PID in the private manifest to the owned OpenCode API process.",
+        "unsupported_opencode_version": "Use the supported OpenCode 2.2.5 API server for this preflight.",
+        "opencode_server_pid_mismatch": "Confirm the manifest points to the intended owned API process, then update only its private manifest if needed.",
+        "manifest_model_mismatch": "Align optional provider/model pins in the private manifest with the exact saved role choice.",
+        "unsupported_local_provider_model": "Inspect the exact OpenCode provider id and model slug in the saved role and existing target-worktree settings; do not substitute a catalog model.",
+        "exact_model_unavailable": "Inspect the exact existing provider/model configuration and API catalog in the target worktree with read-only commands; do not update a catalog or substitute a model.",
+        "model_output_limit_below_maximum_effort": "Check the exact model's reported output allowance; no fallback model is selected.",
+        "unsupported_provider_package": "Check that the existing exact provider uses the supported local OpenAI-compatible package; do not install or update packages.",
+        "unsupported_model_schema": "Check the pinned OpenCode 2.2.5 model catalog response shape in the exact worktree; unknown schemas are not treated as ready.",
+        "unsupported_model_variant_schema": "Inspect the existing model's `max` variant in the target worktree configuration; the preflight does not change variants.",
+        "max_reasoning_variant_unverified": "Inspect the existing `max` variant settings in the target worktree; do not replace the saved role choice.",
+        "max_reasoning_request_body_unverified": "Inspect the existing model and variant request-body overlays for `reasoning_effort: max`; do not alter them automatically.",
+        "model_tool_capability_unverified": "Check the exact provider/model's reported tool capability in the existing target-worktree catalog.",
+        "unsupported_provider_schema": "Check the pinned OpenCode 2.2.5 provider response shape and exact provider id in the target worktree.",
+        "local_provider_base_url_unavailable": "Confirm the exact saved provider reports its local loopback base URL in the target worktree.",
+        "unsupported_plugin_schema": "Inspect the pinned OpenCode 2.2.5 GET /api/plugin response shape for the exact worktree; unknown rows are not treated as active.",
+        "required_plugin_not_active": "Resolve the plugin load failure in the exact project and rerun with its API-reported ID; a configured path alone is not proof.",
+        "required_plugin_status_ambiguous": "Resolve duplicate API plugin rows for this ID and retry only after the exact project reports one active row.",
+        "invalid_required_plugin_id": "Pass the exact nonempty plugin id reported by the OpenCode API.",
+        "plugin_status_location_mismatch": "Check the exact worktree and OpenCode project configuration; the API response must report that same directory.",
+    }
+    if code == "required_plugin_not_active" and isinstance(details, dict) and details.get("unidentified_failed_local_plugins"):
+        return ("Inspect the failed local plugin row's source basename, error summary and ref; the API omitted its id, "
+                "so it cannot satisfy --require-plugin. Resolve the load failure and rerun after the exact API row "
+                "reports active; do not fabricate an id or trust a configured path.")
+    if code in messages:
+        return messages[code]
+    if code.startswith("plugin_status_"):
+        return "Check the owned loopback OpenCode API and its exact project plugin endpoint; preserve the typed error and do not infer plugin readiness."
+    if code.endswith("_http_timeout") or code in ("http_timeout", "http_unavailable"):
+        return "Check that the intended owned loopback OpenCode API is responsive, then rerun this read-only preflight after resolving the cause."
+    return "Inspect the typed preflight code against the Model Preferences guide and exact worktree configuration; no session or prompt was created."
+
+
+def _preflight_output(args, *, status, code=None, details=None, profile=None,
+                      choice=None, selection_digest=None, cwd=None, metadata=None, plugins=None):
+    result = {
+        "kind": "opencode_preflight",
+        "status": status,
+        "evidence_scope": "read_only_api_metadata",
+        "profile": profile,
+        "role": args.role,
+        "slot": args.slot,
+        "selection": selection_digest,
+        "worktree": str(cwd) if cwd else None,
+        "choice": ({"harness": choice.get("harness"), "provider_id": choice.get("provider_id"),
+                    "model": choice.get("model"), "effort": choice.get("effort")} if choice else None),
+        "metadata": metadata,
+        "required_plugins": plugins or [],
+        "required_reading": {
+            "purpose": ["OpenCode harness preparation", "parent/child task-brief relay"],
+            "guide_url": QWEN_OBSERVER_GUIDE_URL,
+            "relay_to_children_before_brief_snapshot": True,
+            "comprehension_verified": False,
+        },
+        "operations": {
+            "api_request_methods_allowed": ["GET"],
+            "preferences_written": False,
+            "session_created": False,
+            "surface_created": False,
+            "prompt_submitted": False,
+            "model_inference_requested": False,
+        },
+        "native_proof": False,
+        "exit_code": 0 if status == "passed" else 2,
+    }
+    if code:
+        result["error"] = {"code": code, "remediation": preflight_remediation(code, details),
+                           **({"details": details} if details else {})}
+    else:
+        result["limits"] = [
+            "API metadata and any server-reported plugin status do not prove native TUI hook delivery, permissions, model reception or task success.",
+            "No session, CMUX surface, prompt or model inference was started by this command.",
+        ]
+    return result
+
+
+def opencode_preflight(app, args):
+    profile = None
+    active_selection = None
+    choice = None
+    cwd = None
+    try:
+        config = app.config()
+    except FileNotFoundError:
+        return _preflight_output(args, status="held", code="profile_config_missing")
+    except (OSError, PreferenceError, ValueError, KeyError, TypeError):
+        return _preflight_output(args, status="held", code="profile_config_invalid")
+    if config.get("active") is None:
+        return _preflight_output(args, status="held", code="active_profile_required")
+    try:
+        active_selection = selection(config)
+        profile = active_selection["profile"]
+        choice = resolve(active_selection, args.role, args.slot)
+    except PreferenceError:
+        return _preflight_output(args, status="held", code="invalid_role_slot", profile=profile)
+    if choice.get("harness") != "opencode":
+        return _preflight_output(args, status="held", code="selected_role_not_opencode",
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"])
+    try:
+        cwd = Path(args.cwd).expanduser().resolve(strict=True)
+        if not cwd.is_dir():
+            raise OSError("not a directory")
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return _preflight_output(args, status="held", code="preflight_worktree_unavailable",
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"])
+    try:
+        git_root = Path(git(cwd, "rev-parse", "--show-toplevel").decode().strip()).resolve(strict=True)
+    except (PreferenceError, OSError, RuntimeError, ValueError):
+        return _preflight_output(args, status="held", code="preflight_worktree_unavailable",
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"], cwd=cwd)
+    if git_root != cwd:
+        return _preflight_output(args, status="held", code="preflight_worktree_root_required",
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"], cwd=cwd)
+    metadata = None
+    try:
+        connection = opencode_dispatch.load_connection(args.opencode_manifest)
+        evidence = opencode_dispatch.preflight(connection, choice, directory=cwd)
+        metadata = {
+            "api_contract": evidence.api_contract,
+            "api_origin": evidence.api_origin,
+            "server_version": evidence.server_version,
+            "server_pid": evidence.server_pid,
+            "provider_id": evidence.provider_id,
+            "model_id": evidence.model_id,
+            "variant": evidence.model_variant,
+            "output_limit": evidence.output_limit,
+            "tools": evidence.tools,
+            "local_provider_origin": evidence.local_provider_origin,
+        }
+        plugins = opencode_dispatch.preflight_plugins(
+            connection, directory=cwd, required_plugin_ids=args.require_plugin)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        return _preflight_output(args, status="held", code=exc.code, details=exc.details,
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"], cwd=cwd,
+                                 metadata=metadata)
+    return _preflight_output(args, status="passed", profile=profile, choice=choice,
+                             selection_digest=active_selection["selection"], cwd=cwd,
+                             metadata=metadata, plugins=plugins)
 
 
 def cmux_uuid(value, field):
@@ -1452,6 +1636,8 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
 def execute(args):
     app = App(args.config_dir, args.state_dir)
     command = args.command
+    if command == "preflight":
+        return opencode_preflight(app, args)
     if command == "resume":
         return resume_launch(app, args)
     if command == "examples":

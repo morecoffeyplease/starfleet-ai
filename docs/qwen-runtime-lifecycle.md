@@ -7,7 +7,8 @@ It covers both a Codex-Qwen implementer and a Qwen-only orchestrator, including 
 
 This is a source-checked operator recipe, not a clean-host or end-to-end qualification.
 The candidate Pattern Buffer source now includes an opt-in OpenCode lower-anchor pressure reminder, descriptor validation, and checkpoint and compaction lifecycle accounting.
-Its same-session usage and runtime descriptor, native plugin loading, recovery behavior, and warning delivery remain unqualified.
+A separate native v3 context-usage probe observed one valid, nonzero prior-assistant usage read matched to the active session, agent, provider, model and variant.
+This confirms one prior-usage read only; the backend usable window and active compaction settings needed by a runtime descriptor, candidate Pattern Buffer plugin loading, recovery behavior and warning delivery remain unqualified.
 The candidate also includes an opt-in Policy Guard OpenCode Prime Directive plugin with focused source coverage, but native plugin loading, permission handling, and covered action outcomes remain unqualified.
 The Prime Directive plugin passes event data as JSON to a local CLI bridge, and that bridge does not authenticate the event cryptographically.
 A local caller able to invoke the bridge can forge its event shape and bypass the plugin's native permission assertion, subject to the remaining local owner, checkout, and report checks.
@@ -27,6 +28,9 @@ The strict `native_empty_composer` delivery policy remains the default, and an u
 Do not switch to `api_sidechannel` to get past a hold.
 
 ## Before opening a run
+
+Before costly inference, run Model Preferences `preflight` for the exact active role and worktree, then follow the [Qwen inference and test observer preflight](qwen-operating-guide.md#inference-and-test-observer-preflight).
+The read-only API result checks saved model configuration and optional server-reported plugin status; it is not native TUI or task acceptance and does not clear the readiness gate.
 
 1. Use an existing task-assigned CMUX workspace and work in a visible tab or pane for that task.
 2. Run `cmux --json --id-format uuids identify` in the current pane, record its exact workspace and surface UUIDs, and confirm it is the intended workspace; never create a new left-rail workspace for another session in the same task.

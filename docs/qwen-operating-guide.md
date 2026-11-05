@@ -29,7 +29,7 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 | Component | Candidate source behavior | Observed native boundary |
 | --- | --- | --- |
 | Model Preferences | Exact provider/model/variant preflight and managed dispatch path in candidate source | Fresh Codex-Qwen startup and one explicit-policy managed continuation preserved a visible synthetic draft; every parent route and Qwen-led orchestration remain unqualified |
-| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks, opt-in lower-anchor pressure reminder, and checkpoint lifecycle accounting | Initial context, compaction, same-session read and a separate finished-task refusal passed; D5 added assisted post-compaction Qwen coding with four parent-run passing tests, without Qwen test execution; native pressure, recovery and warning delivery remain unqualified |
+| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks, opt-in lower-anchor pressure reminder, and checkpoint lifecycle accounting | Initial context, compaction, same-session read and a separate finished-task refusal passed; D5 added assisted post-compaction Qwen coding with four parent-run passing tests, without Qwen test execution; a separate native v3 probe read prior-assistant usage once with matching session, agent, provider, model and variant; runtime descriptor, PB plugin loading, pressure, recovery and warning delivery remain unqualified |
 | Hailing Frequencies | Exact OpenCode identity, enrollment and guarded API delivery | Native self-enrollment, one experimental API-sidechannel wake, pending-inbox refusal and B12 bounded own-inbox receipt/body consumption passed on their recorded candidates; strict delivery still holds unknown composer state |
 | Discord Watch | Exact thread ownership and guarded Hailing delivery | DW1 reproduced busy receive refusal; DW2 on `ffd0a31` passed local-synthetic receipt and exclusive primary-model body attribution; remote Discord ingestion remains separate |
 | Temporal Beacon | Exact enrolled owner and bounded timer continuation | TC2 reproduced busy timer creation; TC5 on `2dd9410` passed actual Qwen creation with one exact active timer; delivery and automatic wake unobserved |
@@ -122,6 +122,17 @@ Passing these checks once would describe only that candidate, configuration and 
 
 Security instructions alone are not empirical evidence that permissions or secret boundaries hold.
 Record the exact candidate, provider, model, role, tools, canary location, observed accesses and limits before changing this status.
+
+### Inference and test observer preflight
+
+Read this section before preparing OpenCode for a Qwen orchestrator or worker, or relaying a parent/child task brief.
+An orchestrator should relay this guide and the applicable checks in the bounded child brief before dispatch; do not rewrite an existing brief or its digest afterward.
+Before costly inference or a test run, pin OpenCode and local-runtime versions plus effective provider and model settings, and reuse a maintained or generated client for the supported API contract.
+Start with a model-free smoke check of effective configuration and representative API response shapes, including expected success and error responses.
+Replay sanitized retained examples of streaming, completed, failed and typed-tool output through the same observer and verify its expected results.
+Review the observer's success condition before inference: treat streaming as nonterminal and wait for an authoritative terminal state before claiming completion.
+Keep raw API values distinct from rendered UI content, and distinguish product or model failures from transport, schema, test or observer failures.
+These checks prevent avoidable inference on harness mistakes; they are preparation guidance, not additional product acceptance gates.
 
 ### Observed version-specific behavior
 

@@ -274,11 +274,13 @@ The Pattern Buffer OpenCode checkpoint adapter now has source coverage for expli
 Its context plugin uses the shared atomic publisher and retains an invalid-draft advisory until that draft content changes.
 Compaction attempts and failures do not increment the observed successful-completion count, and duplicate or foreign-session events are rejected.
 The event stream has no replay guarantee, so generation coverage remains uncertain.
-The v2.2.5 context callback is too late to warn before automatic compaction decides to compact.
+The `session.compaction` context callback runs after v2.2.5 has decided to compact and cannot warn on that same compaction attempt.
+An ordinary `context` callback for a request below the automatic ceiling can read prior-assistant usage before that request, but it cannot guarantee a warning before every compaction.
 Pattern Buffer source now includes an opt-in warning from a last-measured lower-anchor token total and requires a reviewed descriptor bound to the exact session and runtime configuration.
 Without that descriptor, the reminder stays disabled; exact current occupancy and guaranteed headroom are not available from this source.
-No native descriptor, hook load or warning delivery has qualified this candidate.
-This source change has not been installed or exercised in a native OpenCode session; the offline controls and canonical verification remain separate evidence.
+A separate native v3 context-usage probe observed one valid, nonzero prior-assistant usage read matched to the active session, agent, provider, model and variant.
+That read does not establish the backend usable window and active compaction settings needed by the descriptor, candidate Pattern Buffer plugin loading, warning publication or delivery, or completed-compaction recovery.
+The candidate warning path remains unqualified; the offline controls and canonical verification remain separate evidence.
 
 The current integration candidate also includes a Policy Guard OpenCode plugin source path for bounded Prime Directive actions.
 Its focused fixtures are source coverage only; no native plugin load, permission decision or covered GitHub action was qualified on this candidate.

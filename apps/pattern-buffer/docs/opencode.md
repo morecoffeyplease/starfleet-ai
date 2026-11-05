@@ -89,6 +89,8 @@ In OpenCode v2.2.5, automatic compaction checks whether compaction is due and em
 The `session.compaction` context callback runs after that decision and is not used to warn on the same compaction attempt.
 An ordinary `context` callback for a request that proceeds below the automatic ceiling can read the latest assistant usage before that request, and a tool-completion callback publishes a changed valid draft before a later automatic-compaction decision.
 This ordering provides a useful earlier reminder path, but it does not guarantee a warning before every compaction because a large unseen context tail can cross the ceiling between measurements.
+The separate native v3 context-usage probe observed one valid, nonzero prior-assistant usage read matched to the active session, agent, provider, model and variant.
+That probe did not establish that this Pattern Buffer plugin loaded or published a warning.
 The pressure adapter reads only the latest assistant's native input, output, reasoning, cache-read and cache-write token counts through `ctx.session.context`.
 It requires both that assistant and the current hook request to match the enrolled session, worktree, provider, model, variant and agent exactly.
 Missing, stale, nonpositive or mismatched usage and missing, expired or mismatched runtime configuration produce an explicit unknown status and no warning.
@@ -106,7 +108,9 @@ python3 apps/pattern-buffer/pattern_buffer.py --cwd /absolute/path/to/worktree c
 For its early reminder, Pattern Buffer compares the sum of the last measured assistant token counts to the observed automatic-compaction ceiling minus the configured warning lead.
 The reminder labels this sum as a last-measured lower-bound token anchor, not exact current occupancy or guaranteed headroom.
 A sudden large unseen context tail can still trigger compaction without a warning.
-The source adapter is prepared, but live pressure remains unknown until the native probe provides reviewed same-session runtime evidence and the owner imports its descriptor.
+The usage read does not capture the backend usable context window or active compaction settings required by the descriptor.
+The reminder remains disabled until the owner imports a fresh reviewed same-session descriptor, and warning delivery and completed-compaction recovery remain unqualified.
+Live pressure therefore remains unknown.
 
 ## Two-phase task binding
 

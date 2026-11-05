@@ -6,8 +6,11 @@ The model was tested as GGUF Q4_K_M with a 131,072-token context, 32,768-token o
 The observations came from one Apple M5 Max host with 128 GB of unified memory and are not a performance recommendation.
 Clean-host installation, clean-host model download and the full end-to-end Starfleet orchestration path have not been qualified.
 Use the [Qwen runtime lifecycle runbook](qwen-runtime-lifecycle.md) for the source-checked private runtime, profile, managed dispatch, worker scaling, and owned shutdown command sequence.
+Before costly inference, use Model Preferences `preflight` for a read-only active-role, worktree and OpenCode API configuration check, then follow the [Qwen inference and test observer preflight](qwen-operating-guide.md#inference-and-test-observer-preflight).
+This metadata check does not create a session, send a prompt or prove native TUI behavior.
 The current candidate includes source implementations for the opt-in Pattern Buffer pressure reminder and Policy Guard OpenCode Prime Directive plugin.
-Their native hook loading, warning delivery, permissions and covered action outcomes remain unqualified, so the runbook retains its native acceptance prerequisite.
+A separate native v3 context-usage probe observed one prior-assistant usage read, but it does not qualify either candidate plugin's native loading, Pattern Buffer warning delivery, Policy Guard permissions or covered action outcomes.
+The runbook retains its native acceptance prerequisite.
 
 ## Prerequisites
 
@@ -177,14 +180,16 @@ Read the maintained [Pattern Buffer OpenCode guide](../apps/pattern-buffer/docs/
 The same guide documents opt-in orchestrator checkpoint enrollment, successful tool-completion publication, recovery instructions and uncertain compaction observations.
 OpenCode pressure warnings are opt-in and require an imported descriptor for the exact session, provider, model, variant, agent, usable context window and active compaction settings.
 The warning uses a lower anchor from last-measured assistant token usage, not exact current occupancy or guaranteed headroom.
-Native descriptor evidence and warning delivery remain unqualified for this candidate.
-The context callback runs after the v2.2.5 automatic compaction decision and is not a supported advance-warning point.
+The `session.compaction` context callback runs after v2.2.5 has decided to compact and cannot warn on that same compaction attempt.
+An ordinary `context` callback for a request below the automatic ceiling can read prior-assistant usage before that request, but it cannot guarantee a warning before every compaction.
+A separate native v3 context-usage probe observed one valid, nonzero prior-assistant usage read matched to the active session, agent, provider, model and variant.
+That observation proves a prior-usage read path only; the backend usable window and active compaction settings needed by the descriptor remain unobserved, and the candidate Pattern Buffer plugin load and warning delivery remain unqualified.
 The native pilot observed shared context, the implementer role and initial task text in a primary request, an updated task in completed compaction, and a broken-bound-context failure that resulted in zero provider requests.
 A separate managed case resumed a permitted fixture read after compaction and correctly held continuation after task finish without another provider request.
 A later supervised case completed a same-session post-compaction edit; the chief reviewed its unchanged diff and ran four passing behavior tests.
 Qwen itself did not run those tests or issue a native test permission request, and model reception of the finished notice remains unqualified.
 The Pattern Buffer source now includes opt-in lower-anchor pressure reminders and checkpoint and compaction lifecycle accounting.
-Its native plugin loading, same-session usage descriptor, recovery behavior and warning delivery remain unqualified, so context and task reinjection observations do not satisfy that readiness requirement.
+The separate native v3 usage read did not establish a complete same-session runtime descriptor, Pattern Buffer plugin loading, recovery behavior or warning delivery, so it does not satisfy that readiness requirement.
 
 Hailing Frequencies currently holds OpenCode delivery while the installed CMUX projection reports composer state `unknown`.
 The historical CMUX parser experiment passed its package and build-only checks but was never installed or launched for a native empty-composer check.

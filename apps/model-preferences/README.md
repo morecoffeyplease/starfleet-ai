@@ -117,6 +117,23 @@ The policy does not change startup prompts or role choices, and changing it on a
 The password stays in its private file and is not copied into the manifest, process arguments, launch records or receipts.
 The API PID and loopback origin bind the connection for this preflight, but OpenCode 2.2.5 exposes no stable server-startup identity, so PID reuse remains a limitation.
 
+Use the read-only preflight before costly inference to check the active saved role against the exact worktree and OpenCode API metadata.
+It reads the active profile only from the provided `--config-dir` and requires the requested role to select OpenCode and the exact Git worktree root.
+Use the runbook's isolated `--config-dir` and matching `--state-dir` for pilot choices; preflight never activates a profile or overrides shared launch choices.
+It reads the private connection manifest, checks the OpenCode version, provider, model, local URL, `max` reasoning variant, request body and output allowance, and returns bounded JSON evidence with a typed error code and remediation when held.
+It sends `GET` requests only and does not write profile state, create a session or CMUX surface, submit a prompt, or request model inference.
+Optional repeated `--require-plugin ID` checks use the `GET /api/plugin` response for that exact directory and require the matching row's `state.status` to be `active`.
+A configured plugin path is not evidence that the API server loaded it, and a failed local plugin row may have no `id`, so that failure is reported without assigning it a made-up ID.
+API plugin status is server-reported configuration evidence only; it does not prove native TUI hook delivery, permissions, model reception or task success.
+For model-free config and API-shape smoke checks plus observer preparation, see the [Qwen inference and test observer preflight](../../docs/qwen-operating-guide.md#inference-and-test-observer-preflight).
+
+```sh
+model-preferences --config-dir /private/config --state-dir /private/state preflight \
+  --role implementer --cwd /absolute/path/to/worktree \
+  --opencode-manifest /private/opencode-connection.json \
+  --require-plugin EXACT_API_PLUGIN_ID
+```
+
 Launch an implementer or researcher task from the exact Git worktree root while running inside the intended CMUX pane.
 
     model-preferences --config-dir /private/config --state-dir /private/state dispatch --role implementer --cwd /absolute/path/to/worktree --task-file /absolute/path/to/task.md --opencode-manifest /private/opencode-connection.json
