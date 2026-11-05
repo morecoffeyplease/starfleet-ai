@@ -101,6 +101,25 @@ class LaneInstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
+    def init_fixture_repo(self, path, branch, remote):
+        path = Path(path)
+        path.mkdir(parents=True)
+        (path / '.gitignore').write_text('.claude/settings.local.json\n')
+        (path / 'fixture.txt').write_text('disposable fixture\n')
+        for args in (('init', '-b', branch), ('config', 'user.name', 'Fixture'),
+                     ('config', 'user.email', 'fixture@example.invalid'),
+                     ('add', '.gitignore', 'fixture.txt'), ('commit', '-m', 'disposable fixture'),
+                     ('remote', 'add', 'origin', remote)):
+            result = subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True,
+                                    env=self.env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        gitdir = subprocess.run(['git', '-C', str(path), 'rev-parse', '--absolute-git-dir'],
+                                capture_output=True, text=True, env=self.env, check=True).stdout.strip()
+        common_gitdir = subprocess.run(['git', '-C', str(path), 'rev-parse', '--path-format=absolute',
+                                        '--git-common-dir'], capture_output=True, text=True,
+                                       env=self.env, check=True).stdout.strip()
+        return gitdir, common_gitdir
+
     def call(self, *args, ok=True, input=None, env=None, cwd=None):
         result = subprocess.run([sys.executable, str(LANE), '--cwd', str(cwd or self.repo), *map(str, args)],
                                 capture_output=True, text=True, input=input, env=env or self.env)
@@ -421,6 +440,378 @@ class LaneInstallTest(unittest.TestCase):
         self.assertTrue(status['installed_here'])
         self.assertEqual(status['attachment_state'], 'active-here')
         self.assertIsNone(status['pr_url'])
+
+    def test_migration_preserves_target_settings_mode_and_runtime_for_followup_upgrade(self):
+        source = self.source_checkout('migration-settings-mode')
+        owner_session = 'claude-migration-mode-fixture'
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='claude',
+                         CLAUDE_CODE_SESSION_ID=owner_session)
+        owner_env.pop('CODEX_THREAD_ID', None)
+        plan_env = dict(owner_env, PYTHONHASHSEED='1')
+        apply_env = dict(owner_env, PYTHONHASHSEED='2')
+        seat_root = self.base / 'permanent seat'
+        seat_gitdir, _ = self.init_fixture_repo(
+            seat_root, 'main', 'git@fixture.invalid:starfleet/seat.git')
+        seat_settings = seat_root / '.claude/settings.local.json'
+        seat_settings.parent.mkdir(parents=True)
+        seat_original = {'permissions': {'allow': ['Bash(existing-command)']},
+                         'env': {'EXISTING_FLAG': 'preserve'}}
+        seat_settings.write_text(json.dumps(seat_original, indent=2) + '\n')
+        seat_settings.chmod(0o644)
+
+        self.settings.chmod(0o600)
+        legacy_groups = lane_runtime.hook_groups(self.repo, seat_root)
+        legacy_settings = json.loads(self.original_raw)
+        for event, group in legacy_groups.items():
+            legacy_settings.setdefault('hooks', {}).setdefault(event, []).append(group)
+        legacy_settings_raw = json.dumps(legacy_settings, indent=2) + '\n'
+        self.settings.write_text(legacy_settings_raw)
+        self.settings.chmod(0o600)
+        product_gitdir = self.git('rev-parse', '--absolute-git-dir').stdout.strip()
+        branch = self.git('branch', '--show-current').stdout.strip()
+        fake_gh = Path(self.env['PATH'].split(os.pathsep)[0]) / 'gh'
+        adapter_path = Path(product_gitdir) / 'starfleet-delivery-lane/bin/gh'
+        adapter_path.parent.mkdir(parents=True)
+        adapter_text = lane_runtime.adapter_script(self.repo)
+        adapter_path.write_text(adapter_text)
+        adapter_path.chmod(0o700)
+        legacy_state = {
+            'root': str(self.repo), 'session_root': str(seat_root), 'branch': branch,
+            'head_branch': branch, 'pr_url': None, 'base_ref': None,
+            'settings': str(self.settings),
+            'settings_sha256': hashlib.sha256(legacy_settings_raw.encode()).hexdigest(),
+            'settings_existed': True, 'settings_mode': 0o600, 'manages_claude_hooks': True,
+            'groups': legacy_groups, 'original_hook_events': list(legacy_settings.get('hooks', {})),
+            'original_had_hooks': True, 'real_gh': str(fake_gh),
+            'real_gh_identity': lane_runtime.captured_binary_identity(fake_gh),
+            'source': str(APP), 'source_revision': lane_runtime.source_revision(),
+            'source_versions': lane_runtime.source_versions(), 'adapter': str(adapter_path),
+            'adapter_sha256': hashlib.sha256(adapter_text.encode()).hexdigest(),
+            'lane_owner': {'harness': 'claude', 'session_id': owner_session,
+                           'host': 'fixture.invalid', 'repository': 'starfleet/guard',
+                           'seat_root': str(seat_root), 'product_gitdir': product_gitdir,
+                           'seat_gitdir': seat_gitdir},
+            'pr_bindings': {}, 'owner_history': [{'fixture': 'preserve owner history'}],
+            'history': [{'fixture': 'preserve report history'}],
+            'installation_history': [{'fixture': 'preserve installation history'}],
+            'phase': 'active',
+        }
+        legacy_state_path = Path(product_gitdir) / 'starfleet-delivery-lane/state.json'
+        legacy_state_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_state_path.write_text(json.dumps(legacy_state, indent=2) + '\n')
+
+        planned = self.call_source(source, 'migrate-plan', '--host', 'fixture.invalid', env=plan_env)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        migration_plan = json.loads(planned.stdout)
+        migrated_plan_state = migration_plan['migrated_state']
+        self.assertEqual(migrated_plan_state['settings_mode'], 0o644)
+        self.assertEqual(migrated_plan_state['settings'], str(seat_settings))
+        self.assertEqual(migrated_plan_state['runtime']['version'], migration_plan['runtime']['version'])
+        cross_seed_plan_result = self.call_source(
+            source, 'migrate-plan', '--host', 'fixture.invalid', env=apply_env)
+        self.assertEqual(cross_seed_plan_result.returncode, 0, cross_seed_plan_result.stderr)
+        cross_seed_plan = json.loads(cross_seed_plan_result.stdout)
+        self.assertEqual(cross_seed_plan['plan_sha256'], migration_plan['plan_sha256'])
+        self.assertEqual(cross_seed_plan['settings_changes'], migration_plan['settings_changes'])
+        target_change = next(row for row in migration_plan['settings_changes']
+                             if row['path'] == str(seat_settings))
+        self.assertEqual(target_change['mode'], 0o644)
+        migrated = self.call_source(source, 'migrate', '--host', 'fixture.invalid',
+                                    '--plan-sha256', migration_plan['plan_sha256'], env=apply_env)
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+
+        state_path = (Path(migrated_plan_state['seat_dir']) / 'checkouts' /
+                      migrated_plan_state['checkout_id'] / 'state.json')
+        migrated_state = json.loads(state_path.read_text())
+        seat_manifest = json.loads((Path(migrated_plan_state['seat_dir']) / 'seat.json').read_text())
+        target_text = seat_settings.read_text()
+        self.assertEqual(migrated_state['settings_mode'], 0o644)
+        self.assertEqual(migrated_state['settings_sha256'], hashlib.sha256(target_text.encode()).hexdigest())
+        self.assertEqual(migrated_state['runtime']['version'], seat_manifest['runtime']['version'])
+        self.assertEqual(migrated_state['runtime']['path'], seat_manifest['runtime']['path'])
+        self.assertEqual(migrated_state['settings'], seat_manifest['settings']['path'])
+        self.assertEqual(seat_manifest['settings']['mode'], 0o644)
+        self.assertEqual(seat_settings.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(json.loads(target_text)['permissions'], seat_original['permissions'])
+        self.assertEqual(json.loads(target_text)['env'], seat_original['env'])
+        self.assertEqual(migrated_state['owner_history'], legacy_state['owner_history'])
+        self.assertEqual(migrated_state['history'], legacy_state['history'])
+        self.assertEqual(migrated_state['installation_history'], legacy_state['installation_history'])
+        self.assertEqual(json.loads(legacy_state_path.read_text())['phase'], 'migrated')
+
+        successor = self.source_checkout('migration-settings-mode-followup')
+        upgrade_plan_result = self.call_source(successor, 'upgrade-plan', env=owner_env)
+        self.assertEqual(upgrade_plan_result.returncode, 0, upgrade_plan_result.stderr)
+        upgrade_plan = json.loads(upgrade_plan_result.stdout)
+        self.assertEqual(upgrade_plan['migration_metadata_recovery'], [])
+        applied = self.call_source(successor, 'upgrade', '--plan-sha256',
+                                   upgrade_plan['plan_sha256'], env=owner_env)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        upgraded_state = json.loads(state_path.read_text())
+        updated_seat = json.loads((Path(migrated_plan_state['seat_dir']) / 'seat.json').read_text())
+        self.assertEqual(upgraded_state['settings_mode'], 0o644)
+        self.assertEqual(upgraded_state['runtime']['version'],
+                         upgrade_plan['executing_source_after']['runtime_version'])
+        self.assertEqual(updated_seat['runtime']['version'], upgraded_state['runtime']['version'])
+        self.assertEqual(upgraded_state['owner_history'], legacy_state['owner_history'])
+        self.assertEqual(upgraded_state['history'], legacy_state['history'])
+        self.assertEqual(upgraded_state['installation_history'], legacy_state['installation_history'])
+        self.assertEqual(seat_settings.stat().st_mode & 0o777, 0o644)
+
+    def test_upgrade_recovers_exact_migrated_metadata_across_attached_checkouts(self):
+        old_source = self.source_checkout('migration-metadata-old-runtime')
+        owner_session = 'claude-migration-recovery-fixture'
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='claude',
+                         CLAUDE_CODE_SESSION_ID=owner_session)
+        owner_env.pop('CODEX_THREAD_ID', None)
+        seat_root = self.base / 'recovery seat'
+        seat_gitdir, _ = self.init_fixture_repo(
+            seat_root, 'main', 'git@fixture.invalid:starfleet/seat-recovery.git')
+        seat_settings = seat_root / '.claude/settings.local.json'
+        seat_settings.parent.mkdir(parents=True)
+        seat_original = {'permissions': {'allow': ['Bash(existing-command)']},
+                         'env': {'EXISTING_FLAG': 'preserve'}}
+        seat_settings.write_text(json.dumps(seat_original, indent=2) + '\n')
+        seat_settings.chmod(0o644)
+
+        owner_args = ['--lane', '--host', 'fixture.invalid', '--owner-harness', 'claude',
+                      '--owner-session', owner_session]
+        seat_plan_result = self.call_source(old_source, '--session-root', seat_root, 'plan',
+                                            *owner_args, env=owner_env)
+        self.assertEqual(seat_plan_result.returncode, 0, seat_plan_result.stderr)
+        seat_plan = json.loads(seat_plan_result.stdout)
+        attached = self.call_source(old_source, '--session-root', seat_root, 'install',
+                                    *owner_args, '--plan-sha256', seat_plan['plan_sha256'], env=owner_env)
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        seat_id = seat_plan['seat_id']
+        seat_dir = Path(seat_plan['seat_dir'])
+        first_state_path = seat_dir / 'checkouts' / seat_plan['checkout_id'] / 'state.json'
+        first_state = json.loads(first_state_path.read_text())
+        seat_manifest_path = seat_dir / 'seat.json'
+        seat_manifest = json.loads(seat_manifest_path.read_text())
+        old_runtime = seat_manifest['runtime']
+        old_runtime_cli = Path(old_runtime['path']) / 'lane.py'
+
+        second_product = self.base / 'runtime-attached-product'
+        self.init_fixture_repo(
+            second_product, 'feature/runtime-attach', 'git@fixture.invalid:starfleet/guard.git')
+        runtime_plan_result = subprocess.run(
+            [sys.executable, str(old_runtime_cli), '--cwd', str(second_product),
+             '--session-root', str(seat_root), 'plan', *owner_args],
+            capture_output=True, text=True, env=owner_env)
+        self.assertEqual(runtime_plan_result.returncode, 0, runtime_plan_result.stderr)
+        runtime_plan = json.loads(runtime_plan_result.stdout)
+        runtime_attached = subprocess.run(
+            [sys.executable, str(old_runtime_cli), '--cwd', str(second_product),
+             '--session-root', str(seat_root), 'install', *owner_args,
+             '--plan-sha256', runtime_plan['plan_sha256']],
+            capture_output=True, text=True, env=owner_env)
+        self.assertEqual(runtime_attached.returncode, 0, runtime_attached.stderr)
+        seat_manifest = json.loads(seat_manifest_path.read_text())
+        self.assertEqual(seat_manifest['runtime']['source_revision'], 'runtime:' + old_runtime['version'])
+        self.assertEqual(first_state['source_revision'], old_runtime['source_revision'])
+        self.assertNotEqual(first_state['source_revision'], seat_manifest['runtime']['source_revision'])
+
+        existing_migration_product = self.base / 'existing-seat-migration-product'
+        existing_gitdir, _ = self.init_fixture_repo(
+            existing_migration_product, 'feature/existing-seat-migration',
+            'git@fixture.invalid:starfleet/guard.git')
+        existing_settings = existing_migration_product / '.claude/settings.local.json'
+        existing_settings.parent.mkdir(parents=True)
+        existing_groups = lane_runtime.hook_groups(existing_migration_product, seat_root)
+        existing_settings_value = {
+            'permissions': {'allow': ['Bash(legacy-permission)']},
+            'hooks': {event: [group] for event, group in existing_groups.items()}}
+        existing_settings_raw = json.dumps(existing_settings_value, indent=2) + '\n'
+        existing_settings.write_text(existing_settings_raw)
+        existing_settings.chmod(0o600)
+        fake_gh = Path(self.env['PATH'].split(os.pathsep)[0]) / 'gh'
+        existing_adapter = Path(existing_gitdir) / 'starfleet-delivery-lane/bin/gh'
+        existing_adapter.parent.mkdir(parents=True)
+        existing_adapter_text = lane_runtime.adapter_script(existing_migration_product)
+        existing_adapter.write_text(existing_adapter_text)
+        existing_adapter.chmod(0o700)
+        existing_state = {
+            'root': str(existing_migration_product), 'session_root': str(seat_root),
+            'branch': 'feature/existing-seat-migration', 'head_branch': 'feature/existing-seat-migration',
+            'pr_url': None, 'base_ref': None, 'settings': str(existing_settings),
+            'settings_sha256': hashlib.sha256(existing_settings_raw.encode()).hexdigest(),
+            'settings_existed': True, 'settings_mode': 0o600, 'manages_claude_hooks': True,
+            'groups': existing_groups, 'original_hook_events': [], 'original_had_hooks': False,
+            'real_gh': str(fake_gh), 'real_gh_identity': lane_runtime.captured_binary_identity(fake_gh),
+            'source': str(APP), 'source_revision': lane_runtime.source_revision(),
+            'source_versions': lane_runtime.source_versions(), 'adapter': str(existing_adapter),
+            'adapter_sha256': hashlib.sha256(existing_adapter_text.encode()).hexdigest(),
+            'lane_owner': {'harness': 'claude', 'session_id': owner_session,
+                           'host': 'fixture.invalid', 'repository': 'starfleet/guard',
+                           'seat_root': str(seat_root), 'product_gitdir': existing_gitdir,
+                           'seat_gitdir': seat_gitdir},
+            'pr_bindings': {}, 'owner_history': [], 'history': [],
+            'installation_history': [], 'phase': 'active',
+        }
+        existing_state_path = Path(existing_gitdir) / 'starfleet-delivery-lane/state.json'
+        existing_state_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_state_path.write_text(json.dumps(existing_state, indent=2) + '\n')
+        existing_migrate_plan_result = subprocess.run(
+            [sys.executable, str(old_runtime_cli), '--cwd', str(existing_migration_product),
+             '--session-root', str(seat_root), 'migrate-plan', '--host', 'fixture.invalid'],
+            capture_output=True, text=True, env=owner_env)
+        self.assertEqual(existing_migrate_plan_result.returncode, 0, existing_migrate_plan_result.stderr)
+        existing_migrate_plan = json.loads(existing_migrate_plan_result.stdout)
+        self.assertFalse(any(row['path'] == str(seat_settings)
+                             for row in existing_migrate_plan['settings_changes']))
+        self.assertEqual(existing_migrate_plan['migrated_state']['settings_mode'], 0o644)
+        self.assertEqual(existing_migrate_plan['migrated_state']['settings_sha256'],
+                         hashlib.sha256(seat_settings.read_bytes()).hexdigest())
+        existing_migrated = subprocess.run(
+            [sys.executable, str(old_runtime_cli), '--cwd', str(existing_migration_product),
+             '--session-root', str(seat_root), 'migrate', '--host', 'fixture.invalid',
+             '--plan-sha256', existing_migrate_plan['plan_sha256']],
+            capture_output=True, text=True, env=owner_env)
+        self.assertEqual(existing_migrated.returncode, 0, existing_migrated.stderr)
+        existing_migrated_state_path = (seat_dir / 'checkouts' /
+            existing_migrate_plan['migrated_state']['checkout_id'] / 'state.json')
+        existing_migrated_state = json.loads(existing_migrated_state_path.read_text())
+        self.assertEqual(existing_migrated_state['settings_mode'], 0o644)
+        self.assertEqual(existing_migrated_state['settings_sha256'],
+                         hashlib.sha256(seat_settings.read_bytes()).hexdigest())
+        self.assertEqual(existing_migrated_state['runtime']['version'], old_runtime['version'])
+
+        legacy_product = self.base / 'recovered-migrated-product'
+        legacy_gitdir, legacy_common_gitdir = self.init_fixture_repo(
+            legacy_product, 'feature/legacy', 'git@fixture.invalid:starfleet/guard.git')
+        affected_state = json.loads(json.dumps(first_state))
+        affected_state.update(root=str(legacy_product), branch='feature/legacy',
+                              head_branch='feature/legacy', settings=str(seat_settings),
+                              settings_mode=0o600,
+                              settings_sha256=hashlib.sha256(seat_settings.read_bytes()).hexdigest(),
+                              owner_history=[{'fixture': 'preserve owner history'}],
+                              history=[{'fixture': 'preserve report history'}],
+                              installation_history=[{'fixture': 'preserve installation history'}],
+                              checkout_id=lane_runtime.session_store.checkout_id(legacy_product))
+        affected_state['lane_owner'].update(product_gitdir=legacy_gitdir, seat_gitdir=seat_gitdir,
+                                            repository='starfleet/guard')
+        affected_state.pop('runtime')
+        lane_runtime.session_store.write_checkout(
+            seat_id, legacy_product, affected_state, repository='starfleet/guard',
+            host='fixture.invalid', gitdir=legacy_gitdir, common_gitdir=legacy_common_gitdir)
+        affected_state_path = (seat_dir / 'checkouts' /
+                               lane_runtime.session_store.checkout_id(legacy_product) / 'state.json')
+
+        successor = self.source_checkout('migration-metadata-successor')
+        malformed_state = json.loads(affected_state_path.read_text())
+        malformed_state['runtime'] = None
+        lane_runtime.session_store.write_checkout(
+            seat_id, legacy_product, malformed_state, repository='starfleet/guard',
+            host='fixture.invalid', gitdir=legacy_gitdir, common_gitdir=legacy_common_gitdir)
+        malformed_before = affected_state_path.read_bytes()
+        manifest_before = seat_manifest_path.read_bytes()
+        malformed_refusal = self.call_source(successor, 'upgrade-plan', ok=False, env=owner_env)
+        self.assertEqual(malformed_refusal.returncode, 2)
+        self.assertIn('Active seat checkouts do not share one runtime version', malformed_refusal.stderr)
+        self.assertEqual(affected_state_path.read_bytes(), malformed_before)
+        self.assertEqual(seat_manifest_path.read_bytes(), manifest_before)
+
+        affected_state = json.loads(malformed_before)
+        affected_state['runtime'] = {'version': 'unrelated-runtime-version'}
+        lane_runtime.session_store.write_checkout(
+            seat_id, legacy_product, affected_state, repository='starfleet/guard',
+            host='fixture.invalid', gitdir=legacy_gitdir, common_gitdir=legacy_common_gitdir)
+        incompatible_before = affected_state_path.read_bytes()
+        manifest_before = seat_manifest_path.read_bytes()
+        incompatible_refusal = self.call_source(successor, 'upgrade-plan', ok=False, env=owner_env)
+        self.assertEqual(incompatible_refusal.returncode, 2)
+        self.assertIn('Active seat checkouts do not share one runtime version', incompatible_refusal.stderr)
+        self.assertEqual(affected_state_path.read_bytes(), incompatible_before)
+        self.assertEqual(seat_manifest_path.read_bytes(), manifest_before)
+
+        affected_state = json.loads(incompatible_before)
+        affected_state.pop('runtime')
+        legacy_source_revision = affected_state['source_revision']
+        affected_state['source_revision'] = 'unvalidated-runtime-revision'
+        lane_runtime.session_store.write_checkout(
+            seat_id, legacy_product, affected_state, repository='starfleet/guard',
+            host='fixture.invalid', gitdir=legacy_gitdir, common_gitdir=legacy_common_gitdir)
+        malformed_revision_before = affected_state_path.read_bytes()
+        manifest_before = seat_manifest_path.read_bytes()
+        revision_refusal = self.call_source(successor, 'upgrade-plan', ok=False, env=owner_env)
+        self.assertEqual(revision_refusal.returncode, 2)
+        self.assertIn('Active seat checkouts do not share one runtime version', revision_refusal.stderr)
+        self.assertEqual(affected_state_path.read_bytes(), malformed_revision_before)
+        self.assertEqual(seat_manifest_path.read_bytes(), manifest_before)
+
+        affected_state['source_revision'] = legacy_source_revision
+        affected_state['source_versions'] = {
+            'README.md': seat_manifest['runtime']['files']['README.md']}
+        lane_runtime.session_store.write_checkout(
+            seat_id, legacy_product, affected_state, repository='starfleet/guard',
+            host='fixture.invalid', gitdir=legacy_gitdir, common_gitdir=legacy_common_gitdir)
+        truncated_fingerprints_before = affected_state_path.read_bytes()
+        manifest_before = seat_manifest_path.read_bytes()
+        truncated_fingerprints_refusal = self.call_source(successor, 'upgrade-plan', ok=False, env=owner_env)
+        self.assertEqual(truncated_fingerprints_refusal.returncode, 2)
+        self.assertIn('Active seat checkouts do not share one runtime version', truncated_fingerprints_refusal.stderr)
+        self.assertEqual(affected_state_path.read_bytes(), truncated_fingerprints_before)
+        self.assertEqual(seat_manifest_path.read_bytes(), manifest_before)
+
+        affected_state['source_versions'] = first_state['source_versions']
+        lane_runtime.session_store.write_checkout(
+            seat_id, legacy_product, affected_state, repository='starfleet/guard',
+            host='fixture.invalid', gitdir=legacy_gitdir, common_gitdir=legacy_common_gitdir)
+        stale_mode_state = affected_state_path.read_bytes()
+        stale_mode_manifest = seat_manifest_path.read_bytes()
+        seat_settings.chmod(0o600)
+        stale_mode_refusal = self.call_source(successor, 'upgrade-plan', ok=False, env=owner_env)
+        self.assertEqual(stale_mode_refusal.returncode, 2)
+        self.assertIn('Claude settings mode changed since installation', stale_mode_refusal.stderr)
+        self.assertEqual(affected_state_path.read_bytes(), stale_mode_state)
+        self.assertEqual(seat_manifest_path.read_bytes(), stale_mode_manifest)
+        seat_settings.chmod(0o644)
+
+        planned = self.call_source(successor, 'upgrade-plan', env=owner_env)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        upgrade_plan = json.loads(planned.stdout)
+        repairs = [row for row in upgrade_plan['migration_metadata_recovery']
+                   if row['checkout'] == str(legacy_product)]
+        self.assertEqual({row['field'] for row in repairs}, {'runtime', 'settings_mode'})
+        self.assertFalse(any(row['checkout'] in (str(self.repo), str(second_product))
+                             for row in upgrade_plan['migration_metadata_recovery']))
+        applied = self.call_source(successor, 'upgrade', '--plan-sha256',
+                                   upgrade_plan['plan_sha256'], env=owner_env)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+
+        updated_seat = json.loads(seat_manifest_path.read_text())
+        self.assertEqual(seat_settings.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(updated_seat['settings']['mode'], 0o644)
+        self.assertEqual(updated_seat['runtime']['version'],
+                         upgrade_plan['executing_source_after']['runtime_version'])
+        self.assertEqual(json.loads(seat_settings.read_text())['permissions'], seat_original['permissions'])
+        self.assertEqual(json.loads(seat_settings.read_text())['env'], seat_original['env'])
+        recovered_states = [item['state'] for item in lane_runtime.session_store.all_checkouts(seat_id)]
+        by_root = {row['root']: row for row in recovered_states}
+        self.assertEqual(set(by_root), {str(self.repo), str(second_product),
+                                        str(existing_migration_product), str(legacy_product)})
+        self.assertEqual(by_root[str(legacy_product)]['settings_mode'], 0o644)
+        self.assertEqual(by_root[str(legacy_product)]['runtime']['version'], updated_seat['runtime']['version'])
+        self.assertEqual(by_root[str(legacy_product)]['owner_history'], affected_state['owner_history'])
+        self.assertEqual(by_root[str(legacy_product)]['history'], affected_state['history'])
+        self.assertEqual(by_root[str(legacy_product)]['installation_history'], affected_state['installation_history'])
+        self.assertEqual(by_root[str(self.repo)]['settings_mode'], 0o644)
+        self.assertEqual(by_root[str(second_product)]['settings_mode'], 0o644)
+        self.assertEqual(by_root[str(existing_migration_product)]['settings_mode'], 0o644)
+
+    def test_upgrade_plan_still_refuses_a_real_settings_mode_change(self):
+        self.settings.chmod(0o644)
+        old_source = self.source_checkout('mode-change-old-pin')
+        self.install_from_source(old_source)
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        before_state = state_path.read_bytes()
+        self.settings.chmod(0o600)
+        successor = self.source_checkout('mode-change-successor')
+        refused = self.call_source(successor, 'upgrade-plan', ok=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn('Claude settings mode changed since installation', refused.stderr)
+        self.assertEqual(state_path.read_bytes(), before_state)
 
     def test_lane_help_describes_attachment_and_no_pr_migration(self):
         parent_help = ' '.join(self.call('--help').stdout.split())
