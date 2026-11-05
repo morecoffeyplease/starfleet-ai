@@ -85,7 +85,7 @@ hailing-frequencies opencode-enroll --manifest /absolute/private/opencode-bindin
 ```
 
 Enrollment requires the current OpenCode hook record, exact CMUX surface and workspace, matching API session and server PID, matching native worktree, and enabled native messaging.
-The default policy also requires an explicitly empty native composer, while `api_sidechannel` permits only exact `empty`, `draft`, or `unknown` composer classifications.
+The default policy requires an explicitly empty native composer before sending, while `api_sidechannel` permits only exact `empty`, `draft`, or `unknown` composer classifications.
 Both policies require agent and terminal identity, `blocks_typing: false`, `waiting_on_human: false`, an active native lifecycle, exact current and hook state, and an inactive API session with empty inbox, permission, and form lists before sending.
 OpenCode enrollment verifies authenticated API, exact session, PID, directories, native surface, workspace, worktree, and session generation, and may register while the exact API session is busy.
 Registration does not establish send readiness or bypass any later busy, inbox, permission, form, composer, human-input, or receiving guard.
