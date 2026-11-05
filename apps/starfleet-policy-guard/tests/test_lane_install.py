@@ -1,5 +1,6 @@
 """Delivery-only installation preserves other controls and probes never publish."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -277,6 +278,163 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(value['binding']['state'], 'inactive-local-binding')
         self.assertEqual(before, state.read_bytes())
         self.assertFalse(self.forwarded.exists())
+
+    def test_no_pr_native_lane_is_attached_without_delivery_eligibility(self):
+        source = self.source_checkout_same_fingerprints('no-pr-native-lane-status')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        self.install_from_source(source, lane=True, env=owner_env)
+        state = lane_runtime.read(self.repo)
+
+        with mock.patch.dict(os.environ, owner_env):
+            detail = lane_runtime.status(self.repo, 'codex-fixture-thread', state=state)
+            self.assertTrue(detail['lane_enrolled'])
+            self.assertTrue(detail['installed_here'])
+            self.assertEqual(detail['attachment_state'], 'active-here')
+            self.assertEqual(detail['current_owner']['state'], 'matches')
+            self.assertIsNone(detail['pr_url'])
+            self.assertEqual(detail['report_status']['state'], 'absent')
+            self.assertFalse(lane_runtime.active(state, self.repo))
+            with self.assertRaisesRegex(ValueError, 'Lane is enrolled; after its real PR is published'):
+                lane_runtime.require(state, self.repo)
+
+            coverage = lane_runtime.coverage(self.repo)
+            self.assertTrue(coverage['installed_here'])
+            self.assertEqual(coverage['attachment_state'], 'active-here')
+            self.assertEqual(coverage['binding']['state'], 'lane-enrolled-no-pr-binding')
+
+        summary = self.call('coverage', '--summary', env=owner_env).stdout
+        self.assertIn('Policy Guard: delivery-only installation', summary)
+        self.assertIn('bound=none (lane-enrolled-no-pr-binding', summary)
+        self.assertIn('Report: absent', summary)
+
+        wrong_owner = dict(owner_env, CODEX_THREAD_ID='another-codex-thread')
+        wrong_owner_status = json.loads(self.call('status', env=wrong_owner).stdout)
+        self.assertTrue(wrong_owner_status['installed_here'])
+        self.assertEqual(wrong_owner_status['current_owner']['state'], 'mismatch')
+        with mock.patch.dict(os.environ, wrong_owner):
+            with self.assertRaisesRegex(ValueError, 'belongs to another native session'):
+                lane_runtime.require(state, self.repo)
+
+        with mock.patch.dict(os.environ, owner_env), mock.patch.object(
+                lane_runtime, 'source_versions', return_value={'lane.py': 'changed-source'}):
+            with self.assertRaisesRegex(ValueError, 'Pinned delivery adapter source changed'):
+                lane_runtime.require(state, self.repo)
+
+    def test_no_pr_legacy_migration_cli_preserves_lane_and_owner_history(self):
+        source = self.source_checkout_same_fingerprints('no-pr-migration-cli')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        branch = self.git('branch', '--show-current').stdout.strip()
+        gitdir = self.git('rev-parse', '--absolute-git-dir').stdout.strip()
+        fake_gh = Path(self.env['PATH'].split(os.pathsep)[0]) / 'gh'
+        adapter_path = Path(gitdir) / 'starfleet-delivery-lane/bin/gh'
+        adapter_path.parent.mkdir(parents=True)
+        adapter_text = lane_runtime.adapter_script(self.repo)
+        adapter_path.write_text(adapter_text)
+        adapter_path.chmod(0o700)
+        lane_owner = {
+            'harness': 'codex',
+            'session_id': 'legacy-fixture-owner',
+            'host': 'fixture.invalid',
+            'repository': 'starfleet/guard',
+            'product_gitdir': gitdir,
+            'seat_gitdir': gitdir,
+        }
+        # Model the active no-PR legacy schema observed from the historical CLI reproduction.
+        # The owner history is added below through the CLI handoff, and no live state is read.
+        legacy_state = {
+            'root': str(self.repo),
+            'session_root': str(self.repo),
+            'branch': branch,
+            'head_branch': branch,
+            'pr_url': None,
+            'base_ref': None,
+            'settings': str(self.settings),
+            'settings_sha256': hashlib.sha256(b'').hexdigest(),
+            'settings_existed': False,
+            'settings_mode': 0o600,
+            'manages_claude_hooks': False,
+            'groups': {},
+            'real_gh': str(fake_gh),
+            'source': str(source),
+            'source_revision': subprocess.run(['git', '-C', str(source), 'rev-parse', 'HEAD'],
+                                               capture_output=True, text=True, check=True).stdout.strip(),
+            'source_versions': lane_runtime.source_versions(),
+            'adapter': str(adapter_path),
+            'adapter_sha256': hashlib.sha256(adapter_text.encode()).hexdigest(),
+            'lane_owner': lane_owner,
+            'pr_bindings': {},
+            'owner_history': [],
+            'history': [],
+            'installation_history': [],
+            'phase': 'active',
+        }
+        legacy_state_path = Path(gitdir) / 'starfleet-delivery-lane/state.json'
+        legacy_state_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_state_path.write_text(json.dumps(legacy_state, indent=2) + '\n')
+
+        handoff = self.call_source(source, 'rebind-owner', '--from-harness', 'codex',
+                                   '--from-session', 'legacy-fixture-owner', '--confirm-handoff',
+                                   env=owner_env)
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
+        self.assertTrue(json.loads(handoff.stdout)['history_preserved'])
+        before_plan = json.loads(legacy_state_path.read_text())
+        self.assertIsNone(before_plan['pr_url'])
+        self.assertEqual(len(before_plan['owner_history']), 1)
+        before_hash = hashlib.sha256(legacy_state_path.read_bytes()).hexdigest()
+
+        planned = self.call_source(source, 'migrate-plan', '--host', 'fixture.invalid', env=owner_env)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        plan = json.loads(planned.stdout)
+        self.assertIsNone(plan['migrated_state']['pr_url'])
+        self.assertEqual(plan['migrated_state']['owner_history'], before_plan['owner_history'])
+        self.assertEqual(hashlib.sha256(legacy_state_path.read_bytes()).hexdigest(), before_hash)
+
+        self.git('switch', 'main')
+        wrong_branch = self.call_source(source, 'migrate-plan', '--host', 'fixture.invalid',
+                                       env=owner_env, ok=False)
+        self.assertEqual(wrong_branch.returncode, 2)
+        self.assertIn('Switch to the recorded legacy product branch', wrong_branch.stderr)
+        self.assertEqual(hashlib.sha256(legacy_state_path.read_bytes()).hexdigest(), before_hash)
+        self.git('switch', branch)
+
+        migrated = self.call_source(source, 'migrate', '--host', 'fixture.invalid',
+                                    '--plan-sha256', plan['plan_sha256'], env=owner_env)
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+        result = json.loads(migrated.stdout)
+        self.assertTrue(result['migrated'])
+        self.assertTrue(result['history_preserved'])
+        state_info = plan['migrated_state']
+        migrated_state_path = (Path(state_info['seat_dir']) / 'checkouts' /
+                               state_info['checkout_id'] / 'state.json')
+        migrated_state = json.loads(migrated_state_path.read_text())
+        for key in ('root', 'branch', 'head_branch', 'pr_url', 'base_ref',
+                    'owner_history', 'pr_bindings', 'history', 'installation_history'):
+            self.assertEqual(migrated_state.get(key), before_plan.get(key), key)
+        for key in ('harness', 'session_id', 'host', 'repository', 'product_gitdir', 'seat_gitdir'):
+            self.assertEqual(migrated_state['lane_owner'].get(key), before_plan['lane_owner'].get(key), key)
+        tombstone = json.loads(legacy_state_path.read_text())
+        self.assertEqual(tombstone['phase'], 'migrated')
+        self.assertEqual(tombstone['preserved_state_sha256'], before_hash)
+        status = json.loads(self.call_source(source, 'status', '--session-id', 'codex-fixture-thread',
+                                            env=owner_env).stdout)
+        self.assertTrue(status['lane_enrolled'])
+        self.assertTrue(status['installed_here'])
+        self.assertEqual(status['attachment_state'], 'active-here')
+        self.assertIsNone(status['pr_url'])
+
+    def test_lane_help_describes_attachment_and_no_pr_migration(self):
+        parent_help = ' '.join(self.call('--help').stdout.split())
+        plan_help = ' '.join(self.call('plan', '--help').stdout.split())
+        status_help = ' '.join(self.call('status', '--help').stdout.split())
+        coverage_help = ' '.join(self.call('coverage', '--help').stdout.split())
+        migration_help = ' '.join(self.call('migrate-plan', '--help').stdout.split())
+        self.assertIn('optionally binding a PR or discovering it later', plan_help)
+        self.assertIn('Inspect checkout attachment, PR binding', parent_help)
+        self.assertIn('Inspect checkout attachment, PR binding', status_help)
+        self.assertIn('Read-only attachment, binding, owner', parent_help)
+        self.assertIn('attachment, binding, owner', coverage_help)
+        self.assertIn('including a no-PR lane', parent_help)
+        self.assertIn('including a no-PR lane', migration_help)
 
     def test_coverage_does_not_credit_legacy_adapter_to_codex_owner(self):
         self.install()
