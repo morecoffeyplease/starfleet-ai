@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import io
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -146,6 +147,7 @@ class OpenCodeDeliveryTests(unittest.TestCase):
                       "agent": True, "terminal": True, "blocks_typing": False,
                       "waiting_on_human": False, "lifecycle": "idle"}
         self.settings = {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+        self.messages = []
         self.current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
                         "items": [{"placement": {"kind": "local"},
                                    "projections": [{"panel_id": SURFACE, "workspace_id": WORKSPACE}],
@@ -179,10 +181,101 @@ class OpenCodeDeliveryTests(unittest.TestCase):
                 return copy.deepcopy(self.guard)
             if method == "agent.message.settings":
                 return copy.deepcopy(self.settings)
+            if method == "agent.message.list":
+                return {"messages": copy.deepcopy(self.messages)}
         raise AssertionError(f"Unexpected native command: {args}")
 
     def submit(self, target=None):
         return self.cmux.submit(target or self.target, "Synthetic attention prompt")
+
+    def inbox_source(self):
+        source = {
+            "id": "CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC", "body": "Synthetic peer request",
+            "recipient_surface_id": SURFACE, "recipient_workspace_id": WORKSPACE,
+            "sender_surface_id": "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD",
+            "sender_workspace_id": WORKSPACE, "sender_name": "peer", "created_at": STARTED_AT + 1,
+            "state": "queued", "read_at": None, "in_reply_to": None,
+        }
+        self.messages = [source]
+        self.server.active[SESSION] = {"type": "running"}
+        self.current["items"][0]["agents"][0]["state"] = "working"
+        self.hook_record["agentLifecycle"] = "running"
+        self._write_hook()
+        return source
+
+    def test_running_recipient_reads_and_receipts_own_inbox_without_prompting(self):
+        source = self.inbox_source()
+        self.guard.update(state="unknown", lifecycle="running")
+        self.server.inbox = [{"id": "queued-api-work"}]
+        self.server.permissions = [{"id": "permission-fixture"}]
+        self.server.forms = [{"id": "form-fixture"}]
+        output = io.StringIO()
+
+        result = self.app.consume_inbox(SESSION, [source["id"]], SURFACE, output)
+
+        self.assertEqual(json.loads(output.getvalue())["messages"][0]["body"], source["body"])
+        self.assertEqual((result["acknowledged"], result["evidence"]), (True, "inbox"))
+        with contextlib.closing(self.app.database()) as db:
+            self.assertEqual(db.execute("SELECT session,message,evidence FROM acknowledgements").fetchall(),
+                             [(SESSION, source["id"], "inbox")])
+        self.assertIsNone(self.messages[0]["read_at"])
+        self.assertEqual(self.messages[0]["state"], "queued")
+        with self.assertRaises(hf.DeliveryHoldError):
+            self.submit()
+        self.assertEqual(self.server.posts, [])
+
+    def test_running_inbox_still_requires_authenticated_exact_native_identity(self):
+        source = self.inbox_source()
+        cases = ("api-auth", "api-pid", "api-directory", "native-generation", "native-worktree",
+                 "receiving", "caller-surface")
+        for case in cases:
+            with self.subTest(case=case):
+                self.server.overrides.clear()
+                self.server.password = PASSWORD
+                self.hook_record["startedAt"] = STARTED_AT
+                self.hook_record["cwd"] = str(self.worktree)
+                self._write_hook()
+                self.settings["receiving"] = True
+                surface = SURFACE
+                if case == "api-auth":
+                    self.server.password = "different-synthetic-password"
+                elif case == "api-pid":
+                    self.server.overrides["/api/info"] = (200, {"version": "2.2.5", "pid": os.getpid() + 1})
+                elif case == "api-directory":
+                    self.server.overrides[f"/api/session/{SESSION}"] = (200, {"data": {
+                        "id": SESSION, "location": {"directory": str(self.root)}, "time": {"archived": None}}})
+                elif case == "native-generation":
+                    self.hook_record["startedAt"] += 1
+                    self._write_hook()
+                elif case == "native-worktree":
+                    self.hook_record["cwd"] = str(self.root)
+                    self._write_hook()
+                elif case == "receiving":
+                    self.settings["receiving"] = False
+                else:
+                    surface = WORKSPACE
+                output = io.StringIO()
+                with self.assertRaises(ValueError):
+                    self.app.consume_inbox(SESSION, [source["id"]], surface, output)
+                self.assertEqual(output.getvalue(), "")
+                self.assertFalse((self.state / "receipts.sqlite3").exists())
+                self.assertEqual(self.server.posts, [])
+
+    def test_running_inbox_rechecks_identity_after_output_before_receipt(self):
+        source = self.inbox_source()
+        fixture = self
+
+        class ReplacedOnFlush(io.StringIO):
+            def flush(self):
+                fixture.hook_record["startedAt"] += 1
+                fixture._write_hook()
+
+        output = ReplacedOnFlush()
+        with self.assertRaisesRegex(ValueError, "generation changed"):
+            self.app.consume_inbox(SESSION, [source["id"]], SURFACE, output)
+        self.assertEqual(json.loads(output.getvalue())["messages"][0]["body"], source["body"])
+        self.assertFalse((self.state / "receipts.sqlite3").exists())
+        self.assertEqual(self.server.posts, [])
 
     def attention_once(self, body=b"Synthetic attention prompt", key="fixture-event"):
         with patch.dict("os.environ", self.env, clear=False):

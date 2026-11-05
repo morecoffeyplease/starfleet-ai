@@ -204,6 +204,8 @@ hailing-frequencies inbox --session OWN_ENROLLED_SESSION_UUID --message SOURCE_M
 
 Repeat `--message` for additional IDs, up to 20 per command.
 The command requires the caller's `CMUX_SURFACE_ID` to match the enrolled surface and verifies the current session binding, workspace, and generation.
+OpenCode inbox reads verify the authenticated API identity, exact native owner, worktree, generation, and enabled receiving while allowing the recipient's tool turn to be running.
+Prompt delivery continues to require the full API-idle, pending-interaction, composer, and human-input guards.
 It validates every ID before output, writes the selected message records as one JSON document, and flushes stdout before saving local acknowledgments.
 Output is limited to 64 KiB; select a smaller batch when the limit is reached.
 The command waits up to 30 seconds for an active scan or another short state operation to release its lock.

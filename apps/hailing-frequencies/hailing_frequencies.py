@@ -909,13 +909,19 @@ class Monitor:
                    for offset in range(0, len(message_ids), INBOX_MESSAGE_LIMIT))
         return "\n".join(self._inbox_command(target, batch, launcher) for batch in batches)
 
+    def _inbox_binding(self, target):
+        if target.get("harness") == "opencode":
+            # A recipient tool is already running while reading its own inbox.
+            return self.cmux.enrollment_binding(target)
+        return self.cmux.binding(target)
+
     def consume_inbox(self, session_id, message_ids, surface_id, output, details=False):
         require(isinstance(message_ids, list) and 0 < len(message_ids) <= INBOX_MESSAGE_LIMIT,
                 f"Select between 1 and {INBOX_MESSAGE_LIMIT} message IDs")
         normalized_ids = [identity(message_id) for message_id in message_ids]
         require(len(set(normalized_ids)) == len(normalized_ids), "Duplicate message IDs are not allowed")
         target = self.enrolled_target(session_id, surface_id)
-        self.cmux.binding(target)
+        self._inbox_binding(target)
         rows = self.cmux.messages(target)
         require(len(rows) < SCAN_LIMIT, "Inbox scan saturated; no messages output or acknowledged")
         selected = self.select_inbox_messages(target, normalized_ids, rows)
@@ -929,7 +935,7 @@ class Monitor:
 
         current_target = self.enrolled_target(session_id, surface_id)
         require(current_target == target, "Enrollment changed; no messages acknowledged")
-        self.cmux.binding(current_target)
+        self._inbox_binding(current_target)
         current_rows = self.cmux.messages(current_target)
         require(len(current_rows) < SCAN_LIMIT, "Inbox scan saturated; no messages acknowledged")
         current = self.select_inbox_messages(current_target, normalized_ids, current_rows)
@@ -938,7 +944,7 @@ class Monitor:
                              "recipient_surface_id", "recipient_workspace_id", "created_at", "in_reply_to")
             require(all(previous.get(field) == latest.get(field) for field in stable_fields),
                     "Message changed during output; no messages acknowledged")
-        self.cmux.binding(current_target)
+        self._inbox_binding(current_target)
 
         acknowledged_at = self.clock()
         with contextlib.closing(self.database()) as db:
