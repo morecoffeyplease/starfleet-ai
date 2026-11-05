@@ -297,6 +297,47 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("role: unassigned", other)
         self.assertNotIn("Track ownership", other)
 
+    def test_opencode_public_assignment_and_checkpoint_enrollment_accept_exact_native_session(self):
+        session = "ses_cliBoundary20261105"
+        env = {"OPENCODE_SESSION_ID": ""}
+        self.cli("init", "--default-role", "orchestrator", env=env)
+        self.cli("enable", env=env)
+        source = (self.root / ".context-injector/context.md").resolve()
+        assigned = self.cli("assign", "--harness", "opencode", "--session", session,
+                            "--role", "orchestrator", "--context-file", str(source), env=env)
+        binding = json.loads(assigned.stdout)
+        self.assertEqual((binding["harness"], binding["session_id"], binding["role"]),
+                         ("opencode", session, "orchestrator"))
+
+        delivered = json.loads(self.cli("context", "--harness", "opencode", "--session", session,
+                                        env=env).stdout)
+        self.assertEqual(delivered["status"], "context")
+        self.assertIn("Track ownership", delivered["text"])
+
+        briefing = json.loads(self.cli("checkpoint-enroll", "--harness", "opencode",
+                                       "--session", session, env=env).stdout)
+        self.assertEqual(briefing["state"], "briefing")
+        self.assertIsNone(briefing["compact_at"])
+        self.assertIn("unqualified exact occupancy", briefing["threshold_source"])
+
+        malformed = self.cli("assign", "--harness", "opencode", "--session", "SES_wrong",
+                             "--role", "orchestrator", "--context-file", str(source),
+                             success=False, env=env)
+        self.assertIn("exact case-sensitive ses_ session ID", malformed.stderr)
+
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
+        task_assignment = ci.state_path(gitdir, "opencode", session)
+        task_assignment.parent.mkdir(parents=True, exist_ok=True)
+        task_assignment.write_text(json.dumps({"root": str(self.root.resolve()),
+                                               "role": "implementer", "task_id": "invalid-task-id"}))
+        collision = self.cli("context", "--harness", "opencode", "--session", session,
+                             success=False, env=env)
+        self.assertIn("invalid task ID", collision.stderr)
+        replacement = self.cli("assign", "--harness", "opencode", "--session", session,
+                               "--role", "orchestrator", "--context-file", str(source),
+                               success=False, env=env)
+        self.assertIn("a dispatched task cannot be replaced by a session enrollment", replacement.stderr)
+
     def test_default_and_child_isolation(self):
         self.cli("init", "--default-role", "orchestrator")
         self.assertIn("Track ownership", self.content(self.event()))

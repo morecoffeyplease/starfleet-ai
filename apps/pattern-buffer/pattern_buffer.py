@@ -69,8 +69,19 @@ def auxiliary(name):
 
 
 def session_binding(root, gitdir, harness, session, agent=""):
-    if harness == "opencode" or agent or not session:
+    if agent or not session:
         return None
+    if harness == "opencode":
+        task_assignment = state_path(gitdir, harness, session)
+        if task_assignment.is_symlink():
+            return None
+        if task_assignment.exists():
+            try:
+                saved = json.loads(bounded(task_assignment, FILE_LIMIT))
+            except (OSError, ValueError, UnicodeError, TypeError):
+                return None
+            if not isinstance(saved, dict) or saved.get("task_id"):
+                return None
     return auxiliary("sessions").lookup(root, gitdir, harness, session)
 
 
@@ -835,7 +846,7 @@ def resolve_role(root, gitdir, config, harness, session, agent="", forced_role=N
         return forced_role or enrolled.role, "session enrollment", {"enrollment_id": enrolled.enrollment_id,
                                                      "context_file": str(enrolled.path)}
     path = state_path(gitdir, harness, session, agent)
-    if not role and path.exists():
+    if not role and (path.exists() or path.is_symlink()):
         saved = json.loads(bounded(path, FILE_LIMIT))
         if not isinstance(saved, dict):
             raise ValueError("invalid session registration")

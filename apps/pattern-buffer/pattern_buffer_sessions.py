@@ -23,11 +23,12 @@ MAX_BINDINGS = 128
 MAX_EVENTS = 2048
 MAX_EVIDENCE_BYTES = 1024
 LOCK_TIMEOUT_SECONDS = 5
-HARNESS_NAMES = ("claude", "codex")
+HARNESS_NAMES = ("claude", "codex", "opencode")
 ROLE_NAMES = ("implementer", "orchestrator")
 
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 _SAFE_SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_OPENCODE_SESSION = re.compile(r"ses_[A-Za-z0-9]+\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _META_PARTS = ("context-injector", "session-enrollments")
 
@@ -239,7 +240,7 @@ def _normalize_session(value, *, strict):
 
 def _harness(value):
     if not isinstance(value, str) or value.casefold() not in HARNESS_NAMES:
-        raise ValueError("harness must be claude or codex")
+        raise ValueError("harness must be claude, codex or opencode")
     return value.casefold()
 
 
@@ -264,6 +265,10 @@ def _evidence(value):
 
 
 def _identity(root, harness, session_id):
+    harness = _harness(harness)
+    session_id = _normalize_session(session_id, strict=True)
+    if harness == "opencode" and not _OPENCODE_SESSION.fullmatch(session_id):
+        raise ValueError("OpenCode requires the exact case-sensitive ses_ session ID")
     return {"root": str(root), "harness": harness, "session_id": session_id}
 
 
@@ -290,7 +295,7 @@ def _valid_identity(value, root):
     session_id = _normalize_session(value.get("session_id"), strict=True)
     if value.get("harness") != harness or value.get("session_id") != session_id:
         raise ValueError("enrollment identity is not canonical")
-    return {"root": str(root), "harness": harness, "session_id": session_id}
+    return _identity(root, harness, session_id)
 
 
 def _validate_registry(value, root, gitdir):
