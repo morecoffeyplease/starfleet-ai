@@ -164,6 +164,16 @@ class RenameCompatibilityTests(unittest.TestCase):
             damaged.write_text("unowned other-harness runtime\n")
             runtime_before = {path.name: path.read_bytes() for path in runtime.iterdir() if path.is_file()}
             settings_before = {path: path.read_bytes() for path in (codex_settings, claude_settings)}
+            settings_locks = [path.with_name(path.name + ".context-injector.lock")
+                              for path in (codex_settings, claude_settings)]
+
+            def lock_state(path):
+                if not path.exists():
+                    return None
+                stat = path.stat()
+                return path.read_bytes(), stat.st_mode & 0o777, stat.st_mtime_ns
+
+            locks_before = {path: lock_state(path) for path in settings_locks}
             refused = subprocess.run([sys.executable, str(CURRENT_CLI), "install", "--harness", "codex",
                                       "--settings", str(codex_settings), "--runtime-dir", str(runtime)],
                                      capture_output=True, text=True, env=env)
@@ -181,7 +191,7 @@ class RenameCompatibilityTests(unittest.TestCase):
             self.assertEqual({path.name: path.read_bytes() for path in runtime.iterdir() if path.is_file()},
                              runtime_before)
             self.assertEqual({path: path.read_bytes() for path in settings_before}, settings_before)
-            self.assertFalse(codex_settings.with_name(codex_settings.name + ".context-injector.lock").exists())
+            self.assertEqual({path: lock_state(path) for path in settings_locks}, locks_before)
 
     def test_install_refuses_unowned_entrypoints_and_orphan_helpers_before_any_write(self):
         for filename, content, expected in (
