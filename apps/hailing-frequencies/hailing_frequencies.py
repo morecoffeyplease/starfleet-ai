@@ -378,7 +378,15 @@ class Cmux:
         opencode_identity_binding(target)
         return self._opencode_native_binding(target, require_delivery_readiness=False)
 
-    def _opencode_native_binding(self, target, *, require_delivery_readiness=True):
+    def owner_identity_binding(self, target):
+        """Verify an exact OpenCode owner without requiring prompt receiving to be enabled."""
+        require(target.get("harness") == "opencode", "Owner identity check requires OpenCode")
+        opencode_identity_binding(target)
+        return self._opencode_native_binding(target, require_delivery_readiness=False,
+                                             require_message_receiving=False)
+
+    def _opencode_native_binding(self, target, *, require_delivery_readiness=True,
+                                 require_message_receiving=True):
         current = self.command("current", "--limit", "200")
         require(isinstance(current, dict), "CMUX current snapshot is unknown")
         require(not current.get("truncated", True), "CMUX current snapshot is incomplete")
@@ -446,7 +454,9 @@ class Cmux:
                 "Exact OpenCode CMUX session projection is missing, ambiguous or inactive")
 
         if not require_delivery_readiness:
-            return self._require_opencode_message_receiving(target)
+            if require_message_receiving:
+                return self._require_opencode_message_receiving(target)
+            return True
 
         guard = self.rpc("surface.input_state", surface_id=target["surface"])
         require(isinstance(guard, dict), "OpenCode input state is unknown")

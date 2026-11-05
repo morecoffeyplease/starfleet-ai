@@ -159,6 +159,8 @@ def connect(state_dir):
             size TEXT NOT NULL CHECK(size IN ('light','heavy')),
             family TEXT NOT NULL,
             workers INTEGER NOT NULL,
+            requested_cpu_cores REAL,
+            cpu_basis TEXT,
             expected_runtime REAL NOT NULL,
             command_json TEXT NOT NULL,
             state TEXT NOT NULL CHECK(state IN ('waiting','reserved','finished','cancelled')),
@@ -222,6 +224,12 @@ def connect(state_dir):
             resolved_at REAL
         );
     """)
+    with immediate_transaction(db):
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(reservations)")}
+        if "requested_cpu_cores" not in columns:
+            db.execute("ALTER TABLE reservations ADD COLUMN requested_cpu_cores REAL")
+        if "cpu_basis" not in columns:
+            db.execute("ALTER TABLE reservations ADD COLUMN cpu_basis TEXT")
     defaults = {
         "schema_version": 1,
         "target_cpu_fraction": 0.95,
@@ -231,7 +239,6 @@ def connect(state_dir):
         "last_heavy_grant": None,
         "protected_turn_request_id": None,
         "notifications_enabled": True,
-        "policy_version": policy.POLICY_VERSION,
         "idle_unadmitted_since": None,
     }
     with db:
@@ -315,6 +322,23 @@ def request_content(args, owner, command):
         "expected_runtime": float(args.expected_runtime),
         "command": command,
     }
+    requested_cpu_cores = getattr(args, "cpu_cores", None)
+    cpu_basis = getattr(args, "cpu_basis", None)
+    require((requested_cpu_cores is None) == (cpu_basis is None),
+            "--cpu-cores and --cpu-basis must be provided together")
+    if requested_cpu_cores is not None:
+        require(not isinstance(requested_cpu_cores, bool),
+                "--cpu-cores must be a finite positive number")
+        try:
+            requested_cpu_cores = float(requested_cpu_cores)
+        except (TypeError, ValueError) as exc:
+            raise WarpError("--cpu-cores must be a finite positive number") from exc
+        require(math.isfinite(requested_cpu_cores) and requested_cpu_cores > 0,
+                "--cpu-cores must be a finite positive number")
+        require(isinstance(cpu_basis, str) and cpu_basis.strip(),
+                "--cpu-basis must be nonempty")
+        values["requested_cpu_cores"] = requested_cpu_cores
+        values["cpu_basis"] = cpu_basis.strip()
     require(values["size"] in ("light", "heavy"), "--size must be light or heavy")
     require(values["family"], "--family must be nonempty")
     require(values["workers"] > 0, "--workers must be positive")
@@ -323,6 +347,14 @@ def request_content(args, owner, command):
     require(isinstance(command, list) and command and all(isinstance(part, str) for part in command),
             "Provide a command after --")
     return values
+
+
+def require_compatible_cpu_policy(db):
+    current_policy = get_setting(db, "policy_version")
+    require(current_policy == policy.POLICY_VERSION,
+            "Explicit CPU estimates require the compatible Warp-drive scheduler policy "
+            f"{policy.POLICY_VERSION}; this state reports {current_policy or 'unknown'}. "
+            "Wait for the coordinator-authorized compatible scheduler rollout before submitting or resuming this request.")
 
 
 def submit_one(db, request_key, content, owner):
@@ -338,24 +370,32 @@ def submit_one(db, request_key, content, owner):
         require(owner_matches(existing, owner),
                 "Request already belongs to another owner; use transfer before attaching")
         return existing["id"], False
+    if content.get("requested_cpu_cores") is not None:
+        require_compatible_cpu_policy(db)
     identifier = str(uuid.uuid4())
     sequence = db.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM reservations").fetchone()[0]
     created = now()
     start_at = created
     db.execute("""INSERT INTO reservations
         (id,request_key,content_sha256,sequence,worktree_id,repo,worktree_path,
-         owner_harness,owner_session,owner_surface,size,family,workers,expected_runtime,
+         owner_harness,owner_session,owner_surface,size,family,workers,requested_cpu_cores,
+         cpu_basis,expected_runtime,
          command_json,state,created_at,eligible_at,wait_reason)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,?)""",
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,?)""",
         (identifier, request_key, digest, sequence, worktree_id, content["repo"],
          content["worktree_path"], owner["harness"], owner["session"], owner["surface"],
-         content["size"], content["family"], content["workers"], content["expected_runtime"],
+         content["size"], content["family"], content["workers"],
+         content.get("requested_cpu_cores"), content.get("cpu_basis"), content["expected_runtime"],
          json_text(content["command"]), created, start_at, "awaiting attached helper"))
     event(db, "submitted", identifier, request_key=request_key, sequence=sequence,
           worktree_id=worktree_id, repo=content["repo"], path=content["worktree_path"],
           size=content["size"], family=content["family"], workers=content["workers"],
           expected_runtime=content["expected_runtime"], command=content["command"],
           policy_version=policy.POLICY_VERSION)
+    if content.get("requested_cpu_cores") is not None:
+        event(db, "cpu_estimate_declared", identifier,
+              requested_cpu_cores=content["requested_cpu_cores"],
+              cpu_basis=content["cpu_basis"])
     return identifier, True
 
 
@@ -378,6 +418,9 @@ def attach_helper(db, request_id, owner, helper_id):
                          (request_id, request_id)).fetchone()
         require(row is not None, "Reservation not found")
         require(owner_matches(row, owner), "Current owner does not match; transfer this reservation first")
+        if (row["requested_cpu_cores"] is not None and
+                row["state"] in ("waiting", "reserved") and row["launch_intent_at"] is None):
+            require_compatible_cpu_policy(db)
         require(row["state"] not in ("cancelled",), "Reservation is cancelled")
         if row["state"] == "finished":
             return row["id"], row["helper_generation"], "finished"
@@ -491,7 +534,7 @@ def protected_turn_target(db, ready, unserved, *, at, target_cores, projected_co
 
     def decide(row, grant_at=last_heavy_grant):
         return policy.admission_decision(
-            {"size": row["size"], "workers": row["workers"]},
+            row,
             target_cores=target_cores, projected_cores=projected_cores,
             light_ready=light_ready, pressure=pressure,
             sample_fresh=sample_fresh, now=at, last_heavy_grant=grant_at,
@@ -572,7 +615,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
     for job in active:
         start = job["started_at"] or job["granted_at"]
         if latest is None or start is None or latest["at"] < start + 10:
-            unreflected += policy.estimated_cores(job["size"], job["workers"], target_cores)
+            unreflected += policy.request_estimate(job, target_cores)
     projected = observed_cores + unreflected
     ready = db.execute("""SELECT r.*,w.order_position,w.served_round FROM reservations r
         JOIN worktrees w ON w.id=r.worktree_id
@@ -602,9 +645,9 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                              "position": row["order_position"]})
     request_rows.sort(key=policy.request_order_key)
     light_ready = any(row["size"] == "light" for row in ready)
-    active_heavy_cores = sum(policy.estimated_cores(job["size"], job["workers"], target_cores)
+    active_heavy_cores = sum(policy.request_estimate(job, target_cores)
                              for job in active if job["size"] == "heavy")
-    active_managed_cores = sum(policy.estimated_cores(job["size"], job["workers"], target_cores)
+    active_managed_cores = sum(policy.request_estimate(job, target_cores)
                                for job in active)
     active_light_jobs = [job for job in active if job["size"] == "light"]
     active_worktree_ids = {job["worktree_id"] for job in active}
@@ -646,14 +689,14 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                     reason = (f"light backfill held for aged request {protected_target['id']} "
                               "while the observed CPU window settles")
                 if reason is not None:
-                    estimate = policy.estimated_cores(row["size"], row["workers"], target_cores,
-                                                      light_ready=light_ready)
+                    estimate = policy.request_estimate(row, target_cores,
+                                                       light_ready=light_ready)
                     set_wait_reason(db, row, reason)
                     decision_log.append({"request_id": row["id"], "reason": reason,
                                          "estimate_cores": estimate, "allowed": False})
                     continue
             allowed, reason, estimate, _draining = policy.admission_decision(
-                {"size": row["size"], "workers": row["workers"]},
+                row,
                 target_cores=target_cores, projected_cores=projected,
                 light_ready=light_ready, pressure=pressure,
                 sample_fresh=fresh and mean_busy is not None, now=at,
@@ -674,7 +717,9 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                       round=current_round, estimated_cores=estimate,
                       policy_version=policy.POLICY_VERSION, cpu_busy=current_busy,
                       cpu_30s_mean=mean_busy, projected_cores=projected,
-                      target_cores=target_cores, decision=reason)
+                      target_cores=target_cores, decision=reason,
+                      requested_cpu_cores=row["requested_cpu_cores"],
+                      cpu_basis=row["cpu_basis"])
                 projected += estimate
                 return row["id"]
             set_wait_reason(db, row, reason)
@@ -704,7 +749,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
             if row["size"] != "heavy" or row["id"] == target_id:
                 continue
             allowed, reason, estimate, _draining = policy.admission_decision(
-                {"size": row["size"], "workers": row["workers"]},
+                row,
                 target_cores=target_cores, projected_cores=projected,
                 light_ready=light_ready, pressure=pressure,
                 sample_fresh=fresh and mean_busy is not None, now=at,
@@ -751,8 +796,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
     headroom_available = False
     if fresh and mean_busy is not None and pressure in (None, "normal"):
         for row in ready:
-            estimate = policy.estimated_cores(row["size"], row["workers"], target_cores,
-                                              light_ready=light_ready)
+            estimate = policy.request_estimate(row, target_cores,
+                                               light_ready=light_ready)
             budget = target_cores
             if row["size"] == "heavy" and light_ready:
                 budget -= min(1.0, target_cores / 2)
@@ -764,7 +809,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
             protected_target is None):
         for row in ready:
             allowed, reason, estimate, _draining = policy.admission_decision(
-                {"size": row["size"], "workers": row["workers"]},
+                row,
                 target_cores=target_cores, projected_cores=projected,
                 light_ready=light_ready, pressure=pressure,
                 sample_fresh=fresh and mean_busy is not None, now=at,
@@ -786,7 +831,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 if row["id"] not in prior_ids or row["id"] == granted:
                     continue
                 allowed, _reason, _estimate, _draining = policy.admission_decision(
-                    {"size": row["size"], "workers": row["workers"]},
+                    row,
                     target_cores=target_cores, projected_cores=projected,
                     light_ready=light_ready, pressure=pressure,
                     sample_fresh=fresh and mean_busy is not None, now=at,
@@ -873,15 +918,17 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
     active_contributors = []
     for job in active:
         start = job["started_at"] or job["granted_at"]
-        estimate = policy.estimated_cores(job["size"], job["workers"], target_cores)
+        estimate = policy.request_estimate(job, target_cores)
         unreflected_job = latest is None or start is None or latest["at"] < start + 10
         unreflected_estimate = estimate if unreflected_job else 0.0
         unreflected += unreflected_estimate
         active_contributors.append({
             "request_id": job["id"], "worktree_id": job["worktree_id"],
             "size": job["size"], "workers": job["workers"],
+            "requested_cpu_cores": job["requested_cpu_cores"],
             "estimated_cores": round(estimate, 2),
             "unreflected_cores": round(unreflected_estimate, 2),
+            "cpu_basis": job["cpu_basis"],
             "started_at": job["started_at"], "granted_at": job["granted_at"]})
     projected = observed_cores + unreflected
     ready = db.execute("""SELECT r.*,w.order_position,w.served_round FROM reservations r
@@ -893,9 +940,9 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
     heavy_budget = target_cores
     if light_ready:
         heavy_budget -= min(1.0, target_cores / 2)
-    active_heavy_cores = sum(policy.estimated_cores(job["size"], job["workers"], target_cores)
+    active_heavy_cores = sum(policy.request_estimate(job, target_cores)
                              for job in active if job["size"] == "heavy")
-    active_managed_cores = sum(policy.estimated_cores(job["size"], job["workers"], target_cores)
+    active_managed_cores = sum(policy.request_estimate(job, target_cores)
                                for job in active)
     active_light_jobs = [job for job in active if job["size"] == "light"]
     active_escape_ids = active_aged_escape_request_ids(db, active)
@@ -952,10 +999,10 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
             "eligible_request_ids": [],
             "eligible_this_selection_round": row["served_round"] < selection_round})
         worktree_turn["eligible_request_ids"].append(row["id"])
-        estimate = policy.estimated_cores(row["size"], row["workers"], target_cores,
-                                          light_ready=light_ready)
+        estimate = policy.request_estimate(row, target_cores,
+                                           light_ready=light_ready)
         _allowed, policy_reason, _estimate, _draining = policy.admission_decision(
-            {"size": row["size"], "workers": row["workers"]},
+            row,
             target_cores=target_cores, projected_cores=projected,
             light_ready=light_ready, pressure=pressure,
             sample_fresh=fresh and mean_busy is not None, now=at,
@@ -1003,6 +1050,8 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
             blocker = {"kind": "startup_observation", "request_ids": []}
         candidates.append({"request_id": row["id"], "worktree_id": row["worktree_id"],
                            "size": row["size"], "workers": row["workers"],
+                           "requested_cpu_cores": row["requested_cpu_cores"],
+                           "cpu_basis": row["cpu_basis"],
                            "estimated_cores": estimate, "policy_reason": policy_reason,
                            "blocking_reason": reason, "blocking_target_id": target_id,
                            "diagnostic_blocker": blocker,
@@ -1546,6 +1595,12 @@ def run_helper(state_dir, request_id, owner, timeout=None, product_umask=0o077):
 
 
 def detach_helper(args, state_dir, request_id, owner, product_umask=0o077):
+    with contextlib.closing(connect(state_dir)) as db:
+        row = current_request(db, request_id)
+        require(owner_matches(row, owner), "Current owner does not match; transfer this reservation first")
+        if (row["requested_cpu_cores"] is not None and
+                row["state"] in ("waiting", "reserved") and row["launch_intent_at"] is None):
+            require_compatible_cpu_policy(db)
     logs = safe_state_dir(Path(state_dir) / "logs")
     log_path = logs / f"{request_id}.log"
     argv = [sys.executable, str(Path(__file__).resolve()), "--state-dir", str(state_dir),
@@ -1718,6 +1773,8 @@ def command_batch(args, state_dir):
         entry.size = item["size"]
         entry.family = item["family"]
         entry.workers = item["workers"]
+        entry.cpu_cores = item.get("cpu_cores")
+        entry.cpu_basis = item.get("cpu_basis")
         entry.expected_runtime = item["expected_runtime"]
         content = request_content(entry, owner, item["command"])
         prepared.append((item["key"], content, owner))
@@ -1744,7 +1801,8 @@ def status_data(db):
     latest, mean, fresh = fresh_host_window(db, at)
     targets = read_hailing_targets()
     rows = db.execute("""SELECT r.id,r.request_key,r.repo,r.worktree_path,r.owner_harness,
-        r.owner_session,r.size,r.family,r.workers,r.expected_runtime,r.state,r.outcome,
+        r.owner_session,r.size,r.family,r.workers,r.requested_cpu_cores,r.cpu_basis,
+        r.expected_runtime,r.state,r.outcome,
         r.exit_code,r.created_at,r.eligible_at,r.credit_seconds,r.heartbeat_at,
         r.granted_at,r.started_at,r.ended_at,r.wait_reason,r.priority,r.wake_status,
         r.worktree_id,w.order_position,w.served_round
@@ -1919,7 +1977,11 @@ def _add_request_args(parser):
     parser.add_argument("--family", required=True,
                         help="workload family for later raw-data classification")
     parser.add_argument("--workers", type=int, required=True,
-                        help="simultaneous CPU workers in this phase, not a sum across serial phases")
+                        help="independent simultaneous workload slots, not internal backend threads or serial phases")
+    parser.add_argument("--cpu-cores", type=float,
+                        help="optional positive CPU admission estimate for this phase")
+    parser.add_argument("--cpu-basis",
+                        help="nonempty evidence or bound basis required with --cpu-cores")
     parser.add_argument("--expected-runtime", type=float, required=True,
                         help="expected duration of this command phase in seconds")
     parser.add_argument("--repo")

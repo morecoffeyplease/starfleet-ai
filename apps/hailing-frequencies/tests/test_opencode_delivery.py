@@ -365,6 +365,16 @@ class OpenCodeDeliveryTests(unittest.TestCase):
         row = self.app.prior_attention_intent(self.target, "busy-enrolled-session")
         self.assertEqual(row[1:3], ("held", 0))
 
+    def test_owner_identity_binding_does_not_require_prompt_receiving(self):
+        self.settings["receiving"] = False
+        with patch.dict("os.environ", self.env, clear=False):
+            self.assertTrue(self.cmux.owner_identity_binding(self.target))
+            with self.assertRaisesRegex(ValueError, "Native messaging is disabled"):
+                self.cmux.enrollment_binding(self.target)
+            with self.assertRaisesRegex(ValueError, "Native messaging is disabled"):
+                self.cmux.binding(self.target)
+        self.assertEqual(self.server.posts, [])
+
     def test_manifest_policy_is_explicit_validated_and_existing_policy_cannot_change(self):
         invalid = self.opencode_manifest("future-policy")
         with self.assertRaisesRegex(ValueError, "delivery policy"):

@@ -3,12 +3,14 @@
 
 import argparse
 import contextlib
+from datetime import datetime
 import fcntl
 import json
 import math
 import os
 from pathlib import Path
 import re
+import threading
 import shlex
 import signal
 import shutil
@@ -21,6 +23,10 @@ import urllib.parse
 import urllib.request
 
 sys.dont_write_bytecode = True
+
+RUNTIME_VENDOR = Path(__file__).resolve().parent / "vendor"
+if RUNTIME_VENDOR.is_dir() and str(RUNTIME_VENDOR) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_VENDOR))
 
 try:
     import hailing_frequencies as hf
@@ -41,10 +47,20 @@ MESSAGE_LIMIT = 100
 MAX_CATCHUP_PAGES = 50
 MAX_MESSAGE_BYTES = 64 * 1024
 MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_RATE_LIMIT_WAIT = 24 * 60 * 60
 MAX_RECEIVE_MESSAGES = 20
-MAX_RECEIVE_BYTES = 64 * 1024
+MAX_RECEIVE_BYTES = 256 * 1024
+GROUP_QUIET_SECONDS = 3
+GROUP_MAX_DELAY = 10
+ROUTINE_REST_INTERVAL = 30
+REST_TURN_INTERVAL = 1
+WORKER_REST_THREADS_PER_TURN = 8
+WORKER_REST_PAGES_PER_THREAD = 2
+SENDER_INTERVAL = 0.25
+LANE_JOIN_TIMEOUT = 20
 MAX_WAKE_ATTEMPTS = 3
 REMIND_AFTER = 120
+DORMANT_AFTER = 7 * 24 * 60 * 60
 ALLOWED_LAUNCH_KINDS = {"claude", "codex", "opencode"}
 ACTIVE_MESSAGE_STATES = ("pending", "awaiting_receipt", "uncertain", "stalled")
 
@@ -63,6 +79,24 @@ def snowflake(value, label="Discord snowflake"):
 
 def id_order(value):
     return int(snowflake(value))
+
+
+def timestamp_epoch(value):
+    require(isinstance(value, str) and 1 <= len(value) <= 64,
+            "Discord message timestamp is invalid")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError("Discord message timestamp is invalid") from None
+    require(parsed.tzinfo is not None and parsed.utcoffset() is not None,
+            "Discord message timestamp must include a timezone")
+    try:
+        epoch = parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("Discord message timestamp is invalid") from None
+    require(math.isfinite(epoch), "Discord message timestamp is invalid")
+    return epoch
 
 
 def ensure_private_file(path, label):
@@ -103,11 +137,74 @@ class DiscordAPIError(ValueError):
 
 
 class Discord:
-    def __init__(self, token, timeout=HTTP_TIMEOUT, opener=None):
+    def __init__(self, token, timeout=HTTP_TIMEOUT, opener=None, clock=time.time):
         require(isinstance(token, str) and token.strip(), "DISCORD_BOT_TOKEN is required")
         self.token = token.strip()
         self.timeout = timeout
         self.opener = opener or urllib.request.urlopen
+        self.clock = clock
+        self.request_count = 0
+        self.route_limits = {}
+        self.rate_updates = []
+        self.global_not_before = 0.0
+
+    @staticmethod
+    def route_key(path):
+        return "GET " + path.split("?", 1)[0]
+
+    def load_route_limits(self, values, global_not_before=0.0):
+        self.route_limits = {row[0]: {"bucket_key": row[1], "remaining": row[2],
+                                      "reset_at": row[3]} for row in values}
+        self.global_not_before = float(global_not_before or 0.0)
+
+    def deferred_until(self, path, now):
+        if now < self.global_not_before:
+            return self.global_not_before
+        route = self.route_key(path)
+        limit = self.route_limits.get(route)
+        candidates = [limit] if limit else []
+        if limit and limit.get("bucket_key"):
+            candidates.extend(item for item in self.route_limits.values()
+                              if item.get("bucket_key") == limit["bucket_key"])
+        waits = [item["reset_at"] for item in candidates
+                 if item and item.get("remaining") == 0 and item.get("reset_at", 0) > now]
+        return max(waits, default=0.0)
+
+    def _remember_headers(self, path, headers, now):
+        if headers is None:
+            return
+        route = self.route_key(path)
+        bucket = headers.get("X-RateLimit-Bucket")
+        major = path.split("/", 3)[2] if path.startswith("/channels/") else ""
+        bucket_key = f"{bucket}:{major}" if bucket else route
+        def number(name):
+            raw = headers.get(name)
+            try:
+                value = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                return None
+            return value if value is not None and math.isfinite(value) and value >= 0 else None
+        remaining_value = number("X-RateLimit-Remaining")
+        limit_value = number("X-RateLimit-Limit")
+        reset_after = number("X-RateLimit-Reset-After")
+        reset_epoch = number("X-RateLimit-Reset")
+        if reset_after is not None:
+            reset_at = now + min(MAX_RATE_LIMIT_WAIT, reset_after)
+        elif reset_epoch is not None:
+            reset_at = min(now + MAX_RATE_LIMIT_WAIT, reset_epoch)
+        else:
+            reset_at = None
+        if remaining_value is not None or reset_at is not None:
+            value = {"route": route, "bucket_key": bucket_key,
+                     "remaining": int(remaining_value) if remaining_value is not None else None,
+                     "limit_total": int(limit_value) if limit_value is not None else None,
+                     "reset_at": reset_at or 0.0, "updated_at": now}
+            self.route_limits[route] = value
+            self.rate_updates.append(value)
+        if str(headers.get("X-RateLimit-Global", "")).lower() == "true" or \
+                headers.get("X-RateLimit-Scope") == "global":
+            wait = min(MAX_RATE_LIMIT_WAIT, reset_after or number("Retry-After") or 0)
+            self.global_not_before = max(self.global_not_before, now + wait)
 
     def get(self, path, query=None):
         url = API + path
@@ -119,13 +216,16 @@ class Discord:
             "Accept": "application/json",
         })
         try:
+            self.request_count += 1
             with self.opener(request, timeout=self.timeout) as response:
+                self._remember_headers(path, getattr(response, "headers", None), self.clock())
                 body = response.read(MAX_API_RESPONSE_BYTES + 1)
                 require(len(body) <= MAX_API_RESPONSE_BYTES,
                         "Discord response exceeded the bounded response size")
         except urllib.error.HTTPError as error:
             body = error.read(16 * 1024)
             headers = error.headers or {}
+            self._remember_headers(path, headers, self.clock())
             parsed = {}
             try:
                 parsed = json.loads(body.decode("utf-8", "replace"))
@@ -209,7 +309,7 @@ def read_notify_credentials(notify_home):
 class Watch:
     def __init__(self, state_dir=DEFAULT_STATE, hailing_state=DEFAULT_HAILING_STATE,
                  notify_home=DEFAULT_NOTIFY_HOME, cmux="cmux", clock=time.time,
-                 discord_factory=Discord, cmux_factory=None):
+                 discord_factory=Discord, cmux_factory=None, gateway_factory=None):
         self.directory = Path(state_dir).expanduser().absolute()
         self.hailing_state = Path(hailing_state).expanduser().absolute()
         self.notify_home = Path(notify_home).expanduser().absolute()
@@ -217,6 +317,8 @@ class Watch:
         self.clock = clock
         self.discord_factory = discord_factory
         self.cmux_factory = cmux_factory or (lambda: hf.Cmux(cmux))
+        self.gateway_factory = gateway_factory
+        self._configured_user_id = None
         self.global_not_before = 0.0
         os.umask(0o077)
 
@@ -264,6 +366,7 @@ class Watch:
           thread_id TEXT PRIMARY KEY,
           owner_json TEXT NOT NULL,
           cursor TEXT NOT NULL,
+          initial_cutoff TEXT,
           is_open INTEGER NOT NULL DEFAULT 1,
           registered_at REAL NOT NULL,
           updated_at REAL NOT NULL,
@@ -273,7 +376,10 @@ class Watch:
           catchup_max TEXT,
           last_error_json TEXT,
           remote_json TEXT NOT NULL DEFAULT '{}',
-          owner_generation INTEGER NOT NULL DEFAULT 1
+          owner_generation INTEGER NOT NULL DEFAULT 1,
+          subscription_state TEXT NOT NULL DEFAULT 'active',
+          last_activity_at REAL,
+          remote_closed INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS messages (
           thread_id TEXT NOT NULL REFERENCES threads(thread_id),
@@ -289,6 +395,10 @@ class Watch:
           submitted_at REAL,
           received_at REAL,
           last_error_json TEXT,
+          groupable INTEGER NOT NULL DEFAULT 1,
+          ingested_at REAL,
+          owner_generation INTEGER,
+          group_id INTEGER,
           PRIMARY KEY(thread_id, message_id)
         );
         CREATE INDEX IF NOT EXISTS messages_queue ON messages(thread_id, state, message_id);
@@ -300,16 +410,199 @@ class Watch:
           at REAL NOT NULL,
           owner_generation INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS delivery_groups (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          thread_id TEXT NOT NULL,
+          owner_generation INTEGER NOT NULL,
+          owner_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at REAL NOT NULL,
+          first_message_id TEXT NOT NULL,
+          last_message_id TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_wake_at REAL,
+          submitted_at REAL,
+          last_error_json TEXT,
+          legacy INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS delivery_groups_queue ON delivery_groups(thread_id,status,id);
+        CREATE TABLE IF NOT EXISTS delivery_group_members (
+          group_id INTEGER NOT NULL REFERENCES delivery_groups(id),
+          thread_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          PRIMARY KEY(group_id,message_id),
+          UNIQUE(thread_id,message_id)
+        );
+        CREATE TABLE IF NOT EXISTS delivery_group_attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          group_id INTEGER NOT NULL REFERENCES delivery_groups(id),
+          state TEXT NOT NULL,
+          created_at REAL NOT NULL,
+          transport_started_at REAL,
+          submitted_at REAL,
+          last_error_json TEXT,
+          target_owner_json TEXT,
+          target_owner_generation INTEGER
+        );
+        CREATE TRIGGER IF NOT EXISTS delivery_group_members_no_update
+        BEFORE UPDATE ON delivery_group_members BEGIN
+          SELECT RAISE(ABORT, 'delivery group membership is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS delivery_group_members_no_delete
+        BEFORE DELETE ON delivery_group_members BEGIN
+          SELECT RAISE(ABORT, 'delivery group membership is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS delivery_groups_identity_no_update
+        BEFORE UPDATE OF thread_id,owner_generation,owner_json,created_at,first_message_id,last_message_id,legacy
+        ON delivery_groups BEGIN
+          SELECT RAISE(ABORT, 'delivery group identity is immutable');
+        END;
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS gateway_state (
+          id INTEGER PRIMARY KEY CHECK(id=1),
+          condition TEXT NOT NULL DEFAULT 'degraded',
+          session_id TEXT,
+          resume_url TEXT,
+          sequence TEXT,
+          session_start_total INTEGER,
+          session_start_remaining INTEGER,
+          session_start_reset_at REAL,
+          last_identify_at REAL,
+          last_event_at REAL,
+          last_error_json TEXT,
+          recovery_epoch INTEGER NOT NULL DEFAULT 0,
+          recovery_state TEXT NOT NULL DEFAULT 'pending',
+          recovery_reason TEXT,
+          recovery_started_at REAL,
+          recovery_completed_at REAL,
+          updated_at REAL NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO gateway_state(id,condition,updated_at) VALUES(1,'degraded',0);
+        CREATE TABLE IF NOT EXISTS gateway_recovery_work (
+          epoch INTEGER NOT NULL,
+          thread_id TEXT NOT NULL,
+          owner_generation INTEGER NOT NULL,
+          state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          updated_at REAL NOT NULL,
+          completed_at REAL,
+          last_error_json TEXT,
+          PRIMARY KEY(epoch,thread_id,owner_generation)
+        );
+        CREATE INDEX IF NOT EXISTS gateway_recovery_queue
+        ON gateway_recovery_work(epoch,state,thread_id);
+        CREATE TABLE IF NOT EXISTS api_rate_limits (
+          route_key TEXT PRIMARY KEY,
+          bucket_key TEXT NOT NULL,
+          remaining INTEGER,
+          limit_total INTEGER,
+          reset_at REAL NOT NULL DEFAULT 0,
+          updated_at REAL NOT NULL
+        );
         """)
+        db.execute("BEGIN IMMEDIATE")
+        attempt_columns = {row[1] for row in db.execute("PRAGMA table_info(delivery_group_attempts)")}
+        if "target_owner_json" not in attempt_columns:
+            db.execute("ALTER TABLE delivery_group_attempts ADD COLUMN target_owner_json TEXT")
+        if "target_owner_generation" not in attempt_columns:
+            db.execute("ALTER TABLE delivery_group_attempts ADD COLUMN target_owner_generation INTEGER")
         thread_columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
         if "catchup_before" not in thread_columns:
             db.execute("ALTER TABLE threads ADD COLUMN catchup_before TEXT")
         if "catchup_max" not in thread_columns:
             db.execute("ALTER TABLE threads ADD COLUMN catchup_max TEXT")
+        if "subscription_state" not in thread_columns:
+            db.execute("ALTER TABLE threads ADD COLUMN subscription_state TEXT NOT NULL DEFAULT 'active'")
+        if "last_activity_at" not in thread_columns:
+            db.execute("ALTER TABLE threads ADD COLUMN last_activity_at REAL")
+        if "remote_closed" not in thread_columns:
+            db.execute("ALTER TABLE threads ADD COLUMN remote_closed INTEGER NOT NULL DEFAULT 0")
+        if "initial_cutoff" not in thread_columns:
+            db.execute("ALTER TABLE threads ADD COLUMN initial_cutoff TEXT")
         message_columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         if "attachments_json" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'")
+        if "groupable" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN groupable INTEGER NOT NULL DEFAULT 1")
+            db.execute("UPDATE messages SET groupable=0")
+        if "ingested_at" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN ingested_at REAL")
+        if "owner_generation" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN owner_generation INTEGER")
+        if "group_id" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN group_id INTEGER")
+        db.execute("CREATE INDEX IF NOT EXISTS messages_group_queue "
+                   "ON messages(thread_id,groupable,owner_generation,group_id,state,message_id)")
+        activity_migrated = db.execute(
+            "SELECT 1 FROM meta WHERE key='meaningful_activity_migration_v1'").fetchone()
+        if activity_migrated is None:
+            for thread_id, registered_at, remote_json in db.execute(
+                    "SELECT thread_id,registered_at,remote_json FROM threads").fetchall():
+                activity_at = None
+                for (created_at,) in db.execute(
+                        "SELECT created_at FROM messages WHERE thread_id=? "
+                        "ORDER BY length(message_id) DESC,message_id DESC", (thread_id,)):
+                    try:
+                        activity_at = timestamp_epoch(created_at)
+                        break
+                    except ValueError:
+                        continue
+                try:
+                    remote = json.loads(remote_json)
+                except (TypeError, ValueError):
+                    remote = {}
+                metadata = remote.get("thread_metadata") if isinstance(remote, dict) else None
+                remote_closed = isinstance(metadata, dict) and metadata.get("archived") is True
+                db.execute("UPDATE threads SET last_activity_at=?,subscription_state='active',remote_closed=? "
+                           "WHERE thread_id=?", (activity_at, int(remote_closed), thread_id))
+            db.execute("INSERT INTO meta(key,value) VALUES('meaningful_activity_migration_v1','complete')")
+        cutoff_migrated = db.execute(
+            "SELECT 1 FROM meta WHERE key='initial_intake_cutoff_migration_v1'").fetchone()
+        if cutoff_migrated is None:
+            db.execute("UPDATE threads SET initial_cutoff=cursor WHERE initial_cutoff IS NULL")
+            db.execute("INSERT INTO meta(key,value) VALUES('initial_intake_cutoff_migration_v1','complete')")
+        # Older supported CLI versions can still insert registrations without this column.
+        db.execute("UPDATE threads SET initial_cutoff=cursor WHERE initial_cutoff IS NULL")
+        # Older supported CLI versions can write rows without the new intake metadata.
+        db.execute("UPDATE messages SET owner_generation=(SELECT owner_generation FROM threads "
+                   "WHERE threads.thread_id=messages.thread_id) WHERE owner_generation IS NULL")
+        for thread_id, message_id, created_at in db.execute(
+                "SELECT thread_id,message_id,created_at FROM messages WHERE ingested_at IS NULL").fetchall():
+            try:
+                ingested_at = timestamp_epoch(created_at)
+            except ValueError:
+                ingested_at = db.execute("SELECT registered_at FROM threads WHERE thread_id=?",
+                                         (thread_id,)).fetchone()[0]
+            db.execute("UPDATE messages SET ingested_at=? WHERE thread_id=? AND message_id=? "
+                       "AND ingested_at IS NULL", (ingested_at, thread_id, message_id))
+        # Existing per-message delivery evidence becomes immutable singleton groups.
+        for row in db.execute(
+                "SELECT m.thread_id,m.message_id,m.state,m.wake_attempts,m.last_wake_at,m.submitted_at,"
+                "m.ingested_at,t.owner_json,t.owner_generation FROM messages m JOIN threads t "
+                "ON t.thread_id=m.thread_id WHERE (m.groupable=0 OR m.state IN "
+                "('awaiting_receipt','uncertain','stalled') OR m.wake_attempts>0) AND m.group_id IS NULL "
+                "AND m.state!='received' ORDER BY m.thread_id,length(m.message_id),m.message_id").fetchall():
+            thread_id, message_id, state, attempts, last_wake_at, submitted_at, ingested_at, owner_json, generation = row
+            group_state = state if state in ("awaiting_receipt", "uncertain", "stalled") else "eligible"
+            if state == "pending" and attempts >= MAX_WAKE_ATTEMPTS:
+                group_state = "stalled"
+            created_at = last_wake_at if last_wake_at is not None else ingested_at
+            cursor = db.execute(
+                "INSERT INTO delivery_groups(thread_id,owner_generation,owner_json,status,created_at,"
+                "first_message_id,last_message_id,attempt_count,last_wake_at,submitted_at,legacy) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+                (thread_id, generation, owner_json, group_state, created_at, message_id, message_id,
+                 attempts, last_wake_at, submitted_at))
+            group_id = cursor.lastrowid
+            db.execute("INSERT INTO delivery_group_members(group_id,thread_id,message_id,ordinal) VALUES(?,?,?,0)",
+                       (group_id, thread_id, message_id))
+            db.execute("UPDATE messages SET group_id=? WHERE thread_id=? AND message_id=?",
+                       (group_id, thread_id, message_id))
+        db.execute("UPDATE delivery_groups SET status='received' WHERE status!='received' AND NOT EXISTS ("
+                   "SELECT 1 FROM delivery_group_members gm JOIN messages m "
+                   "ON m.thread_id=gm.thread_id AND m.message_id=gm.message_id "
+                   "WHERE gm.group_id=delivery_groups.id AND m.state!='received')")
         db.commit()
         db.close()
         path.chmod(0o600)
@@ -317,6 +610,185 @@ class Watch:
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA foreign_keys=ON")
         return db
+
+    def gateway_session(self):
+        with contextlib.closing(self.database(create=False)) as db:
+            row = db.execute(
+                "SELECT condition,session_id,resume_url,sequence,session_start_total,"
+                "session_start_remaining,session_start_reset_at,last_identify_at,last_event_at,"
+                "recovery_epoch,recovery_state,recovery_reason,last_error_json "
+                "FROM gateway_state WHERE id=1").fetchone()
+        return {"condition": row[0], "session_id": row[1], "resume_url": row[2],
+                "sequence": row[3], "session_start_total": row[4],
+                "session_start_remaining": row[5], "session_start_reset_at": row[6],
+                "last_identify_at": row[7], "last_event_at": row[8],
+                "recovery_epoch": row[9], "recovery_state": row[10],
+                "recovery_reason": row[11],
+                "last_error": json.loads(row[12]) if row[12] else None}
+
+    def set_gateway_condition(self, condition, detail=None):
+        allowed = {"connected", "connecting", "degraded", "reconnecting",
+                   "fatal_configuration", "offline_rest"}
+        require(condition in allowed, "Invalid Gateway condition")
+        now = self.clock()
+        error_json = json.dumps({"detail": str(detail)[:300]}, separators=(",", ":")) if detail else None
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE gateway_state SET condition=?,last_error_json=?,"
+                           "last_event_at=CASE WHEN ?='connected' THEN ? ELSE last_event_at END,"
+                           "updated_at=? WHERE id=1",
+                           (condition, error_json, condition, now, now))
+
+    @staticmethod
+    def _begin_gateway_recovery_tx(db, reason, now):
+        row = db.execute("SELECT recovery_epoch FROM gateway_state WHERE id=1").fetchone()
+        epoch = row[0] + 1
+        threads = db.execute("SELECT thread_id,owner_generation FROM threads "
+                             "ORDER BY registered_at,thread_id").fetchall()
+        for thread_id, generation in threads:
+            db.execute("INSERT OR IGNORE INTO gateway_recovery_work("
+                       "epoch,thread_id,owner_generation,state,updated_at) VALUES(?,?,?,'queued',?)",
+                       (epoch, thread_id, generation, now))
+        state = "pending" if threads else "complete"
+        db.execute("UPDATE gateway_state SET recovery_epoch=?,recovery_state=?,recovery_reason=?,"
+                   "recovery_started_at=?,recovery_completed_at=?,updated_at=? WHERE id=1",
+                   (epoch, state, str(reason)[:100], now, now if not threads else None, now))
+        return epoch
+
+    def begin_gateway_recovery(self, reason):
+        now = self.clock()
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                epoch = self._begin_gateway_recovery_tx(db, reason, now)
+        return epoch
+
+    def save_gateway_start_limit(self, limit, now=None):
+        now = self.clock() if now is None else now
+        reset_at = now + limit["reset_after"] / 1000
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE gateway_state SET session_start_total=?,session_start_remaining=?,"
+                           "session_start_reset_at=?,updated_at=? WHERE id=1",
+                           (limit["total"], limit["remaining"], reset_at, now))
+
+    def reserve_gateway_identify(self, now, limit):
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                row = db.execute("SELECT session_start_remaining,session_start_reset_at "
+                                 "FROM gateway_state WHERE id=1").fetchone()
+                remaining = row[0] if row[0] is not None else limit["remaining"]
+                require(remaining > 0, "Discord Gateway session-start limit is exhausted")
+                db.execute("UPDATE gateway_state SET session_start_remaining=?,last_identify_at=?,"
+                           "updated_at=? WHERE id=1", (remaining - 1, now, now))
+
+    def clear_gateway_session(self, reset_sequence=True):
+        now = self.clock()
+        sequence_sql = ",sequence=NULL" if reset_sequence else ""
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE gateway_state SET session_id=NULL,resume_url=NULL" + sequence_sql +
+                           ",updated_at=? WHERE id=1", (now,))
+
+    def commit_gateway_dispatch(self, sequence, event_name, data, configured_user_id,
+                                validate_resume_url=None):
+        require(isinstance(sequence, int) and not isinstance(sequence, bool) and
+                0 <= sequence <= 10 ** 18, "Discord Gateway dispatch sequence is invalid")
+        sequence = str(sequence)
+        now = self.clock()
+        inserted = False
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                state = db.execute("SELECT sequence FROM gateway_state WHERE id=1").fetchone()
+                current = int(state[0]) if state[0] is not None else -1
+                if int(sequence) <= current:
+                    return {"committed": False, "duplicate": True, "ingested": False}
+                if event_name == "READY":
+                    require(isinstance(data, dict), "Discord Gateway READY payload is invalid")
+                    session_id = data.get("session_id")
+                    resume_url = data.get("resume_gateway_url")
+                    require(isinstance(session_id, str) and 1 <= len(session_id) <= 128 and
+                            not any(ord(char) < 32 for char in session_id),
+                            "Discord Gateway READY session ID is invalid")
+                    require(callable(validate_resume_url), "Discord Gateway resume URL validator is unavailable")
+                    resume_url = validate_resume_url(resume_url)
+                    self._begin_gateway_recovery_tx(db, "fresh_identify_ready", now)
+                    db.execute("UPDATE gateway_state SET session_id=?,resume_url=? WHERE id=1",
+                               (session_id, resume_url))
+                elif event_name == "RESUMED":
+                    self._begin_gateway_recovery_tx(db, "resume_ready", now)
+                elif event_name == "MESSAGE_CREATE":
+                    require(isinstance(data, dict), "Discord Gateway MESSAGE_CREATE payload is invalid")
+                    thread_id = snowflake(data.get("channel_id"), "Gateway message channel ID")
+                    known = db.execute("SELECT 1 FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
+                    if known:
+                        inserted = self._ingest_message(db, thread_id, data, configured_user_id, now,
+                                                        source="gateway")
+                db.execute("UPDATE gateway_state SET sequence=?,last_event_at=?,updated_at=? WHERE id=1",
+                           (sequence, now, now))
+        return {"committed": True, "duplicate": False, "ingested": inserted}
+
+    @staticmethod
+    def _prepare_api_limits(db, api, global_not_before=0.0):
+        if not hasattr(api, "load_route_limits"):
+            return
+        rows = db.execute("SELECT route_key,bucket_key,remaining,reset_at FROM api_rate_limits").fetchall()
+        api.load_route_limits(rows, global_not_before)
+
+    @staticmethod
+    def _persist_api_limits(db, api, thread_id=None, now=None):
+        updates = getattr(api, "rate_updates", None)
+        if not updates:
+            return
+        now = time.time() if now is None else now
+        with db:
+            for row in updates:
+                db.execute("INSERT INTO api_rate_limits(route_key,bucket_key,remaining,limit_total,reset_at,updated_at) "
+                           "VALUES(?,?,?,?,?,?) ON CONFLICT(route_key) DO UPDATE SET "
+                           "bucket_key=excluded.bucket_key,remaining=excluded.remaining,"
+                           "limit_total=excluded.limit_total,reset_at=excluded.reset_at,"
+                           "updated_at=excluded.updated_at",
+                           (row["route"], row["bucket_key"], row["remaining"],
+                            row["limit_total"], row["reset_at"], row["updated_at"]))
+                if thread_id is not None and row["remaining"] == 0 and row["reset_at"] > now:
+                    db.execute("UPDATE threads SET next_poll_at=MAX(next_poll_at,?) WHERE thread_id=?",
+                               (row["reset_at"], thread_id))
+            del updates[:]
+        global_until = getattr(api, "global_not_before", 0.0)
+        if global_until > now:
+            with db:
+                db.execute("INSERT INTO meta(key,value) VALUES('global_not_before',?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS REAL),CAST(excluded.value AS REAL))",
+                           (str(global_until),))
+
+    @staticmethod
+    def _api_deferred_until(db, api, path, now):
+        if hasattr(api, "deferred_until"):
+            return api.deferred_until(path, now)
+        return 0.0
+
+    def record_api_retry(self, api, path, retry_after, global_limit=False, now=None):
+        now = self.clock() if now is None else now
+        wait = retry_after if isinstance(retry_after, (int, float)) and math.isfinite(retry_after) else 0
+        deadline = now + min(MAX_RATE_LIMIT_WAIT, max(0, wait))
+        if global_limit:
+            self.global_not_before = max(self.global_not_before, deadline)
+            with contextlib.closing(self.database(create=False)) as db:
+                with db:
+                    db.execute("INSERT INTO meta(key,value) VALUES('global_not_before',?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS REAL),"
+                               "CAST(excluded.value AS REAL))", (str(deadline),))
+            if hasattr(api, "global_not_before"):
+                api.global_not_before = max(api.global_not_before, deadline)
+            return
+        route = api.route_key(path) if hasattr(api, "route_key") else "GET " + path
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("INSERT INTO api_rate_limits(route_key,bucket_key,remaining,limit_total,reset_at,updated_at) "
+                           "VALUES(?,?,0,NULL,?,?) ON CONFLICT(route_key) DO UPDATE SET "
+                           "remaining=0,reset_at=MAX(reset_at,excluded.reset_at),updated_at=excluded.updated_at",
+                           (route, route, deadline, now))
 
     def hailing_config(self):
         path = self.hailing_state / "config.json"
@@ -380,7 +852,7 @@ class Watch:
         current = self.current_owner(verify=False, session_hint=session_hint)
         cmux = self.cmux_factory()
         if current["harness"] == "opencode":
-            cmux.enrollment_binding(current)
+            cmux.owner_identity_binding(current)
         else:
             cmux.binding(current)
         return current
@@ -408,6 +880,7 @@ class Watch:
 
     def read_credentials(self):
         values = read_notify_credentials(self.notify_home)
+        self._configured_user_id = values["user_id"]
         return values, self.discord_factory(values["token"])
 
     @staticmethod
@@ -430,8 +903,7 @@ class Watch:
         owner = self._identity_owner(session_hint=session_hint)
         credentials, api = self.read_credentials()
         remote = self.remote_thread(api, thread_id)
-        require(not self.thread_closed(remote, credentials["closed_tag"]),
-                "Discord thread is archived or tagged Closed")
+        remote_closed = self.thread_closed(remote, credentials["closed_tag"])
         if after is not None:
             cursor = snowflake(after, "after cursor")
         else:
@@ -439,25 +911,27 @@ class Watch:
         require(id_order(cursor) >= id_order(thread_id), "Cursor cannot precede thread creation")
         now = self.clock()
         with contextlib.closing(self.database()) as db:
-            existing = db.execute("SELECT owner_json,cursor,is_open FROM threads WHERE thread_id=?",
+            existing = db.execute("SELECT owner_json,cursor,initial_cutoff FROM threads WHERE thread_id=?",
                                   (thread_id,)).fetchone()
             if existing is not None:
                 existing_owner = json.loads(existing[0])
                 require(existing_owner == owner,
                         "Thread already belongs to another exact session; use transfer explicitly")
-                require(bool(existing[2]), "Thread registration is closed")
                 if after is not None:
-                    require(cursor == existing[1], "Thread is already registered with a different cursor")
+                    require(cursor in (existing[2], existing[1]),
+                            "Thread is already registered with a different initial cutoff or current cursor")
                 with db:
-                    db.execute("UPDATE threads SET updated_at=?,remote_json=? WHERE thread_id=?",
-                               (now, json.dumps(remote, separators=(",", ":")), thread_id))
+                    db.execute("UPDATE threads SET updated_at=?,remote_json=?,remote_closed=? WHERE thread_id=?",
+                               (now, json.dumps(remote, separators=(",", ":")), int(remote_closed), thread_id))
                 return {"thread": thread_id, "registered": True, "already_registered": True,
                         "owner_session": owner["session"], "cursor": existing[1]}
+            require(not remote_closed, "Discord thread is archived or tagged Closed")
             with db:
-                db.execute("INSERT INTO threads(thread_id,owner_json,cursor,is_open,registered_at,updated_at,remote_json) "
-                           "VALUES(?,?,?,1,?,?,?)",
-                           (thread_id, json.dumps(owner, separators=(",", ":")), cursor, now, now,
+                db.execute("INSERT INTO threads(thread_id,owner_json,cursor,initial_cutoff,is_open,registered_at,"
+                           "updated_at,remote_json) VALUES(?,?,?,?,1,?,?,?)",
+                           (thread_id, json.dumps(owner, separators=(",", ":")), cursor, cursor, now, now,
                             json.dumps(remote, separators=(",", ":"))))
+                self._ensure_gateway_recovery_coverage(db, now)
         return {"thread": thread_id, "registered": True, "already_registered": False,
                 "owner_session": owner["session"], "cursor": cursor,
                 "cursor_source": "explicit" if after is not None else "thread-created"}
@@ -465,24 +939,52 @@ class Watch:
     def _thread(self, db, thread_id, require_open=True):
         thread_id = snowflake(thread_id, "thread ID")
         row = db.execute("SELECT thread_id,owner_json,cursor,is_open,registered_at,updated_at,last_poll_at,"
-                         "next_poll_at,catchup_before,catchup_max,last_error_json,remote_json,owner_generation "
+                         "next_poll_at,catchup_before,catchup_max,last_error_json,remote_json,owner_generation,"
+                         "subscription_state,last_activity_at,remote_closed,initial_cutoff "
                          "FROM threads WHERE thread_id=?",
                          (thread_id,)).fetchone()
         require(row is not None, "Thread is not registered")
         result = dict(zip(("thread_id", "owner_json", "cursor", "is_open", "registered_at", "updated_at",
                            "last_poll_at", "next_poll_at", "catchup_before", "catchup_max",
-                           "last_error_json", "remote_json", "owner_generation"), row))
+                           "last_error_json", "remote_json", "owner_generation", "subscription_state",
+                           "last_activity_at", "remote_closed", "initial_cutoff"), row))
         result["owner"] = json.loads(result.pop("owner_json"))
         result["last_error"] = json.loads(result["last_error_json"]) if result["last_error_json"] else None
         result["remote"] = json.loads(result.pop("remote_json"))
         require(not require_open or result["is_open"], "Thread registration is closed")
         return result
 
+    @staticmethod
+    def _refresh_dormancy(db, now):
+        cutoff = now - DORMANT_AFTER
+        with db:
+            db.execute("UPDATE threads SET subscription_state='dormant' "
+                       "WHERE subscription_state='active' "
+                       "AND COALESCE(last_activity_at,registered_at)<?", (cutoff,))
+
+    @staticmethod
+    def _catchup_incomplete(thread):
+        return thread["catchup_before"] is not None or thread["catchup_max"] is not None
+
+    @staticmethod
+    def _gateway_recovery_hold_reason(db, thread):
+        epoch = db.execute("SELECT recovery_epoch FROM gateway_state WHERE id=1").fetchone()[0]
+        if epoch <= 0:
+            return None
+        work = db.execute("SELECT state FROM gateway_recovery_work WHERE epoch=? AND thread_id=? "
+                          "AND owner_generation=?", (epoch, thread["thread_id"],
+                                                       thread["owner_generation"])).fetchone()
+        if work is None:
+            return "gateway_recovery_coverage_missing"
+        if work[0] not in ("complete", "superseded"):
+            return "gateway_recovery_incomplete"
+        return None
+
     def managed(self, thread_id, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
         current = self._identity_owner(session_hint=session_hint)
         with contextlib.closing(self.database(create=False)) as db:
-            thread = self._thread(db, thread_id)
+            thread = self._thread(db, thread_id, require_open=False)
             require(thread["owner"] == current,
                     "Thread belongs to another exact session; use explicit transfer")
             active = db.execute("SELECT state,COUNT(*) FROM messages WHERE thread_id=? GROUP BY state",
@@ -490,6 +992,8 @@ class Watch:
             counts = {state: count for state, count in active}
             status = self._health(db, thread_id)
         return {"thread": thread_id, "managed": True, "owner_session": current["session"],
+                "open": bool(thread["is_open"]), "subscription_state": thread["subscription_state"],
+                "remote_closed": bool(thread["remote_closed"]),
                 "queue": counts, "worker_health": status}
 
     def close(self, thread_id, session_hint=None):
@@ -497,62 +1001,135 @@ class Watch:
         current = self._identity_owner(session_hint=session_hint)
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
-            thread = self._thread(db, thread_id)
+            thread = self._thread(db, thread_id, require_open=False)
             require(thread["owner"] == current,
                     "Only the registered current owner can close this Discord Watch registration")
             with db:
                 db.execute("UPDATE threads SET is_open=0,updated_at=? WHERE thread_id=?",
                            (now, thread_id))
-        return {"thread": thread_id, "closed": True, "pending_preserved": True}
+        return {"thread": thread_id, "closed": True, "subscribed": True, "pending_preserved": True}
+
+    def ingest_gateway_message(self, thread_id, message):
+        """Durably ingest one Gateway message without changing the REST cursor."""
+        thread_id = snowflake(thread_id, "thread ID")
+        if self._configured_user_id is None:
+            credentials, _ = self.read_credentials()
+            self._configured_user_id = credentials["user_id"]
+        now = self.clock()
+        with contextlib.closing(self.database(create=False)) as db:
+            self._refresh_dormancy(db, now)
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                inserted = self._ingest_message(db, thread_id, message, self._configured_user_id, now,
+                                                source="gateway")
+            message_id = snowflake(message.get("id"), "message ID") if isinstance(message, dict) else None
+        return {"thread": thread_id, "message": message_id, "ingested": inserted,
+                "rest_cursor_advanced": False}
 
     def transfer(self, thread_id, from_session, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
         old_session = hf.session_identity(from_session)
-        current = self.current_owner(session_hint=session_hint)
+        # Resolve and verify the caller before taking the short SQLite write lock.
+        current = self._identity_owner(session_hint=session_hint)
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
-            thread = self._thread(db, thread_id)
-            require(thread["is_open"], "Thread registration is closed")
-            require(thread["owner"].get("session") == old_session,
-                    "--from-session does not match the registered owner")
-            require(thread["owner"] != current, "Thread already belongs to this exact session")
-            generation = thread["owner_generation"] + 1
             with db:
-                db.execute("UPDATE threads SET owner_json=?,owner_generation=?,updated_at=? WHERE thread_id=?",
-                           (json.dumps(current, separators=(",", ":")), generation, now, thread_id))
+                db.execute("BEGIN IMMEDIATE")
+                thread = self._thread(db, thread_id, require_open=False)
+                require(thread["owner"].get("session") == old_session,
+                        "--from-session does not match the registered owner")
+                require(thread["owner"] != current, "Thread already belongs to this exact session")
+                generation = thread["owner_generation"] + 1
+                stored_owner_json = db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
+                                               (thread_id,)).fetchone()[0]
+                updated = db.execute("UPDATE threads SET owner_json=?,owner_generation=?,updated_at=? "
+                                     "WHERE thread_id=? AND owner_json=? AND owner_generation=?",
+                                     (json.dumps(current, separators=(",", ":")), generation, now,
+                                      thread_id, stored_owner_json, thread["owner_generation"]))
+                require(updated.rowcount == 1,
+                        "Thread owner changed before the explicit transfer could commit")
                 db.execute("INSERT INTO ownership_events(thread_id,from_session,to_session,at,owner_generation) "
                            "VALUES(?,?,?,?,?)", (thread_id, old_session, current["session"], now, generation))
                 db.execute("UPDATE messages SET state='pending',wake_attempts=0,last_wake_at=NULL,submitted_at=NULL "
-                           "WHERE thread_id=? AND state='awaiting_receipt'", (thread_id,))
+                           "WHERE thread_id=? AND group_id IS NULL AND state='awaiting_receipt'", (thread_id,))
+                db.execute("UPDATE messages SET owner_generation=? WHERE thread_id=? AND group_id IS NULL "
+                           "AND state!='received'", (generation, thread_id))
+                self._ensure_gateway_recovery_coverage(db, now)
         return {"thread": thread_id, "transferred": True, "from_session": old_session,
                 "to_session": current["session"], "pending_preserved": True}
 
-    def _api_pages(self, api, thread_id, cursor, owner_id, db):
+    @staticmethod
+    def _attachment_json(row):
+        values = row.get("attachments", [])
+        require(isinstance(values, list) and len(values) <= 10,
+                "Discord attachment list exceeds the bounded storage size")
+        normalized = []
+        for item in values:
+            require(isinstance(item, dict), "Discord returned a malformed attachment")
+            filename, url = item.get("filename"), item.get("url")
+            require(isinstance(filename, str) and isinstance(url, str),
+                    "Discord attachment filename or URL is missing")
+            require(len(filename.encode("utf-8")) <= 512 and len(url.encode("utf-8")) <= 2048 and
+                    url.startswith("https://") and not any(ord(c) < 32 for c in filename + url),
+                    "Discord attachment metadata exceeds the bounded format")
+            normalized.append({"filename": filename, "url": url})
+        encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+        require(len(encoded.encode("utf-8")) <= 16 * 1024,
+                "Discord attachment metadata exceeds the bounded storage size")
+        return encoded
+
+    def _ingest_message(self, db, thread_id, row, configured_user_id, now, source="rest"):
+        thread_id = snowflake(thread_id, "thread ID")
+        require(isinstance(row, dict), "Discord returned a malformed message")
+        message_id = snowflake(row.get("id"), "message ID")
+        require(source in ("rest", "gateway"), "Unknown Discord message source")
+        thread = db.execute("SELECT last_activity_at,initial_cutoff,owner_generation FROM threads WHERE thread_id=?",
+                            (thread_id,)).fetchone()
+        require(thread is not None, "Thread is not registered")
+        channel_id = row.get("channel_id")
+        if channel_id is not None:
+            require(snowflake(channel_id, "message channel ID") == thread_id,
+                    "Discord message channel ID does not match the selected thread")
+        author = row.get("author") if isinstance(row.get("author"), dict) else {}
+        author_id = str(author.get("id", ""))
+        if (author_id != snowflake(configured_user_id, "configured Discord user ID") or
+                author.get("bot", False) or row.get("webhook_id") is not None):
+            return False
+        if source == "gateway" and id_order(message_id) <= id_order(
+                snowflake(thread[1], "initial intake cutoff")):
+            return False
+        body = row.get("content", "")
+        require(isinstance(body, str), "Discord message content is not text")
+        require(len(body.encode("utf-8")) <= MAX_MESSAGE_BYTES,
+                "Discord message content exceeds the bounded storage size")
+        attachment_json = self._attachment_json(row)
+        author_name = str(author.get("global_name") or author.get("username") or "Configured user")[:256]
+        created_at = row.get("timestamp", "")
+        activity_at = timestamp_epoch(created_at)
+        inserted = db.execute(
+            "INSERT OR IGNORE INTO messages(thread_id,message_id,author_id,author_name,body,attachments_json,"
+            "created_at,groupable,ingested_at,owner_generation) VALUES(?,?,?,?,?,?,?,1,?,?)",
+            (thread_id, message_id, author_id, author_name, body, attachment_json, created_at,
+             now, thread[2])).rowcount == 1
+        if inserted:
+            previous_activity = thread[0]
+            if previous_activity is None or activity_at >= previous_activity:
+                latest_activity = activity_at if previous_activity is None else max(activity_at, previous_activity)
+                subscription_state = "active" if now <= activity_at + DORMANT_AFTER else "dormant"
+                db.execute("UPDATE threads SET last_activity_at=?,subscription_state=? WHERE thread_id=?",
+                           (latest_activity, subscription_state, thread_id))
+        return inserted
+
+    def _api_pages(self, api, thread_id, cursor, owner_id, db, max_pages=None,
+                   stop_event=None):
+        max_pages = MAX_CATCHUP_PAGES if max_pages is None else max_pages
         pages = 0
         total = 0
+        deferred_until = 0.0
         thread_row = db.execute("SELECT cursor,catchup_before,catchup_max FROM threads WHERE thread_id=?",
                                 (thread_id,)).fetchone()
         require(thread_row is not None, "Thread registration disappeared during polling")
         current_cursor, boundary, caught_up_to = thread_row
-
-        def attachments(row):
-            values = row.get("attachments", [])
-            require(isinstance(values, list) and len(values) <= 10,
-                    "Discord attachment list exceeds the bounded storage size")
-            normalized = []
-            for item in values:
-                require(isinstance(item, dict), "Discord returned a malformed attachment")
-                filename, url = item.get("filename"), item.get("url")
-                require(isinstance(filename, str) and isinstance(url, str),
-                        "Discord attachment filename or URL is missing")
-                require(len(filename.encode("utf-8")) <= 512 and len(url.encode("utf-8")) <= 2048 and
-                        url.startswith("https://") and not any(ord(c) < 32 for c in filename + url),
-                        "Discord attachment metadata exceeds the bounded format")
-                normalized.append({"filename": filename, "url": url})
-            encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
-            require(len(encoded.encode("utf-8")) <= 16 * 1024,
-                    "Discord attachment metadata exceeds the bounded storage size")
-            return encoded
 
         def commit_page(normalized, next_boundary, next_max, complete):
             nonlocal current_cursor, total
@@ -563,27 +1140,15 @@ class Watch:
                 next_max = None
             else:
                 final_cursor = current_cursor
+            if not db.in_transaction:
+                db.execute("BEGIN IMMEDIATE")
             db.execute("SAVEPOINT discord_watch_page")
             try:
                 seen = set()
                 for message_id, row in normalized:
                     require(message_id not in seen, "Discord returned duplicate message IDs")
                     seen.add(message_id)
-                    author = row.get("author") if isinstance(row.get("author"), dict) else {}
-                    author_id = str(author.get("id", ""))
-                    if author_id == owner_id and not author.get("bot", False) and row.get("webhook_id") is None:
-                        body = row.get("content", "")
-                        require(isinstance(body, str), "Discord message content is not text")
-                        require(len(body.encode("utf-8")) <= MAX_MESSAGE_BYTES,
-                                "Discord message content exceeds the bounded storage size")
-                        attachment_json = attachments(row)
-                        author_name = str(author.get("global_name") or author.get("username") or "Configured user")[:256]
-                        created_at = row.get("timestamp", "")
-                        require(isinstance(created_at, str) and len(created_at) <= 64,
-                                "Discord returned an invalid message timestamp")
-                        db.execute("INSERT OR IGNORE INTO messages(thread_id,message_id,author_id,author_name,body,"
-                                   "attachments_json,created_at) VALUES(?,?,?,?,?,?,?)",
-                                   (thread_id, message_id, author_id, author_name, body, attachment_json, created_at))
+                    self._ingest_message(db, thread_id, row, owner_id, self.clock())
                     total += 1
                 db.execute("UPDATE threads SET cursor=CASE "
                            "WHEN length(cursor)<length(?) OR (length(cursor)=length(?) AND cursor<?) THEN ? "
@@ -599,12 +1164,19 @@ class Watch:
                 db.rollback()
                 raise
 
-        while pages < MAX_CATCHUP_PAGES:
+        while pages < max_pages:
+            if stop_event is not None and stop_event.is_set():
+                break
             if boundary:
                 query = {"before": boundary, "limit": MESSAGE_LIMIT}
             else:
                 query = {"after": current_cursor, "limit": MESSAGE_LIMIT}
-            rows = api.get(f"/channels/{thread_id}/messages", query)
+            path = f"/channels/{thread_id}/messages"
+            deferred_until = self._api_deferred_until(db, api, path, self.clock())
+            if deferred_until > self.clock():
+                break
+            rows = api.get(path, query)
+            self._persist_api_limits(db, api, thread_id, self.clock())
             require(isinstance(rows, list), "Discord messages response was not an array")
             require(len(rows) <= MESSAGE_LIMIT, "Discord returned more messages than requested")
             pages += 1
@@ -645,7 +1217,8 @@ class Watch:
         row = db.execute("SELECT cursor,catchup_before FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
         return {"pages": pages, "messages_seen": total, "cursor": row[0],
                 "catchup_before": row[1], "catchup_pending": row[1] is not None,
-                "catchup_limited": row[1] is not None and pages >= MAX_CATCHUP_PAGES}
+                "catchup_limited": row[1] is not None and pages >= max_pages,
+                "deferred_until": deferred_until}
 
     def _record_thread_error(self, db, thread_id, error, now):
         if isinstance(error, DiscordAPIError):
@@ -667,40 +1240,68 @@ class Watch:
                        (json.dumps(record, separators=(",", ":")), next_poll, now, thread_id))
         return record
 
-    def _poll_thread(self, db, thread, api, credentials, now):
+    def _poll_thread(self, db, thread, api, credentials, now, max_pages=None,
+                     routine=False, stop_event=None):
+        max_pages = MAX_CATCHUP_PAGES if max_pages is None else max_pages
         thread_id = thread["thread_id"]
         try:
             with self.locked(timeout=0, name=f"poll-{thread_id}.lock"):
                 latest = self._thread(db, thread_id, require_open=False)
-                return self._poll_thread_locked(db, latest, api, credentials, now)
+                return self._poll_thread_locked(db, latest, api, credentials, now,
+                                                max_pages=max_pages, routine=routine,
+                                                stop_event=stop_event)
         except ValueError as error:
             if "operation owns this state" in str(error):
                 return {"thread": thread_id, "status": "poll_busy"}
             raise
 
-    def _poll_thread_locked(self, db, thread, api, credentials, now):
+    def _poll_thread_locked(self, db, thread, api, credentials, now, max_pages=None,
+                            routine=False, stop_event=None):
+        max_pages = MAX_CATCHUP_PAGES if max_pages is None else max_pages
         thread_id = thread["thread_id"]
-        if not thread["is_open"]:
-            return {"thread": thread_id, "status": "closed"}
+        if stop_event is not None and stop_event.is_set():
+            return {"thread": thread_id, "status": "stopped"}
         if now < self.global_not_before:
             return {"thread": thread_id, "status": "global_backoff",
                     "retry_after": max(0, int(self.global_not_before - now))}
         if now < thread["next_poll_at"]:
             return {"thread": thread_id, "status": "backoff",
                     "retry_after": max(0, int(thread["next_poll_at"] - now))}
+        remote_path = f"/channels/{thread_id}"
+        deferred = self._api_deferred_until(db, api, remote_path, now)
+        if deferred > now:
+            with db:
+                db.execute("UPDATE threads SET next_poll_at=MAX(next_poll_at,?) WHERE thread_id=?",
+                           (deferred, thread_id))
+            return {"thread": thread_id, "status": "rate_limited", "retry_at": deferred}
         try:
             remote = self.remote_thread(api, thread_id)
-            if self.thread_closed(remote, credentials["closed_tag"]):
-                with db:
-                    db.execute("UPDATE threads SET is_open=0,remote_json=?,last_poll_at=?,last_error_json=NULL,updated_at=? "
-                               "WHERE thread_id=?", (json.dumps(remote, separators=(",", ":")), now, now, thread_id))
-                return {"thread": thread_id, "status": "closed_remote"}
-            result = self._api_pages(api, thread_id, thread["cursor"], credentials["user_id"], db)
+            self._persist_api_limits(db, api, thread_id, now)
+            if stop_event is not None and stop_event.is_set():
+                return {"thread": thread_id, "status": "stopped"}
+            remote_closed = self.thread_closed(remote, credentials["closed_tag"])
+            remote_json = json.dumps(remote, separators=(",", ":"))
             with db:
-                db.execute("UPDATE threads SET remote_json=?,last_poll_at=?,next_poll_at=0,last_error_json=NULL,updated_at=? "
-                           "WHERE thread_id=?", (json.dumps(remote, separators=(",", ":")), now, now, thread_id))
-            return {"thread": thread_id, "status": "polled", **result}
+                db.execute("UPDATE threads SET remote_json=?,remote_closed=?,updated_at=? WHERE thread_id=?",
+                           (remote_json, int(remote_closed), now, thread_id))
+            result = self._api_pages(api, thread_id, thread["cursor"], credentials["user_id"], db,
+                                     max_pages=max_pages, stop_event=stop_event)
+            if stop_event is not None and stop_event.is_set():
+                return {"thread": thread_id, "status": "stopped", **result}
+            if result["deferred_until"] > self.clock():
+                with db:
+                    db.execute("UPDATE threads SET next_poll_at=MAX(next_poll_at,?) WHERE thread_id=?",
+                               (result["deferred_until"], thread_id))
+                return {"thread": thread_id, "status": "rate_limited",
+                        "retry_at": result["deferred_until"], **result}
+            with db:
+                next_poll = now + ROUTINE_REST_INTERVAL if routine else 0
+                db.execute("UPDATE threads SET last_poll_at=?,next_poll_at=MAX(next_poll_at,?),"
+                           "last_error_json=NULL,updated_at=? "
+                           "WHERE thread_id=?", (now, next_poll, now, thread_id))
+            return {"thread": thread_id, "status": "polled", "remote_closed": remote_closed, **result}
         except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+            self._persist_api_limits(db, api, thread_id, now)
             record = self._record_thread_error(db, thread_id, error, now)
             return {"thread": thread_id, "status": "error", "error": record}
 
@@ -718,6 +1319,155 @@ class Watch:
         return ("A reply from the configured Discord user is ready in Discord Watch. At a safe checkpoint, retrieve the exact reply with:\n"
                 + command)
 
+    @staticmethod
+    def _render_messages(thread_id, rows):
+        rendered_parts = []
+        for message_id, author_name, body, attachments_json in rows:
+            rendered_parts.append(f"[discord:{thread_id}:{message_id}] {author_name}: {body}")
+            for attachment in json.loads(attachments_json):
+                filename = re.sub(r"[\x00-\x1f\x7f]", " ", attachment["filename"])
+                rendered_parts.append(f"[attachment] {filename}: {attachment['url']}")
+        return "\n".join(rendered_parts) + "\n"
+
+    def _generation_chain_valid(self, db, thread, group_generation, group_owner):
+        current_generation = thread["owner_generation"]
+        if group_generation > current_generation:
+            return False
+        if current_generation == 1:
+            return group_generation == 1 and group_owner == thread["owner"]
+        events = db.execute(
+            "SELECT owner_generation,from_session,to_session FROM ownership_events "
+            "WHERE thread_id=? AND owner_generation<=? ORDER BY owner_generation",
+            (thread["thread_id"], current_generation)).fetchall()
+        if len(events) != current_generation - 1:
+            return False
+        previous = events[0][1]
+        owner_at_generation = previous
+        for expected_generation, (generation, from_session, to_session) in enumerate(events, start=2):
+            if generation != expected_generation or from_session != previous:
+                return False
+            previous = to_session
+            if generation == group_generation:
+                owner_at_generation = to_session
+        if previous != thread["owner"].get("session"):
+            return False
+        if group_generation == 1:
+            return group_owner.get("session") == owner_at_generation
+        if group_generation == current_generation:
+            return group_owner == thread["owner"]
+        return group_owner.get("session") == owner_at_generation
+
+    @staticmethod
+    def _reconcile_group_receipts(db, thread_id=None):
+        clause = " AND thread_id=?" if thread_id is not None else ""
+        params = (thread_id,) if thread_id is not None else ()
+        db.execute("UPDATE delivery_groups SET status='received' WHERE status!='received'" + clause +
+                   " AND NOT EXISTS (SELECT 1 FROM delivery_group_members gm JOIN messages m "
+                   "ON m.thread_id=gm.thread_id AND m.message_id=gm.message_id "
+                   "WHERE gm.group_id=delivery_groups.id AND m.state!='received')", params)
+
+    def _seal_delivery_groups(self, db, thread, now, force=False, max_groups=None):
+        formed = []
+        while max_groups is None or len(formed) < max_groups:
+            require(not db.in_transaction,
+                    "Group freezing requires a fresh bounded SQLite transaction")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                latest = self._thread(db, thread["thread_id"], require_open=False)
+                require(latest["owner"] == thread["owner"] and
+                        latest["owner_generation"] == thread["owner_generation"],
+                        "Exact owner changed before a delivery group could be frozen")
+                if self._catchup_incomplete(latest):
+                    db.commit()
+                    return formed
+                if not self._generation_chain_valid(db, latest, latest["owner_generation"],
+                                                    latest["owner"]):
+                    db.commit()
+                    return formed + [{"state": "held", "reason": "owner_generation_event_chain_invalid"}]
+                self._ensure_gateway_recovery_coverage(db, now)
+                candidates = db.execute(
+                    "SELECT message_id,author_name,body,attachments_json,ingested_at FROM messages "
+                    "WHERE thread_id=? AND groupable=1 AND group_id IS NULL AND state='pending' "
+                    "AND owner_generation=? ORDER BY length(message_id),message_id",
+                    (latest["thread_id"], latest["owner_generation"])).fetchall()
+                if not candidates:
+                    db.commit()
+                    return formed
+                recovery_hold = self._gateway_recovery_hold_reason(db, latest)
+                if recovery_hold:
+                    db.commit()
+                    return formed + [{"state": "held", "reason": recovery_hold}]
+                prefix = []
+                for row in candidates[:MAX_RECEIVE_MESSAGES]:
+                    tentative = prefix + [row]
+                    rendered = self._render_messages(latest["thread_id"],
+                                                     [item[:4] for item in tentative])
+                    if len(rendered.encode("utf-8")) > MAX_RECEIVE_BYTES:
+                        if not prefix:
+                            raise ValueError("A stored reply exceeds the bounded group output size")
+                        break
+                    prefix = tentative
+                if not prefix:
+                    db.commit()
+                    return formed
+                first_at = min(row[4] for row in prefix)
+                last_at = max(row[4] for row in prefix)
+                if not force and now - first_at < GROUP_MAX_DELAY and now - last_at < GROUP_QUIET_SECONDS:
+                    db.commit()
+                    return formed
+                # Recheck the barriers immediately before the immutable membership write.
+                latest = self._thread(db, latest["thread_id"], require_open=False)
+                require(latest["owner"] == thread["owner"] and
+                        latest["owner_generation"] == thread["owner_generation"],
+                        "Exact owner changed while a delivery group was being frozen")
+                require(not self._catchup_incomplete(latest),
+                        "REST catch-up began while a delivery group was being frozen")
+                self._ensure_gateway_recovery_coverage(db, now)
+                recovery_hold = self._gateway_recovery_hold_reason(db, latest)
+                if recovery_hold:
+                    db.commit()
+                    return formed + [{"state": "held", "reason": recovery_hold}]
+                require(self._generation_chain_valid(db, latest, latest["owner_generation"],
+                                                     latest["owner"]),
+                        "Owner generation changed while a delivery group was being frozen")
+                ids = [row[0] for row in prefix]
+                cursor = db.execute(
+                    "INSERT INTO delivery_groups(thread_id,owner_generation,owner_json,status,created_at,"
+                    "first_message_id,last_message_id) VALUES(?,?,?,'eligible',?,?,?)",
+                    (latest["thread_id"], latest["owner_generation"],
+                     json.dumps(latest["owner"], separators=(",", ":")), now, ids[0], ids[-1]))
+                group_id = cursor.lastrowid
+                for ordinal, row in enumerate(prefix):
+                    message_id = row[0]
+                    db.execute("INSERT INTO delivery_group_members(group_id,thread_id,message_id,ordinal) "
+                               "VALUES(?,?,?,?)", (group_id, latest["thread_id"], message_id, ordinal))
+                    updated = db.execute("UPDATE messages SET group_id=? WHERE thread_id=? AND message_id=? "
+                                         "AND group_id IS NULL AND state='pending' AND owner_generation=?",
+                                         (group_id, latest["thread_id"], message_id,
+                                          latest["owner_generation"]))
+                    require(updated.rowcount == 1, "Reply changed while a delivery group was being frozen")
+                db.commit()
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+            formed.append({"group": group_id, "messages": ids, "state": "eligible"})
+        return formed
+
+    def _group_wake_prompt(self, thread_id, group_id, owner):
+        args = [sys.executable, str(Path(__file__).resolve()),
+                "--state-dir", str(self.directory),
+                "--notify-home", str(self.notify_home),
+                "--hailing-state", str(self.hailing_state),
+                "--cmux", self.cmux_executable,
+                "receive", "--thread", thread_id]
+        if owner.get("harness") == "opencode":
+            args.extend(("--session", owner["session"]))
+        args.extend(("--group", str(group_id)))
+        command = shlex.join(args)
+        return ("A reply group from the configured Discord user is ready in Discord Watch. "
+                "At a safe checkpoint, retrieve the exact group with:\n" + command)
+
     def _wake_one(self, db, thread, now):
         thread_id = thread["thread_id"]
         try:
@@ -731,134 +1481,462 @@ class Watch:
 
     def _wake_one_locked(self, db, thread, now):
         thread_id = thread["thread_id"]
-        if not thread["is_open"]:
-            return {"state": "closed", "would_wake": False}
-        # An uncertain or exhausted wake blocks later prompts until the owner
-        # explicitly receives the queued reply.
-        blocked = db.execute("SELECT message_id,state FROM messages WHERE thread_id=? "
-                             "AND state IN ('uncertain','stalled') ORDER BY length(message_id),message_id LIMIT 1",
-                             (thread_id,)).fetchone()
-        if blocked:
-            return {"message": blocked[0], "state": blocked[1], "would_wake": False}
-        row = db.execute("SELECT message_id,state,wake_attempts,last_wake_at FROM messages "
-                         "WHERE thread_id=? AND state IN ('pending','awaiting_receipt') "
-                         "ORDER BY length(message_id),message_id LIMIT 1", (thread_id,)).fetchone()
+        with db:
+            self._reconcile_group_receipts(db, thread_id)
+        formed = self._seal_delivery_groups(db, thread, now)
+        row = db.execute("SELECT id,owner_generation,owner_json,status,attempt_count,legacy "
+                         "FROM delivery_groups WHERE thread_id=? AND status!='received' "
+                         "ORDER BY id LIMIT 1", (thread_id,)).fetchone()
         if row is None:
+            candidates = db.execute("SELECT message_id,author_name,body,attachments_json,ingested_at FROM messages "
+                                    "WHERE thread_id=? "
+                                    "AND groupable=1 AND group_id IS NULL AND state='pending' "
+                                    "AND owner_generation=? ORDER BY length(message_id),message_id",
+                                    (thread_id, thread["owner_generation"])).fetchall()
+            if candidates:
+                prefix = []
+                for item in candidates[:MAX_RECEIVE_MESSAGES]:
+                    if len(self._render_messages(thread_id, [row[:4] for row in prefix + [item]])
+                            .encode("utf-8")) > MAX_RECEIVE_BYTES:
+                        break
+                    prefix.append(item)
+                first_at = min(item[4] for item in prefix)
+                last_at = max(item[4] for item in prefix)
+                eligible_at = min(first_at + GROUP_MAX_DELAY, last_at + GROUP_QUIET_SECONDS)
+                held = next((item for item in formed if item.get("state") == "held"), None)
+                state = "held" if self._catchup_incomplete(thread) or held else (
+                    "eligible" if now >= eligible_at else "forming")
+                return {"state": state, "would_wake": False,
+                        "forming_messages": [item[0] for item in candidates],
+                        "eligible_at": eligible_at,
+                        "held": held.get("reason") if held else (
+                            "rest_catchup_incomplete" if self._catchup_incomplete(thread) else None),
+                        "groups_formed": formed}
+            if formed:
+                return {"state": formed[0]["state"], "groups_formed": formed, "would_wake": False}
             return None
-        message_id, state, attempts, last_wake_at = row
-        if state == "awaiting_receipt":
-            if last_wake_at is None or now - last_wake_at < REMIND_AFTER:
-                return {"message": message_id, "state": state, "would_wake": False}
-            if attempts >= MAX_WAKE_ATTEMPTS:
-                with db:
-                    db.execute("UPDATE messages SET state='stalled' WHERE thread_id=? AND message_id=? "
-                               "AND state='awaiting_receipt'", (thread_id, message_id))
-                return {"message": message_id, "state": "stalled", "would_wake": False}
-        if state == "pending" and attempts >= MAX_WAKE_ATTEMPTS:
-            with db:
-                db.execute("UPDATE messages SET state='stalled' WHERE thread_id=? AND message_id=? "
-                           "AND state='pending'", (thread_id, message_id))
-            return {"message": message_id, "state": "stalled", "would_wake": False}
+        group_id, generation, group_owner_json, state, attempt_count, legacy = row
+        if state in ("uncertain", "stalled", "awaiting_receipt"):
+            return {"group": group_id, "state": state, "would_wake": False,
+                    "groups_formed": formed}
+        if state not in ("eligible", "intent"):
+            return {"group": group_id, "state": "held", "would_wake": False,
+                    "groups_formed": formed}
+        if self._catchup_incomplete(thread) and not legacy:
+            return {"group": group_id, "state": "held", "held": "rest_catchup_incomplete",
+                    "would_wake": False, "groups_formed": formed}
+        recovery_hold = self._gateway_recovery_hold_reason(db, thread)
+        if recovery_hold and not legacy:
+            return {"group": group_id, "state": "held", "held": recovery_hold,
+                    "would_wake": False, "groups_formed": formed}
+        group_owner = json.loads(group_owner_json)
+        if not self._generation_chain_valid(db, thread, generation, group_owner):
+            return {"group": group_id, "state": "held", "held": "owner_generation_event_chain_invalid",
+                    "would_wake": False, "groups_formed": formed}
         owner = thread["owner"]
-        self.validate_registered_owner(owner)
-        prompt = self._wake_prompt(thread_id, message_id, owner)
+        try:
+            self.validate_registered_owner(owner)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            with db:
+                db.execute("UPDATE delivery_group_attempts SET state='abandoned_before_transport' "
+                           "WHERE group_id=? AND state='intent'", (group_id,))
+                db.execute("UPDATE delivery_groups SET status='eligible',last_error_json=? "
+                           "WHERE id=? AND status IN ('eligible','intent')",
+                           (json.dumps({"held": str(error)[:500]}), group_id))
+            return {"group": group_id, "state": "held", "held": str(error)[:300],
+                    "would_wake": False, "groups_formed": formed}
+        owner_json = json.dumps(owner, separators=(",", ":"))
+        with db:
+            if state == "intent":
+                db.execute("UPDATE delivery_group_attempts SET state='abandoned_before_transport' "
+                           "WHERE group_id=? AND state='intent'", (group_id,))
+            attempt = db.execute(
+                "INSERT INTO delivery_group_attempts(group_id,state,created_at,target_owner_json,"
+                "target_owner_generation) VALUES(?,'intent',?,?,?)",
+                (group_id, now, owner_json, thread["owner_generation"]))
+            attempt_id = attempt.lastrowid
+            updated = db.execute("UPDATE delivery_groups SET status='intent',last_error_json=NULL "
+                                 "WHERE id=? AND status IN ('eligible','intent') AND EXISTS ("
+                                 "SELECT 1 FROM threads WHERE thread_id=? AND owner_json=? AND owner_generation=?)",
+                                 (group_id, thread_id, owner_json, thread["owner_generation"]))
+            require(updated.rowcount == 1, "Reply group or exact owner changed before CMUX submit")
+        prompt = self._group_wake_prompt(thread_id, group_id, owner)
 
         def mark_transport_start():
-            owner_json = json.dumps(owner, separators=(",", ":"))
             with db:
                 updated = db.execute(
-                    "UPDATE messages SET state='uncertain',wake_attempts=wake_attempts+1,last_wake_at=?, "
-                    "submitted_at=NULL,last_error_json=NULL WHERE thread_id=? AND message_id=? "
-                    "AND state IN ('pending','awaiting_receipt') AND EXISTS ("
-                    "SELECT 1 FROM threads WHERE thread_id=? AND is_open=1 AND owner_json=?)",
-                    (now, thread_id, message_id, thread_id, owner_json))
+                    "UPDATE delivery_groups SET status='uncertain',attempt_count=attempt_count+1,"
+                    "last_wake_at=?,submitted_at=NULL,last_error_json=NULL WHERE id=? AND status='intent' "
+                    "AND EXISTS (SELECT 1 FROM threads WHERE thread_id=? AND owner_json=? AND owner_generation=?)",
+                    (now, group_id, thread_id, owner_json, thread["owner_generation"]))
                 require(updated.rowcount == 1,
-                        "Reply or ownership changed before the CMUX submit; wake held")
+                        "Reply group or exact owner changed before the CMUX submit; wake held")
+                db.execute("UPDATE delivery_group_attempts SET state='transport_started',transport_started_at=? "
+                           "WHERE id=? AND state='intent'", (now, attempt_id))
+                db.execute("UPDATE messages SET state='uncertain',wake_attempts=wake_attempts+1,last_wake_at=?,"
+                           "submitted_at=NULL,last_error_json=NULL WHERE group_id=? AND state!='received'",
+                           (now, group_id))
 
         try:
             self.cmux_factory().submit(owner, prompt, on_transport_start=mark_transport_start)
         except hf.DeliveryHoldError as error:
-            latest = db.execute("SELECT state FROM messages WHERE thread_id=? AND message_id=?",
-                                (thread_id, message_id)).fetchone()
-            state_now = latest[0] if latest else "missing"
             with db:
-                db.execute("UPDATE messages SET last_error_json=? WHERE thread_id=? AND message_id=? "
-                           "AND state!='received'", (json.dumps({"held": str(error)[:500]}),
-                                                       thread_id, message_id))
-            return {"message": message_id, "state": state_now, "held": str(error)[:300]}
+                db.execute("UPDATE delivery_group_attempts SET state='held',last_error_json=? "
+                           "WHERE id=? AND state='intent'", (json.dumps({"held": str(error)[:500]}), attempt_id))
+                db.execute("UPDATE delivery_groups SET status='eligible',last_error_json=? "
+                           "WHERE id=? AND status='intent'",
+                           (json.dumps({"held": str(error)[:500]}), group_id))
+            return {"group": group_id, "state": "held", "held": str(error)[:300],
+                    "would_wake": False, "groups_formed": formed}
         except (ValueError, OSError, subprocess.SubprocessError) as error:
-            latest = db.execute("SELECT state FROM messages WHERE thread_id=? AND message_id=?",
-                                (thread_id, message_id)).fetchone()
-            state_now = latest[0] if latest else "missing"
-            if state_now == "uncertain":
-                with db:
-                    db.execute("UPDATE messages SET last_error_json=? WHERE thread_id=? AND message_id=? "
-                               "AND state='uncertain'", (json.dumps({"uncertain": str(error)[:500]}),
-                                                           thread_id, message_id))
-                return {"message": message_id, "state": "uncertain", "error": str(error)[:300]}
+            latest = db.execute("SELECT status FROM delivery_groups WHERE id=?", (group_id,)).fetchone()
+            current_status = latest[0] if latest else "missing"
             with db:
-                db.execute("UPDATE messages SET last_error_json=? WHERE thread_id=? AND message_id=? "
-                           "AND state!='received'", (json.dumps({"held": str(error)[:500]}),
-                                                       thread_id, message_id))
-            return {"message": message_id, "state": state_now, "held": str(error)[:300]}
-        owner_json = json.dumps(owner, separators=(",", ":"))
+                db.execute("UPDATE delivery_group_attempts SET state=?,last_error_json=? WHERE id=? "
+                           "AND state IN ('intent','transport_started')",
+                           ("uncertain" if current_status == "uncertain" else "held",
+                            json.dumps({"uncertain" if current_status == "uncertain" else "held": str(error)[:500]}),
+                            attempt_id))
+                if current_status == "uncertain":
+                    db.execute("UPDATE delivery_groups SET last_error_json=? WHERE id=? AND status='uncertain'",
+                               (json.dumps({"uncertain": str(error)[:500]}), group_id))
+                elif current_status == "intent":
+                    db.execute("UPDATE delivery_groups SET status='eligible',last_error_json=? "
+                               "WHERE id=? AND status='intent'",
+                               (json.dumps({"held": str(error)[:500]}), group_id))
+            return {"group": group_id, "state": current_status, "error": str(error)[:300],
+                    "would_wake": False, "groups_formed": formed}
         with db:
+            db.execute("UPDATE delivery_group_attempts SET state='confirmed',submitted_at=? "
+                       "WHERE id=? AND state='transport_started'", (now, attempt_id))
+            db.execute("UPDATE delivery_groups SET status='awaiting_receipt',submitted_at=?,last_wake_at=?,"
+                       "last_error_json=NULL WHERE id=? AND status='uncertain' AND EXISTS ("
+                       "SELECT 1 FROM threads WHERE thread_id=? AND owner_json=? AND owner_generation=?)",
+                       (now, now, group_id, thread_id, owner_json, thread["owner_generation"]))
             db.execute("UPDATE messages SET state='awaiting_receipt',submitted_at=?,last_wake_at=?,last_error_json=NULL "
-                       "WHERE thread_id=? AND message_id=? AND state='uncertain' AND EXISTS ("
-                       "SELECT 1 FROM threads WHERE thread_id=? AND is_open=1 AND owner_json=?)",
-                       (now, now, thread_id, message_id, thread_id, owner_json))
-        final = db.execute("SELECT state FROM messages WHERE thread_id=? AND message_id=?",
-                           (thread_id, message_id)).fetchone()
+                       "WHERE group_id=? AND state='uncertain' AND EXISTS ("
+                       "SELECT 1 FROM delivery_groups WHERE id=? AND status='awaiting_receipt')",
+                       (now, now, group_id, group_id))
+        final = db.execute("SELECT status FROM delivery_groups WHERE id=?", (group_id,)).fetchone()
         if final and final[0] == "received":
-            return {"message": message_id, "state": "received", "submitted": True,
-                    "received_during_submit": True}
+            return {"group": group_id, "state": "received", "submitted": True,
+                    "received_during_submit": True, "groups_formed": formed}
         if final and final[0] == "uncertain":
-            return {"message": message_id, "state": "uncertain", "submitted": True,
-                    "owner_changed_during_submit": True}
-        return {"message": message_id, "state": "awaiting_receipt", "submitted": True}
+            return {"group": group_id, "state": "uncertain", "submitted": True,
+                    "owner_changed_during_submit": True, "groups_formed": formed}
+        return {"group": group_id, "state": final[0] if final else "missing",
+                "submitted": True, "groups_formed": formed}
 
     def scan(self, send=False, only_thread=None, origin="manual"):
         credentials, api = self.read_credentials()
         now = self.clock()
         report = {"at": now, "mode": "send" if send else "observe", "origin": origin, "threads": []}
         with contextlib.closing(self.database(create=False)) as db:
+            self._refresh_dormancy(db, now)
             global_row = db.execute("SELECT value FROM meta WHERE key='global_not_before'").fetchone()
             self.global_not_before = float(global_row[0]) if global_row else 0.0
+            self._prepare_api_limits(db, api, self.global_not_before)
             if only_thread is not None:
                 thread_ids = [snowflake(only_thread, "thread ID")]
             else:
                 thread_ids = [row[0] for row in db.execute(
-                    "SELECT thread_id FROM threads WHERE is_open=1 ORDER BY registered_at,thread_id")]
+                    "SELECT thread_id FROM threads WHERE subscription_state='active' OR EXISTS ("
+                    "SELECT 1 FROM messages WHERE messages.thread_id=threads.thread_id "
+                    "AND state IN ('pending','awaiting_receipt','uncertain','stalled')) "
+                    "ORDER BY registered_at,thread_id")]
             send_scope = list(thread_ids) if send else []
             for thread_id in thread_ids:
                 try:
-                    thread = self._thread(db, thread_id)
+                    thread = self._thread(db, thread_id, require_open=False)
                 except ValueError as error:
                     report["threads"].append({"thread": thread_id, "status": "error",
                                                "error": {"error": str(error)[:300]}})
                     continue
-                polled = self._poll_thread(db, thread, api, credentials, now)
+                manual_dormant_poll = only_thread is not None and origin == "manual"
+                queue_count = db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE thread_id=? "
+                    "AND state IN ('pending','awaiting_receipt','uncertain','stalled')",
+                    (thread_id,)).fetchone()[0]
+                dormant = thread["subscription_state"] == "dormant"
+                if dormant and not manual_dormant_poll:
+                    polled = {"thread": thread_id, "status": "dormant", "poll_skipped": True}
+                else:
+                    polled = self._poll_thread(db, thread, api, credentials, now)
+                if polled.get("status") == "polled" and not polled.get("catchup_pending"):
+                    self._mark_gateway_thread_reconciled(db, thread_id, thread["owner_generation"],
+                                                         self.clock())
                 row = {**polled}
-                if polled.get("status") == "polled":
-                    queue_count = db.execute("SELECT COUNT(*) FROM messages WHERE thread_id=? AND state='pending'",
-                                             (thread_id,)).fetchone()[0]
-                    row["pending"] = queue_count
-                    if send:
-                        try:
-                            latest_thread = self._thread(db, thread_id)
-                            row["wake"] = self._wake_one(db, latest_thread, now)
-                        except (ValueError, OSError, subprocess.SubprocessError, sqlite3.Error) as error:
-                            detail = str(error)[:500]
-                            row["wake_error"] = detail
-                            pending = db.execute("SELECT message_id FROM messages WHERE thread_id=? AND state='pending' "
-                                                 "ORDER BY length(message_id),message_id LIMIT 1", (thread_id,)).fetchone()
-                            if pending:
-                                with db:
-                                    db.execute("UPDATE messages SET last_error_json=? WHERE thread_id=? AND message_id=?",
-                                               (json.dumps({"held": detail}), thread_id, pending[0]))
+                row["subscription_state"] = thread["subscription_state"]
+                row["pending"] = db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE thread_id=? AND state='pending'",
+                    (thread_id,)).fetchone()[0]
+                should_wake = polled.get("status") == "polled" or (
+                    dormant and not manual_dormant_poll and queue_count > 0)
+                if send and should_wake:
+                    try:
+                        latest_thread = self._thread(db, thread_id, require_open=False)
+                        row["wake"] = self._wake_one(db, latest_thread, now)
+                    except (ValueError, OSError, subprocess.SubprocessError, sqlite3.Error) as error:
+                        detail = str(error)[:500]
+                        row["wake_error"] = detail
+                        pending = db.execute("SELECT message_id FROM messages WHERE thread_id=? AND state='pending' "
+                                             "ORDER BY length(message_id),message_id LIMIT 1", (thread_id,)).fetchone()
+                        if pending:
+                            with db:
+                                db.execute("UPDATE messages SET last_error_json=? WHERE thread_id=? AND message_id=?",
+                                           (json.dumps({"held": detail}), thread_id, pending[0]))
                 report["threads"].append(row)
-            api_success = any(item.get("status") in ("polled", "closed_remote") for item in report["threads"])
+            api_success = any(item.get("status") == "polled" for item in report["threads"])
             self._record_scan_meta(db, report, api_success, send_scope)
+        return report
+
+    def _ensure_gateway_recovery_coverage(self, db, now):
+        state = db.execute("SELECT recovery_epoch FROM gateway_state WHERE id=1").fetchone()
+        epoch = state[0]
+        if epoch <= 0:
+            return epoch
+        rows = db.execute("SELECT thread_id,owner_generation FROM threads").fetchall()
+        for thread_id, generation in rows:
+            db.execute("UPDATE gateway_recovery_work SET state='superseded',updated_at=? "
+                       "WHERE epoch=? AND thread_id=? AND owner_generation!=? "
+                       "AND state NOT IN ('complete','superseded')",
+                       (now, epoch, thread_id, generation))
+            inserted = db.execute(
+                "INSERT OR IGNORE INTO gateway_recovery_work(epoch,thread_id,owner_generation,state,updated_at) "
+                "VALUES(?,?,?,'queued',?)", (epoch, thread_id, generation, now)).rowcount
+            if inserted:
+                db.execute("UPDATE gateway_state SET recovery_state='pending',recovery_completed_at=NULL,"
+                           "updated_at=? WHERE id=1", (now,))
+        return epoch
+
+    def _mark_gateway_thread_reconciled(self, db, thread_id, owner_generation, now):
+        epoch = self._ensure_gateway_recovery_coverage(db, now)
+        if epoch <= 0:
+            return
+        with db:
+            current = db.execute("SELECT owner_generation FROM threads WHERE thread_id=?",
+                                 (thread_id,)).fetchone()
+            if current is not None and current[0] == owner_generation:
+                db.execute("UPDATE gateway_recovery_work SET state='complete',updated_at=?,completed_at=?,"
+                           "last_error_json=NULL WHERE epoch=? AND thread_id=? AND owner_generation=? "
+                           "AND state NOT IN ('complete','superseded')",
+                           (now, now, epoch, thread_id, owner_generation))
+            self._refresh_gateway_recovery_state(db, epoch, now)
+
+    @staticmethod
+    def _refresh_gateway_recovery_state(db, epoch, now):
+        counts = dict(db.execute(
+            "SELECT w.state,COUNT(*) FROM gateway_recovery_work w JOIN threads t "
+            "ON t.thread_id=w.thread_id AND t.owner_generation=w.owner_generation "
+            "WHERE w.epoch=? GROUP BY w.state", (epoch,)))
+        incomplete = sum(value for state, value in counts.items() if state not in ("complete", "superseded"))
+        if incomplete == 0:
+            recovery_state = "complete"
+            completed_at = now
+        elif counts.get("blocked", 0):
+            recovery_state = "blocked"
+            completed_at = None
+        else:
+            recovery_state = "pending"
+            completed_at = None
+        db.execute("UPDATE gateway_state SET recovery_state=?,recovery_completed_at=?,updated_at=? "
+                   "WHERE id=1 AND recovery_epoch=?",
+                   (recovery_state, completed_at, now, epoch))
+        return recovery_state
+
+    @staticmethod
+    def _rest_condition(error):
+        if not isinstance(error, dict):
+            return "healthy"
+        if error.get("state") in ("rate_limited", "backoff", "global_backoff"):
+            return "rate_limited"
+        status = error.get("http_status")
+        if status == 404:
+            return "remote_missing"
+        if status == 403:
+            return "inaccessible"
+        if status == 429:
+            return "rate_limited"
+        if isinstance(status, int) and status >= 500:
+            return "unavailable"
+        if error.get("error"):
+            return "unavailable"
+        return "authentication_or_request_error"
+
+    def _rest_recovery_turn(self, only_thread=None, stop_event=None):
+        credentials, api = self.read_credentials()
+        now = self.clock()
+        results = []
+        with contextlib.closing(self.database(create=False)) as db:
+            self._refresh_dormancy(db, now)
+            global_row = db.execute("SELECT value FROM meta WHERE key='global_not_before'").fetchone()
+            self.global_not_before = float(global_row[0]) if global_row else 0.0
+            self._prepare_api_limits(db, api, self.global_not_before)
+            epoch = self._ensure_gateway_recovery_coverage(db, now)
+            rotation_row = db.execute("SELECT value FROM meta WHERE key='rest_rotation_after'").fetchone()
+            rotation_after = rotation_row[0] if rotation_row else None
+
+            due = {}
+            if epoch > 0:
+                for thread_id, generation, state in db.execute(
+                        "SELECT w.thread_id,w.owner_generation,w.state FROM gateway_recovery_work w "
+                        "JOIN threads t ON t.thread_id=w.thread_id AND t.owner_generation=w.owner_generation "
+                        "WHERE w.epoch=? "
+                        "AND w.state NOT IN ('complete','superseded') AND t.next_poll_at<=? "
+                        "ORDER BY t.registered_at,t.thread_id", (epoch, now)):
+                    if only_thread is not None and thread_id != only_thread:
+                        continue
+                    due[thread_id] = {"recovery": True, "generation": generation, "state": state}
+            routine_rows = db.execute(
+                "SELECT thread_id,owner_generation FROM threads WHERE subscription_state='active' "
+                "AND next_poll_at<=? AND (last_poll_at IS NULL OR last_poll_at<=?) "
+                "ORDER BY registered_at,thread_id", (now, now - ROUTINE_REST_INTERVAL)).fetchall()
+            for thread_id, generation in routine_rows:
+                if only_thread is not None and thread_id != only_thread:
+                    continue
+                due.setdefault(thread_id, {"recovery": False, "generation": generation, "state": None})
+
+            ordered = [row[0] for row in db.execute(
+                "SELECT thread_id FROM threads ORDER BY registered_at,thread_id") if row[0] in due]
+            if rotation_after in ordered:
+                split = ordered.index(rotation_after) + 1
+                ordered = ordered[split:] + ordered[:split]
+            selected = ordered[:WORKER_REST_THREADS_PER_TURN]
+            with db:
+                self._ensure_gateway_recovery_coverage(db, now)
+
+            for thread_id in selected:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                thread = self._thread(db, thread_id, require_open=False)
+                work = due[thread_id]
+                current_generation = thread["owner_generation"]
+                if work["recovery"]:
+                    old_generation = work["generation"]
+                    if old_generation != current_generation:
+                        with db:
+                            db.execute("UPDATE gateway_recovery_work SET state='superseded',updated_at=? "
+                                       "WHERE epoch=? AND thread_id=? AND owner_generation=?",
+                                       (now, epoch, thread_id, old_generation))
+                            db.execute("INSERT OR IGNORE INTO gateway_recovery_work("
+                                       "epoch,thread_id,owner_generation,state,updated_at) "
+                                       "VALUES(?,?,?,'queued',?)",
+                                       (epoch, thread_id, current_generation, now))
+                        work["generation"] = current_generation
+                if self.global_not_before > self.clock():
+                    results.append({"thread": thread_id, "status": "global_backoff"})
+                    continue
+                with db:
+                    if work["recovery"]:
+                        db.execute("UPDATE gateway_recovery_work SET state='working',attempts=attempts+1,"
+                                   "updated_at=?,last_error_json=NULL WHERE epoch=? AND thread_id=? "
+                                   "AND owner_generation=? AND state NOT IN ('complete','superseded')",
+                                   (now, epoch, thread_id, work["generation"]))
+                polled = self._poll_thread(db, thread, api, credentials, self.clock(),
+                                           max_pages=WORKER_REST_PAGES_PER_THREAD,
+                                           routine=True, stop_event=stop_event)
+                results.append(polled)
+                latest = self._thread(db, thread_id, require_open=False)
+                if work["recovery"]:
+                    if latest["owner_generation"] != work["generation"]:
+                        state = "superseded"
+                        error_json = None
+                        with db:
+                            db.execute("INSERT OR IGNORE INTO gateway_recovery_work("
+                                       "epoch,thread_id,owner_generation,state,updated_at) "
+                                       "VALUES(?,?,?,'queued',?)",
+                                       (epoch, thread_id, latest["owner_generation"], self.clock()))
+                    elif polled.get("status") == "polled" and not polled.get("catchup_pending"):
+                        state = "complete"
+                        error_json = None
+                    elif polled.get("status") in ("error", "rate_limited", "backoff", "global_backoff"):
+                        state = "blocked"
+                        error_json = json.dumps(polled.get("error") or {"state": polled.get("status")},
+                                                separators=(",", ":"))
+                    else:
+                        state = "queued"
+                        error_json = None
+                    with db:
+                        db.execute("UPDATE gateway_recovery_work SET state=?,updated_at=?,completed_at=?,"
+                                   "last_error_json=? WHERE epoch=? AND thread_id=? AND owner_generation=? "
+                                   "AND state!='superseded'",
+                                   (state, self.clock(), self.clock() if state == "complete" else None,
+                                    error_json, epoch, thread_id, work["generation"]))
+                with db:
+                    db.execute("INSERT INTO meta(key,value) VALUES('rest_rotation_after',?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (thread_id,))
+            with db:
+                recovery_state = self._refresh_gateway_recovery_state(db, epoch, self.clock()) if epoch > 0 else "idle"
+                report = {"at": self.clock(), "mode": "recovery", "origin": "worker",
+                          "threads": results, "recovery_epoch": epoch,
+                          "recovery_state": recovery_state,
+                          "request_budget": WORKER_REST_THREADS_PER_TURN *
+                          (1 + WORKER_REST_PAGES_PER_THREAD)}
+                api_success = any(row.get("status") == "polled" for row in results)
+                values = {"last_rest_recovery_at": str(report["at"])}
+                if api_success:
+                    values["last_api_success_at"] = str(report["at"])
+                for key, value in values.items():
+                    db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        return report
+
+    def _dispatch_turn(self, send=False, only_thread=None):
+        now = self.clock()
+        result_rows = []
+        with contextlib.closing(self.database(create=False)) as db:
+            self._refresh_dormancy(db, now)
+            if only_thread is None:
+                rows = db.execute(
+                    "SELECT thread_id FROM threads WHERE EXISTS(SELECT 1 FROM messages "
+                    "WHERE messages.thread_id=threads.thread_id AND state IN "
+                    "('pending','awaiting_receipt','uncertain','stalled')) OR EXISTS("
+                    "SELECT 1 FROM delivery_groups WHERE delivery_groups.thread_id=threads.thread_id "
+                    "AND status!='received') ORDER BY registered_at,thread_id").fetchall()
+                thread_ids = [row[0] for row in rows]
+            else:
+                thread_ids = [snowflake(only_thread, "thread ID")]
+            send_scope = thread_ids if send else []
+            rotation_row = db.execute("SELECT value FROM meta WHERE key='sender_rotation_after'").fetchone()
+            rotation_after = rotation_row[0] if rotation_row else None
+            if rotation_after in thread_ids and only_thread is None:
+                split = thread_ids.index(rotation_after) + 1
+                thread_ids = thread_ids[split:] + thread_ids[:split]
+            for thread_id in thread_ids:
+                if not send:
+                    break
+                delay_row = db.execute("SELECT value FROM meta WHERE key=?",
+                                       (f"sender_retry_after:{thread_id}",)).fetchone()
+                if delay_row and float(delay_row[0]) > now:
+                    continue
+                try:
+                    thread = self._thread(db, thread_id, require_open=False)
+                    wake = self._wake_one(db, thread, now)
+                    state = wake.get("state") if wake else None
+                    with db:
+                        db.execute("INSERT INTO meta(key,value) VALUES('sender_rotation_after',?) "
+                                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (thread_id,))
+                    if wake and state not in ("forming",):
+                        with db:
+                            db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                       (f"sender_retry_after:{thread_id}", str(now + POLL_INTERVAL)))
+                    if wake and state not in ("forming",):
+                        result_rows.append({"thread": thread_id, "wake": wake})
+                    if wake and wake.get("submitted"):
+                        break
+                except (ValueError, OSError, subprocess.SubprocessError, sqlite3.Error) as error:
+                    with db:
+                        db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                   (f"sender_retry_after:{thread_id}", str(now + POLL_INTERVAL)))
+                    result_rows.append({"thread": thread_id, "wake_error": str(error)[:300]})
+                    with db:
+                        db.execute("INSERT INTO meta(key,value) VALUES('sender_rotation_after',?) "
+                                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (thread_id,))
+            report = {"at": now, "mode": "send" if send else "observe", "origin": "worker",
+                      "threads": result_rows, "send_scope": send_scope}
+            self._record_scan_meta(db, report, False, send_scope)
         return report
 
     def _record_scan_meta(self, db, report, api_success, send_scope=None):
@@ -886,8 +1964,12 @@ class Watch:
         try:
             with contextlib.closing(self.database(create=False)) as db:
                 now = self.clock()
+                self._refresh_dormancy(db, now)
                 scope = [snowflake(only_thread, "thread ID")] if only_thread else [
-                    row[0] for row in db.execute("SELECT thread_id FROM threads WHERE is_open=1")]
+                    row[0] for row in db.execute(
+                        "SELECT thread_id FROM threads WHERE subscription_state='active' OR EXISTS ("
+                        "SELECT 1 FROM messages WHERE messages.thread_id=threads.thread_id "
+                        "AND state IN ('pending','awaiting_receipt','uncertain','stalled'))")]
                 report = {"at": now, "mode": "send" if send else "observe", "origin": "worker",
                           "threads": [{"thread": item, "status": "error"} for item in scope]}
                 self._record_scan_meta(db, report, False, scope if send else [])
@@ -897,53 +1979,159 @@ class Watch:
         except (ValueError, OSError, sqlite3.Error):
             return
 
-    def receive(self, thread_id, message_id=None, output=None, session_hint=None):
+    def receive(self, thread_id, message_id=None, output=None, session_hint=None, *, group_id=None):
         thread_id = snowflake(thread_id, "thread ID")
         current = self._identity_owner(session_hint=session_hint)
-        output = output or sys.stdout
-        with contextlib.closing(self.database(create=False)) as db:
-            thread = self._thread(db, thread_id, require_open=False)
-            require(thread["owner"] == current,
-                    "Only the registered current owner can receive this thread's replies")
-            rows = db.execute("SELECT message_id,author_name,body,attachments_json,state FROM messages WHERE thread_id=? "
-                              "AND state!='received' ORDER BY length(message_id),message_id",
-                              (thread_id,)).fetchall()
-            if message_id is not None:
-                message_id = snowflake(message_id, "message ID")
-                rows = [row for row in rows if row[0] == message_id]
-                require(len(rows) == 1, "Reply is missing or already received")
-            else:
-                rows = rows[:MAX_RECEIVE_MESSAGES]
-            if not rows:
-                return {"thread": thread_id, "received": [], "pending": False}
-            rendered_parts = []
-            for row in rows:
-                rendered_parts.append(f"[discord:{thread_id}:{row[0]}] {row[1]}: {row[2]}")
-                for attachment in json.loads(row[3]):
-                    filename = re.sub(r"[\x00-\x1f\x7f]", " ", attachment["filename"])
-                    rendered_parts.append(f"[attachment] {filename}: {attachment['url']}")
-            rendered = "\n".join(rendered_parts) + "\n"
-            payload = rendered.encode("utf-8")
-            require(len(payload) <= MAX_RECEIVE_BYTES,
-                    "Reply output exceeds 64 KiB; receive one message by exact ID")
-            written = output.write(rendered)
-            require(written == len(rendered), "Reply output was incomplete; no replies were acknowledged")
-            output.flush()
-            # Revalidate the exact live owner after the output boundary.
-            latest = self._identity_owner(session_hint=session_hint)
-            require(latest == current, "Owner changed during reply output; no replies were acknowledged")
-            now = self.clock()
-            owner_json = json.dumps(current, separators=(",", ":"))
-            with db:
-                for row in rows:
-                    updated = db.execute(
-                        "UPDATE messages SET state='received',received_at=?,last_error_json=NULL "
-                        "WHERE thread_id=? AND message_id=? AND state!='received' AND EXISTS ("
-                        "SELECT 1 FROM threads WHERE thread_id=? AND owner_json=?)",
-                        (now, thread_id, row[0], thread_id, owner_json))
-                    require(updated.rowcount == 1,
-                            "Reply or ownership changed during output; no replies were acknowledged")
-        return {"thread": thread_id, "received": [row[0] for row in rows],
+        output = output if output is not None else sys.stdout
+        require(message_id is None or group_id is None,
+                "Select either an exact message or a delivery group, not both")
+        with self.locked(timeout=LOCK_TIMEOUT, name="receive.lock"):
+            with contextlib.closing(self.database(create=False)) as db:
+                with db:
+                    self._reconcile_group_receipts(db, thread_id)
+                thread = self._thread(db, thread_id, require_open=False)
+                require(thread["owner"] == current,
+                        "Only the registered current owner can receive this thread's replies")
+                if message_id is None and group_id is None:
+                    older_group = db.execute(
+                        "SELECT 1 FROM delivery_groups WHERE thread_id=? AND status!='received' LIMIT 1",
+                        (thread_id,)).fetchone()
+                    if older_group is None:
+                        formed = self._seal_delivery_groups(db, thread, self.clock(), force=True, max_groups=1)
+                        held = next((item for item in formed if item.get("state") == "held"), None)
+                        if held:
+                            pending_groupable = db.execute(
+                                "SELECT 1 FROM messages WHERE thread_id=? AND groupable=1 "
+                                "AND group_id IS NULL AND state='pending' AND owner_generation=? LIMIT 1",
+                                (thread_id, thread["owner_generation"])).fetchone()
+                            if pending_groupable:
+                                raise ValueError("Reply remains held: " + held["reason"])
+                selected_group = None
+                if group_id is not None:
+                    require(isinstance(group_id, (str, int)) and not isinstance(group_id, bool) and
+                            re.fullmatch(r"[1-9][0-9]{0,18}", str(group_id)) is not None,
+                            "Invalid delivery group ID")
+                    group_id = int(group_id)
+                    selected_group = db.execute(
+                        "SELECT id,owner_generation,owner_json,status,legacy FROM delivery_groups "
+                        "WHERE id=? AND thread_id=?", (group_id, thread_id)).fetchone()
+                    require(selected_group is not None and selected_group[3] != "received",
+                            "Delivery group is missing or already received")
+                    group_owner = json.loads(selected_group[2])
+                    require(self._generation_chain_valid(db, thread, selected_group[1], group_owner),
+                            "Delivery group owner generation has no authorized transfer chain")
+                    require(not self._catchup_incomplete(thread) or selected_group[4],
+                            "REST catch-up is incomplete; this new group remains held")
+                    rows = db.execute(
+                        "SELECT m.message_id,m.author_name,m.body,m.attachments_json,m.state "
+                        "FROM delivery_group_members gm JOIN messages m "
+                        "ON m.thread_id=gm.thread_id AND m.message_id=gm.message_id "
+                        "WHERE gm.group_id=? AND m.state!='received' ORDER BY gm.ordinal",
+                        (group_id,)).fetchall()
+                elif message_id is not None:
+                    message_id = snowflake(message_id, "message ID")
+                    rows = db.execute(
+                        "SELECT message_id,author_name,body,attachments_json,state FROM messages "
+                        "WHERE thread_id=? AND message_id=? AND state!='received'",
+                        (thread_id, message_id)).fetchall()
+                    if rows:
+                        membership = db.execute(
+                            "SELECT g.id,g.owner_generation,g.owner_json,g.status,g.legacy FROM messages m "
+                            "JOIN delivery_groups g ON g.id=m.group_id "
+                            "WHERE m.thread_id=? AND m.message_id=?", (thread_id, message_id)).fetchone()
+                        if membership:
+                            selected_group = membership
+                            require(self._generation_chain_valid(db, thread, membership[1],
+                                                                json.loads(membership[2])),
+                                    "Delivery group owner generation has no authorized transfer chain")
+                            require(not self._catchup_incomplete(thread) or membership[4],
+                                    "REST catch-up is incomplete; this new group remains held")
+                        else:
+                            message_generation = db.execute(
+                                "SELECT owner_generation FROM messages WHERE thread_id=? AND message_id=?",
+                                (thread_id, message_id)).fetchone()[0]
+                            require(message_generation == thread["owner_generation"] and
+                                    self._generation_chain_valid(db, thread, message_generation, current),
+                                    "Reply owner generation has no authorized transfer chain")
+                            require(not self._catchup_incomplete(thread),
+                                    "REST catch-up is incomplete; this reply remains held")
+                            require(self._gateway_recovery_hold_reason(db, thread) is None,
+                                    "Gateway recovery is incomplete; this reply remains held")
+                else:
+                    selected_group = db.execute(
+                        "SELECT id,owner_generation,owner_json,status,legacy FROM delivery_groups "
+                        "WHERE thread_id=? AND status!='received' ORDER BY id LIMIT 1",
+                        (thread_id,)).fetchone()
+                    if selected_group:
+                        require(self._generation_chain_valid(db, thread, selected_group[1],
+                                                             json.loads(selected_group[2])),
+                                "Delivery group owner generation has no authorized transfer chain")
+                        recovery_hold = self._gateway_recovery_hold_reason(db, thread)
+                        require(not recovery_hold or selected_group[4],
+                                "Reply remains held: " + str(recovery_hold))
+                        require(not self._catchup_incomplete(thread) or selected_group[4],
+                                "REST catch-up is incomplete; this new group remains held")
+                        rows = db.execute(
+                            "SELECT m.message_id,m.author_name,m.body,m.attachments_json,m.state "
+                            "FROM delivery_group_members gm JOIN messages m "
+                            "ON m.thread_id=gm.thread_id AND m.message_id=gm.message_id "
+                            "WHERE gm.group_id=? AND m.state!='received' ORDER BY gm.ordinal",
+                            (selected_group[0],)).fetchall()
+                    else:
+                        rows = db.execute(
+                            "SELECT message_id,author_name,body,attachments_json,state FROM messages "
+                            "WHERE thread_id=? AND group_id IS NULL AND groupable=0 AND state!='received' "
+                            "ORDER BY length(message_id),message_id LIMIT ?",
+                            (thread_id, MAX_RECEIVE_MESSAGES)).fetchall()
+                if message_id is not None:
+                    require(len(rows) == 1, "Reply is missing or already received")
+                if not rows:
+                    return {"thread": thread_id, "group": selected_group[0] if selected_group else None,
+                            "received": [], "pending": False}
+                rendered = self._render_messages(thread_id, [row[:4] for row in rows])
+                payload = rendered.encode("utf-8")
+                require(len(payload) <= MAX_RECEIVE_BYTES,
+                        "Reply output exceeds the bounded output size; receive one message by exact ID")
+                written = output.write(rendered)
+                require(written == len(rendered),
+                        "Reply output was incomplete; no replies were acknowledged")
+                output.flush()
+                latest = self._identity_owner(session_hint=session_hint)
+                require(latest == current, "Owner changed during reply output; no replies were acknowledged")
+                now = self.clock()
+                owner_json = json.dumps(current, separators=(",", ":"))
+                with db:
+                    latest_thread = self._thread(db, thread_id, require_open=False)
+                    require(latest_thread["owner"] == current,
+                            "Owner changed during reply output; no replies were acknowledged")
+                    if selected_group:
+                        current_group = db.execute(
+                            "SELECT owner_generation,owner_json,status,legacy FROM delivery_groups "
+                            "WHERE id=? AND thread_id=?", (selected_group[0], thread_id)).fetchone()
+                        require(current_group is not None and self._generation_chain_valid(
+                            db, latest_thread, current_group[0], json.loads(current_group[1])),
+                            "Delivery group owner changed during output; no replies were acknowledged")
+                        require(not self._catchup_incomplete(latest_thread) or current_group[3],
+                                "REST catch-up began during output; no replies were acknowledged")
+                    else:
+                        require(not self._catchup_incomplete(latest_thread),
+                                "REST catch-up began during output; no replies were acknowledged")
+                    for row in rows:
+                        updated = db.execute(
+                            "UPDATE messages SET state='received',received_at=?,last_error_json=NULL "
+                            "WHERE thread_id=? AND message_id=? AND state!='received' AND EXISTS ("
+                            "SELECT 1 FROM threads WHERE thread_id=? AND owner_json=?)",
+                            (now, thread_id, row[0], thread_id, owner_json))
+                        require(updated.rowcount == 1,
+                                "Reply or ownership changed during output; no replies were acknowledged")
+                    if selected_group:
+                        db.execute("UPDATE delivery_groups SET status='received' WHERE id=? AND status!='received' "
+                                   "AND NOT EXISTS (SELECT 1 FROM delivery_group_members gm JOIN messages m "
+                                   "ON m.thread_id=gm.thread_id AND m.message_id=gm.message_id "
+                                   "WHERE gm.group_id=? AND m.state!='received')",
+                                   (selected_group[0], selected_group[0]))
+        return {"thread": thread_id, "group": selected_group[0] if selected_group else None,
+                "received": [row[0] for row in rows],
                 "delivery_boundary": "stdout_flushed", "comprehension_confirmed": False}
 
     def _lock_is_held(self, name):
@@ -978,6 +2166,9 @@ class Watch:
         api_fresh = api_age is not None and api_age <= max(60, POLL_INTERVAL * 5)
         worker_running = self._lock_is_held("worker.lock")
         supervisor_running = self._lock_is_held("supervise.lock")
+        gateway_row = db.execute(
+            "SELECT condition,recovery_epoch,recovery_state,recovery_reason,last_event_at,last_error_json "
+            "FROM gateway_state WHERE id=1").fetchone()
         send_scope = []
         try:
             send_scope = json.loads(meta.get("last_send_scope", "[]"))
@@ -1017,6 +2208,10 @@ class Watch:
             "worker_running" if worker_running else "worker_stopped")
         return {"state": state, "ready_for_wakes": ready and thread_error is None,
                 "worker_running": worker_running, "supervisor_running": supervisor_running,
+                "gateway": {"condition": gateway_row[0], "recovery_epoch": gateway_row[1],
+                            "recovery_state": gateway_row[2], "recovery_reason": gateway_row[3],
+                            "last_event_at": gateway_row[4],
+                            "last_error": json.loads(gateway_row[5]) if gateway_row[5] else None},
                 "worker_heartbeat_age_seconds": worker_age,
                 "worker_heartbeat_fresh": heartbeat_fresh,
                 "api_last_success_age_seconds": api_age, "api_success_fresh": api_fresh,
@@ -1033,10 +2228,66 @@ class Watch:
 
     def status(self):
         with contextlib.closing(self.database(create=False)) as db:
+            gateway_row = db.execute(
+                "SELECT condition,sequence,session_id,recovery_epoch,recovery_state,recovery_reason,"
+                "recovery_started_at,recovery_completed_at,last_event_at,last_error_json,"
+                "session_start_total,session_start_remaining,session_start_reset_at "
+                "FROM gateway_state WHERE id=1").fetchone()
+            gateway_epoch = gateway_row[3]
+            coverage_counts = dict(db.execute(
+                "SELECT w.state,COUNT(*) FROM gateway_recovery_work w JOIN threads t "
+                "ON t.thread_id=w.thread_id AND t.owner_generation=w.owner_generation "
+                "WHERE w.epoch=? GROUP BY w.state", (gateway_epoch,))) if gateway_epoch else {}
+            gateway = {
+                "condition": gateway_row[0],
+                "has_resumable_session": bool(gateway_row[2]),
+                "last_committed_sequence": int(gateway_row[1]) if gateway_row[1] is not None else None,
+                "recovery": {"epoch": gateway_epoch, "state": gateway_row[4],
+                             "reason": gateway_row[5], "started_at": gateway_row[6],
+                             "completed_at": gateway_row[7],
+                             "threads_total": sum(coverage_counts.values()),
+                             "threads_complete": coverage_counts.get("complete", 0),
+                             "threads_pending": coverage_counts.get("queued", 0) +
+                             coverage_counts.get("working", 0),
+                             "threads_blocked": coverage_counts.get("blocked", 0)},
+                "session_start_limit": {"total": gateway_row[10], "remaining": gateway_row[11],
+                                        "reset_at": gateway_row[12]},
+                "last_event_at": gateway_row[8],
+                "last_error": json.loads(gateway_row[9]) if gateway_row[9] else None,
+                "coordinator_guidance": (
+                    "Inspect the reported Gateway fatal condition and correct that specific cause in the existing component configuration."
+                    if gateway_row[0] == "fatal_configuration" else (
+                        "Restart serve without --rest-only after Gateway configuration is available."
+                        if gateway_row[0] == "offline_rest" else None))
+            }
             threads = []
             for row in db.execute("SELECT thread_id,owner_json,cursor,is_open,registered_at,last_poll_at,next_poll_at,"
-                                  "last_error_json,owner_generation FROM threads ORDER BY registered_at,thread_id"):
-                thread_id, owner_json, cursor, is_open, registered_at, last_poll_at, next_poll_at, last_error, generation = row
+                                  "last_error_json,owner_generation,subscription_state,last_activity_at,remote_closed,"
+                                  "initial_cutoff,catchup_before,catchup_max "
+                                  "FROM threads ORDER BY registered_at,thread_id"):
+                (thread_id, owner_json, cursor, is_open, registered_at, last_poll_at, next_poll_at,
+                 last_error, generation, subscription_state, last_activity_at, remote_closed, initial_cutoff,
+                 catchup_before, catchup_max) = row
+                status_thread = {"thread_id": thread_id, "owner": json.loads(owner_json),
+                                 "owner_generation": generation, "catchup_before": catchup_before,
+                                 "catchup_max": catchup_max}
+                catchup_incomplete = self._catchup_incomplete(status_thread)
+                recovery_work = db.execute(
+                    "SELECT state,owner_generation,updated_at,completed_at,last_error_json "
+                    "FROM gateway_recovery_work WHERE epoch=? AND thread_id=? AND owner_generation=?",
+                    (gateway_epoch, thread_id, generation)).fetchone()
+                rest_recovery = None
+                if recovery_work:
+                    rest_recovery = {"state": recovery_work[0],
+                                     "condition": self._rest_condition(
+                                         json.loads(recovery_work[4]) if recovery_work[4] else None),
+                                     "covered_generation": recovery_work[1],
+                                     "updated_at": recovery_work[2],
+                                     "completed_at": recovery_work[3],
+                                     "last_error": json.loads(recovery_work[4]) if recovery_work[4] else None}
+                recovery_order_hold = self._gateway_recovery_hold_reason(db, status_thread)
+                if rest_recovery is not None:
+                    rest_recovery["delivery_order_hold"] = recovery_order_hold
                 counts = {state: count for state, count in db.execute(
                     "SELECT state,COUNT(*) FROM messages WHERE thread_id=? GROUP BY state", (thread_id,))}
                 recent = [{"message": message_id, "state": state, "wake_attempts": attempts,
@@ -1046,12 +2297,131 @@ class Watch:
                               "SELECT message_id,state,wake_attempts,submitted_at,received_at,last_error_json "
                               "FROM messages WHERE thread_id=? ORDER BY length(message_id) DESC,message_id DESC LIMIT 20",
                               (thread_id,))]
+                delivery_groups = []
+                for group in db.execute(
+                        "SELECT id,owner_generation,owner_json,status,created_at,first_message_id,last_message_id,"
+                        "attempt_count,last_wake_at,submitted_at,last_error_json,legacy "
+                        "FROM delivery_groups WHERE thread_id=? ORDER BY id", (thread_id,)):
+                    (group_id, group_generation, group_owner_json, group_state, group_created_at,
+                     first_message_id, last_message_id, attempts, last_wake_at, submitted_at,
+                     group_error, legacy) = group
+                    group_owner = json.loads(group_owner_json)
+                    if not self._generation_chain_valid(db, status_thread, group_generation, group_owner):
+                        visible_state = "held"
+                        hold_reason = "owner_generation_event_chain_invalid"
+                    elif catchup_incomplete and not legacy and group_state != "received":
+                        visible_state = "held"
+                        hold_reason = "rest_catchup_incomplete"
+                    elif (recovery_order_hold and not legacy and
+                          group_state in ("eligible", "intent")):
+                        visible_state = "held"
+                        hold_reason = recovery_order_hold
+                    elif group_state in ("eligible", "intent") and group_error:
+                        error_record = json.loads(group_error)
+                        if isinstance(error_record, dict) and "held" in error_record:
+                            visible_state = "held"
+                            hold_reason = "guard_or_owner_hold"
+                        else:
+                            visible_state = group_state
+                            hold_reason = None
+                    else:
+                        visible_state = group_state
+                        hold_reason = None
+                    members = [{"message": message_id, "state": state, "received_at": received_at}
+                               for message_id, state, received_at in db.execute(
+                                   "SELECT m.message_id,m.state,m.received_at FROM delivery_group_members gm "
+                                   "JOIN messages m ON m.thread_id=gm.thread_id AND m.message_id=gm.message_id "
+                                   "WHERE gm.group_id=? ORDER BY gm.ordinal", (group_id,))]
+                    group_attempts = [{"attempt": attempt_id, "state": attempt_state,
+                                       "created_at": created_at,
+                                       "transport_started_at": transport_started_at,
+                                       "submitted_at": attempt_submitted_at,
+                                       "target_owner": json.loads(target_owner_json) if target_owner_json else None,
+                                       "target_owner_generation": target_owner_generation,
+                                       "last_error": json.loads(attempt_error) if attempt_error else None}
+                                      for attempt_id, attempt_state, created_at, transport_started_at,
+                                      attempt_submitted_at, target_owner_json, target_owner_generation,
+                                      attempt_error in db.execute(
+                                          "SELECT id,state,created_at,transport_started_at,submitted_at,"
+                                          "target_owner_json,target_owner_generation,last_error_json "
+                                          "FROM delivery_group_attempts WHERE group_id=? ORDER BY id", (group_id,))]
+                    delivery_groups.append({"group": group_id, "owner_generation": group_generation,
+                                            "state": visible_state, "stored_state": group_state,
+                                            "created_at": group_created_at,
+                                            "first_message": first_message_id, "last_message": last_message_id,
+                                            "attempt_count": attempts, "last_wake_at": last_wake_at,
+                                            "submitted_at": submitted_at,
+                                            "last_error": json.loads(group_error) if group_error else None,
+                                            "legacy": bool(legacy), "hold_reason": hold_reason,
+                                            "members": members, "attempts": group_attempts})
+                forming_rows = db.execute(
+                    "SELECT message_id,author_name,body,attachments_json,ingested_at FROM messages "
+                    "WHERE thread_id=? AND groupable=1 "
+                    "AND group_id IS NULL AND state='pending' AND owner_generation=? "
+                    "ORDER BY length(message_id),message_id", (thread_id, generation)).fetchall()
+                forming = None
+                if forming_rows:
+                    prefix = []
+                    for item in forming_rows[:MAX_RECEIVE_MESSAGES]:
+                        if len(self._render_messages(thread_id, [row[:4] for row in prefix + [item]])
+                                .encode("utf-8")) > MAX_RECEIVE_BYTES:
+                            break
+                        prefix.append(item)
+                    first_at = min(item[4] for item in prefix)
+                    last_at = max(item[4] for item in prefix)
+                    eligible_at = min(first_at + GROUP_MAX_DELAY, last_at + GROUP_QUIET_SECONDS)
+                    generation_valid = self._generation_chain_valid(db, status_thread, generation,
+                                                                    status_thread["owner"])
+                    group_state = "held" if catchup_incomplete or recovery_order_hold or not generation_valid else (
+                        "eligible" if self.clock() >= eligible_at else "forming")
+                    forming_hold_reason = None
+                    if catchup_incomplete:
+                        forming_hold_reason = "rest_catchup_incomplete"
+                    elif recovery_order_hold:
+                        forming_hold_reason = recovery_order_hold
+                    elif not generation_valid:
+                        forming_hold_reason = "owner_generation_event_chain_invalid"
+                    forming = {"state": group_state, "messages": [item[0] for item in forming_rows],
+                               "next_group_messages": [item[0] for item in prefix],
+                               "first_at": first_at, "last_at": last_at, "eligible_at": eligible_at,
+                               "hold_reason": forming_hold_reason}
+                thread_error_record = json.loads(last_error) if last_error else None
+                recovery_error_record = json.loads(recovery_work[4]) if recovery_work and recovery_work[4] else None
+                rest_condition = self._rest_condition(thread_error_record or recovery_error_record)
+                exact_owner_hold = any(group["hold_reason"] in
+                                       ("owner_generation_event_chain_invalid", "guard_or_owner_hold")
+                                       for group in delivery_groups)
+                exact_owner_hold = exact_owner_hold or bool(
+                    forming and forming["hold_reason"] == "owner_generation_event_chain_invalid")
+                if exact_owner_hold:
+                    coordinator_guidance = (
+                        "Restore the exact enrolled owner binding or arrange an explicit authorized transfer.")
+                elif rest_condition == "inaccessible":
+                    coordinator_guidance = "Restore the configured bot's access to this retained Discord thread."
+                elif rest_condition == "remote_missing":
+                    coordinator_guidance = "Restore access to the retained Discord thread before reconciliation can continue."
+                elif rest_condition == "rate_limited":
+                    coordinator_guidance = "Wait until the reported Discord route or global retry deadline."
+                elif rest_condition == "unavailable":
+                    coordinator_guidance = "Wait for the Discord REST route to recover; the thread remains retained."
+                else:
+                    coordinator_guidance = None
                 threads.append({"thread": thread_id, "owner": json.loads(owner_json), "cursor": cursor,
                                 "open": bool(is_open), "registered_at": registered_at,
+                                "subscription_state": subscription_state,
+                                "last_activity_at": last_activity_at,
+                                "remote_closed": bool(remote_closed),
+                                "initial_cutoff": initial_cutoff,
                                 "last_poll_at": last_poll_at, "next_poll_at": next_poll_at,
-                                "last_error": json.loads(last_error) if last_error else None,
-                                "owner_generation": generation, "queue": counts, "recent": recent})
-            return {"health": self._health(db), "threads": threads}
+                                "last_error": thread_error_record,
+                                "rest_condition": rest_condition,
+                                "coordinator_guidance": coordinator_guidance,
+                                "owner_generation": generation, "queue": counts, "recent": recent,
+                                "catchup_before": catchup_before, "catchup_max": catchup_max,
+                                "rest_recovery": rest_recovery,
+                                "forming_group": forming,
+                                "delivery_groups": delivery_groups})
+            return {"health": self._health(db), "gateway": gateway, "threads": threads}
 
     def doctor(self):
         result = {"state_directory": str(self.directory), "state_initialized": False,
@@ -1081,7 +2451,7 @@ class Watch:
             result["checks"].append({"name": "hailing", "ok": False, "detail": str(error)[:300]})
         return result
 
-    def serve(self, send=False, only_thread=None):
+    def serve(self, send=False, only_thread=None, rest_only=False, *, gateway_factory=None, stop_event=None):
         with contextlib.closing(self.database(create=False)):
             pass
         lock_path = self.directory / "worker.lock"
@@ -1093,31 +2463,69 @@ class Watch:
             except BlockingIOError:
                 raise ValueError("A Discord Watch worker already owns this state") from None
             stopping = False
+            stop_event = stop_event or threading.Event()
             original_handlers = {}
             def stop(signum, frame):
                 nonlocal stopping
                 stopping = True
+                stop_event.set()
             for sig in (signal.SIGINT, signal.SIGTERM):
-                original_handlers[sig] = signal.signal(sig, stop)
+                try:
+                    original_handlers[sig] = signal.signal(sig, stop)
+                except ValueError:
+                    break
+            gateway = None
+            if rest_only:
+                self.set_gateway_condition("offline_rest", "Gateway disabled by explicit REST-only mode")
+            else:
+                from discord_gateway import GatewayClient
+                factory = gateway_factory or self.gateway_factory or GatewayClient
+                gateway = factory(self)
+            lanes = []
+            if gateway is not None:
+                lanes.append(threading.Thread(target=gateway.run, args=(stop_event,),
+                                              name="discord-watch-gateway", daemon=True))
+
+            def rest_loop():
+                while not stop_event.is_set():
+                    try:
+                        self._rest_recovery_turn(only_thread, stop_event)
+                    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+                        self._record_worker_failure(send, only_thread, error)
+                    stop_event.wait(REST_TURN_INTERVAL)
+
+            lanes.append(threading.Thread(target=rest_loop, name="discord-watch-rest", daemon=True))
+            for lane in lanes:
+                lane.start()
+            last_report = 0.0
             try:
                 while not stopping:
+                    if stop_event.is_set():
+                        stopping = True
+                        break
                     try:
-                        report = self.scan(send=send, only_thread=only_thread, origin="worker")
+                        report = self._dispatch_turn(send=send, only_thread=only_thread)
                     except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
                         report = {"at": self.clock(), "mode": "send" if send else "observe",
                                   "worker_error": str(error)[:500]}
                         self._record_worker_failure(send, only_thread, error)
-                    print(json.dumps(report, ensure_ascii=False), flush=True)
-                    deadline = time.monotonic() + POLL_INTERVAL
-                    while not stopping and time.monotonic() < deadline:
-                        time.sleep(min(1, max(0, deadline - time.monotonic())))
+                    now = time.monotonic()
+                    if report.get("threads") or now - last_report >= POLL_INTERVAL:
+                        print(json.dumps(report, ensure_ascii=False), flush=True)
+                        last_report = now
+                    stop_event.wait(SENDER_INTERVAL)
             finally:
+                stop_event.set()
+                if gateway is not None:
+                    gateway.stop()
+                for lane in lanes:
+                    lane.join(timeout=LANE_JOIN_TIMEOUT)
                 for sig, handler in original_handlers.items():
                     signal.signal(sig, handler)
                 fcntl.flock(lock, fcntl.LOCK_UN)
         return {"stopped": True}
 
-    def supervise(self, send=False, only_thread=None):
+    def supervise(self, send=False, only_thread=None, rest_only=False):
         with contextlib.closing(self.database(create=False)):
             pass
         lock_path = self.directory / "supervise.lock"
@@ -1148,6 +2556,8 @@ class Watch:
                         command.append("--send")
                     if only_thread:
                         command.extend(("--only-thread", only_thread))
+                    if rest_only:
+                        command.append("--rest-only")
                     child = subprocess.Popen(command)
                     code = child.wait()
                     if stopping:
@@ -1190,7 +2600,9 @@ def parser():
     managed.add_argument("--session", help="Select an exact OpenCode ses_ owner when the surface is ambiguous")
     receive = sub.add_parser("receive", help="Output and acknowledge exact pending replies")
     receive.add_argument("--thread", required=True)
-    receive.add_argument("--message")
+    receive_selection = receive.add_mutually_exclusive_group()
+    receive_selection.add_argument("--message")
+    receive_selection.add_argument("--group")
     receive.add_argument("--session", help="Select the exact enrolled OpenCode ses_ owner")
     close = sub.add_parser("close", help="Close this exact owner's local thread registration")
     close.add_argument("thread")
@@ -1205,6 +2617,9 @@ def parser():
         child = sub.add_parser(name)
         child.add_argument("--send", action="store_true", help="Enable guarded CMUX wakes")
         child.add_argument("--only-thread", help="Limit polling and wakes to one registered thread")
+        if name in ("serve", "supervise"):
+            child.add_argument("--rest-only", action="store_true",
+                               help="Disable Gateway intake and report degraded REST-only operation")
     return command
 
 
@@ -1221,8 +2636,7 @@ def main(argv=None):
     elif args.command == "managed":
         result = app.managed(args.thread, args.session)
     elif args.command == "receive":
-        with app.locked(timeout=LOCK_TIMEOUT, name="receive.lock"):
-            result = app.receive(args.thread, args.message, session_hint=args.session)
+        result = app.receive(args.thread, args.message, session_hint=args.session, group_id=args.group)
         if not result.get("received"):
             return 3
         return 0
@@ -1239,9 +2653,9 @@ def main(argv=None):
     elif args.command == "scan":
         result = app.scan(args.send, args.only_thread)
     elif args.command == "serve":
-        result = app.serve(args.send, args.only_thread)
+        result = app.serve(args.send, args.only_thread, args.rest_only)
     elif args.command == "supervise":
-        result = app.supervise(args.send, args.only_thread)
+        result = app.supervise(args.send, args.only_thread, args.rest_only)
     else:
         raise ValueError("Unknown command")
     print(json.dumps(result, ensure_ascii=False, indent=2))

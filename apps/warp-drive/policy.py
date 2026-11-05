@@ -1,16 +1,34 @@
 """Deterministic worktree-round and CPU admission policy."""
 
-POLICY_VERSION = "warp-drive-admission-v6"
+POLICY_VERSION = "warp-drive-admission-v7"
 MAX_ACTIVE_AGED_ESCAPES = 2
 
 
-def estimated_cores(size, workers, target_cores, light_ready=False):
-    per_worker = 1.0 if size == "light" else 4.0
-    estimate = max(1.0, workers * per_worker)
+def estimated_cores(size, workers, target_cores, light_ready=False,
+                    requested_cpu_cores=None):
+    if requested_cpu_cores is None:
+        per_worker = 1.0 if size == "light" else 4.0
+        estimate = max(1.0, workers * per_worker)
+    else:
+        estimate = float(requested_cpu_cores)
     estimate = min(estimate, max(0.01, target_cores))
     if size == "heavy" and light_ready:
         estimate = min(estimate, max(0.01, target_cores - min(1.0, target_cores / 2)))
     return estimate
+
+
+def request_estimate(request, target_cores, light_ready=False):
+    """Return one request's effective admission estimate, preserving legacy fallback."""
+    try:
+        requested = request["requested_cpu_cores"]
+    except (KeyError, IndexError, TypeError):
+        try:
+            requested = request["cpu_cores"]
+        except (KeyError, IndexError, TypeError):
+            requested = None
+    return estimated_cores(request["size"], request["workers"], target_cores,
+                           light_ready=light_ready,
+                           requested_cpu_cores=requested)
 
 
 def ordering_served_round(served_round):
@@ -69,8 +87,7 @@ def admission_decision(request, *, target_cores, projected_cores, light_ready,
         return False, "host sample stale or unavailable", 0.0, False
     if pressure not in ("normal", None):
         return False, "memory pressure observed", 0.0, False
-    estimate = estimated_cores(request["size"], request["workers"], target_cores,
-                               light_ready=light_ready)
+    estimate = request_estimate(request, target_cores, light_ready=light_ready)
     if request["size"] == "light":
         if projected_cores + estimate > target_cores:
             return False, "host target has no room for light work", estimate, False
