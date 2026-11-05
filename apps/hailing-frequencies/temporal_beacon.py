@@ -107,11 +107,11 @@ class TemporalBeacon:
             db.execute("ALTER TABLE timers ADD COLUMN schedule_spec TEXT NOT NULL DEFAULT '{}'")
         return db
 
-    def binding(self, target, expected_worktree=None, *, identity_only=False):
-        if identity_only and target["harness"] == "opencode":
-            self.app.cmux.enrollment_binding(target)
-        else:
-            self.app.cmux.binding(target)
+    def binding(self, target, expected_worktree=None):
+        self.app.cmux.binding(target)
+        return self._verify_expected_worktree(target, expected_worktree)
+
+    def _verify_expected_worktree(self, target, expected_worktree):
         if expected_worktree is not None:
             path = self.app.cmux.hook_directory / (target["harness"] + "-hook-sessions.json")
             store = json.loads(path.read_text())
@@ -125,6 +125,16 @@ class TemporalBeacon:
                     "Canonical worktree changed")
         return True
 
+    def _creation_owner(self):
+        """Verify the exact owner while allowing OpenCode's API session to be busy."""
+        target, owner_key, worktree = self.owner(verify=False)
+        if target["harness"] == "opencode":
+            self.app.cmux.enrollment_binding(target)
+            self._verify_expected_worktree(target, worktree)
+        else:
+            self.binding(target, worktree)
+        return target, owner_key, worktree
+
     @staticmethod
     def owner_key(target, worktree):
         value = ":".join((target["harness"], target["session"], target["surface"],
@@ -137,7 +147,7 @@ class TemporalBeacon:
             value += ":opencode-binding:" + hashlib.sha256(encoded).hexdigest()
         return value
 
-    def owner(self, verify=True, *, identity_only=False):
+    def owner(self, verify=True):
         import hailing_frequencies as hf
         harness = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").lower()
         require(harness in ("claude", "codex", "opencode"),
@@ -183,7 +193,7 @@ class TemporalBeacon:
         else:
             worktree = None
         if verify:
-            self.binding(target, worktree, identity_only=identity_only)
+            self.binding(target, worktree)
         key = self.owner_key(target, worktree)
         return target, key, worktree
 
@@ -317,7 +327,7 @@ class TemporalBeacon:
         deadline = offset_datetime(until)[0] if until is not None else None
         require(schedule == "every" or deadline is None, "--until is only valid with --every")
         resolved_due = timestamp(due)
-        target, owner_key, worktree = self.owner(identity_only=True)
+        target, owner_key, worktree = self._creation_owner()
         if schedule == "idle":
             due = max(due, self.idle_due(target, schedule_value, now))
             resolved_due = timestamp(due)
