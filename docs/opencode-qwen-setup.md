@@ -11,6 +11,14 @@ Clean-host installation, clean-host model download and the full end-to-end Starf
 Use a visible OpenCode tab or pane inside the existing CMUX workspace assigned to this task.
 Use a supported stock CMUX release for native session and composer state.
 The earlier custom CMUX parser experiment is historical and is not a required or supported deployment path.
+
+From the assigned worktree, install the supported project integration with `cmux hooks opencode install --project`.
+The tested integration used the complete generated bundle under `.opencode/plugins`: `cmux-feed.js` and `cmux/{.cmux-owned,index.js,package.json,tui.js}`.
+The feed bridge alone does not provide the TUI session lifecycle hooks; the package exports its TUI adapter separately.
+Keep generated plugin files intact and recheck the installed CMUX release's supported layout when upgrading.
+Before treating a launch as ready, verify current native hook evidence for its exact OpenCode session, CMUX surface, workspace, worktree and generation.
+Bundle presence alone does not prove a live binding.
+
 Keep the task brief, worktree, native OpenCode session, CMUX surface and CMUX workspace identity aligned.
 Use an isolated Git worktree for each bounded task and assign one writer to each changed path.
 Use the exact provider ID and model slug in the task card, then verify OpenCode shows that same route before work starts.
@@ -150,9 +158,13 @@ Source code and a successful read-only preflight do not establish managed sessio
 The parent-routing and startup-command failures were corrected, and a fresh Codex-Qwen managed session completed its exact baseline task using the short protected descriptor and explicit private XDG paths.
 This observed startup case does not qualify every parent route, Hailing delivery or a production API-only send path.
 
+The researcher route has one bounded native read-and-answer case without Pattern Buffer plugin or task-binding arguments.
+Current Pattern Buffer dispatched-task integration supports implementers only; keep researcher configuration separate and do not infer researcher task context from implementer evidence.
+
 Read the maintained [Pattern Buffer OpenCode guide](../apps/pattern-buffer/docs/opencode.md) for explicit plugin installation, two-phase task binding and exact session identity.
 The native pilot observed shared context, the implementer role and initial task text in a primary request, an updated task in completed compaction, and a broken-bound-context failure that resulted in zero provider requests.
-It did not establish post-compaction continuation, same-session resume or model-visible task finish behavior.
+A separate managed case resumed a permitted fixture read after compaction and correctly held continuation after task finish without another provider request.
+Code editing after compaction and model reception of the finished notice remain unqualified.
 
 Hailing Frequencies currently holds OpenCode delivery while the installed CMUX projection reports composer state `unknown`.
 The historical CMUX parser experiment passed its package and build-only checks but was never installed or launched for a native empty-composer check.
@@ -164,8 +176,12 @@ A bounded API-first trial in a manually started visible session observed one API
 It used no tools and was not Model Preferences managed dispatch or Hailing automatic delivery.
 A subsequent managed-session experiment also preserved the synthetic draft, while Model Preferences retained its production delivery hold.
 Separate preflight controls observed pending-form and pending-permission holds, with the exact scope and limits recorded in the [acceptance record](opencode-qwen-acceptance.md).
-These are limited draft-preservation observations and do not qualify a production API-sidechannel route.
-An explicit API-sidechannel policy is under qualification after its first Model Preferences continuation stopped with uncertain queue admission.
+These are bounded draft-preservation observations, including one actual opted-in Model Preferences continuation; they do not qualify every API-sidechannel route.
+The first explicit-policy continuation exposed a receipt-schema mismatch after admission and was not replayed.
+A fresh trial after correction passed actual Model Preferences continuation with the exact visible draft intact and absent from server context.
+A fresh candidate passed actual Qwen-origin Hailing self-enrollment with an exact persisted identity binding while its tool call was running.
+On that enrollment candidate, one experimental API-sidechannel Hailing wake completed its exact Qwen reply, and a pending-inbox control refused further delivery without new provider activity.
+Recipient inbox reading and other pending-interaction controls remain under qualification.
 The default strict composer policy is unchanged; do not opt in based only on source availability.
 Human-controlled visible-session resume remains a fallback requiring its own acceptance.
 OpenCode wake support in Warp-drive, Away Mode, Agent Notify, Discord Watch, Temporal Beacon and Starfleet Markup remains separately unqualified.
@@ -176,9 +192,10 @@ Do not infer notification, wake, task completion or review feedback support from
 Stop before task launch if the exact local provider or model cannot be confirmed.
 Stop if an unexpected credential appears, a hosted request occurs, a permission boundary is broader than the task, or the task needs an unapproved path.
 Report the credential's location and category without copying its value, and wait for the parent to decide the next step.
-Stop any managed or automatic send if OpenCode shows a permission request, human-input obligation, draft or ambiguous composer state.
+Stop any managed or automatic send if OpenCode shows a permission request or human-input obligation.
+Under the default strict policy, a draft or ambiguous composer state also holds delivery.
 Do not treat an idle model state or empty permission list as evidence that the composer is empty.
-Do not use an API-only send or continuation path to bypass an unknown composer state.
+Use the experimental API-sidechannel policy only when explicitly selected for a bounded authorized trial with its separate exact-identity and pending-interaction checks.
 The synthetic draft-preservation control is evidence for one bounded visible-session trial, not authorization to bypass a production guard.
 
 ## Evidence and status

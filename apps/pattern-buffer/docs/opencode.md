@@ -13,7 +13,9 @@ Recheck the exact OpenCode version source before using a later release.
 ## Current limits
 
 The [native acceptance observations](../../../docs/opencode-qwen-acceptance.md) record initial context/task delivery, an updated task in completed compaction and a zero-provider-request failure control on the tested candidate.
-They do not establish a post-compaction implementation turn, same-session resume or model-visible finished-task behavior.
+A separate managed case completed a permitted fixture read in the same session after compaction, then correctly held continuation after the task was finished with zero additional provider requests.
+The local finished notice was checked separately.
+Code editing after compaction and model reception of the finished notice remain unqualified.
 An operator must run the separate native pilot in a disposable child worktree before relying on the integration.
 Use an already existing same-task CMUX workspace and keep the native OpenCode session in a visible tab or pane.
 Select the exact approved local provider and model in OpenCode itself, and verify that hosted providers and fallback paths are disabled for a local-only run.

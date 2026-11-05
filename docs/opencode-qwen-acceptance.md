@@ -1,6 +1,6 @@
 # OpenCode and Qwen acceptance observations
 
-These observations describe bounded local trials on November 4, 2026.
+These observations describe bounded local trials on November 4 and 5, 2026.
 They are not a benchmark, security certification or a claim that every Starfleet component supports OpenCode.
 Private connection data, transcripts and native identifiers are excluded.
 See the [setup guide](opencode-qwen-setup.md) for a portable summary of the observed runtime configuration and prerequisites.
@@ -56,7 +56,13 @@ Its first actual Model Preferences continuation attempt followed successful mana
 An unsent synthetic draft was observed in the exact new tab before continuation.
 The continuation stopped with `prompt_queue_admission_unconfirmed`; the attempt was preserved without replay and the owned runtimes stopped.
 This is a failed acceptance result, not proof that the prompt was rejected or delivered.
-Persisted admission and message evidence must be reconciled before another send.
+Persisted evidence subsequently confirmed that the exact queued user message was promoted and followed by an incomplete assistant row.
+The pinned API returns a string `delivery` enum, while the candidate expected an object with a `mode` field.
+The receipt check was corrected without replaying the uncertain original.
+A fresh trial on candidate `cb392f8` passed actual Model Preferences continuation, completed the expected Qwen reply, preserved the exact visible synthetic draft and confirmed its absence from server context.
+The primary requests used `max` reasoning and Pattern Buffer shared/implementer context; auxiliary title requests are a separate request class.
+The owned model and API processes stopped after the successful trial.
+This qualifies one explicit-policy managed continuation case on the tested configuration, not Hailing enrollment, native wake, every pending-interaction control or every parent route.
 A separate actual API control on candidate `792105b` observed a clear empty inbox followed by a `pending_inbox` hold after a synthetic queued message.
 That control used no model request and does not establish native wake delivery.
 
@@ -114,6 +120,15 @@ A separate one-output control has its own scope and does not change this failed 
 This observation separates mechanical context delivery from final-report completeness for one task.
 It does not establish a general Qwen limitation, a universal marker-count limit, a context budget or a task-size rule.
 
+## Bounded researcher route
+
+A managed `Codex-Qwen` researcher case on candidate `cb392f8` completed one deterministic file question in a visible same-workspace OpenCode session.
+The recorded choice was the local Qwen researcher at `max`, and all three actual provider requests used that setting.
+Independent read-only database inspection confirmed one completed read of the exact fixture path and a subsequent exact answer.
+The owned API and model stopped after the case.
+Pattern Buffer plugin and task-binding arguments were deliberately absent because the current dispatched-task integration supports the implementer role only.
+This is evidence for the bounded researcher launch and tool route, not Pattern Buffer researcher support or general research competence.
+
 ## Synthetic secret-canary boundary
 
 A separate maximum-thinking interactive startup trial used a positive read allowlist and one fake token in a file outside that allowlist.
@@ -150,6 +165,56 @@ No model runtime was started for that control.
 The original synthetic context bytes were restored exactly afterward.
 This establishes that the tested hook failure prevented provider invocation for this candidate, rather than relying on an instruction telling the model to stop.
 
+## Managed post-compaction read and finished-task hold
+
+A separate native case on candidate `cb392f8` completed compaction with the updated task present in its actual model request.
+A subsequent Model Preferences continuation resumed the same session and completed a `read` of the exact authorized fixture path before returning its required response marker.
+Independent read-only database inspection confirmed the completed tool arguments and ordering after the completed compaction.
+All five observed provider requests used `max` reasoning; auxiliary title generation and primary/compaction context were recorded separately.
+After `finish-task`, Model Preferences correctly refused another continuation of that finished assignment.
+The refused attempt produced zero provider requests and left native server context unchanged.
+A local Pattern Buffer rendering contained the finished notice and omitted the old active brief.
+The trial did not submit another model request after finish, so model reception of the finished notice remains unqualified.
+The owned API and model stopped after the bounded case.
+This establishes post-compaction permitted-read continuation and a finished-task refusal, not post-compaction code editing, research-role task binding or Qwen-led orchestration.
+
+## Bounded coding path error
+
+A maximum-thinking native coding case completed the four assigned file reads and edited only `text_cli.py`.
+Its later verification read misspelled a directory segment in the absolute path, and the permission guard rejected that resource as `external_directory`.
+The trial stopped at the denied call before the native test-command stage; it does not qualify the complete coding workflow.
+The original edit, denial and stopped-run evidence were preserved.
+A follow-up supervised case is being prepared with a bounded parent-approved path correction and unchanged permissions; that recovery remains unqualified.
+
+## Complete CMUX project integration
+
+A feed-only coding fixture returned its bootstrap response but failed the managed native-binding check without an exact native hook record.
+The successful enrollment-reproduction fixture also contained the official CMUX TUI package, which the feed-only fixture omitted.
+A fresh coding fixture added that complete package without changing the task or model configuration, then passed the exact native/API binding, session generation and no-tool bootstrap checks on candidate `cb392f8`.
+Its subsequent coding stage was interrupted by the trial observer's handling of streaming tool arguments, so the result establishes the complete-bundle startup prerequisite rather than coding acceptance.
+The fixture remained unchanged and both owned runtimes stopped.
+
+## Native Hailing self-enrollment
+
+A Qwen-origin helper on candidate `cb392f8` reproduced enrollment refusal with `session_busy` while its own tool call was running, after its exact native session and hook generation had been verified.
+The enrollment path was separated into authenticated identity verification and prompt-delivery readiness.
+A fresh native case on candidate `586ff71` then completed one real self-enrollment command while that session was observed running.
+The command result and persisted Hailing configuration matched the exact API PID, session, directories, CMUX surface, workspace and native generation.
+The owner worktree was preserved and the owned API and model stopped after the case.
+This establishes registration on that candidate, without permitting prompt delivery while busy.
+A subsequent native case on the same candidate qualified one real native-source Hailing reminder, exact admitted API body and completed Qwen max marker reply under explicit API-sidechannel policy.
+A queued-inbox negative control held without new batches, attempts, provider calls or API context changes.
+The recipient inbox CLI and original native-message body consumption remain unqualified.
+A subsequent Qwen-origin own-inbox call on `586ff71` reproduced a busy refusal while its actual tool turn was running.
+The exact native source was eligible, identity and self-enrollment checks passed, and no output or acknowledgment was produced.
+This establishes a receipt-side readiness problem to correct and retest; it does not establish successful inbox reading.
+Delivery retains its separate activity, pending interaction, native input and exact-owner checks.
+
+The receipt-side identity correction was integrated into source candidate `7098036` after that reproduction.
+Its first fresh positive inbox trial failed during managed startup before the inbox command, so it does not qualify inbox reading or disprove the receipt-side correction.
+Candidate `818a082` adds bounded observation of authoritative native startup readiness, including running-to-idle transitions after API completion.
+Source tests and that waiting logic do not establish native inbox consumption, complete coding acceptance or successful Qwen-led delegation on the newer candidate.
+
 ## Native ownership and composer gaps
 
 Passively opening an API-created session did not initially register a native CMUX agent identity.
@@ -165,7 +230,7 @@ Do not reinterpret unknown as empty, type a probe, clear a draft or synthesize h
 The pinned OpenCode 2.2.5 TUI plugin context and session API references have no documented draft accessor or atomic admission lock.
 The inspected server routes expose active-turn, inbox, permission and form state but do not expose unsent composer text.
 The initial API-first experiment checked exact native ownership and preserved one synthetic draft, as recorded above.
-The later explicit policy candidate remains under qualification after its uncertain-admission result.
+The later explicit policy candidate passed one fresh Model Preferences continuation after the receipt correction, with the later experimental Hailing wake and pending-inbox control qualified separately above.
 Source inspection of the [pinned TUI submission path](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/tui/src/component/prompt/index.tsx) and [TUI state handling](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/tui/src/context/data.tsx) suggests that an external API prompt leaves the TUI composer untouched because the local reset occurs in the TUI submission path.
 This source-based inference is consistent with the bounded draft-preservation observations above; it does not establish safe automation in every state.
 A human-controlled visible-session resume remains an unproven alternative and is not the selected experiment.
@@ -176,26 +241,26 @@ The trial does not establish that this duplicate caused either ownership or comp
 
 The custom CMUX parser source experiment passed 879 package tests across 101 suites, four targeted static checks and an isolated app build-only check.
 The candidate was never installed or launched for native OpenCode composer verification.
-The currently used stock CMUX continues to report composer state `unknown`, so Hailing Frequencies must keep OpenCode delivery held.
+The currently used stock CMUX continues to report composer state `unknown`, so strict-policy Hailing delivery remains held; the explicit experimental API-sidechannel case has separate bounded evidence above.
 The custom source experiment is historical and is not a supported deployment route for these docs.
 Use supported stock CMUX and do not claim native empty-versus-draft acceptance from source or build-only checks.
 
 ## Remaining acceptance
 
-Managed profile dispatch and exact continuation require their own native acceptance.
+One managed startup and explicit-policy continuation case have native acceptance; remaining parent routes and interaction controls still require their own evidence.
 Pattern Buffer initial shared, role and exact-task delivery and an updated task in completed compaction are observed above.
-A post-compaction implementation turn, same-session resume and model-visible task-finish behavior still require native acceptance.
+Same-session post-compaction permitted-read continuation passed separately; code editing after compaction and model-visible task-finish behavior still require native acceptance.
 Automatic OpenCode inbound delivery and continuation remain held while stock CMUX reports composer state `unknown`.
-No API-only send or continuation bypass is qualified.
+The explicit API-sidechannel candidate has one bounded Model Preferences pass and is not a universal safe-send guarantee.
 OpenCode API and plugin integration remain under investigation for safe ownership and delivery behavior.
 API-sidechannel qualification remains a bounded investigation; the default strict policy is unchanged.
-Guarded messaging still needs authoritative empty-versus-draft evidence, exact owner binding, actual wake receipt and held-permission/draft controls.
+Default strict messaging still needs authoritative empty-composer evidence; explicit API-sidechannel messaging has native registration, actual wake receipt and a pending-inbox refusal pass, with other pending-interaction controls and inbox reading still requiring their own evidence.
 A human-controlled visible-session resume is an unproven alternative, not the selected experiment.
 The remaining synthetic-secret checks are parent credential handling, allowed-token redaction and Qwen-only orchestration.
 Qwen-led orchestration with human or frontier-model assistance requires separate task-framing, actual worker delegation, dependency-relay, acceptance-reporting and escalation evidence.
 Record interventions without treating their presence as failure of the supervised workflow or claiming autonomous behavior.
 The earlier Codex-supervised worker results cannot establish those capabilities.
-The active Model Preferences integration work still needs fresh managed-session, explicit-maximum-variant, post-compaction continuation and failure-control evidence before its source candidate can be described as accepted.
+Remaining managed-workflow acceptance includes code implementation, Qwen-led child delegation, native inbox consumption and the remaining failure controls; native self-enrollment has its separate pass above.
 
 ## Sources
 
