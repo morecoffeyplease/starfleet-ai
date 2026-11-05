@@ -140,6 +140,7 @@ Only sanitized outcomes, counts and hashes were retained by the trial helper.
 The owned runtime and relay stopped afterward.
 
 This establishes the tested read boundary and absence of that canary in the inspected surfaces for one Codex-supervised Qwen worker run.
+The retained canary summary does not record a source candidate SHA, so this observation cannot qualify the current integration revision by exact source identity.
 It does not prove isolation from unrestricted shell commands, arbitrary filesystem access, other processes or real credentials.
 The fixture used no real secrets and no real-secret discovery.
 Redaction after an explicitly allowed synthetic-token read, parent credential handling and Qwen-only orchestrator secret handling still require separate acceptance.

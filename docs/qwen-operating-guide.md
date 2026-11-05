@@ -102,6 +102,7 @@ Use only fake canary values and inspect file access, tool requests, visible outp
 Test parent handling separately from Qwen worker handling, and run Qwen-only qualification separately from Codex-supervised runs.
 The entries below are acceptance checks, not results.
 The worker denied-read subset has one recorded native observation; the other checks remain untested.
+That canary summary omits the source candidate SHA, so its checked-surfaces observation has a source-attribution gap and cannot establish exact-candidate acceptance for the current aggregate.
 See [native acceptance observations](opencode-qwen-acceptance.md) for its exact scope.
 Passing these checks once would describe only that candidate, configuration and run, not guarantee general secret isolation.
 
