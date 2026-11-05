@@ -9,8 +9,13 @@ Use the [Qwen runtime lifecycle runbook](qwen-runtime-lifecycle.md) for the sour
 Before costly inference, use Model Preferences `preflight` for a read-only active-role, worktree and OpenCode API configuration check, then follow the [Qwen inference and test observer preflight](qwen-operating-guide.md#inference-and-test-observer-preflight).
 This metadata check does not create a session, send a prompt or prove native TUI behavior.
 The current candidate includes source implementations for the opt-in Pattern Buffer pressure reminder and Policy Guard OpenCode Prime Directive plugin.
-A separate native v3 context-usage probe observed one prior-assistant usage read, but it does not qualify either candidate plugin's native loading, Pattern Buffer warning delivery, Policy Guard permissions or covered action outcomes.
-The runbook retains its native acceptance prerequisite.
+A bounded native v4 Pattern Buffer case on source candidate `3c86383` observed a low-threshold warning in each of two compaction generations, checkpoint publication after a scoped edit, one manual compaction and lossless same-session recovery.
+That case was accepted as scoped assisted evidence for its exact descriptor and test threshold, without a production timing guarantee.
+The Pattern Buffer source files are unchanged in this integrated candidate, so that observation applies only to the exercised configuration and path.
+A native v8 Policy Guard case on source candidate `3c86383` exercised registered plugin loading, exact parent and child binding, old-owner handoff, report checks, native deny/allow/ASK decisions and post-approval freshness with a scripted local provider and fake `gh`.
+The exercised plugin and covered action handlers are unchanged here; this candidate adds separate Policy Guard migration metadata recovery.
+These scoped observations do not establish Qwen model behavior, real GitHub outcomes, adversarial JSON-bridge security or end-to-end orchestration.
+Dispatch still requires accepted Pattern Buffer evidence for the selected mode and an installed, enabled Policy Guard route for every covered action used by the task.
 
 ## Prerequisites
 
@@ -182,14 +187,18 @@ OpenCode pressure warnings are opt-in and require an imported descriptor for the
 The warning uses a lower anchor from last-measured assistant token usage, not exact current occupancy or guaranteed headroom.
 The `session.compaction` context callback runs after v2.2.5 has decided to compact and cannot warn on that same compaction attempt.
 An ordinary `context` callback for a request below the automatic ceiling can read prior-assistant usage before that request, but it cannot guarantee a warning before every compaction.
-A separate native v3 context-usage probe observed one valid, nonzero prior-assistant usage read matched to the active session, agent, provider, model and variant.
-That observation proves a prior-usage read path only; the backend usable window and active compaction settings needed by the descriptor remain unobserved, and the candidate Pattern Buffer plugin load and warning delivery remain unqualified.
+A separate native v3 probe first observed a valid prior-assistant usage read matched to the active session, agent, provider, model and variant.
+The later native v4 case also observed the exact 131072-token backend window and tested automatic-compaction ceiling of 111412 tokens used by its reviewed descriptor.
+It recorded one warning before the edit publication, one published checkpoint, one manual compaction and one new warning after the compaction generation advanced.
+The case then read the checkpoint in the same session and verified its bytes and recovery marker losslessly.
+This is one scoped assisted observation, not a production threshold, lead-time or general configuration guarantee.
 The native pilot observed shared context, the implementer role and initial task text in a primary request, an updated task in completed compaction, and a broken-bound-context failure that resulted in zero provider requests.
 A separate managed case resumed a permitted fixture read after compaction and correctly held continuation after task finish without another provider request.
 A later supervised case completed a same-session post-compaction edit; the chief reviewed its unchanged diff and ran four passing behavior tests.
 Qwen itself did not run those tests or issue a native test permission request, and model reception of the finished notice remains unqualified.
 The Pattern Buffer source now includes opt-in lower-anchor pressure reminders and checkpoint and compaction lifecycle accounting.
-The separate native v3 usage read did not establish a complete same-session runtime descriptor, Pattern Buffer plugin loading, recovery behavior or warning delivery, so it does not satisfy that readiness requirement.
+The native v4 case described above observed one exact same-session descriptor, warning, checkpoint publication, manual compaction and lossless recovery sequence.
+It satisfies only its accepted scoped evidence; new descriptors, production thresholds and other orchestration modes still require their applicable acceptance.
 
 Hailing Frequencies currently holds OpenCode delivery while the installed CMUX projection reports composer state `unknown`.
 The historical CMUX parser experiment passed its package and build-only checks but was never installed or launched for a native empty-composer check.

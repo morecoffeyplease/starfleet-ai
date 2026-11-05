@@ -7,13 +7,15 @@ It covers both a Codex-Qwen implementer and a Qwen-only orchestrator, including 
 
 This is a source-checked operator recipe, not a clean-host or end-to-end qualification.
 The candidate Pattern Buffer source now includes an opt-in OpenCode lower-anchor pressure reminder, descriptor validation, and checkpoint and compaction lifecycle accounting.
-A separate native v3 context-usage probe observed one valid, nonzero prior-assistant usage read matched to the active session, agent, provider, model and variant.
-This confirms one prior-usage read only; the backend usable window and active compaction settings needed by a runtime descriptor, candidate Pattern Buffer plugin loading, recovery behavior and warning delivery remain unqualified.
-The candidate also includes an opt-in Policy Guard OpenCode Prime Directive plugin with focused source coverage, but native plugin loading, permission handling, and covered action outcomes remain unqualified.
+A native v4 case on source candidate `3c86383` exercised one exact Pattern Buffer descriptor, a low-threshold warning in each of two generations, checkpoint publication, manual compaction and lossless same-session recovery.
+The component owner accepted it as scoped assisted evidence, without a production threshold or warning-timing guarantee.
+A native v8 case on `3c86383` exercised registered Policy Guard plugin loading, exact ownership, report checks, native permission decisions and post-approval freshness with a scripted local provider and fake `gh`.
+The OpenCode plugin and covered action/permission paths are unchanged in this integrated candidate; its later Policy Guard changes cover migration and runtime metadata recovery, which v8 did not exercise.
+These cases do not establish Qwen model behavior, real GitHub action outcomes or adversarial security at the local JSON bridge.
 The Prime Directive plugin passes event data as JSON to a local CLI bridge, and that bridge does not authenticate the event cryptographically.
 A local caller able to invoke the bridge can forge its event shape and bypass the plugin's native permission assertion, subject to the remaining local owner, checkout, and report checks.
 Treat this as a cooperative workflow guard, not an adversarial local-process or operating-system boundary.
-Do not dispatch until the required bounded native acceptance for both features has completed for the selected mode and the owner records its evidence.
+Dispatch requires accepted Pattern Buffer pressure-warning evidence for the selected mode and an installed, enabled Policy Guard route for each covered action used by the task.
 
 The current Model Preferences source reads the API password from the private manifest and places it in the OpenCode TUI process environment.
 This source fact does not establish whether tool subprocesses can read the value; they may use a sanitized environment or execute in another process boundary.
@@ -236,7 +238,10 @@ If the approved CMUX installation requires its project OpenCode hook, run `cmux 
 That is a project-scoped install command, not a read-only status check or proof of live hook delivery.
 Managed dispatch must still confirm the exact session, worktree, CMUX workspace, surface, and hook generation before it releases the prompt.
 The OpenCode Pattern Buffer source includes the opt-in lower-anchor pressure warning described in its guide.
-It remains disabled until an exact-session descriptor is reviewed and imported, and native warning delivery is not yet qualified.
+It remains disabled until an exact-session descriptor is reviewed and imported.
+Native v4 observed a 131072-token backend window, a 111412-token automatic-compaction ceiling and one warning before checkpoint publication.
+After manual compaction advanced the generation, it observed one new warning and lossless same-session recovery.
+That case used a deliberately low test threshold and does not qualify a production threshold, lead time or any untested descriptor.
 
 ## Start one owned runtime pair
 

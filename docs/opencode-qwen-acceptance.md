@@ -179,6 +179,24 @@ The trial did not submit another model request after finish, so model reception 
 The owned API and model stopped after the bounded case.
 This establishes post-compaction permitted-read continuation and a finished-task refusal, not post-compaction code editing, research-role task binding or Qwen-led orchestration.
 
+## Pattern Buffer pressure warning and recovery v4
+
+A native v4 case on source candidate `3c86383` exercised the reviewed descriptor against a 131072-token backend window and 111412-token automatic-compaction ceiling.
+It used a deliberately low 3041-token test threshold to observe the pressure path in a short run; this does not establish a production threshold or guaranteed warning lead time.
+The case recorded one warning in generation zero, one scoped checkpoint edit and one published checkpoint, then a manual compaction and one new warning in generation one.
+The same session read the checkpoint afterward and the observer independently reconstructed the numbered-line output losslessly, matching both the checkpoint bytes and recovery marker.
+The component owner accepted this as scoped assisted evidence for one warning/update, manual compaction and same-session recovery.
+The run used four prompts, including a correction after the first internal file read was denied because an absolute fixture resource did not match OpenCode's location-relative permission resource, plus one warning continuation prompt.
+Keep external paths denied and use the exact project-relative resource; do not widen the fixture permission to resolve an internal path mismatch.
+
+The first v2 observer result was held by a global single-warning assertion even though the native run had one warning in each generation after compaction.
+The corrected count is per generation and shows no duplicate warning within either episode.
+The tool's `execute.after` hook published before the host reported tool completion, so the observed order was tool execution, publication and then host tool completion.
+The earlier observer's opposite timestamp requirement was an observer defect, not a native publication failure.
+A state-changing permission update also returned an unexpected client status while a subsequent read-only `GET` confirmed the update had applied; the exact status was not retained.
+Reconcile unexpected write responses with a read-only `GET` and do not blindly replay a `PATCH`.
+This observation is scoped to the v4 session, descriptor, threshold and assisted sequence, and is not a production timing or autonomy claim.
+
 ## Bounded coding path error
 
 A maximum-thinking native coding case completed the four assigned file reads and edited only `text_cli.py`.
@@ -279,11 +297,23 @@ An ordinary `context` callback for a request below the automatic ceiling can rea
 Pattern Buffer source now includes an opt-in warning from a last-measured lower-anchor token total and requires a reviewed descriptor bound to the exact session and runtime configuration.
 Without that descriptor, the reminder stays disabled; exact current occupancy and guaranteed headroom are not available from this source.
 A separate native v3 context-usage probe observed one valid, nonzero prior-assistant usage read matched to the active session, agent, provider, model and variant.
-That read does not establish the backend usable window and active compaction settings needed by the descriptor, candidate Pattern Buffer plugin loading, warning publication or delivery, or completed-compaction recovery.
-The candidate warning path remains unqualified; the offline controls and canonical verification remain separate evidence.
+The native v4 case above later observed the exact backend window and active compaction settings for its descriptor, plugin warning, publication and recovery path.
+That evidence remains scoped to its reviewed descriptor and run, without a production threshold or timing guarantee.
+The offline controls and canonical verification of the integrated candidate remain separate evidence.
 
-The current integration candidate also includes a Policy Guard OpenCode plugin source path for bounded Prime Directive actions.
-Its focused fixtures are source coverage only; no native plugin load, permission decision or covered GitHub action was qualified on this candidate.
+The current integration candidate includes a Policy Guard OpenCode plugin source path for bounded Prime Directive actions.
+
+### Policy Guard v8 native observation
+
+A native v8 case on source candidate `3c86383` exercised the registered plugin in the real OpenCode executor with a scripted local provider and fake `gh`.
+It exercised exact parent and child binding, the old-owner handoff, delivery-report checks, native deny, allow and ASK decisions, and post-approval freshness before the fake action.
+The v8 evidence reuses a separate v7 native case that independently produced a typed refusal before chain construction.
+The component owner accepted this evidence for the exercised synthetic paths.
+The OpenCode plugin and covered action/permission paths remain unchanged in the integrated candidate, while its later Policy Guard edits are scoped to migration and runtime metadata recovery.
+No native v8 rerun covered those migration changes, and the combined candidate still requires canonical source verification.
+Real GitHub action outcomes, Qwen model behavior and adversarial security at the local JSON bridge remain unqualified.
+Dispatch requires the Policy Guard plugin to be installed and enabled for each covered action route used by the task.
+
 The plugin passes event data as JSON to a local CLI bridge that does not authenticate the event cryptographically.
 A local caller able to invoke that bridge can forge event data and bypass the plugin's native permission assertion, subject to the remaining local owner, checkout and report checks.
 Treat this as a cooperative workflow guard, not an adversarial local-process or operating-system boundary.

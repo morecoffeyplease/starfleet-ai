@@ -6,8 +6,10 @@ The workflow does not require a separate policing service or zero human interven
 Record assistance and interventions so supervised observations are not presented as autonomous orchestration.
 Use the [OpenCode and local Qwen setup guide](opencode-qwen-setup.md) for the pinned pilot configuration and setup prerequisites.
 Use the [Qwen runtime lifecycle runbook](qwen-runtime-lifecycle.md) for private runtime startup, exact managed dispatch commands, worker scaling and owned shutdown.
-The runbook remains gated on native acceptance of the Pattern Buffer pressure reminder and Policy Guard Prime Directive plugin for the selected mode.
-Both source implementations are present in this candidate, but their native warning, recovery, plugin loading, permission and covered-action outcomes remain unqualified.
+The runbook requires accepted Pattern Buffer pressure-warning evidence for the selected mode and an installed, enabled Policy Guard route for each covered action used by the task.
+A native v4 case on source candidate `3c86383` completed one scoped assisted warning/update sequence, one manual compaction, a new warning after the generation advanced and same-session recovery with a deliberately low test threshold.
+A native v8 case on `3c86383` exercised registered Policy Guard loading, ownership, report and permission paths with a scripted local provider and fake `gh`.
+These observations are scoped to their exact source and run; they do not establish production warning timing, real GitHub outcomes, adversarial bridge security or end-to-end orchestration.
 
 Every Qwen run uses a visible OpenCode tab or pane in the existing CMUX workspace assigned to that same task.
 Keep the task, session, worktree and candidate identity together in that workspace.
@@ -29,14 +31,14 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 | Component | Candidate source behavior | Observed native boundary |
 | --- | --- | --- |
 | Model Preferences | Exact provider/model/variant preflight and managed dispatch path in candidate source | Fresh Codex-Qwen startup and one explicit-policy managed continuation preserved a visible synthetic draft; every parent route and Qwen-led orchestration remain unqualified |
-| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks, opt-in lower-anchor pressure reminder, and checkpoint lifecycle accounting | Initial context, compaction, same-session read and a separate finished-task refusal passed; D5 added assisted post-compaction Qwen coding with four parent-run passing tests, without Qwen test execution; a separate native v3 probe read prior-assistant usage once with matching session, agent, provider, model and variant; runtime descriptor, PB plugin loading, pressure, recovery and warning delivery remain unqualified |
+| Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks, opt-in lower-anchor pressure reminder, and checkpoint lifecycle accounting | Native v4 on `3c86383` observed the reviewed descriptor, one warning and checkpoint publication, one manual compaction, a new warning after the generation advanced, and lossless same-session recovery; accepted as scoped assisted evidence without a production timing guarantee |
 | Hailing Frequencies | Exact OpenCode identity, enrollment and guarded API delivery | Native self-enrollment, one experimental API-sidechannel wake, pending-inbox refusal and B12 bounded own-inbox receipt/body consumption passed on their recorded candidates; strict delivery still holds unknown composer state |
 | Discord Watch | Exact thread ownership and guarded Hailing delivery | DW1 reproduced busy receive refusal; DW2 on `ffd0a31` passed local-synthetic receipt and exclusive primary-model body attribution; remote Discord ingestion remains separate |
 | Temporal Beacon | Exact enrolled owner and bounded timer continuation | TC2 reproduced busy timer creation; TC5 on `2dd9410` passed actual Qwen creation with one exact active timer; delivery and automatic wake unobserved |
 | Agent Notify | OpenCode identity and owning-thread paths in source | N1 on `084faeee` completed one assisted real reply/owner-close roundtrip in the same persisted session; automatic DW wake, managed receipt and native-hook restoration remain unqualified |
 | Warp-drive and Away Mode | OpenCode owner identity paths in source | Native Qwen job completion and away-context reception are unqualified |
 | Starfleet Markup | Existing owner-bound CLI and foreground listener; automatic native routes currently target Claude or Codex | No OpenCode automatic feedback-wake qualification; create review documents only when requested |
-| Starfleet Policy Guard | Delivery reports and native-owner seats for documented Claude/Codex paths; opt-in OpenCode plugin source for bounded Prime Directive actions | Native OpenCode plugin load and covered-action outcomes remain unqualified; its local JSON bridge is cooperative and can bypass the plugin permission assertion, so do not treat it as an adversarial boundary |
+| Starfleet Policy Guard | Delivery reports and native-owner seats for documented Claude/Codex paths; opt-in OpenCode plugin source for bounded Prime Directive actions | Native v8 on `3c86383` exercised registered loading, exact parent/child binding and old-owner handoff, report checks, deny/allow/ASK decisions, and post-approval freshness with a real OpenCode executor, scripted local provider and fake `gh`; the route must still be installed and enabled for each covered task action, and the JSON bridge is not an adversarial boundary |
 | Qwen-only orchestration | Opt-in model profile records | A profile is not orchestration proof; Qwen-only startup, actual child delegation, acceptance reporting and escalation remain unqualified |
 
 The active shared profile remains independent of these opt-in examples.
@@ -152,6 +154,16 @@ A separate inbox case stopped before message delivery because its observer compa
 Normalize validated UUID representation for comparison while preserving exact case-sensitive OpenCode session identifiers and process identities.
 These were trial preparation and observation failures, not evidence of failed compaction or inbox consumption.
 
+### Pattern Buffer v4 observer lessons
+
+The v4 case used a deliberately low 3041-token warning threshold against a 131072-token backend window and 111412-token automatic-compaction ceiling to observe one bounded path quickly.
+The threshold is a test mechanism, not a production recommendation or guaranteed lead time.
+The first internal checkpoint read was denied because an absolute fixture permission resource did not match OpenCode's location-relative path; use the exact project-relative resource and keep paths outside the assigned worktree denied.
+The v2 observer's global one-warning assertion rejected two legitimate warnings across separate pre- and post-compaction generations; count one warning per generation and preserve the failed observer result separately from native outcome.
+Publication ran inside `execute.after`, so the observed order was tool execution, checkpoint publication and host tool completion.
+An unexpected client result after a state-changing permission update was followed by a read-only `GET` that confirmed the update had applied; its exact response status was not retained, so do not call it HTTP 204 or replay the update blindly.
+The numbered-line read output was independently reconstructed losslessly from raw content; keep raw API values distinct from rendered text.
+
 A supervised coding attempt completed all four permitted reads, one valid edit and an additional permitted read of the edited file.
 Its trial observer rejected the repeated read because it required an exact read count, so that attempt stopped before tests and did not qualify coding acceptance.
 For ordinary implementation, check required input coverage, allowed resources, bounded work and the resulting diff rather than requiring one particular valid tool sequence.
@@ -208,7 +220,7 @@ A human remains the authority for scope changes, approvals, review launches and 
 8. Set the allowed tools, paths and commands in the local interface or sandbox before the worker starts.
 9. Relay dependencies as concise reports with source, candidate identity, results and remaining uncertainty.
 10. Write acceptance commands, timebox, quiet-time check choice, checkpoints and stop conditions into the task card.
-11. Confirm the Pattern Buffer pressure warning and Prime Directive are implemented and accepted for the selected orchestration mode before dispatch; otherwise stop.
+11. Confirm accepted Pattern Buffer pressure-warning evidence for the selected mode and an installed, enabled Policy Guard route for every covered action used by the task; otherwise stop.
 
 Use the highest supported thinking setting exposed for the exact local model, while reserving enough remaining context for completion evidence and a concise report.
 Record the actual setting used.

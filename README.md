@@ -27,6 +27,7 @@ Start with the component README and its printable guide when available.
 Installation is opt-in, and components do not start workers or change hooks merely because the source is present.
 The [OpenCode and local Qwen setup guide](docs/opencode-qwen-setup.md) records prerequisites, isolated configuration and qualification limits, with the [runtime lifecycle runbook](docs/qwen-runtime-lifecycle.md) for bounded startup and shutdown.
 The [Qwen operating guide](docs/qwen-operating-guide.md) covers task framing, supervision, evidence, secrets and escalation for orchestrators and implementers.
+Qwen dispatch requires accepted Pattern Buffer pressure-warning evidence for the selected mode and an installed, enabled Policy Guard route for each covered action; see the runbook for scope and limits.
 
 ## Prerequisites
 
