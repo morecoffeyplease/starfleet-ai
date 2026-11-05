@@ -29,6 +29,8 @@ SUPPORTED_OPENCODE_VERSION = "2.2.5"
 MAX_REASONING_EFFORT = "max"
 MAX_OUTPUT_TOKENS = 32768
 HTTP_TIMEOUT_SECONDS = 2.0
+# OpenCode 2.2.5 may lazily initialize its provider catalog on the first model read.
+MODEL_CATALOG_HTTP_TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024
 MAX_PASSWORD_BYTES = 4096
@@ -239,6 +241,9 @@ class _Client:
 
     def request(self, method: str, path: str, payload: dict | None = None,
                 *, authenticated: bool = True, location_directory: str | None = None) -> tuple[int, bytes]:
+        is_model_catalog_get = method == "GET" and urllib.parse.urlsplit(path).path == "/api/model"
+        timeout = MODEL_CATALOG_HTTP_TIMEOUT_SECONDS if is_model_catalog_get else HTTP_TIMEOUT_SECONDS
+        timeout_error = "model_catalog_http_timeout" if is_model_catalog_get else "http_timeout"
         headers = {"Accept": "application/json"}
         if authenticated:
             headers["Authorization"] = self.authorization
@@ -250,17 +255,17 @@ class _Client:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.origin + path, data=body, headers=headers, method=method)
         try:
-            response = self.opener.open(request, timeout=HTTP_TIMEOUT_SECONDS)
+            response = self.opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as error:
             status = error.code
             self.last_headers = error.headers or {}
             error.close()
             return status, b""
         except (socket.timeout, TimeoutError):
-            raise OpenCodeDispatchError("http_timeout") from None
+            raise OpenCodeDispatchError(timeout_error) from None
         except urllib.error.URLError as error:
             if isinstance(error.reason, (socket.timeout, TimeoutError)):
-                raise OpenCodeDispatchError("http_timeout") from None
+                raise OpenCodeDispatchError(timeout_error) from None
             raise OpenCodeDispatchError("http_unavailable") from None
         except (OSError, http.client.HTTPException):
             raise OpenCodeDispatchError("http_unavailable") from None
@@ -285,7 +290,7 @@ class _Client:
         except OpenCodeDispatchError:
             raise
         except (socket.timeout, TimeoutError):
-            raise OpenCodeDispatchError("http_timeout") from None
+            raise OpenCodeDispatchError(timeout_error) from None
         except (OSError, http.client.HTTPException):
             raise OpenCodeDispatchError("http_unavailable") from None
 

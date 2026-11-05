@@ -641,6 +641,54 @@ class OpenCodeDispatchTest(unittest.TestCase):
         paths = [path.split("?", 1)[0] for method, path, _ in self.state.calls if method == "GET"]
         self.assertLess(paths.index("/api/model"), paths.index(f"/api/provider/{PROVIDER}"))
 
+    def test_model_catalog_get_uses_longer_timeout_only_for_exact_catalog_route(self):
+        class Response:
+            status = 200
+            headers = {"Content-Length": "2"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _maximum):
+                return b"{}"
+
+        connection = dispatch.load_connection(self.manifest)
+        client = dispatch._Client(connection)
+        with patch.object(client.opener, "open", return_value=Response()) as open_request:
+            client.get("/api/model?location%5Bdirectory%5D=%2Ftmp%2Ftarget",
+                       location_directory="/tmp/target")
+            client.get("/api/model/extra")
+            client.get("/api/info")
+            client.get(f"/api/provider/{PROVIDER}")
+            client.post(f"/api/session/{SESSION}/prompt", {"text": "synthetic"})
+
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in open_request.call_args_list],
+            [dispatch.MODEL_CATALOG_HTTP_TIMEOUT_SECONDS,
+             dispatch.HTTP_TIMEOUT_SECONDS,
+             dispatch.HTTP_TIMEOUT_SECONDS,
+             dispatch.HTTP_TIMEOUT_SECONDS,
+             dispatch.HTTP_TIMEOUT_SECONDS],
+        )
+        self.assertEqual(dispatch.MODEL_CATALOG_HTTP_TIMEOUT_SECONDS, 10.0)
+        self.assertEqual(dispatch.HTTP_TIMEOUT_SECONDS, 2.0)
+
+    def test_model_catalog_timeout_has_phase_specific_error_without_changing_other_timeouts(self):
+        connection = dispatch.load_connection(self.manifest)
+        client = dispatch._Client(connection)
+        with patch.object(client.opener, "open", side_effect=TimeoutError()), \
+                self.assertRaises(dispatch.OpenCodeDispatchError) as catalog_error:
+            client.get("/api/model?location%5Bdirectory%5D=%2Ftmp%2Ftarget")
+        self.assertEqual(catalog_error.exception.code, "model_catalog_http_timeout")
+
+        with patch.object(client.opener, "open", side_effect=TimeoutError()), \
+                self.assertRaises(dispatch.OpenCodeDispatchError) as info_error:
+            client.get("/api/info")
+        self.assertEqual(info_error.exception.code, "http_timeout")
+
     def test_provider_http_diagnostic_exposes_only_operation_and_status(self):
         self.state.provider_route_missing = True
         with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
