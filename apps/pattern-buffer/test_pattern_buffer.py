@@ -860,6 +860,30 @@ else:
         runtime = self.root.parent / "runtime with spaces"
         return settings, runtime, ("--harness", harness, "--settings", str(settings))
 
+    def test_install_preserves_owned_hook_slot_and_mixed_group_fields(self):
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        data = json.loads(settings.read_text())
+        groups = data["hooks"]["SessionStart"]
+        self.assertEqual(len(groups), 1)
+        groups[0]["customFilter"] = {"source": "fixture"}
+        mixed_group_handler = {"type": "command", "command": "echo same-group foreign handler"}
+        groups[0]["hooks"].append(mixed_group_handler)
+        foreign_after_group = {"matcher": "custom-event", "customGroup": "keep",
+                               "hooks": [{"type": "command", "command": "echo later foreign group"}]}
+        groups.append(foreign_after_group)
+        settings.write_text(json.dumps(data))
+        expected_groups = json.loads(settings.read_text())["hooks"]["SessionStart"]
+
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+
+        installed_groups = json.loads(settings.read_text())["hooks"]["SessionStart"]
+        self.assertEqual(installed_groups, expected_groups)
+        self.assertTrue(ci.owned(installed_groups[0]["hooks"][0], "codex"))
+        self.assertEqual(installed_groups[0]["hooks"][1], mixed_group_handler)
+        self.assertEqual(installed_groups[0]["customFilter"], {"source": "fixture"})
+        self.assertEqual(installed_groups[1], foreign_after_group)
+
     def test_install_preserves_existing_settings_and_is_idempotent(self):
         for harness in ("codex", "claude"):
             settings, runtime, options = self.install_args(harness)

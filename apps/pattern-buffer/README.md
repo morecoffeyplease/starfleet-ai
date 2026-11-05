@@ -19,6 +19,9 @@ Dispatch receipts, event logs and Hailing Frequencies receipts describe observed
 Read the [printable guide](guide.md) with the installed command pattern-buffer guide --print before configuring an installation.
 Install only the harness adapters you use.
 Installing one harness refreshes recognized aliases already present in that same runtime directory, while retaining their stable hook commands.
+For events that remain enabled, when one owned handler exists, an upgrade replaces it at its existing group and handler positions while preserving group filters and unrelated handlers.
+Duplicate owned handlers retain the existing cleanup behavior.
+Preserving configured positions does not guarantee that a harness will trust or load the hook or deliver its output.
 It does not change another runtime directory, another harness's settings, or native trust.
 
     pattern-buffer install --harness codex

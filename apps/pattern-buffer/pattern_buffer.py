@@ -727,6 +727,31 @@ def owned(handler, harness):
             and command.endswith(marker(harness)))
 
 
+def reconcile_hook_groups(groups, harness, additions):
+    owned_slots = [(group_index, handler_index)
+                   for group_index, group in enumerate(groups)
+                   for handler_index, handler in enumerate(group["hooks"])
+                   if owned(handler, harness)]
+    if len(owned_slots) == 1 and len(additions) == 1:
+        group_index, handler_index = owned_slots[0]
+        updated = list(groups)
+        group = groups[group_index]
+        handlers = list(group["hooks"])
+        handlers[handler_index] = additions[0]["hooks"][0]
+        updated[group_index] = {**group, "hooks": handlers}
+        return updated
+
+    # Duplicate cleanup and uninstall retain the existing remove-then-add behavior.
+    retained = []
+    for group in groups:
+        handlers = [handler for handler in group["hooks"] if not owned(handler, harness)]
+        if len(handlers) == len(group["hooks"]):
+            retained.append(group)
+        elif handlers:
+            retained.append({**group, "hooks": handlers})
+    return [*retained, *additions]
+
+
 def installed_checkpoints_enabled(data, harness):
     events = ("PreCompact", "PostToolUse", "UserPromptSubmit")
     if any(owned(handler, harness) for event in events
@@ -767,19 +792,16 @@ def configure_hooks(args):
         before = json.dumps(data, sort_keys=True)
         hooks = data.get("hooks", {})
         hooks = dict(hooks)
+        runtime = install["runtime"] if install else None
+        additions_by_event = (hook_config(args.harness, runtime, args.checkpoints)["hooks"]
+                              if install else {})
         for event in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit"):
-            groups = []
-            for group in hooks.get(event, []):
-                handlers = [item for item in group["hooks"] if not owned(item, args.harness)]
-                if len(handlers) == len(group["hooks"]):
-                    groups.append(group)
-                elif handlers:
-                    groups.append({**group, "hooks": handlers})
+            groups = reconcile_hook_groups(hooks.get(event, []), args.harness,
+                                           additions_by_event.get(event, []))
             if groups:
                 hooks[event] = groups
             else:
                 hooks.pop(event, None)
-        runtime = install["runtime"] if install else None
         if install:
             base = install["base"]
             runtime_launcher = install["runtime_launcher"]
@@ -787,8 +809,6 @@ def configure_hooks(args):
             install_scripts = install["install_scripts"]
             install_sources = install["sources"]
             launcher_source = install["launcher_source"]
-            for event, additions in hook_config(args.harness, runtime, args.checkpoints)["hooks"].items():
-                hooks.setdefault(event, []).extend(additions)
         if hooks:
             data["hooks"] = hooks
         else:
