@@ -298,12 +298,27 @@ The currently used stock CMUX continues to report composer state `unknown`, so s
 The custom source experiment is historical and is not a supported deployment route for these docs.
 Use supported stock CMUX and do not claim native empty-versus-draft acceptance from source or build-only checks.
 
+## Representative workflow dispositions
+
+A representative Warp workflow attempted on `818a082` failed without submitting its intended inner light job.
+The observed tools were four denied context or Git reconnaissance commands; the exact allowed dispatch command was never attempted.
+The managed launch also ended uncertain because its exact native hook record remained absent after the API turn completed.
+The missing-hook cause was not established, and the original attempt was not replayed.
+This records a failed representative attempt, without a job-submission, child-delegation or native OpenCode Warp-ownership claim.
+
+The real Discord conversation and reply were retained for recovery on the lifecycle candidate `084faeee`.
+A fresh client attached to the same persisted session, but the native hook guard held before a pointer prompt, receive operation or model request.
+That recovery did not qualify managed receipt, automatic wake or an end-to-end real Discord roundtrip.
+Preparation of a manual assisted route is not an executed or accepted roundtrip.
+These final dispositions preserve the existing evidence and limits without requiring additional inference or an exhaustive live matrix.
+
 ## Representative verification and remaining limits
 
 The current completion standard is representative relevant tool use, ordinary software verification and accurate reporting of limits.
 It does not require every tool or branch to run live through Qwen, full autonomy, Qwen-executed tests or a native test permission request.
 Reuse the recorded HF, Temporal, Pattern Buffer and supervised coding observations within their exact candidate and assistance boundaries.
-One representative light Warp job and one real Discord roundtrip are separate workflow observations; their results must be recorded when actually available.
+The representative Warp attempt and real Discord recovery are recorded above with their unsuccessful or unqualified outcomes.
+Neither is reported as a completed workflow or silently left as future acceptance work.
 No exhaustive live matrix or additional model trial is implied by an unobserved table cell.
 
 Strict delivery remains held on unknown composer state; the opted-in experimental API-sidechannel cases do not establish universal send safety.

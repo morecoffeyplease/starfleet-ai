@@ -371,7 +371,8 @@ Canonical aggregate verification and Model Preferences component verification ar
 Verify representative relevant tool use and run ordinary software tests on the final candidate.
 Do not require every component or branch to run live through Qwen, full autonomy, Qwen-executed tests or a native test permission request as a completion gate.
 Reuse the recorded HF, Temporal, Pattern Buffer and supervised coding evidence with its exact source pins and assistance attribution.
-One representative light Warp job and one real Discord roundtrip provide useful additional workflow observations when actually completed.
+The representative light Warp attempt failed before any inner job was submitted, and the real Discord recovery remained unqualified.
+Record those outcomes directly; do not describe preparation or a retained reply as workflow completion.
 A prepared card, queued job or open post is not a completed roundtrip.
 Record the actual results without launching more inference solely to fill a matrix.
 

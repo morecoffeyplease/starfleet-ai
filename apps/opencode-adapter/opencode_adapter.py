@@ -462,4 +462,3 @@ class OpenCodeSessionAdapter:
             return Inspection("clear", (), api_state, identity)
         except AdapterError as error:
             return Inspection("hold", (error.code,), api_state, identity)
-
