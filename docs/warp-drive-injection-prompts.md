@@ -9,7 +9,7 @@ They do not grant authority beyond the operator's existing instructions.
 For CPU-intensive local work, read `warp-drive guide --print` and use its reservation workflow.
 Eligible unserved worktrees are selected by authorized boost, least recently served round, then manual order, with waiting credit and stable request details breaking ties.
 The existing protected aged-target path keeps its earned-credit selection and protected-turn behavior.
-Submit one meaningful CPU phase per reservation and count independent workload slots that run simultaneously, not backend threads.
+Submit one meaningful CPU phase per reservation and declare its workload family, size, expected runtime, and count of independent workload slots that run simultaneously, not backend threads.
 Do not sum worker counts across serial phases.
 Within one checkout, keep only one CPU-intensive request eligible when commands share generated files, caches, or a database.
 Enable each dependent phase after its predecessor finishes.
@@ -23,6 +23,7 @@ Foreground attach sends product output to the current CLI's stdout, so redirecte
 An unknown result is not permission to rerun the command.
 
 Use your own observed harness, session, and surface as the completion recipient.
+Use another owner's exact enrolled identity only when that owner explicitly delegates it for this request.
 New submit, run, and batch items require one exact local Hailing enrollment match for the harness, session, and surface.
 This check accepts enrolled idle or busy recipients and explicitly delegated parents without checking prompt readiness or starting a service.
 Correct a rejected tuple to the observed enrolled recipient, or follow the Hailing guide to enroll the actual intended owner; never enroll a guessed or mistyped identity.

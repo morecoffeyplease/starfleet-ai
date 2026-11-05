@@ -1431,8 +1431,6 @@ def hailing_target_for_owner(owner, targets):
 def require_hailing_enrollment(owner, snapshot):
     if hailing_target_for_owner(owner, snapshot["targets"]) is not None:
         return
-    enroll = ("hailing-frequencies enroll --harness {harness} --surface {surface} "
-              "--session {session} --label warp-drive-owner").format(**owner)
     if snapshot["problem"]:
         detail = snapshot["problem"]
     elif snapshot["malformed"]:
@@ -1442,7 +1440,6 @@ def require_hailing_enrollment(owner, snapshot):
         detail = "No exact Hailing enrollment matches this harness, session, and surface"
     raise WarpError(f"{detail}. Correct the tuple to the observed enrolled recipient, or follow "
                     "`hailing-frequencies guide --print` to enroll the actual intended owner. "
-                    f"Only after confirming that this is the intended native identity, enroll with: {enroll}. "
                     "An explicitly delegated parent is accepted when its exact tuple is enrolled; "
                     "Warp-drive does not enroll recipients or start Hailing services.")
 

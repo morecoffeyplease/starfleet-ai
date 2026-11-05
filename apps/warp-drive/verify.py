@@ -2171,7 +2171,8 @@ def test_new_recipient_enrollment_guard(temp):
     typo_run_args[delimiter:delimiter] = ["--attach-timeout", "0.1"]
     typo_run = run_cli(state, *typo_run_args, env=env, ok=False)
     check(typo_run.returncode == 2 and "No exact Hailing enrollment" in typo_run.stderr and
-          "Correct the tuple" in typo_run.stderr and not marker.exists(),
+          "Correct the tuple" in typo_run.stderr and
+          "hailing-frequencies enroll" not in typo_run.stderr and not marker.exists(),
           "run accepted an unmatched recipient or launched its product command")
     with contextlib.closing(warp_drive.connect(state)) as db:
         check(db.execute("SELECT count(*) FROM reservations").fetchone()[0] == 0 and
