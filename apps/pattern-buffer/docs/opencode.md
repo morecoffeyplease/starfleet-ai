@@ -33,6 +33,8 @@ The plugin throws when a bound child lacks its exact task/session state or when 
 Pinned v2.2.5 source awaits these callbacks before returning the prepared provider request, but the native pilot must still verify that a failed callback produces zero provider requests.
 Checkpoint pressure detection, compaction telemetry, native session recovery evidence, and native delivery confirmation are not implemented here.
 The existing synthetic trial evidence proves only its own candidate fixture, denied actions, API call, tests, and rollback.
+A separate N1 human-assisted visible-session continuation on `084faeee` completed a real Agent Notify roundtrip in the same persisted Qwen session.
+That assisted legacy CLI result does not establish automatic Pattern Buffer native recovery, global native-hook restoration or model reception of the finished-task notice.
 Do not make a portable acceptance claim until the actual OpenCode candidate passes its acceptance task and its owner records the evidence.
 
 ## Explicit opt-in plugin setup

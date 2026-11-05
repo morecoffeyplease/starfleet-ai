@@ -30,7 +30,7 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 | Hailing Frequencies | Exact OpenCode identity, enrollment and guarded API delivery | Native self-enrollment, one experimental API-sidechannel wake, pending-inbox refusal and B12 bounded own-inbox receipt/body consumption passed on their recorded candidates; strict delivery still holds unknown composer state |
 | Discord Watch | Exact thread ownership and guarded Hailing delivery | DW1 reproduced busy receive refusal; DW2 on `ffd0a31` passed local-synthetic receipt and exclusive primary-model body attribution; remote Discord ingestion remains separate |
 | Temporal Beacon | Exact enrolled owner and bounded timer continuation | TC2 reproduced busy timer creation; TC5 on `2dd9410` passed actual Qwen creation with one exact active timer; delivery and automatic wake unobserved |
-| Agent Notify | OpenCode identity and owning-thread paths in source | Real conversation/reply outcomes are tracked separately; local-synthetic receipt does not prove remote ingestion |
+| Agent Notify | OpenCode identity and owning-thread paths in source | N1 on `084faeee` completed one assisted real reply/owner-close roundtrip in the same persisted session; automatic DW wake, managed receipt and native-hook restoration remain unqualified |
 | Warp-drive and Away Mode | OpenCode owner identity paths in source | Native Qwen job completion and away-context reception are unqualified |
 | Starfleet Markup | Existing owner-bound CLI and foreground listener; automatic native routes currently target Claude or Codex | No OpenCode automatic feedback-wake qualification; create review documents only when requested |
 | Starfleet Policy Guard | Delivery reports and native-owner seats for documented Claude/Codex GitHub CLI paths | No OpenCode policy-seat load or native-owner action observed; do not infer an OpenCode gate |
@@ -51,7 +51,8 @@ The later B12 case separately qualified one own-inbox receipt and primary-model 
 The first explicit-policy Model Preferences attempt stopped with uncertain admission and was not replayed; persisted evidence exposed a receipt-schema mismatch.
 After correction, a fresh actual managed continuation completed its reply with the unsent draft intact and absent from server context.
 The strict composer policy remains the default.
-Human-controlled visible-session resume is an available fallback, but its own acceptance remains unproven.
+N1 separately qualified one human-controlled visible-session continuation for an assisted real Discord roundtrip.
+Record the chief-entered user reply, restored same-session client/API scope and manually entered pointer tasks; this does not qualify automatic wake or managed native recovery.
 
 ### Operator guidance
 
@@ -361,6 +362,7 @@ The trial labels identify observations, not public commands or reproducibility p
 | A11 implementer | `818a082` | Scoped native coding | Six tools and one-file diff reviewed by chief; private review-receipt transport stopped observer before tests | Partial coding evidence; no model or source failure inferred |
 | DW2 recipient | `ffd0a31` | Local synthetic reply receipt | Exact CLI body and persisted receipt, completed max-Qwen token attributed only to primary tool result | No remote Discord registration or ingestion proof |
 | TC5 owner | `2dd9410` | Create a two-minute timer during running tool turn | CLI exit zero, exactly one raw active timer and no occurrences, exact identity and schedule | Creation only; no delivery worker, automatic wake or continuation consumption |
+| N1 assisted owner | `084faeee` | Real Discord reply and owner close in the same persisted Qwen session | Actual wait/close CLI exit zero, primary max-Qwen exact reply from tool role, remote/local closure and stopped runtimes | Chief entered user reply, restored same-session scope and manual pointer tasks; no automatic wake, managed DW receipt or native-hook restoration |
 
 The documentation aggregate starts from source `818a082` and includes the accepted Temporal creation chain through `2dd9410` and Discord receipt/lifecycle policy chain through `084faeee`.
 The earlier native passes retain their original candidate pins and are not silently promoted to this newer source.
@@ -371,8 +373,9 @@ Canonical aggregate verification and Model Preferences component verification ar
 Verify representative relevant tool use and run ordinary software tests on the final candidate.
 Do not require every component or branch to run live through Qwen, full autonomy, Qwen-executed tests or a native test permission request as a completion gate.
 Reuse the recorded HF, Temporal, Pattern Buffer and supervised coding evidence with its exact source pins and assistance attribution.
-The representative light Warp attempt failed before any inner job was submitted, and the real Discord recovery remained unqualified.
-Record those outcomes directly; do not describe preparation or a retained reply as workflow completion.
+The representative light Warp attempt failed before any inner job was submitted.
+N1 later completed a real Discord reply/owner-close roundtrip through an explicitly assisted visible-session route, preserving the earlier held recovery.
+Record the assistance and actual CLI/model/closure evidence; automatic DW wake, managed receipt and global native-hook restoration remain unqualified.
 A prepared card, queued job or open post is not a completed roundtrip.
 Record the actual results without launching more inference solely to fill a matrix.
 

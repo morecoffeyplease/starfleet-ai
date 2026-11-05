@@ -184,9 +184,11 @@ A fresh candidate passed actual Qwen-origin Hailing self-enrollment with an exac
 On that enrollment candidate, one experimental API-sidechannel Hailing wake completed its exact Qwen reply, and a pending-inbox control refused further delivery without new provider activity.
 A fresh case on `818a082` subsequently completed the Qwen-origin own-inbox CLI and exact local receipt while its API was running.
 Independent tool and request-channel inspection attributed the completed max-Qwen body-derived reply to the primary tool result.
-This qualifies bounded inbox consumption; other pending-interaction controls, Discord replies and timer delivery retain their separate gaps.
+This qualifies bounded inbox consumption; the later assisted Discord roundtrip below is separate, and other pending-interaction controls and timer delivery retain their limits.
 The default strict composer policy is unchanged; do not opt in based only on source availability.
-Human-controlled visible-session resume remains a fallback requiring its own acceptance.
+One N1 case on `084faeee` later qualified a human-controlled visible-session continuation for a real Agent Notify reply and owner close in the same persisted Qwen session.
+The chief supplied the signed-in user reply and manual pointer tasks after restoring the actual client/API scope; reply content entered the model only through the tool result.
+This is assisted legacy CLI coverage, without automatic DW wake, managed DW receipt or global native-hook restoration.
 A later timer case on `2dd9410` qualified actual Qwen-origin timer creation while busy, without delivery or automatic wake.
 A local-synthetic Discord Watch case on `ffd0a31` qualified receipt and primary-model body consumption, without remote registration or ingestion.
 Lifecycle identity and delivery-policy changes were accepted separately at `084faeee`.

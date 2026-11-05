@@ -286,7 +286,8 @@ The initial API-first experiment checked exact native ownership and preserved on
 The later explicit policy candidate passed one fresh Model Preferences continuation after the receipt correction, with the later experimental Hailing wake and pending-inbox control qualified separately above.
 Source inspection of the [pinned TUI submission path](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/tui/src/component/prompt/index.tsx) and [TUI state handling](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/tui/src/context/data.tsx) suggests that an external API prompt leaves the TUI composer untouched because the local reset occurs in the TUI submission path.
 This source-based inference is consistent with the bounded draft-preservation observations above; it does not establish safe automation in every state.
-A human-controlled visible-session resume remains an unproven alternative and is not the selected experiment.
+A later N1 case separately qualified one human-assisted visible-session continuation for a real Discord roundtrip, as recorded below.
+It does not qualify automatic continuation or a managed native-hook recovery path.
 The installed project hook discovery also reported a duplicate server-plugin ID for a compatibility file; one package was active and the duplicate was failed.
 The trial does not establish that this duplicate caused either ownership or composer behavior.
 
@@ -309,16 +310,24 @@ This records a failed representative attempt, without a job-submission, child-de
 The real Discord conversation and reply were retained for recovery on the lifecycle candidate `084faeee`.
 A fresh client attached to the same persisted session, but the native hook guard held before a pointer prompt, receive operation or model request.
 That recovery did not qualify managed receipt, automatic wake or an end-to-end real Discord roundtrip.
-Preparation of a manual assisted route is not an executed or accepted roundtrip.
-These final dispositions preserve the existing evidence and limits without requiring additional inference or an exhaustive live matrix.
+A later N1 assisted run on `084faeee` completed the real roundtrip using that same persisted Qwen session and retained conversation.
+The chief entered one synthetic configured-user reply through the signed-in Discord UI, restored the same session's API and actual client scope, then manually entered pointer-only receive and close tasks into the verified visible client.
+The actual wait command exited zero, and the primary local Qwen model at `max` returned the exact received reply body.
+The reply token was absent from the initial model prompt and first appeared through the tool result.
+The same owner completed the close command with exit zero; remote observation showed the conversation closed and independent local state showed it no longer open.
+Both owned API and model processes stopped.
+This qualifies one representative assisted Agent Notify real roundtrip and human-controlled visible-session continuation.
+It does not qualify automatic Discord Watch wake, managed Discord Watch receipt or global native-hook restoration.
+The earlier held recovery remains preserved and is not retroactively marked successful.
+These dispositions preserve the evidence and limits without requiring additional inference or an exhaustive live matrix.
 
 ## Representative verification and remaining limits
 
 The current completion standard is representative relevant tool use, ordinary software verification and accurate reporting of limits.
 It does not require every tool or branch to run live through Qwen, full autonomy, Qwen-executed tests or a native test permission request.
 Reuse the recorded HF, Temporal, Pattern Buffer and supervised coding observations within their exact candidate and assistance boundaries.
-The representative Warp attempt and real Discord recovery are recorded above with their unsuccessful or unqualified outcomes.
-Neither is reported as a completed workflow or silently left as future acceptance work.
+The representative Warp attempt remains failed with no inner job, while the later real Discord roundtrip has the explicitly assisted acceptance recorded above.
+Neither result is generalized into autonomous orchestration or blanket automatic delivery support.
 No exhaustive live matrix or additional model trial is implied by an unobserved table cell.
 
 Strict delivery remains held on unknown composer state; the opted-in experimental API-sidechannel cases do not establish universal send safety.
