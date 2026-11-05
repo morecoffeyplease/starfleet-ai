@@ -356,11 +356,12 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("WARNING: orchestrator", result.stderr)
         # A longer actual identity can exceed the cap even when the sample fits.
         result = self.cli("validate", "--session", "s" * 512, success=False)
-        self.assertIn("orchestrator context uses", result.stderr)
-        self.assertIn("over)", result.stderr)
+        self.assertRegex(result.stderr,
+                         r"orchestrator: Header \d+ bytes; content 7607 / \d+ usable bytes; -\d+ bytes remaining\.")
         source.write_text(text + "é" * 500)
         result = self.cli("validate", success=False)
-        self.assertIn("orchestrator context uses", result.stderr)
+        self.assertRegex(result.stderr,
+                         r"orchestrator: Header \d+ bytes; content 8607 / \d+ usable bytes; -\d+ bytes remaining\.")
         # The active implementer still fits; lint must catch the other role too.
         self.assertIn("implementer:", result.stdout)
 
@@ -769,6 +770,12 @@ else:
         self.assertFalse(report["checks"]["hook_runtime"]["ok"])
         self.assertIn("runtime differs", report["checks"]["hook_runtime"]["detail"])
 
+        refused = self.cli("install", *options, "--runtime-dir", str(runtime), success=False)
+        self.assertIn("refusing to update unowned runtime entrypoint", refused.stderr)
+
+        settings = self.root.parent / "fresh codex settings.json"
+        runtime = self.root.parent / "fresh runtime with spaces"
+        options = ("--harness", "codex", "--settings", str(settings))
         self.cli("install", *options, "--runtime-dir", str(runtime))
         data = json.loads(settings.read_text())
         handler = data["hooks"]["SessionStart"][0]["hooks"][0]
@@ -950,6 +957,35 @@ else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(lambda _: self.cli("install", *options, "--runtime-dir", str(runtime)), range(4)))
         self.assertEqual(json.loads(self.cli("status", *options).stdout)["owned_hook_handlers"], 1)
+
+    def test_parallel_cross_harness_installs_share_runtime_lock(self):
+        codex_settings, runtime, codex_options = self.install_args("codex")
+        claude_settings, claude_runtime, claude_options = self.install_args("claude")
+        self.assertEqual(runtime, claude_runtime)
+        installs = [("install", *codex_options, "--runtime-dir", str(runtime)),
+                    ("install", *claude_options, "--runtime-dir", str(runtime))]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda args: self.cli(*args), installs))
+
+        codex_status = json.loads(self.cli("status", *codex_options).stdout)
+        claude_status = json.loads(self.cli("status", *claude_options).stdout)
+        self.assertEqual(codex_status["owned_hook_handlers"], 1)
+        self.assertEqual(claude_status["owned_hook_handlers"], 1)
+        cores = [(runtime / "pattern_buffer.py").read_bytes()]
+        for harness in ("codex", "claude"):
+            for script in (runtime / f"context_injector_{harness}.py",
+                           runtime / f"pattern_buffer_{harness}.py"):
+                self.assertTrue(script.is_file())
+                self.assertIn("def configure_hooks(args):", script.read_text())
+                cores.append(script.read_bytes())
+        self.assertTrue(all(core == cores[0] for core in cores[1:]))
+        for helper in ("checkpoint", "enrollment", "sessions", "reliability"):
+            copies = [runtime / f"{prefix}_{harness}_{helper}.py"
+                      for harness in ("codex", "claude")
+                      for prefix in ("context_injector", "pattern_buffer")]
+            self.assertTrue(all(path.is_file() for path in copies))
+            contents = [path.read_bytes() for path in copies]
+            self.assertTrue(all(content == contents[0] for content in contents[1:]))
 
     def implementer(self, brief="Implement the assigned change. Verify the result."):
         self.cli("init", "--default-role", "orchestrator")

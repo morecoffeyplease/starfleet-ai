@@ -3,7 +3,7 @@
 import argparse
 import datetime
 from dataclasses import asdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import importlib.util
@@ -13,6 +13,7 @@ from pathlib import Path
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -402,6 +403,48 @@ def locked(path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+@contextmanager
+def locked_directory(path):
+    """Serialize installs that share a runtime, even across harness settings files."""
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"runtime directory changed or is unsafe: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ValueError(f"runtime path must be a directory: {path}")
+
+        def validate_path_identity():
+            try:
+                current = os.stat(path, follow_symlinks=False)
+            except OSError as error:
+                raise ValueError(f"runtime directory changed or is unsafe: {path}") from error
+            if (not stat.S_ISDIR(current.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+                raise ValueError(f"runtime directory changed or is unsafe: {path}")
+
+        validate_path_identity()
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError(f"another Pattern Buffer install holds runtime directory {path}")
+                time.sleep(0.05)
+        try:
+            validate_path_identity()
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def settings_path(harness, explicit=None):
     if explicit:
         return Path(explicit).expanduser().absolute()
@@ -547,10 +590,14 @@ def owned_runtime_core(path, harness):
     return text
 
 
-def prepare_install(args):
-    base = Path(args.runtime_dir).expanduser().absolute() if args.runtime_dir else (
+def runtime_directory(args):
+    return Path(args.runtime_dir).expanduser().absolute() if args.runtime_dir else (
         Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
         / "starfleet-ai" / "context-injector")
+
+
+def prepare_install(args):
+    base = runtime_directory(args)
     runtime = base / f"context_injector_{args.harness}.py"
     canonical_runtime = base / "pattern_buffer.py"
     harness_alias = base / f"pattern_buffer_{args.harness}.py"
@@ -637,8 +684,29 @@ def owned(handler, harness):
 
 def configure_hooks(args):
     path = settings_path(args.harness, args.settings)
-    install = prepare_install(args) if args.command == "install" else None
-    with locked(path.with_name(path.name + ".context-injector.lock")):
+    with ExitStack() as locks:
+        install = None
+        if args.command == "install":
+            base = runtime_directory(args)
+            # Keep malformed settings and unsafe runtimes as no-write refusals.
+            read_settings(path)
+            try:
+                install = prepare_install(args)
+            except ValueError:
+                if base.is_symlink() or not base.is_dir():
+                    raise
+                # Another cooperating install may have been between its atomic
+                # bundle writes during the refusal-only preflight above.
+                locks.enter_context(locked_directory(base))
+                install = prepare_install(args)
+            else:
+                if not base.exists():
+                    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+                locks.enter_context(locked_directory(base))
+                # Rebuild the complete plan while holding the shared runtime lock.
+                # Other-harness aliases may have changed since the first snapshot.
+                install = prepare_install(args)
+        locks.enter_context(locked(path.with_name(path.name + ".context-injector.lock")))
         data = read_settings(path)
         before = json.dumps(data, sort_keys=True)
         hooks = data.get("hooks", {})
