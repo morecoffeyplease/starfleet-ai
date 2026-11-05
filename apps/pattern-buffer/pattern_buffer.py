@@ -905,8 +905,8 @@ def list_owner_tasks(owner_cwd, status=None):
 
 def preflight_dispatch_standing(root, source, harness, content):
     # The native session is created by the harness, so reserve its exact UUID-sized header here.
-    render_standing(root, source, harness, "00000000-0000-4000-8000-000000000000", "",
-                    "implementer", "session assignment", content)
+    return render_standing(root, source, harness, "00000000-0000-4000-8000-000000000000", "",
+                           "implementer", "session assignment", content)
 
 
 def prepare_dispatch(root, gitdir, args):
@@ -956,10 +956,11 @@ def prepare_dispatch(root, gitdir, args):
     return task_id
 
 
-def preflight_dispatch_context(root, harness):
+def preflight_dispatch_context(root, harness, task_id, task_data, brief):
     root, gitdir = checkout(root)
     _config, source = load(root, gitdir)
-    preflight_dispatch_standing(root, source, harness, sections(source))
+    standing = preflight_dispatch_standing(root, source, harness, sections(source))
+    return compose_task_context(standing, task_id, task_data, brief)
 
 
 def bind_dispatch(root, gitdir, harness, session, task_id):
@@ -1412,12 +1413,18 @@ def render(cwd, harness, session, agent="", forced_role=None):
         expected_owner = config.get("context_owner") or {"root": str(root), "gitdir": str(gitdir)}
         if data["owner"] != expected_owner or data["session_id"] != session or data["harness"] != harness:
             raise ValueError("task/session/context-owner binding changed")
-        if data["status"] == "finished":
+        return compose_task_context(text, task_id, data, brief)
+    return compose_task_context(text)
+
+
+def compose_task_context(text, task_id=None, task_data=None, brief=None):
+    if task_id is not None:
+        if task_data["status"] == "finished":
             text += f"\n\nTask {task_id} is finished. No task is restored; await a new assignment."
         else:
-            text += (f"\n\n# Active task {task_id}\nTask brief SHA-256: {data['brief_sha256']}\n"
+            text += (f"\n\n# Active task {task_id}\nTask brief SHA-256: {task_data['brief_sha256']}\n"
                      "Repeat of the dispatched assignment, subject to later user direction; this does not reset progress.\n\n" + brief)
-    if len(text.encode()) > INJECTION_LIMIT:
+    if len(text.encode("utf-8")) > INJECTION_LIMIT:
         raise ValueError("combined reminder and task exceed the 24 KiB injection limit")
     return text
 
@@ -2037,8 +2044,8 @@ def main():
             if args.prepare_only:
                 print(json.dumps({"task_id": task_id, "environment": {DISPATCH_ENV: task_id}}))
             else:
-                _, brief = read_task(root, gitdir, task_id)
-                preflight_dispatch_context(root, args.harness)
+                task_data, brief = read_task(root, gitdir, task_id)
+                preflight_dispatch_context(root, args.harness, task_id, task_data, brief)
                 print(f"Pattern Buffer dispatch {task_id}; task retained for explicit update/finish.", file=sys.stderr, flush=True)
                 snapshot = task_path(gitdir, task_id).parent / f"{hashlib.sha256(brief.encode()).hexdigest()}.txt"
                 with snapshot.open("rb") as handle:

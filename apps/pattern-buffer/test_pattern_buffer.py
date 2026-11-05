@@ -476,7 +476,8 @@ class PatternBufferTests(unittest.TestCase):
                 self.assertNotIn("unassigned", enrolled["standing_context_budgets"]["roles"])
 
                 preview = self.cli("preview", "--harness", harness, "--session", session)
-                self.assertEqual(len(preview.stdout.encode("utf-8")), expected)
+                self.assertTrue(preview.stdout.endswith("\n"))
+                self.assertEqual(len(preview.stdout[:-1].encode("utf-8")), expected)
                 status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
                 budgets = status["standing_context_budgets"]
                 self.assertEqual(budgets["role"], "orchestrator")
@@ -1112,6 +1113,61 @@ else:
         self.assertIn(f"{actual_budget['bytes_used']} / 8192 bytes", rejected.stderr)
         self.assertFalse(started.exists())
         self.assertTrue(self.registration(worker).exists())
+
+    def test_dispatch_preflights_composed_task_limit_before_launch_with_shorter_control(self):
+        worker, task_file = self.implementer()
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        source = self.root / ".context-injector/context.md"
+        source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\nz\n")
+        session = "88888888-8888-4888-8888-888888888888"
+        content = ci.sections_text(source.read_text())
+        header = ci.standing_parts(
+            worker.resolve(), source.resolve(), "codex", session, "",
+            "implementer", "session assignment", content)[0]
+        shared_bytes = 8111 - len(header.encode("utf-8")) - len("\n\ny".encode("utf-8"))
+        source.write_text("# shared\n" + "x" * shared_bytes +
+                          "\n# implementer\ny\n# orchestrator\nz\n")
+        content = ci.sections_text(source.read_text())
+        standing, standing_budget = ci.render_standing_details(
+            worker.resolve(), source.resolve(), "codex", session, "",
+            "implementer", "session assignment", content)
+        self.assertEqual(len(standing.encode("utf-8")), 8111)
+        self.assertEqual(standing_budget["bytes_used"], 8111)
+
+        started = self.root.parent / "codex-combined-started"
+        harness = self.root.parent / "codex"
+        harness.write_text("#!" + sys.executable + "\n" + f'''import json, os, subprocess, sys
+from pathlib import Path
+Path({str(started)!r}).write_text("started")
+task = sys.stdin.read()
+settings = json.loads(Path({str(settings)!r}).read_text())
+command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+payload = {{"hook_event_name": "SessionStart", "source": "startup",
+           "session_id": {session!r}, "cwd": os.getcwd()}}
+result = subprocess.run(command, shell=True, input=json.dumps(payload), capture_output=True, text=True)
+print(json.dumps({{"task": task, "hook_returncode": result.returncode, "hook_stdout": result.stdout}}))
+''')
+        harness.chmod(0o700)
+
+        task_file.write_text("x" * ci.TASK_LIMIT)
+        rejected = self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
+                            "--task-file", str(task_file), "--settings", str(settings), "--",
+                            str(harness), "exec", "-C", str(worker), "-", root=worker, success=False)
+        self.assertIn("combined reminder and task exceed the 24 KiB injection limit", rejected.stderr)
+        self.assertFalse(started.exists())
+
+        task_file.write_text("y" * 15884)
+        accepted = self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
+                            "--task-file", str(task_file), "--settings", str(settings), "--",
+                            str(harness), "exec", "-C", str(worker), "-", root=worker)
+        self.assertTrue(started.exists())
+        result = json.loads(accepted.stdout)
+        self.assertEqual(result["task"], "y" * 15884)
+        self.assertEqual(result["hook_returncode"], 0)
+        hook = json.loads(result["hook_stdout"])
+        self.assertIn("additionalContext", hook["hookSpecificOutput"])
+        self.assertTrue(hook["hookSpecificOutput"]["additionalContext"].endswith("y" * 15884))
 
     def test_dispatch_exec_preserves_path_shim_arguments_and_exact_stdin(self):
         worker, task_file = self.implementer("The exact original task.\n")
