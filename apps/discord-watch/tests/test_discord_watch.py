@@ -164,6 +164,11 @@ class FakeCmux:
             raise ValueError(self.fail_binding)
         return True
 
+    def owner_identity_binding(self, current):
+        if current.get("harness") != "opencode":
+            raise ValueError("Owner identity check requires OpenCode")
+        return self.binding(current)
+
     def enrollment_binding(self, current):
         return self.binding(current)
 
