@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -122,10 +123,50 @@ def _remove_staging(root):
     shutil.rmtree(root, ignore_errors=True)
 
 
+def _remove_published_runtime(runtime, identity):
+    runtime = Path(runtime)
+    try:
+        root_stat = runtime.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(root_stat.st_mode) or (root_stat.st_dev, root_stat.st_ino) != identity:
+        raise RuntimeError("Refusing to remove a runtime not owned by this installation")
+
+    runtime.chmod(0o700)
+    for path in runtime.rglob("*"):
+        path_stat = path.lstat()
+        if stat.S_ISDIR(path_stat.st_mode):
+            path.chmod(0o700)
+        elif not stat.S_ISLNK(path_stat.st_mode):
+            path.chmod(0o600)
+
+    root_stat = runtime.lstat()
+    if not stat.S_ISDIR(root_stat.st_mode) or (root_stat.st_dev, root_stat.st_ino) != identity:
+        raise RuntimeError("Refusing to remove a runtime no longer owned by this installation")
+    shutil.rmtree(runtime)
+    if os.path.lexists(runtime):
+        raise OSError(f"Published runtime still exists after cleanup: {runtime}")
+
+
+def _require_sealed_runtime(runtime):
+    runtime = Path(runtime)
+    for path in (runtime, *runtime.rglob("*")):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            expected = 0o555
+        elif stat.S_ISREG(mode):
+            expected = 0o444
+        else:
+            raise ValueError("Existing runtime contains an unsupported entry")
+        if stat.S_IMODE(mode) != expected:
+            raise ValueError(f"Existing runtime is not sealed: {runtime}")
+
+
 def _verify_existing_runtime(runtime, expected_hashes, expected_digest):
     runtime = Path(runtime)
     if runtime.is_symlink() or not runtime.is_dir():
         raise ValueError("Refusing invalid immutable runtime")
+    _require_sealed_runtime(runtime)
     if _file_map(runtime) != expected_hashes:
         raise ValueError("Existing runtime content does not match its content identity")
     try:
@@ -189,8 +230,20 @@ def install(runtime_root=None, bin_dir=None, uninstall=False, provisioner=None):
             _verify_existing_runtime(runtime, file_hashes, digest)
             _remove_staging(staging)
         else:
-            _make_read_only(staging)
+            staging_stat = staging.lstat()
+            identity = (staging_stat.st_dev, staging_stat.st_ino)
             os.replace(staging, runtime)
+            try:
+                _make_read_only(runtime)
+            except BaseException as seal_error:
+                try:
+                    _remove_published_runtime(runtime, identity)
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"Could not seal new runtime {runtime}: {seal_error}; "
+                        f"cleanup also failed: {cleanup_error}"
+                    ) from seal_error
+                raise
 
         bin_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         content = ("#!/bin/sh\n" + MARKER + "\nexec " + shlex.quote(sys.executable) + " " +

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import queue
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -2198,6 +2199,140 @@ class InstallerTests(unittest.TestCase):
         package = Path(vendor_dir) / "websocket"
         package.mkdir(parents=True)
         (package / "__init__.py").write_text('__version__ = "1.9.2"\n', encoding="utf-8")
+
+    def test_runtime_is_published_before_sealing_and_launcher_replacement(self):
+        sys.path.insert(0, str(APP_DIR))
+        import install
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_root = root / "runtime"
+            bin_dir = root / "bin"
+            launcher = bin_dir / "discord-watch"
+            events = []
+            candidate = {}
+            original_replace = install.os.replace
+            original_seal = install._make_read_only
+
+            def record_replace(source, destination):
+                source, destination = Path(source), Path(destination)
+                if source.name.startswith(".staging-") and destination.parent == runtime_root:
+                    self.assertTrue(source.stat().st_mode & stat.S_IWUSR)
+                    candidate["runtime"] = destination
+                    events.append("publish")
+                elif destination == launcher:
+                    runtime = candidate["runtime"]
+                    self.assertEqual(stat.S_IMODE(runtime.stat().st_mode), 0o555)
+                    install._require_sealed_runtime(runtime)
+                    events.append("launcher")
+                return original_replace(source, destination)
+
+            def record_seal(path):
+                path = Path(path)
+                self.assertEqual(path, candidate["runtime"])
+                self.assertTrue(path.is_dir())
+                self.assertTrue(path.stat().st_mode & stat.S_IWUSR)
+                events.append("seal")
+                return original_seal(path)
+
+            with mock.patch.object(install.os, "replace", side_effect=record_replace), \
+                    mock.patch.object(install, "_make_read_only", side_effect=record_seal):
+                install.install(runtime_root, bin_dir, provisioner=self.fixture_provisioner)
+
+            self.assertEqual(events, ["publish", "seal", "launcher"])
+
+    def test_seal_failure_removes_only_new_runtime_and_preserves_previous_installation(self):
+        sys.path.insert(0, str(APP_DIR))
+        import install
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_root = root / "runtime"
+            bin_dir = root / "bin"
+            installed = install.install(runtime_root, bin_dir, provisioner=self.fixture_provisioner)
+            launcher = bin_dir / "discord-watch"
+            original_launcher = launcher.read_bytes()
+            prior_runtime = Path(installed["runtime"])
+            prior_snapshot = {
+                path.relative_to(prior_runtime): (
+                    path.read_bytes() if path.is_file() else None,
+                    stat.S_IMODE(path.stat().st_mode),
+                )
+                for path in (prior_runtime, *prior_runtime.rglob("*"))
+            }
+            candidate_digest = "a" * 64
+            self.assertNotEqual(candidate_digest, installed["sha256"])
+            candidate = runtime_root / candidate_digest
+            original_path_chmod = Path.chmod
+
+            def fail_candidate_seal(path, mode):
+                if Path(path) == candidate and mode == 0o555:
+                    raise PermissionError("fixture runtime seal failure")
+                return original_path_chmod(path, mode)
+
+            with mock.patch.object(install, "_content_digest", return_value=candidate_digest), \
+                    mock.patch.object(Path, "chmod", new=fail_candidate_seal):
+                with self.assertRaisesRegex(PermissionError, "fixture runtime seal failure"):
+                    install.install(runtime_root, bin_dir, provisioner=self.fixture_provisioner)
+
+            self.assertFalse(os.path.lexists(candidate))
+            self.assertEqual(launcher.read_bytes(), original_launcher)
+            self.assertTrue(prior_runtime.is_dir())
+            self.assertEqual(
+                {
+                    path.relative_to(prior_runtime): (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in (prior_runtime, *prior_runtime.rglob("*"))
+                },
+                prior_snapshot,
+            )
+
+            original_rmtree = install.shutil.rmtree
+
+            def fail_candidate_cleanup(path, *args, **kwargs):
+                if Path(path) == candidate:
+                    raise PermissionError("fixture runtime cleanup failure")
+                return original_rmtree(path, *args, **kwargs)
+
+            with mock.patch.object(install, "_content_digest", return_value=candidate_digest), \
+                    mock.patch.object(Path, "chmod", new=fail_candidate_seal), \
+                    mock.patch.object(install.shutil, "rmtree", side_effect=fail_candidate_cleanup):
+                with self.assertRaisesRegex(RuntimeError, "cleanup also failed"):
+                    install.install(runtime_root, bin_dir, provisioner=self.fixture_provisioner)
+
+            self.assertTrue(candidate.is_dir())
+            self.assertEqual(launcher.read_bytes(), original_launcher)
+            self.assertEqual(
+                {
+                    path.relative_to(prior_runtime): (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in (prior_runtime, *prior_runtime.rglob("*"))
+                },
+                prior_snapshot,
+            )
+            candidate_snapshot = {
+                path.relative_to(candidate): (
+                    path.read_bytes() if path.is_file() else None,
+                    stat.S_IMODE(path.stat().st_mode),
+                )
+                for path in (candidate, *candidate.rglob("*"))
+            }
+            with mock.patch.object(install, "_content_digest", return_value=candidate_digest):
+                with self.assertRaisesRegex(ValueError, "Existing runtime is not sealed"):
+                    install.install(runtime_root, bin_dir, provisioner=self.fixture_provisioner)
+            self.assertEqual(
+                {
+                    path.relative_to(candidate): (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in (candidate, *candidate.rglob("*"))
+                },
+                candidate_snapshot,
+            )
+            self.assertEqual(launcher.read_bytes(), original_launcher)
 
     def test_installed_guide_prints_outside_checkout_without_creating_state(self):
         sys.path.insert(0, str(APP_DIR))
