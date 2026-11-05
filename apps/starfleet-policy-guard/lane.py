@@ -2546,6 +2546,32 @@ def seat_action(seat_identifier, cwd, argv, *, event=None, published=False):
     return state, argv, True, probe
 
 
+def recheck_opencode_delivery(seat_identifier, selected_state, cwd, action):
+    seat = session_store.load_seat(seat_identifier)
+    if not seat:
+        raise ValueError('Permanent Policy Guard seat registry is missing; preserve history and use recover --inspect')
+    actual = lane_scope.native_identity()
+    if actual != seat.get('owner'):
+        raise ValueError('This Policy Guard seat belongs to another native session; no GitHub action was forwarded')
+    if actual.get('harness') != 'opencode' or lane_scope.native_session_context() != seat.get('owner_context', {}):
+        raise ValueError('This Policy Guard seat belongs to a different OpenCode session API project or location; no GitHub action was forwarded')
+    if seat.get('install_journal') or seat.get('migration_journal') or seat.get('handoff_journal'):
+        raise ValueError('Policy Guard seat installation or migration is incomplete; preserve the journal and use recover --inspect')
+    ensure_no_upgrade_journal(cwd)
+    current = session_store.state_for_root(selected_state['root'])
+    if (not current or current.get('seat_id') != seat_identifier or
+            current.get('root') != selected_state.get('root') or
+            current.get('pr_url') != selected_state.get('pr_url') or
+            current.get('branch') != selected_state.get('branch')):
+        raise ValueError('The attached checkout or PR binding changed after OpenCode permission approval; no GitHub action was forwarded')
+    check_lane_scope(current, current['root'])
+    if not active(current, current['root']):
+        raise ValueError('The attached branch changed after OpenCode permission approval; no GitHub action was forwarded')
+    delivery_runs.target_matches(action, current['pr_url'], current.get('head_branch', current['branch']))
+    require(current, current['root'])
+    return seat, current
+
+
 def seat_gh(args, *, require_coverage=False):
     argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
     _, action, probe = parse_action(argv)
@@ -2563,12 +2589,11 @@ def seat_gh(args, *, require_coverage=False):
             raise ValueError('The OpenCode GitHub tool requires an attached checkout and a fresh Policy Guard report before forwarding')
     else:
         state, forwarded, checked = None, argv, False
-    if checked:
-        trace(state['root'], {'hook_event_name': 'Adapter', 'session_id':
-                              lane_scope.native_identity()['session_id']}, action, probe, 'pass', '')
     if probe:
         if not checked:
             raise ValueError('Probe did not exercise an attached readiness/merge gate')
+        trace(state['root'], {'hook_event_name': 'Adapter', 'session_id':
+                              lane_scope.native_identity()['session_id']}, action, probe, 'pass', '')
         print(json.dumps({'probe': True, 'executed': False, 'published_pr_checked': True,
                           'would_forward': [state['real_gh'], *forwarded], 'pr_url': state['pr_url']}))
         return 0
@@ -2587,8 +2612,22 @@ def seat_gh(args, *, require_coverage=False):
     else:
         captured = state.get('real_gh_identity')
         real_gh = state.get('real_gh')
+    if require_coverage:
+        try:
+            seat, state = recheck_opencode_delivery(args.seat_id, state, args.cwd, action)
+        except Exception as error:
+            trace(args.cwd, {'hook_event_name': 'Adapter', 'session_id':
+                             lane_scope.native_identity()['session_id']}, action, probe, 'deny', str(error))
+            raise
+        captured = state.get('real_gh_identity')
+        real_gh = state.get('real_gh')
+        if seat.get('real_gh') != captured:
+            raise ValueError('Captured GitHub CLI identity changed after OpenCode permission approval; no GitHub action was forwarded')
     if captured and captured_binary_identity(real_gh) != captured:
         raise ValueError('Captured real GitHub CLI changed since seat enrollment; inspect status and recover the runtime')
+    if checked:
+        trace(state['root'], {'hook_event_name': 'Adapter', 'session_id':
+                              lane_scope.native_identity()['session_id']}, action, probe, 'pass', '')
     result = subprocess.call([real_gh, *forwarded], cwd=args.cwd)
     if result == 0 and state and action and action.get('action') == 'merge':
         try:

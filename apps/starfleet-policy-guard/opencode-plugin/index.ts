@@ -201,8 +201,14 @@ function deliveryTool(ctx: Plugin.Context, input: any, context: Tool.Context) {
     } finally {
       pendingAssertions.delete(key)
     }
+    const approvedEvent = yield* eventFor(ctx, DELIVERY_TOOL, context)
+    if (JSON.stringify(approvedEvent) !== JSON.stringify(nativeEvent)) {
+      return yield* Effect.fail(new Tool.Error({
+        message: "The OpenCode session identity or project location changed while delivery permission was pending. Retry in the current session.",
+      }))
+    }
     const argv = ["--cwd", cwd, "gh", "--", ...ghArgv]
-    const output = yield* runGuard(argv, nativeEvent, cwd)
+    const output = yield* runGuard(argv, approvedEvent, cwd)
     return { content: output }
   })
 }
