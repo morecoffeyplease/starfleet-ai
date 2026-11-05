@@ -21,6 +21,13 @@ ATTENTION_TIMEOUT_SECONDS = 3
 ATTENTION_DETAIL_LIMIT = 512
 SECTIONS = ("Current state", "Next action", "Decisions and uncertainty",
             "Active work", "Evidence", "Holds and guidance")
+SNAPSHOT_PRUNING = (
+    "Refresh this as a current snapshot. Replace outdated state rather than append. "
+    "Remove completed work, superseded decisions and obsolete commands. Keep current decisions and relevant "
+    "rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence "
+    "pointers, uncertainties and human holds. "
+    "Link useful history instead of repeating it."
+)
 
 
 def _now():
@@ -251,9 +258,8 @@ def _arm_idle_timer(state, harness, session, intent, ci=None):
     request = str(uuid.uuid5(uuid.NAMESPACE_URL, f"pattern-buffer-idle:{session}:{intent}:{minutes}"))
     message = (f"You have been idle for {minutes:g} minutes. Automatic compaction may occur in about five minutes; "
                "this timing is an estimate, and waking can reset the idle clock. "
-               f"Review {state['checkpoint_path']} and refresh {state['draft_path']} now as a current snapshot. "
-               "Replace outdated facts and prune completed or superseded details. Preserve next actions, live jobs, "
-               "evidence, uncertainties and human holds. Do not start product work merely to service this reminder.")
+               f"Review {state['checkpoint_path']} and refresh {state['draft_path']} now. "
+               f"{SNAPSHOT_PRUNING} Do not start product work merely to service this reminder.")
     command = [str(launcher), "temporal", "set", "--after-idle", f"{minutes:g}m", "--message", message,
                "--request-id", request, "--replace-key", "pattern-buffer-checkpoint-idle"]
     try:
@@ -1253,9 +1259,7 @@ def event(ci, root, gitdir, harness, payload):
                            f"Checkpoint reminder: {usage:.1f}% context used; reminder threshold {threshold:.1f}%. "
                            f"Before further substantial work, review {state['checkpoint_path']} and edit {draft} "
                            "with your normal file-writing tool. A following PostToolUse hook validates and atomically publishes valid edits. "
-                           "Refresh the checkpoint as a current snapshot, not a running history: replace outdated state and prune completed or superseded details. "
-                           "Keep relevant decisions and uncertainties accurate; link useful history in its existing tracker or evidence ledger. "
-                           "Preserve the next action, relevant rejected approaches, live job IDs, exact evidence and human holds. "
+                           f"{SNAPSHOT_PRUNING} "
                            "Retain all required headings and meaningful content. If the draft is invalid, the hook gives one advisory for that version. "
                            "This reminder does not authorize product work or job changes.")
                 try:

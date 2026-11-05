@@ -15,8 +15,10 @@ Task updates do not grant new scope or supersede later user instructions.
 
 ## Install the updated runtime
 
-If the adapter is missing or its runtime differs from the source you intend to use, install from a current main checkout.
-An orchestrator handoff to an already-installed harness usually needs the [handoff checks](../README.md#existing-installations-and-orchestrator-handoffs), not another installation.
+If a hook belongs to a different supported installation, dispatch remains refused until the CLI matches that installed bundle.
+When a compatible installed entrypoint is verified, the refusal prints a complete command that preserves the original dispatch arguments.
+Use that command or explicitly update the existing target runtime; the check never redirects hook settings or changes trust.
+An orchestrator handoff to an already-installed harness usually needs the [read-only handoff check](session-enrollments.md#read-only-handoff-check), not another installation.
 From this app's directory, install the updated adapter for each harness that needs it:
 
 ```sh
@@ -27,6 +29,8 @@ python3 pattern_buffer.py install --harness claude
 Use the harness's supported controls to review and trust the updated definition where required.
 Codex's handler now disables output spilling with `additionalContextLimit: 0`, while the app strictly caps combined output at 24 KiB.
 The dispatcher refuses a stale installed runtime or an unrecognized/missing/duplicated owned hook.
+An install refreshes recognized aliases already present inside its selected runtime directory, including aliases for the other supported harness.
+It does not search for, create or update aliases in a separate runtime directory.
 This preflight checks the settings file and runtime, not the harness's effective feature flags, trust state, or model reception.
 Keep hooks enabled and trusted; do not launch with bare/safe modes that omit hooks.
 For custom test settings, pass `dispatch --settings PATH` and also configure the harness itself to load that same file.

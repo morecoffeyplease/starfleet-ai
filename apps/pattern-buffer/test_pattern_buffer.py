@@ -8,7 +8,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 GUIDE = SCRIPT.with_name("guide.md")
@@ -362,6 +364,64 @@ class PatternBufferTests(unittest.TestCase):
         # The active implementer still fits; lint must catch the other role too.
         self.assertIn("implementer:", result.stdout)
 
+    def test_exact_budget_matches_render_for_both_harnesses_with_long_unicode_paths(self):
+        long_root = self.root.parent / ("worktree-" + "x" * 96 + "é" * 55) / "nested" / "checkout"
+        self.create_repo(long_root)
+        self.cli("init", "--default-role", "orchestrator", root=long_root)
+        source = long_root / ".context-injector/context.md"
+        source.write_text("# shared\n" + "Shared-é-🛰️\n" * 20 +
+                          "# implementer\n" + "Implementation-ø\n" * 12 +
+                          "# orchestrator\n" + "Decision-Ω\n" * 13)
+        gitdir = Path(self.git_at(long_root, "rev-parse", "--absolute-git-dir").stdout.strip())
+        session = "session-" + "é" * 35
+
+        for harness in ("codex", "claude"):
+            with self.subTest(harness=harness):
+                for role in ci.ROLES:
+                    with self.subTest(role=role):
+                        self.cli("init", "--default-role", role, root=long_root)
+                        report = ci.current_context_budgets(long_root.resolve(), gitdir, harness, session)
+                        rendered = ci.render(long_root, harness, session)
+                        budget = report["roles"][role]
+                        self.assertEqual(len(rendered.encode("utf-8")), budget["bytes_used"])
+                        self.assertEqual(budget["header_bytes"] + budget["content_bytes"], budget["bytes_used"])
+                        self.assertEqual(budget["usable_content_bytes"], ci.LIMIT - budget["header_bytes"])
+                        self.assertEqual(budget["remaining_bytes"], ci.LIMIT - budget["bytes_used"])
+                        self.assertLessEqual(budget["bytes_used"], ci.LIMIT)
+
+                future = ci.auxiliary("sessions")._session_path(long_root.resolve(), harness, session)
+                validator = ci.context_validator(long_root.resolve(), harness, session)
+                validation = validator(source.read_text(), future, "orchestrator")
+                self.assertEqual(validation["budgets"]["source"], str(future))
+                future_header = ci.standing_parts(long_root.resolve(), future, harness, session, "",
+                                                  "orchestrator", "session enrollment",
+                                                  ci.sections_text(source.read_text()))[0]
+                future_budget = validation["budgets"]["roles"]["orchestrator"]
+                self.assertEqual(future_budget["header_bytes"], len(future_header.encode("utf-8")))
+                self.assertNotEqual(future, source)
+
+    def test_install_preflights_missing_helper_source_before_creating_settings_or_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            runtime = folder / "runtime"
+            settings = folder / "hooks.json"
+            missing = folder / "missing-sessions.py"
+            args = SimpleNamespace(command="install", harness="claude", settings=str(settings),
+                                   runtime_dir=str(runtime), bin_dir=str(runtime), checkpoints=True)
+            original = ci.auxiliary_source
+
+            def source(name, script=None):
+                if name == "sessions" and script is None:
+                    return missing
+                return original(name, script)
+
+            with mock.patch.object(ci, "auxiliary_source", side_effect=source):
+                with self.assertRaisesRegex(ValueError, "expected a regular, non-symlink file"):
+                    ci.configure_hooks(args)
+            self.assertFalse(runtime.exists())
+            self.assertFalse(settings.exists())
+            self.assertFalse(settings.with_name(settings.name + ".context-injector.lock").exists())
+
     def test_concurrent_sessions_and_harness_namespace(self):
         self.cli("init")
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -465,10 +525,16 @@ class PatternBufferTests(unittest.TestCase):
         self.assertTrue(report["configuration_ready"])
         self.assertEqual(report["resolved_role"], {"role": "orchestrator", "source": "worktree default"})
         self.assertTrue(all(check["ok"] for check in report["checks"].values()))
+        self.assertTrue(all(check.get("next_action") for check in report["checks"].values()))
         self.assertEqual(set(report["checks"]["context"]["budgets"]), {"implementer", "orchestrator"})
         for budget in report["checks"]["context"]["budgets"].values():
             self.assertLessEqual(budget["bytes_used"], budget["limit_bytes"])
         self.assertEqual(report["delivery_state"], "not_tracked")
+        self.assertEqual(report["checkpoint"]["state"], "not_enrolled")
+        self.assertFalse(report["checkpoint"]["required"])
+        self.assertEqual(report["native_binding"]["state"], "unknown")
+        self.assertEqual(report["delivery_evidence"]["state"], "unknown")
+        self.assertEqual(report["installed_hooks"]["state"], "compatible")
         self.assertIn("actual harness cwd must match", " ".join(report["notes"]).lower())
         self.assertIn("manual observation", " ".join(report["notes"]))
         self.assertIn("Hook trust", " ".join(report["notes"]))
@@ -477,6 +543,87 @@ class PatternBufferTests(unittest.TestCase):
 
         preview = self.cli("preview", "--harness", "codex", "--session", "successor-1").stdout
         self.assertIn("role: orchestrator | source: worktree default", preview)
+
+    def test_handoff_check_reads_enrollment_without_creating_registry_lock(self):
+        self.cli("init", "--default-role", "implementer")
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        source = self.root / ".context-injector/context.md"
+        source.write_text("# shared\nApproved session context.\n# implementer\nImplement this session.\n"
+                          "# orchestrator\nPreserve this session's holds.\n")
+        self.cli("session-enroll", "--harness", "codex", "--session", "successor-enrolled",
+                 "--context-file", str(source.resolve()), "--role", "orchestrator")
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
+        registry_lock = gitdir / "context-injector/session-enrollments/registry.lock"
+        self.assertTrue(registry_lock.exists())
+        registry_lock.unlink()
+        before = self.snapshot(self.root.parent)
+
+        result = self.cli("handoff-check", "--harness", "codex", "--session", "successor-enrolled",
+                          "--settings", str(settings))
+        report = json.loads(result.stdout)
+
+        self.assertTrue(report["configuration_ready"])
+        self.assertEqual(report["resolved_role"], {"role": "orchestrator", "source": "session enrollment"})
+        self.assertEqual(report["standing_context"]["enrollment_binding"]["state"], "active")
+        self.assertEqual(report["standing_context"]["source"],
+                         str((self.root / ".context-injector/sessions/codex-successor-enrolled.md").resolve()))
+        self.assertFalse(registry_lock.exists())
+        self.assertEqual(self.snapshot(self.root.parent), before)
+
+    def test_handoff_check_does_not_fall_back_when_read_only_binding_lookup_fails(self):
+        self.cli("init", "--default-role", "orchestrator")
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
+        registry = gitdir / "context-injector/session-enrollments/registry.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text("not a registry")
+
+        result = self.cli("handoff-check", "--harness", "codex", "--session", "successor-corrupt",
+                          "--settings", str(settings), success=False)
+        report = json.loads(result.stdout)
+
+        self.assertEqual(report["resolved_role"], {"role": None, "source": None})
+        self.assertIn("binding could not be read", report["checks"]["resolved_role"]["detail"])
+        self.assertFalse(report["checks"]["context"]["ok"])
+        self.assertEqual(report["standing_context"]["enrollment_binding"]["state"], "unknown")
+        self.assertFalse(report["configuration_ready"])
+
+    def test_handoff_check_reports_existing_claude_idle_warning_disabled_without_changing_it(self):
+        home = self.root.parent / "isolated-home"
+        launcher = home / ".local/bin/hailing-frequencies"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!" + sys.executable + "\n" + '''import json, sys
+if sys.argv[2] == "set":
+    print(json.dumps({"timer": {"id": "11111111-1111-4111-8111-111111111111", "due_at": 1800003000}}))
+else:
+    print(json.dumps({"status": "canceled"}))
+''')
+        launcher.chmod(0o700)
+        session = "11111111-1111-4111-8111-111111111111"
+        env = {"HOME": str(home), "CMUX_AGENT_LAUNCH_KIND": "claude", "CLAUDE_CODE_SESSION_ID": session}
+        self.cli("init", "--default-role", "orchestrator")
+        settings = self.root.parent / "claude-settings.json"
+        runtime = self.root.parent / "claude-runtime"
+        self.cli("install", "--harness", "claude", "--settings", str(settings),
+                 "--runtime-dir", str(runtime), env=env)
+        self.cli("checkpoint-init", "--harness", "claude", "--session", session,
+                 "--compact-at", "60", env=env)
+        self.cli("checkpoint-config", "--harness", "claude", "--session", session,
+                 "--idle-warning-minutes", "0", env=env)
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
+        checkpoint_before = ci.checkpoints()._state_path(gitdir, "claude", session).read_bytes()
+
+        report = json.loads(self.cli("handoff-check", "--harness", "claude", "--session", session,
+                                     "--settings", str(settings), env=env).stdout)
+
+        self.assertTrue(report["configuration_ready"])
+        self.assertEqual(report["checkpoint"]["state"], "invalid")
+        self.assertEqual(report["checkpoint"]["idle_warning"]["state"], "disabled")
+        self.assertIn("checkpoint-config", report["checkpoint"]["idle_warning"]["next_action"])
+        self.assertIn("--idle-warning-minutes 50", report["checkpoint"]["idle_warning"]["next_action"])
+        self.assertEqual(ci.checkpoints()._state_path(gitdir, "claude", session).read_bytes(), checkpoint_before)
 
     def test_handoff_check_reports_registration_enabled_role_context_and_hook_failures(self):
         settings, runtime, options = self.install_args()

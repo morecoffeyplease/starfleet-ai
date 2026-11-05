@@ -30,8 +30,10 @@ Change it only within its approval requirements.
 
 **The checkpoint** is the current implementation snapshot for your future self.
 Keep the next action, active work, relevant decisions, worker or job identity, evidence links, uncertainty and human holds.
-Update it after meaningful changes by replacing stale facts and pruning completed or superseded details.
-Keep historical evidence in its existing tracker or ledger.
+Refresh it as a current snapshot and replace outdated state rather than appending.
+Remove completed work, superseded decisions and obsolete commands.
+Keep current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
+Link useful history instead of repeating it.
 A checkpoint does not change standing context or grant authority.
 
 ## Install or reuse the existing hooks
@@ -48,6 +50,8 @@ python3 apps/pattern-buffer/pattern_buffer.py install --harness claude
 The generic `pattern-buffer` launcher goes to `$HOME/.local/bin` for a standard install.
 Add that directory to `PATH` using your usual shell setup if you want the short command.
 No worktree is initialized or enabled by installation.
+Installing one harness refreshes recognized aliases already present in that same runtime directory, while retaining their stable hook commands.
+It does not change another runtime directory, another harness's settings, or native trust.
 Restart or resume the harness so it loads the existing configuration, then review and trust the Codex hook through its supported hook-management flow.
 
 ## Prepare and check a worktree
@@ -79,9 +83,20 @@ pattern-buffer --cwd /absolute/worktree preview --harness codex --session ACTUAL
 
 Use `--harness claude` for Claude and a real session identity when known.
 `validate` checks both role sections and exits nonzero on malformed or oversized context.
-It reports UTF-8 bytes used and remaining, including the rendered session header.
+It reports header bytes, usable content bytes and remaining UTF-8 bytes from the exact rendered header.
+Use the exact session ID when available so the report includes the selected session file path.
+`status`, `session-enroll`, `enrollment-status` and `handoff-check` use the same calculation.
+Oversized or malformed required sources fail closed and are never truncated.
 The hook uses the harness-reported working directory, not the directory from which installation was run.
 Unregistered worktrees emit no context.
+
+Use `handoff-check --harness HARNESS --session SESSION_UUID` for a read-only local successor check.
+It reports standing context, optional checkpoint ownership and runtime compatibility separately from native binding and actual delivery.
+Unavailable native or delivery evidence is marked unknown and does not add a readiness requirement.
+For an exact Claude checkpoint owner it also reports the existing idle-warning minutes and timer state, if that checkpoint exists.
+If an existing warning is disabled, its next action shows the supported `checkpoint-config` command without changing state.
+New Claude checkpoints default to 50 minutes, while existing checkpoints remain unchanged until their owner enables a warning.
+An armed timer is configuration evidence, not proof that its wake was received.
 
 ## Checkpoints for orchestrators
 
@@ -131,7 +146,7 @@ Install the matching Hailing Frequencies runtime with idle-timer support before 
 Enrollment and later ordinary prompts arm or replace the timer through the existing worker; no new daemon, hook identity or enrollment is created.
 The timer's own wake is excluded, so its checkpoint-refresh response does not create another idle warning.
 Other activity postpones the deadline; exact-session and human-input guards still apply.
-The reminder asks for a current, pruned checkpoint and says compaction may occur in about five minutes, not that it is guaranteed.
+The idle reminder repeats the current-snapshot guidance above and gives an estimated five-minute compaction window.
 Waking the session may itself reset Claude's idle clock.
 Percentage-based warnings remain independent, and Codex receives no automatic idle timer.
 

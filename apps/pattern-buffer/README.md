@@ -18,6 +18,8 @@ Dispatch receipts, event logs and Hailing Frequencies receipts describe observed
 
 Read the [printable guide](guide.md) with the installed command pattern-buffer guide --print before configuring an installation.
 Install only the harness adapters you use.
+Installing one harness refreshes recognized aliases already present in that same runtime directory, while retaining their stable hook commands.
+It does not change another runtime directory, another harness's settings, or native trust.
 
     pattern-buffer install --harness codex
     pattern-buffer install --harness claude
@@ -48,6 +50,8 @@ Session enrollment replaces the worktree context for that exact identity and fai
 Use the [session enrollment guide](docs/session-enrollments.md) for replacement handoffs, identity checks, trust limits and recovery.
 Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery notes, pressure reminders and Hailing Frequencies idle receipts.
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
+The read-only `handoff-check` distinguishes approved context and optional checkpoint state from installed-hook compatibility, native binding evidence and actual model delivery.
+Unknown native or delivery evidence stays unknown and does not add a readiness gate.
 
 ## Dispatch and task replay
 
@@ -75,6 +79,10 @@ Run the canonical isolated suite from the repository root.
 
 The compatibility suite checks the former Context Injector source entrypoint against the maintained Pattern Buffer behavior.
 If context does not appear, inspect status, validate and preview, then check the harness's own trust and hook controls.
+Validation and status report the exact rendered header overhead, usable content bytes and remaining UTF-8 budget for each role.
+Pass the exact session ID when available so the calculation uses the enrolled file path and identity.
+Session enrollment and handoff checks use the same calculation before reviewed text is adopted.
+Oversized or malformed required sources still fail closed and are never truncated.
 Doctor reads local registration and content only; it does not certify hook activation, model reception or compliance.
 After installation changes, restart or resume the harness according to its own configuration reload behavior.
 Native delivery checks require a separate bounded pilot in disposable state and are not established by these local tests.
