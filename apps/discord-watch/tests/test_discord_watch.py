@@ -80,6 +80,7 @@ class FakeOpenCodeAPI:
         self.directory = str(directory)
         self.password = password
         self.active = {}
+        self.malformed_info = False
         self.version = hf.opencode_adapter_module().SUPPORTED_OPENCODE_VERSION
         owner = self
 
@@ -104,8 +105,11 @@ class FakeOpenCodeAPI:
                     self.respond(401, {}, {"WWW-Authenticate": 'Basic realm="OpenCode fixture"'})
                     return
                 if self.path == "/api/info":
-                    self.respond(200, {"version": owner.version, "pid": os.getpid(), "urls": [],
-                                       "paths": {"tmp": "/tmp/opencode-fixture"}})
+                    info = {"version": owner.version, "pid": os.getpid(), "urls": [],
+                            "paths": {"tmp": "/tmp/opencode-fixture"}}
+                    if owner.malformed_info:
+                        info.pop("version")
+                    self.respond(200, info)
                 elif self.path == f"/api/session/{owner.session}":
                     self.respond(200, {"data": {"id": owner.session, "projectID": "prj_fixture",
                                                  "location": {"directory": owner.directory},
@@ -147,6 +151,9 @@ class FakeCmux:
         if self.fail_binding:
             raise ValueError(self.fail_binding)
         return True
+
+    def enrollment_binding(self, current):
+        return self.binding(current)
 
     def submit(self, current, text, on_transport_start=None):
         self.binding(current)
@@ -359,10 +366,10 @@ class DiscordWatchTests(unittest.TestCase):
         self.app.fake_cmux = cmux
         os.environ["CMUX_AGENT_LAUNCH_KIND"] = "opencode"
         os.environ["OPENCODE_SESSION_ID"] = session
-        return session, server, hook_record, write_hook, current
+        return session, server, hook_record, write_hook, current, settings
 
     def test_busy_opencode_can_receive_with_identity_binding_while_send_stays_held(self):
-        session, server, hook_record, write_hook, current = self._prepare_busy_opencode()
+        session, server, hook_record, write_hook, current, _settings = self._prepare_busy_opencode()
         self.app.register(THREAD, session_hint=session)
         self.api.rows = [message("101", content="busy-session reply")]
         self.app.scan()
@@ -391,6 +398,106 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertEqual(result["received"], ["101"])
         self.assertIn("[discord:100:101] Configured user: busy-session reply", output.getvalue())
         self.assertEqual(self.messages()[0][1], "received")
+
+    def test_busy_opencode_can_register_manage_and_close_without_waking(self):
+        session, server, hook_record, write_hook, current, _settings = self._prepare_busy_opencode()
+        server.active[session] = {"type": "running"}
+        current["items"][0]["agents"][0]["state"] = "working"
+        hook_record["agentLifecycle"] = "running"
+        write_hook()
+        self.api.remote["applied_tags"] = ["900"]
+        with self.assertRaisesRegex(ValueError, "tagged Closed"):
+            self.app.register(THREAD, session_hint=session)
+        self.api.remote["applied_tags"] = []
+
+        registered = self.app.register(THREAD, session_hint=session)
+        self.assertTrue(registered["registered"])
+        self.assertEqual(registered["owner_session"], session)
+        managed = self.app.managed(THREAD, session_hint=session)
+        self.assertTrue(managed["managed"])
+        self.assertEqual(managed["owner_session"], session)
+
+        self.api.rows = [message("101", content="preserve across close")]
+        self.app.scan()
+        report = self.app.scan(send=True)
+        self.assertIn("session_busy", report["threads"][0]["wake_error"])
+        self.assertEqual(self.messages()[0][1:3], ("pending", 0))
+
+        closed = self.app.close(THREAD, session_hint=session)
+        self.assertEqual(closed, {"thread": THREAD, "closed": True, "pending_preserved": True})
+        self.assertEqual(self.messages()[0][1], "pending")
+        with self.assertRaisesRegex(ValueError, "Thread registration is closed"):
+            self.app.register(THREAD, session_hint=session)
+        with self.assertRaisesRegex(ValueError, "Thread registration is closed"):
+            self.app.managed(THREAD, session_hint=session)
+
+    def test_busy_opencode_lifecycle_checks_identity_session_generation_and_api(self):
+        session, server, hook_record, write_hook, current, settings = self._prepare_busy_opencode()
+        server.active[session] = {"type": "running"}
+        current["items"][0]["agents"][0]["state"] = "working"
+        hook_record["agentLifecycle"] = "running"
+        write_hook()
+        self.app.register(THREAD, session_hint=session)
+
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.managed(THREAD, session_hint="ses_OtherDiscordSession")
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.managed(THREAD, session_hint=session)
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_A
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_B
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.managed(THREAD, session_hint=session)
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_A
+        self.targets[0]["started_at"] += 1
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "generation changed"):
+            self.app.managed(THREAD, session_hint=session)
+        self.targets[0]["started_at"] = 1234.5
+        self.targets[0]["expected_server_pid"] += 1
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "api_server_pid_mismatch"):
+            self.app.managed(THREAD, session_hint=session)
+        self.targets[0]["expected_server_pid"] = os.getpid()
+        self._write_hailing()
+
+        server.malformed_info = True
+        with self.assertRaisesRegex(ValueError, "unsupported_api_schema"):
+            self.app.managed(THREAD, session_hint=session)
+        server.malformed_info = False
+        settings["receiving"] = False
+        with self.assertRaisesRegex(ValueError, "Native messaging is disabled"):
+            self.app.managed(THREAD, session_hint=session)
+        settings["receiving"] = True
+        self.assertTrue(self.app.managed(THREAD, session_hint=session)["managed"])
+
+    def test_lifecycle_commands_reject_foreign_owner_and_preserve_existing_registration(self):
+        self.register()
+        self.api.rows = [message("101", content="keep for registered owner")]
+        self.app.scan()
+        self.targets.append(target(SESSION_B, SURFACE_B, WORKSPACE_B))
+        self._write_hailing()
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_B
+        os.environ["CODEX_THREAD_ID"] = SESSION_B
+
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.register(THREAD)
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.managed(THREAD)
+        with self.assertRaisesRegex(ValueError, "Only the registered current owner"):
+            self.app.close(THREAD)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            owner = json.loads(db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
+                                           (THREAD,)).fetchone()[0])
+        self.assertEqual(owner["session"], SESSION_A)
+        self.assertEqual(self.messages()[0][1], "pending")
+
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_A
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_A
+        os.environ["CODEX_THREAD_ID"] = SESSION_A
+        self.assertTrue(self.app.close(THREAD)["closed"])
+        self.assertEqual(self.messages()[0][1], "pending")
 
     def test_receive_output_failure_does_not_record_receipt(self):
         self.register()
@@ -429,8 +536,17 @@ class DiscordWatchTests(unittest.TestCase):
         self.app.scan()
         self.cmux.fail_binding = "session ended"
         with self.assertRaisesRegex(ValueError, "session ended"):
+            self.app.register(THREAD)
+        with self.assertRaisesRegex(ValueError, "session ended"):
+            self.app.managed(THREAD)
+        with self.assertRaisesRegex(ValueError, "session ended"):
+            self.app.close(THREAD)
+        with self.assertRaisesRegex(ValueError, "session ended"):
             self.app.receive(THREAD, "101", io.StringIO())
         self.assertEqual(self.messages()[0][1], "pending")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            is_open = db.execute("SELECT is_open FROM threads WHERE thread_id=?", (THREAD,)).fetchone()[0]
+        self.assertEqual(is_open, 1)
 
     def test_page_messages_and_cursor_roll_back_together_then_replay_after_restart(self):
         self.register()
@@ -637,7 +753,7 @@ class DiscordWatchTests(unittest.TestCase):
     def test_receive_empty_returns_three_without_stdout(self):
         self.register()
         output = io.StringIO()
-        with mock.patch.object(dw.Watch, "_receipt_owner",
+        with mock.patch.object(dw.Watch, "_identity_owner",
                                return_value=self.app.binding_snapshot(self.targets[0])):
             with contextlib.redirect_stdout(output):
                 result = dw.main(["--state-dir", str(self.state), "--hailing-state", str(self.hailing),
