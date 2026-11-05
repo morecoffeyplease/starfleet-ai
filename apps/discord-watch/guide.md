@@ -106,7 +106,27 @@ That flush is a delivery boundary for the CLI and does not prove that the reply 
 The private database stores message bodies, attachment filenames, and attachment URLs with owner-only filesystem permissions.
 Receive prints bounded attachment filenames and HTTPS URLs to the exact recipient and does not download files.
 Status distinguishes a confirmed CMUX submit from a recipient receipt and reports held, uncertain, and stalled states without printing reply bodies.
-After the Discord thread is closed remotely, `close` closes its local registration and preserves unreceived replies for the current owner.
+`close` closes the local registration and preserves the exact owner and unreceived replies.
+It does not unsubscribe the thread, so active retained subscriptions continue polling and queued replies remain eligible for guarded delivery.
+Remote Closed tags and archived state are recorded separately and do not close the local registration or stop reply intake.
+
+## Retained subscriptions and dormancy
+
+Meaningful activity is a newly stored message from the configured Discord user, measured by the message's Discord timestamp.
+If no configured-user reply has been recorded, the seven-day window starts when the thread is registered.
+Exactly seven days without meaningful activity remains eligible for routine REST polling.
+After more than seven days, the subscription becomes dormant and routine REST polling stops for that thread.
+Polling, retries, reminders, and worker heartbeats never extend the activity window.
+A newly inserted configured-user reply at least as recent as the latest activity reactivates the subscription and starts a fresh seven-day window from that timestamp.
+Duplicate messages and older replays do not extend the window.
+
+Dormancy preserves the thread, exact owner generation, REST cursor, catch-up boundary, queued message bodies, attachment references, and delivery state.
+The worker can still send a guarded wake for queued replies on dormant subscriptions.
+Missing or stale exact owners remain a hold, and replies stay available to the owner through `receive`.
+Use `discord-watch scan --only-thread THREAD_ID` for an explicit REST reconciliation of a dormant known thread.
+The narrow Gateway intake method stores messages through the same validation and deduplication path as REST without advancing the REST cursor.
+When Gateway intake is connected, reconnect recovery must reconcile every known retained thread, including dormant threads, before reporting the Gateway recovered.
+Until that integration exists, run the bounded explicit scan for a dormant thread when reconciling after a missed Gateway interval.
 
 ## Verification and delivery evidence
 

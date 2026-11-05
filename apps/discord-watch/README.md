@@ -2,7 +2,7 @@
 
 Discord Watch polls explicitly registered agent-notify forum threads and queues replies from the configured Discord user.
 One supervised polling worker serves all registered threads independently of per-thread `agent-notify listen` processes.
-Each open thread has one exact owner copied from that session's Hailing Frequencies enrollment.
+Each registered thread retains one exact owner copied from that session's Hailing Frequencies enrollment, including after local closure or remote archiving.
 
 Read the [setup guide](guide.md) for installation, enrollment, a bounded pilot, and day-to-day commands.
 Print the same guide from any working directory with `discord-watch guide --print`.
@@ -22,6 +22,20 @@ Each page is sorted in ascending snowflake order before it is committed.
 The implementation follows Discord's [Get Channel Messages](https://discord.com/developers/docs/resources/message#get-channel-messages) ordering and [rate-limit guidance](https://discord.com/developers/docs/topics/rate-limits).
 Duplicate `(thread, message)` pairs are ignored.
 
+Local registration closure and Discord conversation closure are recorded separately from reply-subscription eligibility.
+Closing a registration or observing a Closed tag or archived thread does not unsubscribe it, reset its cursor, or discard its catch-up boundary.
+The worker continues polling closed and archived threads while their subscriptions are active, and status reports local `open`, remote `remote_closed`, and `subscription_state` independently.
+Meaningful activity means a newly stored message from the configured Discord user, using that message's Discord timestamp.
+When no such reply has been recorded, the seven-day window starts at registration time.
+An exact seven days of inactivity remains eligible, while more than seven days makes the subscription dormant and stops routine REST polling.
+Polls, retries, reminders, and worker heartbeats do not change the activity timestamp.
+An inserted reply at least as recent as the latest activity reactivates the subscription and starts its seven-day window from that timestamp.
+Duplicate IDs and older replays remain ineligible to extend the activity window.
+The narrow `Watch.ingest_gateway_message` method uses the same validation, filtering, attachment storage, and deduplication path as REST intake, and does not advance the REST cursor.
+Queued replies remain available for guarded delivery while a subscription is dormant, and missing or stale exact owners continue to hold delivery.
+Use `discord-watch scan --only-thread THREAD_ID` for explicit REST reconciliation of a dormant thread.
+When Gateway intake is in use, reconnect reconciliation must include every retained known thread, including dormant threads, before the integration reports recovery.
+
 For each thread, registration stores the exact Hailing Frequencies harness, surface, workspace, session, and generation.
 The central worker checks that the same target remains enrolled and validates the current CMUX projection and input guard before each wake.
 It never forces input, reads or clears CMUX messages, launches another agent, or sends a reply body in a wake.
@@ -29,7 +43,7 @@ The prompt names one exact `discord-watch receive --thread THREAD --message MESS
 An empty composer with no human-input obligation is required by Hailing Frequencies' existing `Cmux.submit` guard.
 Attachment filenames and HTTPS URLs are printed to the exact recipient during `receive` without downloading the files.
 
-The worker recognizes a remote archived thread or the cached `Closed` forum tag and closes that local registration without sending more wakes.
+The worker records a remote archived thread or the cached `Closed` forum tag without closing the local registration or stopping reply intake.
 Discord access errors, missing permissions, and rate limits remain visible per thread and do not look like remote closure.
 Rate-limit `retry_after`, HTTP status, Discord error code, message, and global-limit scope are retained as structured status data.
 A global rate limit defers all thread requests until its retry time, while a per-route limit defers that thread.
@@ -48,7 +62,7 @@ This flush is the CLI delivery boundary and is not proof that a person or model 
 If output fails or the current owner changes before the receipt commit, the reply remains available for another receive.
 `managed` checks exact current ownership and open registration and includes the latest worker health report.
 Its success is independent of worker freshness so the caller can retain ownership while diagnosing a stale worker.
-`close` preserves all queued replies and closes only the caller's own exact registration.
+`close` preserves all queued replies and closes only the caller's own exact local registration while retaining its reply subscription.
 `transfer` requires an explicit `--from-session` matching the stored owner and must be run from the new exact enrolled session.
 Transfer preserves unreceived replies and resets confirmed-but-unreceived wakes so the new owner can safely receive them.
 An uncertain send stays uncertain across transfer.

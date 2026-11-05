@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+from datetime import datetime
 import fcntl
 import json
 import math
@@ -45,6 +46,7 @@ MAX_RECEIVE_MESSAGES = 20
 MAX_RECEIVE_BYTES = 64 * 1024
 MAX_WAKE_ATTEMPTS = 3
 REMIND_AFTER = 120
+DORMANT_AFTER = 7 * 24 * 60 * 60
 ALLOWED_LAUNCH_KINDS = {"claude", "codex"}
 ACTIVE_MESSAGE_STATES = ("pending", "awaiting_receipt", "uncertain", "stalled")
 
@@ -63,6 +65,24 @@ def snowflake(value, label="Discord snowflake"):
 
 def id_order(value):
     return int(snowflake(value))
+
+
+def timestamp_epoch(value):
+    require(isinstance(value, str) and 1 <= len(value) <= 64,
+            "Discord message timestamp is invalid")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError("Discord message timestamp is invalid") from None
+    require(parsed.tzinfo is not None and parsed.utcoffset() is not None,
+            "Discord message timestamp must include a timezone")
+    try:
+        epoch = parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("Discord message timestamp is invalid") from None
+    require(math.isfinite(epoch), "Discord message timestamp is invalid")
+    return epoch
 
 
 def ensure_private_file(path, label):
@@ -217,6 +237,7 @@ class Watch:
         self.clock = clock
         self.discord_factory = discord_factory
         self.cmux_factory = cmux_factory or (lambda: hf.Cmux(cmux))
+        self._configured_user_id = None
         self.global_not_before = 0.0
         os.umask(0o077)
 
@@ -273,7 +294,10 @@ class Watch:
           catchup_max TEXT,
           last_error_json TEXT,
           remote_json TEXT NOT NULL DEFAULT '{}',
-          owner_generation INTEGER NOT NULL DEFAULT 1
+          owner_generation INTEGER NOT NULL DEFAULT 1,
+          subscription_state TEXT NOT NULL DEFAULT 'active',
+          last_activity_at REAL,
+          remote_closed INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS messages (
           thread_id TEXT NOT NULL REFERENCES threads(thread_id),
@@ -302,14 +326,44 @@ class Watch:
         );
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        db.execute("BEGIN IMMEDIATE")
         thread_columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
         if "catchup_before" not in thread_columns:
             db.execute("ALTER TABLE threads ADD COLUMN catchup_before TEXT")
         if "catchup_max" not in thread_columns:
             db.execute("ALTER TABLE threads ADD COLUMN catchup_max TEXT")
+        if "subscription_state" not in thread_columns:
+            db.execute("ALTER TABLE threads ADD COLUMN subscription_state TEXT NOT NULL DEFAULT 'active'")
+        if "last_activity_at" not in thread_columns:
+            db.execute("ALTER TABLE threads ADD COLUMN last_activity_at REAL")
+        if "remote_closed" not in thread_columns:
+            db.execute("ALTER TABLE threads ADD COLUMN remote_closed INTEGER NOT NULL DEFAULT 0")
         message_columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         if "attachments_json" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'")
+        activity_migrated = db.execute(
+            "SELECT 1 FROM meta WHERE key='meaningful_activity_migration_v1'").fetchone()
+        if activity_migrated is None:
+            for thread_id, registered_at, remote_json in db.execute(
+                    "SELECT thread_id,registered_at,remote_json FROM threads").fetchall():
+                activity_at = None
+                for (created_at,) in db.execute(
+                        "SELECT created_at FROM messages WHERE thread_id=? "
+                        "ORDER BY length(message_id) DESC,message_id DESC", (thread_id,)):
+                    try:
+                        activity_at = timestamp_epoch(created_at)
+                        break
+                    except ValueError:
+                        continue
+                try:
+                    remote = json.loads(remote_json)
+                except (TypeError, ValueError):
+                    remote = {}
+                metadata = remote.get("thread_metadata") if isinstance(remote, dict) else None
+                remote_closed = isinstance(metadata, dict) and metadata.get("archived") is True
+                db.execute("UPDATE threads SET last_activity_at=?,subscription_state='active',remote_closed=? "
+                           "WHERE thread_id=?", (activity_at, int(remote_closed), thread_id))
+            db.execute("INSERT INTO meta(key,value) VALUES('meaningful_activity_migration_v1','complete')")
         db.commit()
         db.close()
         path.chmod(0o600)
@@ -378,6 +432,7 @@ class Watch:
 
     def read_credentials(self):
         values = read_notify_credentials(self.notify_home)
+        self._configured_user_id = values["user_id"]
         return values, self.discord_factory(values["token"])
 
     @staticmethod
@@ -419,7 +474,7 @@ class Watch:
                 if after is not None:
                     require(cursor == existing[1], "Thread is already registered with a different cursor")
                 with db:
-                    db.execute("UPDATE threads SET updated_at=?,remote_json=? WHERE thread_id=?",
+                    db.execute("UPDATE threads SET updated_at=?,remote_json=?,remote_closed=0 WHERE thread_id=?",
                                (now, json.dumps(remote, separators=(",", ":")), thread_id))
                 return {"thread": thread_id, "registered": True, "already_registered": True,
                         "owner_session": owner["session"], "cursor": existing[1]}
@@ -435,18 +490,28 @@ class Watch:
     def _thread(self, db, thread_id, require_open=True):
         thread_id = snowflake(thread_id, "thread ID")
         row = db.execute("SELECT thread_id,owner_json,cursor,is_open,registered_at,updated_at,last_poll_at,"
-                         "next_poll_at,catchup_before,catchup_max,last_error_json,remote_json,owner_generation "
+                         "next_poll_at,catchup_before,catchup_max,last_error_json,remote_json,owner_generation,"
+                         "subscription_state,last_activity_at,remote_closed "
                          "FROM threads WHERE thread_id=?",
                          (thread_id,)).fetchone()
         require(row is not None, "Thread is not registered")
         result = dict(zip(("thread_id", "owner_json", "cursor", "is_open", "registered_at", "updated_at",
                            "last_poll_at", "next_poll_at", "catchup_before", "catchup_max",
-                           "last_error_json", "remote_json", "owner_generation"), row))
+                           "last_error_json", "remote_json", "owner_generation", "subscription_state",
+                           "last_activity_at", "remote_closed"), row))
         result["owner"] = json.loads(result.pop("owner_json"))
         result["last_error"] = json.loads(result["last_error_json"]) if result["last_error_json"] else None
         result["remote"] = json.loads(result.pop("remote_json"))
         require(not require_open or result["is_open"], "Thread registration is closed")
         return result
+
+    @staticmethod
+    def _refresh_dormancy(db, now):
+        cutoff = now - DORMANT_AFTER
+        with db:
+            db.execute("UPDATE threads SET subscription_state='dormant' "
+                       "WHERE subscription_state='active' "
+                       "AND COALESCE(last_activity_at,registered_at)<?", (cutoff,))
 
     def managed(self, thread_id):
         thread_id = snowflake(thread_id, "thread ID")
@@ -473,7 +538,22 @@ class Watch:
             with db:
                 db.execute("UPDATE threads SET is_open=0,updated_at=? WHERE thread_id=?",
                            (now, thread_id))
-        return {"thread": thread_id, "closed": True, "pending_preserved": True}
+        return {"thread": thread_id, "closed": True, "subscribed": True, "pending_preserved": True}
+
+    def ingest_gateway_message(self, thread_id, message):
+        """Durably ingest one Gateway message without changing the REST cursor."""
+        thread_id = snowflake(thread_id, "thread ID")
+        if self._configured_user_id is None:
+            credentials, _ = self.read_credentials()
+            self._configured_user_id = credentials["user_id"]
+        now = self.clock()
+        with contextlib.closing(self.database(create=False)) as db:
+            self._refresh_dormancy(db, now)
+            with db:
+                inserted = self._ingest_message(db, thread_id, message, self._configured_user_id, now)
+            message_id = snowflake(message.get("id"), "message ID") if isinstance(message, dict) else None
+        return {"thread": thread_id, "message": message_id, "ingested": inserted,
+                "rest_cursor_advanced": False}
 
     def transfer(self, thread_id, from_session):
         thread_id = snowflake(thread_id, "thread ID")
@@ -497,6 +577,59 @@ class Watch:
         return {"thread": thread_id, "transferred": True, "from_session": old_session,
                 "to_session": current["session"], "pending_preserved": True}
 
+    @staticmethod
+    def _attachment_json(row):
+        values = row.get("attachments", [])
+        require(isinstance(values, list) and len(values) <= 10,
+                "Discord attachment list exceeds the bounded storage size")
+        normalized = []
+        for item in values:
+            require(isinstance(item, dict), "Discord returned a malformed attachment")
+            filename, url = item.get("filename"), item.get("url")
+            require(isinstance(filename, str) and isinstance(url, str),
+                    "Discord attachment filename or URL is missing")
+            require(len(filename.encode("utf-8")) <= 512 and len(url.encode("utf-8")) <= 2048 and
+                    url.startswith("https://") and not any(ord(c) < 32 for c in filename + url),
+                    "Discord attachment metadata exceeds the bounded format")
+            normalized.append({"filename": filename, "url": url})
+        encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+        require(len(encoded.encode("utf-8")) <= 16 * 1024,
+                "Discord attachment metadata exceeds the bounded storage size")
+        return encoded
+
+    def _ingest_message(self, db, thread_id, row, configured_user_id, now):
+        thread_id = snowflake(thread_id, "thread ID")
+        require(isinstance(row, dict), "Discord returned a malformed message")
+        message_id = snowflake(row.get("id"), "message ID")
+        thread = db.execute("SELECT last_activity_at FROM threads WHERE thread_id=?",
+                            (thread_id,)).fetchone()
+        require(thread is not None, "Thread is not registered")
+        author = row.get("author") if isinstance(row.get("author"), dict) else {}
+        author_id = str(author.get("id", ""))
+        if (author_id != snowflake(configured_user_id, "configured Discord user ID") or
+                author.get("bot", False) or row.get("webhook_id") is not None):
+            return False
+        body = row.get("content", "")
+        require(isinstance(body, str), "Discord message content is not text")
+        require(len(body.encode("utf-8")) <= MAX_MESSAGE_BYTES,
+                "Discord message content exceeds the bounded storage size")
+        attachment_json = self._attachment_json(row)
+        author_name = str(author.get("global_name") or author.get("username") or "Configured user")[:256]
+        created_at = row.get("timestamp", "")
+        activity_at = timestamp_epoch(created_at)
+        inserted = db.execute(
+            "INSERT OR IGNORE INTO messages(thread_id,message_id,author_id,author_name,body,attachments_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (thread_id, message_id, author_id, author_name, body, attachment_json, created_at)).rowcount == 1
+        if inserted:
+            previous_activity = thread[0]
+            if previous_activity is None or activity_at >= previous_activity:
+                latest_activity = activity_at if previous_activity is None else max(activity_at, previous_activity)
+                subscription_state = "active" if now <= activity_at + DORMANT_AFTER else "dormant"
+                db.execute("UPDATE threads SET last_activity_at=?,subscription_state=? WHERE thread_id=?",
+                           (latest_activity, subscription_state, thread_id))
+        return inserted
+
     def _api_pages(self, api, thread_id, cursor, owner_id, db):
         pages = 0
         total = 0
@@ -504,25 +637,6 @@ class Watch:
                                 (thread_id,)).fetchone()
         require(thread_row is not None, "Thread registration disappeared during polling")
         current_cursor, boundary, caught_up_to = thread_row
-
-        def attachments(row):
-            values = row.get("attachments", [])
-            require(isinstance(values, list) and len(values) <= 10,
-                    "Discord attachment list exceeds the bounded storage size")
-            normalized = []
-            for item in values:
-                require(isinstance(item, dict), "Discord returned a malformed attachment")
-                filename, url = item.get("filename"), item.get("url")
-                require(isinstance(filename, str) and isinstance(url, str),
-                        "Discord attachment filename or URL is missing")
-                require(len(filename.encode("utf-8")) <= 512 and len(url.encode("utf-8")) <= 2048 and
-                        url.startswith("https://") and not any(ord(c) < 32 for c in filename + url),
-                        "Discord attachment metadata exceeds the bounded format")
-                normalized.append({"filename": filename, "url": url})
-            encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
-            require(len(encoded.encode("utf-8")) <= 16 * 1024,
-                    "Discord attachment metadata exceeds the bounded storage size")
-            return encoded
 
         def commit_page(normalized, next_boundary, next_max, complete):
             nonlocal current_cursor, total
@@ -539,21 +653,7 @@ class Watch:
                 for message_id, row in normalized:
                     require(message_id not in seen, "Discord returned duplicate message IDs")
                     seen.add(message_id)
-                    author = row.get("author") if isinstance(row.get("author"), dict) else {}
-                    author_id = str(author.get("id", ""))
-                    if author_id == owner_id and not author.get("bot", False) and row.get("webhook_id") is None:
-                        body = row.get("content", "")
-                        require(isinstance(body, str), "Discord message content is not text")
-                        require(len(body.encode("utf-8")) <= MAX_MESSAGE_BYTES,
-                                "Discord message content exceeds the bounded storage size")
-                        attachment_json = attachments(row)
-                        author_name = str(author.get("global_name") or author.get("username") or "Configured user")[:256]
-                        created_at = row.get("timestamp", "")
-                        require(isinstance(created_at, str) and len(created_at) <= 64,
-                                "Discord returned an invalid message timestamp")
-                        db.execute("INSERT OR IGNORE INTO messages(thread_id,message_id,author_id,author_name,body,"
-                                   "attachments_json,created_at) VALUES(?,?,?,?,?,?,?)",
-                                   (thread_id, message_id, author_id, author_name, body, attachment_json, created_at))
+                    self._ingest_message(db, thread_id, row, owner_id, self.clock())
                     total += 1
                 db.execute("UPDATE threads SET cursor=CASE "
                            "WHEN length(cursor)<length(?) OR (length(cursor)=length(?) AND cursor<?) THEN ? "
@@ -650,8 +750,6 @@ class Watch:
 
     def _poll_thread_locked(self, db, thread, api, credentials, now):
         thread_id = thread["thread_id"]
-        if not thread["is_open"]:
-            return {"thread": thread_id, "status": "closed"}
         if now < self.global_not_before:
             return {"thread": thread_id, "status": "global_backoff",
                     "retry_after": max(0, int(self.global_not_before - now))}
@@ -660,16 +758,16 @@ class Watch:
                     "retry_after": max(0, int(thread["next_poll_at"] - now))}
         try:
             remote = self.remote_thread(api, thread_id)
-            if self.thread_closed(remote, credentials["closed_tag"]):
-                with db:
-                    db.execute("UPDATE threads SET is_open=0,remote_json=?,last_poll_at=?,last_error_json=NULL,updated_at=? "
-                               "WHERE thread_id=?", (json.dumps(remote, separators=(",", ":")), now, now, thread_id))
-                return {"thread": thread_id, "status": "closed_remote"}
+            remote_closed = self.thread_closed(remote, credentials["closed_tag"])
+            remote_json = json.dumps(remote, separators=(",", ":"))
+            with db:
+                db.execute("UPDATE threads SET remote_json=?,remote_closed=?,updated_at=? WHERE thread_id=?",
+                           (remote_json, int(remote_closed), now, thread_id))
             result = self._api_pages(api, thread_id, thread["cursor"], credentials["user_id"], db)
             with db:
-                db.execute("UPDATE threads SET remote_json=?,last_poll_at=?,next_poll_at=0,last_error_json=NULL,updated_at=? "
-                           "WHERE thread_id=?", (json.dumps(remote, separators=(",", ":")), now, now, thread_id))
-            return {"thread": thread_id, "status": "polled", **result}
+                db.execute("UPDATE threads SET last_poll_at=?,next_poll_at=0,last_error_json=NULL,updated_at=? "
+                           "WHERE thread_id=?", (now, now, thread_id))
+            return {"thread": thread_id, "status": "polled", "remote_closed": remote_closed, **result}
         except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
             record = self._record_thread_error(db, thread_id, error, now)
             return {"thread": thread_id, "status": "error", "error": record}
@@ -697,8 +795,6 @@ class Watch:
 
     def _wake_one_locked(self, db, thread, now):
         thread_id = thread["thread_id"]
-        if not thread["is_open"]:
-            return {"state": "closed", "would_wake": False}
         # An uncertain or exhausted wake blocks later prompts until the owner
         # explicitly receives the queued reply.
         blocked = db.execute("SELECT message_id,state FROM messages WHERE thread_id=? "
@@ -736,7 +832,7 @@ class Watch:
                     "UPDATE messages SET state='uncertain',wake_attempts=wake_attempts+1,last_wake_at=?, "
                     "submitted_at=NULL,last_error_json=NULL WHERE thread_id=? AND message_id=? "
                     "AND state IN ('pending','awaiting_receipt') AND EXISTS ("
-                    "SELECT 1 FROM threads WHERE thread_id=? AND is_open=1 AND owner_json=?)",
+                    "SELECT 1 FROM threads WHERE thread_id=? AND owner_json=?)",
                     (now, thread_id, message_id, thread_id, owner_json))
                 require(updated.rowcount == 1,
                         "Reply or ownership changed before the CMUX submit; wake held")
@@ -771,7 +867,7 @@ class Watch:
         with db:
             db.execute("UPDATE messages SET state='awaiting_receipt',submitted_at=?,last_wake_at=?,last_error_json=NULL "
                        "WHERE thread_id=? AND message_id=? AND state='uncertain' AND EXISTS ("
-                       "SELECT 1 FROM threads WHERE thread_id=? AND is_open=1 AND owner_json=?)",
+                       "SELECT 1 FROM threads WHERE thread_id=? AND owner_json=?)",
                        (now, now, thread_id, message_id, thread_id, owner_json))
         final = db.execute("SELECT state FROM messages WHERE thread_id=? AND message_id=?",
                            (thread_id, message_id)).fetchone()
@@ -788,42 +884,57 @@ class Watch:
         now = self.clock()
         report = {"at": now, "mode": "send" if send else "observe", "origin": origin, "threads": []}
         with contextlib.closing(self.database(create=False)) as db:
+            self._refresh_dormancy(db, now)
             global_row = db.execute("SELECT value FROM meta WHERE key='global_not_before'").fetchone()
             self.global_not_before = float(global_row[0]) if global_row else 0.0
             if only_thread is not None:
                 thread_ids = [snowflake(only_thread, "thread ID")]
             else:
                 thread_ids = [row[0] for row in db.execute(
-                    "SELECT thread_id FROM threads WHERE is_open=1 ORDER BY registered_at,thread_id")]
+                    "SELECT thread_id FROM threads WHERE subscription_state='active' OR EXISTS ("
+                    "SELECT 1 FROM messages WHERE messages.thread_id=threads.thread_id "
+                    "AND state IN ('pending','awaiting_receipt','uncertain','stalled')) "
+                    "ORDER BY registered_at,thread_id")]
             send_scope = list(thread_ids) if send else []
             for thread_id in thread_ids:
                 try:
-                    thread = self._thread(db, thread_id)
+                    thread = self._thread(db, thread_id, require_open=False)
                 except ValueError as error:
                     report["threads"].append({"thread": thread_id, "status": "error",
                                                "error": {"error": str(error)[:300]}})
                     continue
-                polled = self._poll_thread(db, thread, api, credentials, now)
+                manual_dormant_poll = only_thread is not None and origin == "manual"
+                queue_count = db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE thread_id=? "
+                    "AND state IN ('pending','awaiting_receipt','uncertain','stalled')",
+                    (thread_id,)).fetchone()[0]
+                dormant = thread["subscription_state"] == "dormant"
+                if dormant and not manual_dormant_poll:
+                    polled = {"thread": thread_id, "status": "dormant", "poll_skipped": True}
+                else:
+                    polled = self._poll_thread(db, thread, api, credentials, now)
                 row = {**polled}
-                if polled.get("status") == "polled":
-                    queue_count = db.execute("SELECT COUNT(*) FROM messages WHERE thread_id=? AND state='pending'",
-                                             (thread_id,)).fetchone()[0]
-                    row["pending"] = queue_count
-                    if send:
-                        try:
-                            latest_thread = self._thread(db, thread_id)
-                            row["wake"] = self._wake_one(db, latest_thread, now)
-                        except (ValueError, OSError, subprocess.SubprocessError, sqlite3.Error) as error:
-                            detail = str(error)[:500]
-                            row["wake_error"] = detail
-                            pending = db.execute("SELECT message_id FROM messages WHERE thread_id=? AND state='pending' "
-                                                 "ORDER BY length(message_id),message_id LIMIT 1", (thread_id,)).fetchone()
-                            if pending:
-                                with db:
-                                    db.execute("UPDATE messages SET last_error_json=? WHERE thread_id=? AND message_id=?",
-                                               (json.dumps({"held": detail}), thread_id, pending[0]))
+                row["subscription_state"] = thread["subscription_state"]
+                row["pending"] = db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE thread_id=? AND state='pending'",
+                    (thread_id,)).fetchone()[0]
+                should_wake = polled.get("status") == "polled" or (
+                    dormant and not manual_dormant_poll and queue_count > 0)
+                if send and should_wake:
+                    try:
+                        latest_thread = self._thread(db, thread_id, require_open=False)
+                        row["wake"] = self._wake_one(db, latest_thread, now)
+                    except (ValueError, OSError, subprocess.SubprocessError, sqlite3.Error) as error:
+                        detail = str(error)[:500]
+                        row["wake_error"] = detail
+                        pending = db.execute("SELECT message_id FROM messages WHERE thread_id=? AND state='pending' "
+                                             "ORDER BY length(message_id),message_id LIMIT 1", (thread_id,)).fetchone()
+                        if pending:
+                            with db:
+                                db.execute("UPDATE messages SET last_error_json=? WHERE thread_id=? AND message_id=?",
+                                           (json.dumps({"held": detail}), thread_id, pending[0]))
                 report["threads"].append(row)
-            api_success = any(item.get("status") in ("polled", "closed_remote") for item in report["threads"])
+            api_success = any(item.get("status") == "polled" for item in report["threads"])
             self._record_scan_meta(db, report, api_success, send_scope)
         return report
 
@@ -852,8 +963,12 @@ class Watch:
         try:
             with contextlib.closing(self.database(create=False)) as db:
                 now = self.clock()
+                self._refresh_dormancy(db, now)
                 scope = [snowflake(only_thread, "thread ID")] if only_thread else [
-                    row[0] for row in db.execute("SELECT thread_id FROM threads WHERE is_open=1")]
+                    row[0] for row in db.execute(
+                        "SELECT thread_id FROM threads WHERE subscription_state='active' OR EXISTS ("
+                        "SELECT 1 FROM messages WHERE messages.thread_id=threads.thread_id "
+                        "AND state IN ('pending','awaiting_receipt','uncertain','stalled'))")]
                 report = {"at": now, "mode": "send" if send else "observe", "origin": "worker",
                           "threads": [{"thread": item, "status": "error"} for item in scope]}
                 self._record_scan_meta(db, report, False, scope if send else [])
@@ -1001,8 +1116,10 @@ class Watch:
         with contextlib.closing(self.database(create=False)) as db:
             threads = []
             for row in db.execute("SELECT thread_id,owner_json,cursor,is_open,registered_at,last_poll_at,next_poll_at,"
-                                  "last_error_json,owner_generation FROM threads ORDER BY registered_at,thread_id"):
-                thread_id, owner_json, cursor, is_open, registered_at, last_poll_at, next_poll_at, last_error, generation = row
+                                  "last_error_json,owner_generation,subscription_state,last_activity_at,remote_closed "
+                                  "FROM threads ORDER BY registered_at,thread_id"):
+                (thread_id, owner_json, cursor, is_open, registered_at, last_poll_at, next_poll_at,
+                 last_error, generation, subscription_state, last_activity_at, remote_closed) = row
                 counts = {state: count for state, count in db.execute(
                     "SELECT state,COUNT(*) FROM messages WHERE thread_id=? GROUP BY state", (thread_id,))}
                 recent = [{"message": message_id, "state": state, "wake_attempts": attempts,
@@ -1014,6 +1131,9 @@ class Watch:
                               (thread_id,))]
                 threads.append({"thread": thread_id, "owner": json.loads(owner_json), "cursor": cursor,
                                 "open": bool(is_open), "registered_at": registered_at,
+                                "subscription_state": subscription_state,
+                                "last_activity_at": last_activity_at,
+                                "remote_closed": bool(remote_closed),
                                 "last_poll_at": last_poll_at, "next_poll_at": next_poll_at,
                                 "last_error": json.loads(last_error) if last_error else None,
                                 "owner_generation": generation, "queue": counts, "recent": recent})

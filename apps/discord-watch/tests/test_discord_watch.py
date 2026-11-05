@@ -1,8 +1,10 @@
 import contextlib
+from datetime import datetime, timezone
 import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -25,6 +27,8 @@ SURFACE_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".upper()
 SURFACE_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".upper()
 WORKSPACE_A = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".upper()
 WORKSPACE_B = "dddddddd-dddd-4ddd-8ddd-dddddddddddd".upper()
+TEST_TIMESTAMP = "2026-11-01T12:00:00.000000+00:00"
+TEST_NOW = dw.timestamp_epoch(TEST_TIMESTAMP)
 
 
 def target(session=SESSION_A, surface=SURFACE_A, workspace=WORKSPACE_A, harness="codex", **extra):
@@ -36,11 +40,15 @@ def target(session=SESSION_A, surface=SURFACE_A, workspace=WORKSPACE_A, harness=
 
 
 def message(message_id, author_id=USER_ID, content="Configured user reply", author_name="Configured user", bot=False,
-            webhook_id=None, attachments=None):
+            webhook_id=None, attachments=None, timestamp=TEST_TIMESTAMP):
     return {"id": str(message_id), "author": {"id": str(author_id), "username": author_name,
                                                   "global_name": author_name, "bot": bot},
-            "content": content, "timestamp": "2026-11-01T12:00:00.000000+00:00",
+            "content": content, "timestamp": timestamp,
             "webhook_id": webhook_id, "attachments": attachments or []}
+
+
+def timestamp_at(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
 
 class FakeAPI:
@@ -113,10 +121,11 @@ class FakeWatch(dw.Watch):
         self.api = api or FakeAPI()
         self.values = {"token": "private-test-token", "user_id": USER_ID, "closed_tag": "900"}
         self.fake_cmux = cmux or FakeCmux()
-        self.now = now if now is not None else [1000.0]
+        self.now = now if now is not None else [TEST_NOW]
         super().__init__(*args, clock=lambda: self.now[0], cmux_factory=lambda: self.fake_cmux, **kwargs)
 
     def read_credentials(self):
+        self._configured_user_id = self.values["user_id"]
         return self.values, self.api
 
 
@@ -133,7 +142,7 @@ class DiscordWatchTests(unittest.TestCase):
         self._write_hailing()
         self.api = FakeAPI()
         self.cmux = FakeCmux()
-        self.clock = [1000.0]
+        self.clock = [TEST_NOW]
         self.app = FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
                              cmux=self.cmux, now=self.clock)
         self.old_env = {key: os.environ.get(key) for key in (
@@ -171,6 +180,195 @@ class DiscordWatchTests(unittest.TestCase):
     def thread_cursor(self):
         with contextlib.closing(self.app.database(create=False)) as db:
             return db.execute("SELECT cursor FROM threads WHERE thread_id=?", (THREAD,)).fetchone()[0]
+
+    def thread_lifecycle(self):
+        with contextlib.closing(self.app.database(create=False)) as db:
+            return db.execute("SELECT is_open,subscription_state,last_activity_at,remote_closed,cursor,"
+                              "catchup_before,catchup_max FROM threads WHERE thread_id=?", (THREAD,)).fetchone()
+
+    def test_legacy_closed_registration_migrates_without_losing_durable_state(self):
+        self.state.mkdir(mode=0o700)
+        path = self.state / "discord-watch.sqlite3"
+        db = sqlite3.connect(path)
+        db.executescript("""
+        CREATE TABLE threads (
+          thread_id TEXT PRIMARY KEY, owner_json TEXT NOT NULL, cursor TEXT NOT NULL,
+          is_open INTEGER NOT NULL DEFAULT 1, registered_at REAL NOT NULL, updated_at REAL NOT NULL,
+          last_poll_at REAL, next_poll_at REAL NOT NULL DEFAULT 0, catchup_before TEXT,
+          catchup_max TEXT, last_error_json TEXT, remote_json TEXT NOT NULL DEFAULT '{}',
+          owner_generation INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE messages (
+          thread_id TEXT NOT NULL REFERENCES threads(thread_id), message_id TEXT NOT NULL,
+          author_id TEXT NOT NULL, author_name TEXT NOT NULL, body TEXT NOT NULL,
+          attachments_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT 'pending', wake_attempts INTEGER NOT NULL DEFAULT 0,
+          last_wake_at REAL, submitted_at REAL, received_at REAL, last_error_json TEXT,
+          PRIMARY KEY(thread_id,message_id)
+        );
+        CREATE TABLE ownership_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL,
+          from_session TEXT NOT NULL, to_session TEXT NOT NULL, at REAL NOT NULL,
+          owner_generation INTEGER NOT NULL
+        );
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """)
+        owner_json = json.dumps(self.app.binding_snapshot(self.targets[0]), separators=(",", ":"))
+        remote_json = json.dumps({"id": THREAD, "type": 11,
+                                  "thread_metadata": {"archived": True}, "applied_tags": []})
+        db.execute("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (THREAD, owner_json, "150", 0, TEST_NOW - 500, TEST_NOW - 10, TEST_NOW - 20,
+                    TEST_NOW + 5, "180", "220", json.dumps({"error": "preserved"}), remote_json, 4))
+        db.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (THREAD, "151", USER_ID, "Configured user", "already received", "[]",
+                    timestamp_at(TEST_NOW - 40), "received", 1, TEST_NOW - 35, TEST_NOW - 35,
+                    TEST_NOW - 30, None))
+        attachments = json.dumps([{"filename": "kept.png", "url": "https://example.invalid/kept.png"}])
+        db.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (THREAD, "152", USER_ID, "Configured user", "uncertain body", attachments,
+                    timestamp_at(TEST_NOW - 25), "uncertain", 2, TEST_NOW - 20, None, None,
+                    json.dumps({"uncertain": "preserved"})))
+        db.commit()
+        db.close()
+        path.chmod(0o600)
+
+        with contextlib.closing(self.app.database(create=False)) as migrated:
+            thread = migrated.execute(
+                "SELECT owner_json,cursor,is_open,registered_at,updated_at,last_poll_at,next_poll_at,"
+                "catchup_before,catchup_max,last_error_json,owner_generation,subscription_state,"
+                "last_activity_at,remote_closed FROM threads WHERE thread_id=?", (THREAD,)).fetchone()
+            messages = migrated.execute(
+                "SELECT message_id,body,attachments_json,state,wake_attempts,last_wake_at,submitted_at,"
+                "received_at,last_error_json FROM messages WHERE thread_id=? ORDER BY message_id", (THREAD,)).fetchall()
+        self.assertEqual(thread[:11], (owner_json, "150", 0, TEST_NOW - 500, TEST_NOW - 10,
+                                       TEST_NOW - 20, TEST_NOW + 5, "180", "220",
+                                       json.dumps({"error": "preserved"}), 4))
+        self.assertEqual(thread[11:], ("active", TEST_NOW - 25, 1))
+        self.assertEqual(messages[0][0:4], ("151", "already received", "[]", "received"))
+        self.assertEqual(messages[1][0:5], ("152", "uncertain body", attachments, "uncertain", 2))
+        self.assertEqual(messages[1][5:8], (TEST_NOW - 20, None, None))
+        self.assertEqual(json.loads(messages[1][8]), {"uncertain": "preserved"})
+        self.api.fail = dw.DiscordAPIError(403, "synthetic migrated-thread probe", code=50001)
+        report = self.app.scan()
+        self.assertEqual(report["threads"][0]["status"], "error")
+        self.assertEqual(self.api.calls[0][0], f"/channels/{THREAD}")
+        self.assertEqual(self.thread_lifecycle()[4:], ("150", "180", "220"))
+        self.assertEqual([row[1] for row in self.messages()], ["received", "uncertain"])
+
+    def test_poll_and_retry_bookkeeping_do_not_refresh_meaningful_activity(self):
+        self.register()
+        self.api.fail = dw.DiscordAPIError(403, "temporary synthetic denial", code=50001)
+        self.app.scan()
+        self.assertIsNone(self.thread_lifecycle()[2])
+        self.api.fail = None
+        self.clock[0] = TEST_NOW + dw.POLL_INTERVAL + 1
+        self.app.scan()
+        self.assertIsNone(self.thread_lifecycle()[2])
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("INSERT INTO meta(key,value) VALUES('last_worker_tick_at',?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(self.clock[0]),))
+        self.clock[0] = TEST_NOW + dw.DORMANT_AFTER
+        self.app.scan()
+        self.assertEqual(self.thread_lifecycle()[1], "active")
+        self.clock[0] += 1
+        previous_poll = self.thread_lifecycle()[4]
+        self.api.calls.clear()
+        self.app.scan()
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.thread_lifecycle()[1:3], ("dormant", None))
+        self.assertEqual(self.thread_lifecycle()[4], previous_poll)
+
+    def test_gateway_replies_reset_seven_day_window_without_touching_rest_catchup(self):
+        self.register(after="150")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE threads SET catchup_before='175',catchup_max='190' WHERE thread_id=?",
+                           (THREAD,))
+        first_at = TEST_NOW + 24 * 60 * 60
+        self.clock[0] = first_at
+        first = message("160", timestamp=timestamp_at(first_at))
+        self.assertTrue(self.app.ingest_gateway_message(THREAD, first)["ingested"])
+        self.assertEqual(self.thread_lifecycle()[4:], ("150", "175", "190"))
+        self.assertEqual(self.thread_lifecycle()[2], first_at)
+
+        replay = message("160", timestamp=timestamp_at(first_at + 5 * 24 * 60 * 60))
+        self.assertFalse(self.app.ingest_gateway_message(THREAD, replay)["ingested"])
+        older = message("149", timestamp=timestamp_at(first_at - 24 * 60 * 60))
+        self.assertTrue(self.app.ingest_gateway_message(THREAD, older)["ingested"])
+        self.assertEqual(self.thread_lifecycle()[2], first_at)
+        self.assertEqual(self.thread_cursor(), "150")
+        self.assertEqual([row[0] for row in self.messages()], ["149", "160"])
+
+        second_at = first_at + 6 * 24 * 60 * 60
+        self.clock[0] = second_at
+        second = message("170", timestamp=timestamp_at(second_at))
+        self.assertTrue(self.app.ingest_gateway_message(THREAD, second)["ingested"])
+        self.assertEqual(self.thread_lifecycle()[2], second_at)
+        restarted = FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
+                              cmux=self.cmux, now=self.clock)
+        self.app = restarted
+        self.assertEqual(self.thread_lifecycle()[2], second_at)
+        self.assertEqual([row[0] for row in self.messages()], ["149", "160", "170"])
+        self.clock[0] = second_at + dw.DORMANT_AFTER
+        self.app.scan()
+        self.assertEqual(self.thread_lifecycle()[1], "active")
+        self.clock[0] += 1
+        report = self.app.scan()
+        self.assertEqual(report["threads"][0]["status"], "dormant")
+        self.assertEqual(self.thread_lifecycle()[1], "dormant")
+
+    def test_gateway_ingest_filters_unknown_threads_and_preserves_body_and_attachments(self):
+        self.register()
+        filtered = self.app.ingest_gateway_message(THREAD, message("101", author_id="999"))
+        self.assertFalse(filtered["ingested"])
+        with self.assertRaisesRegex(ValueError, "not registered"):
+            self.app.ingest_gateway_message("999", message("102"))
+        url = "https://cdn.discordapp.com/attachments/100/103/late.png"
+        gateway_event = message("103", content="gateway body",
+                                attachments=[{"filename": "late.png", "url": url}])
+        received = self.app.ingest_gateway_message(THREAD, gateway_event)
+        self.assertTrue(received["ingested"])
+        self.assertFalse(received["rest_cursor_advanced"])
+        self.assertEqual(self.thread_cursor(), THREAD)
+        self.api.rows = [gateway_event]
+        self.app.scan()
+        self.assertEqual(self.thread_cursor(), "103")
+        self.assertEqual(len(self.messages()), 1)
+        output = io.StringIO()
+        self.app.receive(THREAD, "103", output)
+        self.assertIn("gateway body", output.getvalue())
+        self.assertIn("[attachment] late.png: " + url, output.getvalue())
+
+    def test_dormant_pending_reply_skips_rest_and_still_uses_exact_owner_guard(self):
+        self.register()
+        late = message("101", timestamp=timestamp_at(TEST_NOW))
+        self.clock[0] = TEST_NOW + dw.DORMANT_AFTER + 1
+        self.assertTrue(self.app.ingest_gateway_message(THREAD, late)["ingested"])
+        self.assertEqual(self.thread_lifecycle()[1], "dormant")
+        self.api.calls.clear()
+        report = self.app.scan(send=True)
+        self.assertEqual(report["threads"][0]["status"], "dormant")
+        self.assertEqual(report["threads"][0]["wake"]["state"], "awaiting_receipt")
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.cmux.submit_count, 1)
+
+        self.app.ingest_gateway_message(
+            THREAD, message("102", timestamp=timestamp_at(self.clock[0] + 1)))
+        self.app.receive(THREAD, "101", io.StringIO())
+        self.clock[0] += 1
+        self.cmux.fail_binding = "stale exact owner projection"
+        held = self.app.scan(send=True)
+        self.assertIn("wake_error", held["threads"][0])
+        self.assertEqual(self.cmux.submit_count, 1)
+        self.assertEqual(self.messages()[-1][1], "pending")
+        self.cmux.fail_binding = None
+        self.targets.clear()
+        self._write_hailing()
+        missing = self.app.scan(send=True)
+        self.assertIn("wake_error", missing["threads"][0])
+        self.assertEqual(self.cmux.submit_count, 1)
+        self.assertEqual(self.messages()[-1][1], "pending")
 
     def test_register_defaults_to_creation_and_ignores_legacy_cursor_without_proof(self):
         cursor_dir = self.notify_home / "state"
@@ -321,17 +519,39 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertEqual(self.messages()[0][1], "received")
         self.assertEqual(result["threads"][0]["wake"]["state"], "received")
 
-    def test_remote_archive_closes_registration_without_waking_or_dropping_reply(self):
+    def test_local_close_retains_subscription_and_allows_guarded_reply_delivery(self):
         self.register()
+        self.app.close(THREAD)
+        self.assertEqual(self.thread_lifecycle()[:2], (0, "active"))
         self.api.rows = [message("101")]
-        self.app.scan()
-        self.api.remote["thread_metadata"]["archived"] = True
         report = self.app.scan(send=True)
-        self.assertEqual(report["threads"][0]["status"], "closed_remote")
-        self.assertEqual(self.cmux.submit_count, 0)
-        self.assertEqual(self.messages()[0][1], "pending")
+        self.assertEqual(report["threads"][0]["status"], "polled")
+        self.assertTrue(report["threads"][0]["wake"]["submitted"])
+        self.assertEqual(self.messages()[0][1], "awaiting_receipt")
+        self.assertEqual(self.cmux.submit_count, 1)
+        output = io.StringIO()
+        self.app.receive(THREAD, "101", output)
+        self.assertIn("Configured user reply", output.getvalue())
         with self.assertRaisesRegex(ValueError, "closed"):
             self.app.managed(THREAD)
+
+    def test_remote_archive_is_recorded_without_unsubscribing_or_blocking_late_reply(self):
+        self.register()
+        self.api.rows = [message("101")]
+        self.app.scan(send=True)
+        self.app.receive(THREAD, "101", io.StringIO())
+        self.api.remote["thread_metadata"]["archived"] = True
+        self.api.rows.append(message("102", content="late archived reply"))
+        report = self.app.scan(send=True)
+        self.assertEqual(report["threads"][0]["status"], "polled")
+        self.assertTrue(report["threads"][0]["remote_closed"])
+        self.assertEqual(report["threads"][0]["wake"]["state"], "awaiting_receipt")
+        self.assertEqual(self.messages()[1][0:2], ("102", "awaiting_receipt"))
+        self.assertEqual(self.app.managed(THREAD)["owner_session"], SESSION_A)
+        self.assertTrue(self.app.status()["threads"][0]["remote_closed"])
+        output = io.StringIO()
+        self.app.receive(THREAD, "102", output)
+        self.assertIn("late archived reply", output.getvalue())
 
     def test_transfer_requires_exact_from_session_and_preserves_unreceived_replies(self):
         self.register()
@@ -384,7 +604,7 @@ class DiscordWatchTests(unittest.TestCase):
         self.register()
         self.api.rows = [message("101")]
         self.app.scan(origin="worker")
-        self.clock[0] = 1070
+        self.clock[0] = TEST_NOW + 70
         self.api.fail = dw.DiscordAPIError(403, "missing access", code=50001)
         self.app.scan(send=True, origin="worker")
         lock_path = self.state / "worker.lock"
