@@ -535,11 +535,21 @@ def preflight_plugins(connection: Connection, *, directory: str | Path,
         source = row.get("source")
         features = row.get("features")
         state = row.get("state")
-        if (not isinstance(source, dict) or not isinstance(source.get("type"), str)
-                or not source["type"] or not isinstance(source.get("path"), str) or not source["path"]
-                or not isinstance(features, dict) or type(features.get("server")) is not bool
+        source_path = source.get("path") if isinstance(source, dict) else None
+        source_type = source.get("type") if isinstance(source, dict) else None
+        if (not isinstance(source, dict) or source_type not in ("builtin", "package", "local", "sdk")
+                or (source_path is not None and (not isinstance(source_path, str) or not source_path))
+                or (source_type == "local" and source_path is None)
+                or (source_type == "package" and (not isinstance(source.get("target"), str)
+                                                    or not source["target"]))
                 or not isinstance(state, dict) or not isinstance(state.get("status"), str)
-                or not state["status"]):
+                or state["status"] not in ("active", "failed")):
+            raise OpenCodeDispatchError("unsupported_plugin_schema")
+        feature_keys = {"server", "tui", "rpc", "gui"}
+        if (not isinstance(features, dict)
+                or any(key not in feature_keys or features[key] is not True for key in features)):
+            raise OpenCodeDispatchError("unsupported_plugin_schema")
+        if state["status"] == "failed" and not isinstance(state.get("error"), str):
             raise OpenCodeDispatchError("unsupported_plugin_schema")
         if ("error" in state and state["error"] is not None and not isinstance(state["error"], str)):
             raise OpenCodeDispatchError("unsupported_plugin_schema")
@@ -555,8 +565,8 @@ def preflight_plugins(connection: Connection, *, directory: str | Path,
             if source["type"] != "local" or state["status"] not in ("failed", "error"):
                 raise OpenCodeDispatchError("unsupported_plugin_schema")
             unidentified_failed_local.append({
-                "source_type": source["type"],
-                "source_path_basename": Path(source["path"]).name,
+                "source_type": source_type,
+                "source_path_basename": Path(source_path).name,
                 "status": state["status"],
                 "error_summary": error_summary,
                 "ref": state_ref,
@@ -567,9 +577,9 @@ def preflight_plugins(connection: Connection, *, directory: str | Path,
             raise OpenCodeDispatchError("unsupported_plugin_schema")
         parsed.append({
             "id": plugin_id,
-            "source_type": source["type"],
-            "source_path_basename": Path(source["path"]).name,
-            "server_feature": features["server"],
+            "source_type": source_type,
+            "source_path_basename": Path(source_path).name if source_path else None,
+            "server_feature": features.get("server", False),
             "status": state["status"],
             "error_summary": error_summary,
             "ref": state_ref,

@@ -87,6 +87,20 @@ QWEN_OBSERVER_GUIDE_URL = (
     "https://github.com/morecoffeyplease/starfleet-ai/blob/main/docs/qwen-operating-guide.md"
     "#inference-and-test-observer-preflight"
 )
+
+
+def qwen_observer_guide_path():
+    source_path = Path(__file__).resolve()
+    repository_root = source_path.parents[2]
+    guide_path = repository_root / "docs/qwen-operating-guide.md"
+    try:
+        if (repository_root / ".git").exists() and guide_path.is_file():
+            return str(guide_path.resolve(strict=True))
+    except (OSError, RuntimeError):
+        pass
+    return None
+
+
 DELEGATION = ("Ask your parent orchestrator for additional agents, including research and review, unless this task explicitly delegates that authority. "
               "Explicit delegation still follows current role choices, reviewer count and advanced-review permission.")
 
@@ -683,6 +697,15 @@ def preflight_remediation(code, details=None):
 
 def _preflight_output(args, *, status, code=None, details=None, profile=None,
                       choice=None, selection_digest=None, cwd=None, metadata=None, plugins=None):
+    required_reading = {
+        "purpose": ["OpenCode harness preparation", "parent/child task-brief relay"],
+        "guide_url": QWEN_OBSERVER_GUIDE_URL,
+        "relay_to_children_before_brief_snapshot": True,
+        "comprehension_verified": False,
+    }
+    guide_path = qwen_observer_guide_path()
+    if guide_path:
+        required_reading["guide_path"] = guide_path
     result = {
         "kind": "opencode_preflight",
         "status": status,
@@ -696,12 +719,7 @@ def _preflight_output(args, *, status, code=None, details=None, profile=None,
                     "model": choice.get("model"), "effort": choice.get("effort")} if choice else None),
         "metadata": metadata,
         "required_plugins": plugins or [],
-        "required_reading": {
-            "purpose": ["OpenCode harness preparation", "parent/child task-brief relay"],
-            "guide_url": QWEN_OBSERVER_GUIDE_URL,
-            "relay_to_children_before_brief_snapshot": True,
-            "comprehension_verified": False,
-        },
+        "required_reading": required_reading,
         "operations": {
             "api_request_methods_allowed": ["GET"],
             "preferences_written": False,

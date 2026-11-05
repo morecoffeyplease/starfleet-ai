@@ -675,12 +675,22 @@ class OpenCodeDispatchTest(unittest.TestCase):
 
     def test_preflight_cli_checks_exact_saved_role_and_active_api_plugin_without_inference(self):
         self.state.plugins = [{
-            "id": "fixture-pattern-buffer",
-            "source": {"type": "local", "path": "/fixture/plugins/pattern-buffer"},
+            "id": "opencode.agent",
+            "source": {"type": "builtin"},
             "features": {"server": True},
-            "state": {"status": "active", "error": None, "ref": None},
+            "state": {"status": "active"},
+        }, {
+            "id": "fixture.sdk.ui",
+            "source": {"type": "sdk"},
+            "features": {"tui": True},
+            "state": {"status": "active"},
+        }, {
+            "id": "starfleet-policy-guard-opencode",
+            "source": {"type": "local", "path": "/fixture/plugins/starfleet-policy-guard/opencode-plugin"},
+            "features": {"server": True},
+            "state": {"status": "active"},
         }]
-        args, worktree = self.preflight_args(required_plugins=("fixture-pattern-buffer",))
+        args, worktree = self.preflight_args(required_plugins=("starfleet-policy-guard-opencode",))
         with patch.object(mp, "run_json") as cmux:
             exit_code, result = self.invoke_preflight_main(args)
         cmux.assert_not_called()
@@ -698,9 +708,14 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertTrue(result["required_reading"]["relay_to_children_before_brief_snapshot"])
         self.assertFalse(result["required_reading"]["comprehension_verified"])
         self.assertIn("inference-and-test-observer-preflight", result["required_reading"]["guide_url"])
+        self.assertEqual(
+            result["required_reading"]["guide_path"],
+            str(Path(mp.__file__).resolve().parents[2] / "docs/qwen-operating-guide.md"),
+        )
+        self.assertTrue(Path(result["required_reading"]["guide_path"]).is_file())
         self.assertEqual(result["required_plugins"], [{
-            "id": "fixture-pattern-buffer", "source_type": "local",
-            "source_path_basename": "pattern-buffer", "server_feature": True,
+            "id": "starfleet-policy-guard-opencode", "source_type": "local",
+            "source_path_basename": "opencode-plugin", "server_feature": True,
             "status": "active", "error_summary": None, "ref": None,
         }])
         self.assertFalse(result["native_proof"])
@@ -724,9 +739,16 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertFalse(Path(args.state_dir).exists())
         self.assertFalse((Path(args.config_dir) / ".lock").exists())
 
+    def test_observer_guide_path_is_omitted_outside_a_source_checkout(self):
+        installed_module = self.root / "installed" / "model_preferences.py"
+        installed_module.parent.mkdir()
+        installed_module.touch()
+        with patch.object(mp, "__file__", str(installed_module)):
+            self.assertIsNone(mp.qwen_observer_guide_path())
+
     def test_preflight_fails_when_required_local_plugin_has_no_api_id(self):
         self.state.plugins = [{
-            "source": {"type": "local", "path": "/fixture/plugins/prime-directive"},
+            "source": {"type": "local", "path": "/fixture/plugins/starfleet-policy-guard/opencode-plugin"},
             "features": {"server": True},
             "state": {"status": "failed", "error": "Plugin failed to load", "ref": "err_fixture123"},
         }]
@@ -739,7 +761,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(details["plugin_id"], "fixture-prime-directive")
         self.assertIsNone(details["observed"])
         self.assertEqual(details["unidentified_failed_local_plugins"], [{
-            "source_type": "local", "source_path_basename": "prime-directive",
+            "source_type": "local", "source_path_basename": "opencode-plugin",
             "status": "failed", "error_summary": "Plugin failed to load", "ref": "err_fixture123",
         }])
         self.assertIn("API omitted its id", result["error"]["remediation"])
@@ -759,8 +781,8 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.state.plugins = [{
             "id": "fixture-plugin",
             "source": {"type": "local", "path": "/fixture/plugins/example"},
-            "features": {"server": False},
-            "state": {"status": "active", "error": None, "ref": None},
+            "features": {"server": True},
+            "state": {"status": "active"},
         }]
         self.state.plugin_response_directories[str(worktree)] = str(self.root)
         result = mp.execute(args)
