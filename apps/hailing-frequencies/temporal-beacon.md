@@ -14,8 +14,9 @@ The installer publishes an immutable runtime and the Hailing Frequencies, Tempor
 
 OpenCode timers require an exact Hailing Frequencies self-enrollment manifest and use the enrolled loopback API binding when they become due.
 Timer commands require the managed launch's exact `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, `CMUX_SURFACE_ID`, and `CMUX_WORKSPACE_ID` environment values.
-The current native pilot reports OpenCode `surface.input_state` as `unknown`, so OpenCode enrollment, timer creation, and timer delivery remain held until CMUX reports an exact empty composer.
-The OpenCode API inspector checks running state, permissions, forms, session identity, server PID, and directories, but does not expose composer drafts.
+OpenCode enrollment and timer creation verify the exact API and native session identity and may proceed while the API session is busy.
+Timer delivery still requires the full API readiness inspection and the enrolled composer policy; the current native pilot's `unknown` composer state holds delivery under the default `native_empty_composer` policy.
+The OpenCode API identity inspector checks session identity, server PID, and directories without requiring send readiness, while the delivery inspector also checks running state, permissions, and forms; neither exposes composer drafts.
 
 Register the packaged skill with each harness that needs to discover Temporal Beacon.
 Delivery requires the authorized Hailing worker terminal to remain open.

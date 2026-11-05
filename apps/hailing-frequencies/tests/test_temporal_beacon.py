@@ -462,6 +462,76 @@ class TemporalBeaconTests(unittest.TestCase):
             owner, _key, _worktree = self.beacon.owner(verify=False)
         self.assertEqual(owner["session"], target["session"])
 
+    def test_opencode_cli_set_allows_busy_identity_but_delivery_stays_strict(self):
+        target = {**self.target, "session": "ses_TemporalBusyFixture42", "harness": "opencode",
+                  "api_url": "http://127.0.0.1:4096", "password_file": str(self.root / "password"),
+                  "expected_server_pid": 12345, "session_directory": str(self.root),
+                  "worktree_directory": str(self.root), "parent_task_id": "task:temporal-busy-fixture",
+                  "delivery_policy": "native_empty_composer"}
+        hf.atomic_json(self.root / "config.json", {"version": 1, "targets": [target], "coordinator": None,
+            "remind_after": 300, "escalate_after": 900, "cooldown": 600, "interval": 5})
+        hf.atomic_json(self.root / "opencode-hook-sessions.json", {"sessions": {target["session"]: {
+            "surfaceId": target["surface"], "workspaceId": target["workspace"],
+            "startedAt": target["started_at"], "cwd": str(self.root), "agentLifecycle": "running"}}})
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"}, "items": [{
+            "placement": {"kind": "local"},
+            "projections": [{"panel_id": target["surface"], "workspace_id": target["workspace"]}],
+            "agents": [{"kind": "opencode", "session_id": target["session"], "state": "working"}]}]}
+        cmux = hf.Cmux(hook_directory=self.root)
+
+        def command(*args):
+            if args == ("current", "--limit", "200"):
+                return current
+            if len(args) == 3 and args[0] == "rpc" and args[1] == "agent.message.settings":
+                return {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+            raise AssertionError(f"Unexpected CMUX command: {args!r}")
+
+        cmux.command = command
+        env = {"CMUX_AGENT_LAUNCH_KIND": "opencode", "OPENCODE_SESSION_ID": target["session"],
+               "CMUX_SURFACE_ID": target["surface"], "CMUX_WORKSPACE_ID": target["workspace"]}
+        args = ["--state-dir", str(self.root), "temporal", "set", "--after", "2m",
+                "--message", "Resume the bounded task"]
+
+        with patch.object(hf, "Cmux", return_value=cmux), \
+             patch.object(hf, "opencode_identity_binding", return_value=object()), \
+             patch.object(hf, "opencode_binding", side_effect=ValueError("session_busy")), \
+             patch.dict("os.environ", env, clear=True):
+            result = hf.main(args)
+
+            # The caller must still match the exact enrolled session, surface, and workspace.
+            for key, value in (("OPENCODE_SESSION_ID", "ses_WrongOwnerFixture42"),
+                               ("CMUX_SURFACE_ID", uid()), ("CMUX_WORKSPACE_ID", uid())):
+                wrong_env = {**env, key: value}
+                with patch.dict("os.environ", wrong_env, clear=True), self.assertRaises(ValueError):
+                    hf.main(args)
+
+            # Native generation and API identity remain mandatory for creation.
+            hf.atomic_json(self.root / "opencode-hook-sessions.json", {"sessions": {target["session"]: {
+                "surfaceId": target["surface"], "workspaceId": target["workspace"],
+                "startedAt": target["started_at"] + 1, "cwd": str(self.root), "agentLifecycle": "running"}}})
+            with self.assertRaisesRegex(ValueError, "generation changed"):
+                hf.main(args)
+            hf.atomic_json(self.root / "opencode-hook-sessions.json", {"sessions": {target["session"]: {
+                "surfaceId": target["surface"], "workspaceId": target["workspace"],
+                "startedAt": target["started_at"], "cwd": str(self.root), "agentLifecycle": "running"}}})
+            with patch.object(hf, "opencode_identity_binding", side_effect=ValueError("session_id_mismatch")), \
+                 self.assertRaisesRegex(ValueError, "session_id_mismatch"):
+                hf.main(args)
+
+            self.assertEqual(result["timer"]["session"], target["session"])
+            self.assertEqual(result["timer"]["started_at"], target["started_at"])
+            self.assertEqual(len(self.beacon.list(result["timer"]["owner_key"])["timers"]), 1)
+
+            # A busy API session remains a hard hold when the due timer reaches delivery.
+            self.beacon.app.cmux = cmux
+            self.clock.value += 121
+            with patch.object(cmux, "submit", wraps=cmux.submit) as submit:
+                report = self.beacon.tick(send=True)
+            self.assertEqual(report["timers"][0]["status"], "held")
+            self.assertIn("session_busy", report["timers"][0]["detail"])
+            submit.assert_not_called()
+            self.assertEqual(self.status(result["timer"]["id"])[1], ["held"])
+
     def test_concurrent_timer_mutation_fails_with_actionable_retry(self):
         stream = (self.root / "timers.lock").open("a")
         hf.fcntl.flock(stream, hf.fcntl.LOCK_EX | hf.fcntl.LOCK_NB)

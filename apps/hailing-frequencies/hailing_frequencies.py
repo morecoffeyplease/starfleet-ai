@@ -1361,10 +1361,10 @@ def main(argv=None):
         beacon = TemporalBeacon(app)
         if args.temporal_command == "doctor":
             return beacon.doctor()
-        target, owner_key, _worktree = beacon.owner()
         if args.temporal_command == "set":
             return beacon.set(args.after, args.at, args.every, args.until, args.message,
                               args.request_id, args.replace_key, after_idle=args.after_idle)
+        target, owner_key, _worktree = beacon.owner()
         if args.temporal_command == "list":
             return beacon.list(owner_key)
         if args.temporal_command == "inspect":
