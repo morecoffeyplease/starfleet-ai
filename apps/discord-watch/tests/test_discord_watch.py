@@ -408,6 +408,214 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertIn("gateway body", output.getvalue())
         self.assertIn("[attachment] late.png: " + url, output.getvalue())
 
+    def test_gateway_dispatch_commits_sequence_with_intake_and_rolls_back_failures(self):
+        self.register(after="100")
+        invalid = message("101", content={"not": "text"})
+        invalid["channel_id"] = THREAD
+        with self.assertRaisesRegex(ValueError, "content is not text"):
+            self.app.commit_gateway_dispatch(10, "MESSAGE_CREATE", invalid, USER_ID)
+        self.assertIsNone(self.app.gateway_session()["sequence"])
+        self.assertEqual(self.messages(), [])
+
+        accepted = message("103", content="committed with sequence")
+        accepted["channel_id"] = THREAD
+        committed = self.app.commit_gateway_dispatch(10, "MESSAGE_CREATE", accepted, USER_ID)
+        self.assertTrue(committed["committed"])
+        self.assertTrue(committed["ingested"])
+        self.assertEqual(self.app.gateway_session()["sequence"], "10")
+        duplicate = message("102", content="must not replay")
+        duplicate["channel_id"] = THREAD
+        self.assertTrue(self.app.commit_gateway_dispatch(10, "MESSAGE_CREATE", duplicate, USER_ID)["duplicate"])
+        self.assertEqual([row[0] for row in self.messages()], ["103"])
+
+        unrelated = message("104", author_id="999")
+        unrelated["channel_id"] = THREAD
+        ignored = self.app.commit_gateway_dispatch(11, "MESSAGE_CREATE", unrelated, USER_ID)
+        self.assertTrue(ignored["committed"])
+        self.assertFalse(ignored["ingested"])
+        self.assertEqual(self.app.gateway_session()["sequence"], "11")
+        self.assertEqual([row[0] for row in self.messages()], ["103"])
+        self.app = FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
+                             cmux=self.cmux, now=self.clock)
+        self.assertEqual(self.app.gateway_session()["sequence"], "11")
+        self.assertTrue(self.app.commit_gateway_dispatch(10, "MESSAGE_CREATE", duplicate,
+                                                         USER_ID)["duplicate"])
+        self.assertEqual([row[0] for row in self.messages()], ["103"])
+
+    def test_ready_starts_durable_recovery_for_retained_dormant_threads(self):
+        self.register()
+        self.app.close(THREAD)
+        self.app.register("101")
+        self.clock[0] += dw.DORMANT_AFTER + 1
+        self.app.scan()
+        self.assertEqual(self.thread_lifecycle()[1], "dormant")
+        ready = {"session_id": "synthetic-gateway-session",
+                 "resume_gateway_url": "wss://gateway.discord.gg"}
+        result = self.app.commit_gateway_dispatch(
+            12, "READY", ready, USER_ID, validate_resume_url=lambda value: value)
+        self.assertTrue(result["committed"])
+        state = self.app.gateway_session()
+        self.assertEqual(state["session_id"], "synthetic-gateway-session")
+        self.assertEqual(state["sequence"], "12")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            work = dict(db.execute("SELECT thread_id,state FROM gateway_recovery_work WHERE epoch=?",
+                                   (state["recovery_epoch"],)))
+        self.assertEqual(work, {THREAD: "queued", "101": "queued"})
+        self.assertEqual(state["recovery_state"], "pending")
+        self.app = FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
+                             cmux=self.cmux, now=self.clock)
+        self.assertEqual(self.app.gateway_session()["session_id"], "synthetic-gateway-session")
+        self.assertEqual(self.app.gateway_session()["sequence"], "12")
+
+    def test_status_separates_gateway_failure_from_thread_recovery_and_access(self):
+        self.register()
+        self.app.set_gateway_condition("fatal_configuration", "synthetic intent failure")
+        epoch = self.app.begin_gateway_recovery("synthetic reconnect")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE gateway_recovery_work SET state='blocked',last_error_json=? "
+                           "WHERE epoch=? AND thread_id=?",
+                           (json.dumps({"http_status": 403}), epoch, THREAD))
+        status = self.app.status()
+        self.assertEqual(status["gateway"]["condition"], "fatal_configuration")
+        self.assertEqual(status["gateway"]["recovery"]["state"], "pending")
+        self.assertIn("intents", status["gateway"]["coordinator_guidance"])
+        thread = status["threads"][0]
+        self.assertEqual(thread["rest_recovery"]["condition"], "inaccessible")
+        self.assertIn("access", thread["coordinator_guidance"])
+
+    def test_rest_worker_rotates_fairly_and_passes_a_two_page_budget(self):
+        thread_ids = [str(value) for value in range(100, 110)]
+        for thread_id in thread_ids:
+            self.app.register(thread_id)
+        observed = []
+
+        def poll(db, thread, api, credentials, now, max_pages, routine, stop_event=None):
+            observed.append((thread["thread_id"], max_pages, routine))
+            return {"thread": thread["thread_id"], "status": "polled", "catchup_pending": False}
+
+        with mock.patch.object(self.app, "_poll_thread", side_effect=poll):
+            first = self.app._rest_recovery_turn()
+            first_threads = [row[0] for row in observed]
+            self.assertEqual(len(first_threads), dw.WORKER_REST_THREADS_PER_TURN)
+            self.assertTrue(all(row[1:] == (dw.WORKER_REST_PAGES_PER_THREAD, True)
+                                for row in observed))
+            self.assertEqual(first["request_budget"],
+                             dw.WORKER_REST_THREADS_PER_TURN *
+                             (1 + dw.WORKER_REST_PAGES_PER_THREAD))
+        self.app = FakeWatch(self.state, self.hailing, self.notify_home, api=self.api,
+                             cmux=self.cmux, now=self.clock)
+        observed.clear()
+        with mock.patch.object(self.app, "_poll_thread", side_effect=poll):
+            self.app._rest_recovery_turn()
+        second_threads = [row[0] for row in observed]
+        self.assertEqual(second_threads[:2], sorted(set(thread_ids) - set(first_threads)))
+
+    def test_routine_rest_reconciliation_uses_the_thirty_second_due_boundary(self):
+        self.register()
+        calls = []
+
+        def poll(db, thread, api, credentials, now, max_pages, routine, stop_event=None):
+            calls.append(now)
+            with db:
+                db.execute("UPDATE threads SET last_poll_at=?,next_poll_at=? WHERE thread_id=?",
+                           (now, now + dw.ROUTINE_REST_INTERVAL, thread["thread_id"]))
+            return {"thread": thread["thread_id"], "status": "polled", "catchup_pending": False}
+
+        with mock.patch.object(self.app, "_poll_thread", side_effect=poll):
+            self.app._rest_recovery_turn()
+            self.clock[0] = TEST_NOW + dw.ROUTINE_REST_INTERVAL - 1
+            self.app._rest_recovery_turn()
+            self.assertEqual(calls, [TEST_NOW])
+            self.clock[0] = TEST_NOW + dw.ROUTINE_REST_INTERVAL
+            self.app._rest_recovery_turn()
+        self.assertEqual(calls, [TEST_NOW, TEST_NOW + dw.ROUTINE_REST_INTERVAL])
+
+    def test_stopping_during_paginated_recovery_preserves_committed_page_and_boundary(self):
+        self.register()
+        stop_event = threading.Event()
+
+        class StopAfterPageAPI(FakeAPI):
+            def get(self, path, query=None):
+                result = super().get(path, query)
+                if path.endswith("/messages"):
+                    stop_event.set()
+                return result
+
+        api = StopAfterPageAPI([message(str(value)) for value in range(101, 201)])
+        self.app.api = api
+        self.api = api
+        credentials, selected_api = self.app.read_credentials()
+        with contextlib.closing(self.app.database(create=False)) as db:
+            thread = self.app._thread(db, THREAD, require_open=False)
+            result = self.app._poll_thread(db, thread, selected_api, credentials, self.clock[0],
+                                           max_pages=2, routine=True, stop_event=stop_event)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(self.thread_cursor(), THREAD)
+        self.assertEqual(self.thread_lifecycle()[5], "101")
+        self.assertEqual(len(self.messages()), 100)
+        self.app = FakeWatch(self.state, self.hailing, self.notify_home, api=api,
+                             cmux=self.cmux, now=self.clock)
+        self.assertEqual(self.thread_cursor(), THREAD)
+        self.assertEqual(self.thread_lifecycle()[5], "101")
+        self.assertEqual(len(self.messages()), 100)
+
+    def test_gateway_and_group_sender_progress_while_rest_lane_is_blocked(self):
+        self.register()
+        self.gateway("101", "ready while REST is blocked")
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        rest_entered = threading.Event()
+        rest_release = threading.Event()
+        gateway_progress = threading.Event()
+        group_submitted = threading.Event()
+        stop_event = threading.Event()
+
+        class LocalGateway:
+            def __init__(self):
+                self.stop_called = False
+
+            def run(self, shared_stop):
+                gateway_progress.set()
+                shared_stop.wait(timeout=3)
+
+            def stop(self):
+                self.stop_called = True
+
+        local_gateway = LocalGateway()
+
+        def blocked_rest(*args):
+            rest_entered.set()
+            rest_release.wait(timeout=3)
+            return {"threads": []}
+
+        original_dispatch = self.app._dispatch_turn
+
+        def tracked_dispatch(*, send=False, only_thread=None):
+            result = original_dispatch(send=send, only_thread=only_thread)
+            if self.cmux.submit_count:
+                group_submitted.set()
+            return result
+
+        with mock.patch.object(self.app, "_rest_recovery_turn", side_effect=blocked_rest), \
+                mock.patch.object(self.app, "_dispatch_turn", side_effect=tracked_dispatch):
+            worker = threading.Thread(target=self.app.serve,
+                                      kwargs={"send": True,
+                                              "gateway_factory": lambda watch: local_gateway,
+                                              "stop_event": stop_event})
+            worker.start()
+            self.assertTrue(rest_entered.wait(timeout=2))
+            self.assertTrue(gateway_progress.wait(timeout=2))
+            self.assertTrue(group_submitted.wait(timeout=2))
+            self.assertFalse(rest_release.is_set())
+            self.assertEqual(self.cmux.submit_count, 1)
+            stop_event.set()
+            rest_release.set()
+            worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(local_gateway.stop_called)
+        self.assertEqual(self.cmux.submit_count, 1)
+
     def test_rest_channel_mismatch_rolls_back_message_and_cursor_page(self):
         self.register()
         mismatched = message("101")
@@ -1345,6 +1553,38 @@ class DiscordWatchTests(unittest.TestCase):
         self.assertTrue(record["global_rate_limit"])
         self.assertNotIn("do-not-print-this-token", str(caught.exception))
 
+    def test_successful_rate_limit_headers_persist_route_and_global_buckets(self):
+        class Response:
+            def __init__(self, headers):
+                self.headers = headers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, maximum):
+                return b"{}"
+
+        route_api = dw.Discord("synthetic-token", opener=lambda request, timeout: Response({
+            "X-RateLimit-Bucket": "messages-bucket", "X-RateLimit-Limit": "5",
+            "X-RateLimit-Remaining": "0", "X-RateLimit-Reset-After": "10"}),
+            clock=lambda: TEST_NOW)
+        route_api.get("/channels/100/messages")
+        self.assertEqual(route_api.deferred_until("/channels/100/messages", TEST_NOW), TEST_NOW + 10)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.app._persist_api_limits(db, route_api, THREAD, TEST_NOW)
+            stored = db.execute("SELECT bucket_key,remaining,reset_at FROM api_rate_limits WHERE route_key=?",
+                                ("GET /channels/100/messages",)).fetchone()
+        self.assertEqual(stored, ("messages-bucket:100", 0, TEST_NOW + 10))
+
+        global_api = dw.Discord("synthetic-token", opener=lambda request, timeout: Response({
+            "X-RateLimit-Global": "true", "X-RateLimit-Reset-After": "15"}),
+            clock=lambda: TEST_NOW)
+        global_api.get("/gateway/bot")
+        self.assertEqual(global_api.global_not_before, TEST_NOW + 15)
+
     def test_managed_health_is_specific_to_the_requested_thread(self):
         self.register()
         self.app.scan(send=True, origin="worker")
@@ -1399,6 +1639,12 @@ class DiscordWatchTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
+    @staticmethod
+    def fixture_provisioner(vendor_dir, lock_file):
+        package = Path(vendor_dir) / "websocket"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text('__version__ = "1.9.2"\n', encoding="utf-8")
+
     def test_installed_guide_prints_outside_checkout_without_creating_state(self):
         sys.path.insert(0, str(APP_DIR))
         import install
@@ -1406,7 +1652,7 @@ class InstallerTests(unittest.TestCase):
             root = Path(temporary)
             bin_dir = root / "bin"
             runtime_root = root / "runtime"
-            result = install.install(runtime_root, bin_dir)
+            result = install.install(runtime_root, bin_dir, provisioner=self.fixture_provisioner)
             self.assertFalse(result["worker_started"])
             cwd = root / "outside"
             cwd.mkdir()
@@ -1426,6 +1672,48 @@ class InstallerTests(unittest.TestCase):
                      for path in runtime.rglob("*") if path.is_file()}
             self.assertEqual(after, before)
             self.assertFalse(any("__pycache__" in path.parts for path in runtime.rglob("*")))
+
+    def test_dependency_provisioning_failure_keeps_existing_launcher_and_runtime(self):
+        sys.path.insert(0, str(APP_DIR))
+        import install
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            runtime_root = root / "runtime"
+            installed = install.install(runtime_root, bin_dir, provisioner=self.fixture_provisioner)
+            launcher = bin_dir / "discord-watch"
+            original_launcher = launcher.read_bytes()
+            original_runtime = Path(installed["runtime"])
+
+            def fail_provision(vendor_dir, lock_file):
+                raise ValueError("synthetic local fixture provisioning failure")
+
+            with self.assertRaisesRegex(ValueError, "synthetic local fixture"):
+                install.install(runtime_root, bin_dir, provisioner=fail_provision)
+            self.assertEqual(launcher.read_bytes(), original_launcher)
+            self.assertTrue(original_runtime.is_dir())
+
+    def test_dependency_integrity_failure_keeps_existing_launcher_and_runtime(self):
+        sys.path.insert(0, str(APP_DIR))
+        import install
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            runtime_root = root / "runtime"
+            installed = install.install(runtime_root, bin_dir, provisioner=self.fixture_provisioner)
+            launcher = bin_dir / "discord-watch"
+            original_launcher = launcher.read_bytes()
+            original_runtime = Path(installed["runtime"])
+
+            def bad_dependency(vendor_dir, lock_file):
+                package = Path(vendor_dir) / "websocket"
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "integrity check failed"):
+                install.install(runtime_root, bin_dir, provisioner=bad_dependency)
+            self.assertEqual(launcher.read_bytes(), original_launcher)
+            self.assertTrue(original_runtime.is_dir())
 
 
 class ServiceCliTests(unittest.TestCase):

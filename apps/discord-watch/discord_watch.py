@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
 import shlex
 import signal
 import shutil
@@ -22,6 +23,10 @@ import urllib.parse
 import urllib.request
 
 sys.dont_write_bytecode = True
+
+RUNTIME_VENDOR = Path(__file__).resolve().parent / "vendor"
+if RUNTIME_VENDOR.is_dir() and str(RUNTIME_VENDOR) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_VENDOR))
 
 try:
     import hailing_frequencies as hf
@@ -42,10 +47,17 @@ MESSAGE_LIMIT = 100
 MAX_CATCHUP_PAGES = 50
 MAX_MESSAGE_BYTES = 64 * 1024
 MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_RATE_LIMIT_WAIT = 24 * 60 * 60
 MAX_RECEIVE_MESSAGES = 20
 MAX_RECEIVE_BYTES = 256 * 1024
 GROUP_QUIET_SECONDS = 3
 GROUP_MAX_DELAY = 10
+ROUTINE_REST_INTERVAL = 30
+REST_TURN_INTERVAL = 1
+WORKER_REST_THREADS_PER_TURN = 8
+WORKER_REST_PAGES_PER_THREAD = 2
+SENDER_INTERVAL = 0.25
+LANE_JOIN_TIMEOUT = 20
 MAX_WAKE_ATTEMPTS = 3
 DORMANT_AFTER = 7 * 24 * 60 * 60
 ALLOWED_LAUNCH_KINDS = {"claude", "codex"}
@@ -124,11 +136,74 @@ class DiscordAPIError(ValueError):
 
 
 class Discord:
-    def __init__(self, token, timeout=HTTP_TIMEOUT, opener=None):
+    def __init__(self, token, timeout=HTTP_TIMEOUT, opener=None, clock=time.time):
         require(isinstance(token, str) and token.strip(), "DISCORD_BOT_TOKEN is required")
         self.token = token.strip()
         self.timeout = timeout
         self.opener = opener or urllib.request.urlopen
+        self.clock = clock
+        self.request_count = 0
+        self.route_limits = {}
+        self.rate_updates = []
+        self.global_not_before = 0.0
+
+    @staticmethod
+    def route_key(path):
+        return "GET " + path.split("?", 1)[0]
+
+    def load_route_limits(self, values, global_not_before=0.0):
+        self.route_limits = {row[0]: {"bucket_key": row[1], "remaining": row[2],
+                                      "reset_at": row[3]} for row in values}
+        self.global_not_before = float(global_not_before or 0.0)
+
+    def deferred_until(self, path, now):
+        if now < self.global_not_before:
+            return self.global_not_before
+        route = self.route_key(path)
+        limit = self.route_limits.get(route)
+        candidates = [limit] if limit else []
+        if limit and limit.get("bucket_key"):
+            candidates.extend(item for item in self.route_limits.values()
+                              if item.get("bucket_key") == limit["bucket_key"])
+        waits = [item["reset_at"] for item in candidates
+                 if item and item.get("remaining") == 0 and item.get("reset_at", 0) > now]
+        return max(waits, default=0.0)
+
+    def _remember_headers(self, path, headers, now):
+        if headers is None:
+            return
+        route = self.route_key(path)
+        bucket = headers.get("X-RateLimit-Bucket")
+        major = path.split("/", 3)[2] if path.startswith("/channels/") else ""
+        bucket_key = f"{bucket}:{major}" if bucket else route
+        def number(name):
+            raw = headers.get(name)
+            try:
+                value = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                return None
+            return value if value is not None and math.isfinite(value) and value >= 0 else None
+        remaining_value = number("X-RateLimit-Remaining")
+        limit_value = number("X-RateLimit-Limit")
+        reset_after = number("X-RateLimit-Reset-After")
+        reset_epoch = number("X-RateLimit-Reset")
+        if reset_after is not None:
+            reset_at = now + min(MAX_RATE_LIMIT_WAIT, reset_after)
+        elif reset_epoch is not None:
+            reset_at = min(now + MAX_RATE_LIMIT_WAIT, reset_epoch)
+        else:
+            reset_at = None
+        if remaining_value is not None or reset_at is not None:
+            value = {"route": route, "bucket_key": bucket_key,
+                     "remaining": int(remaining_value) if remaining_value is not None else None,
+                     "limit_total": int(limit_value) if limit_value is not None else None,
+                     "reset_at": reset_at or 0.0, "updated_at": now}
+            self.route_limits[route] = value
+            self.rate_updates.append(value)
+        if str(headers.get("X-RateLimit-Global", "")).lower() == "true" or \
+                headers.get("X-RateLimit-Scope") == "global":
+            wait = min(MAX_RATE_LIMIT_WAIT, reset_after or number("Retry-After") or 0)
+            self.global_not_before = max(self.global_not_before, now + wait)
 
     def get(self, path, query=None):
         url = API + path
@@ -140,13 +215,16 @@ class Discord:
             "Accept": "application/json",
         })
         try:
+            self.request_count += 1
             with self.opener(request, timeout=self.timeout) as response:
+                self._remember_headers(path, getattr(response, "headers", None), self.clock())
                 body = response.read(MAX_API_RESPONSE_BYTES + 1)
                 require(len(body) <= MAX_API_RESPONSE_BYTES,
                         "Discord response exceeded the bounded response size")
         except urllib.error.HTTPError as error:
             body = error.read(16 * 1024)
             headers = error.headers or {}
+            self._remember_headers(path, headers, self.clock())
             parsed = {}
             try:
                 parsed = json.loads(body.decode("utf-8", "replace"))
@@ -230,7 +308,7 @@ def read_notify_credentials(notify_home):
 class Watch:
     def __init__(self, state_dir=DEFAULT_STATE, hailing_state=DEFAULT_HAILING_STATE,
                  notify_home=DEFAULT_NOTIFY_HOME, cmux="cmux", clock=time.time,
-                 discord_factory=Discord, cmux_factory=None):
+                 discord_factory=Discord, cmux_factory=None, gateway_factory=None):
         self.directory = Path(state_dir).expanduser().absolute()
         self.hailing_state = Path(hailing_state).expanduser().absolute()
         self.notify_home = Path(notify_home).expanduser().absolute()
@@ -238,6 +316,7 @@ class Watch:
         self.clock = clock
         self.discord_factory = discord_factory
         self.cmux_factory = cmux_factory or (lambda: hf.Cmux(cmux))
+        self.gateway_factory = gateway_factory
         self._configured_user_id = None
         self.global_not_before = 0.0
         os.umask(0o077)
@@ -379,6 +458,47 @@ class Watch:
           SELECT RAISE(ABORT, 'delivery group identity is immutable');
         END;
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS gateway_state (
+          id INTEGER PRIMARY KEY CHECK(id=1),
+          condition TEXT NOT NULL DEFAULT 'degraded',
+          session_id TEXT,
+          resume_url TEXT,
+          sequence TEXT,
+          session_start_total INTEGER,
+          session_start_remaining INTEGER,
+          session_start_reset_at REAL,
+          last_identify_at REAL,
+          last_event_at REAL,
+          last_error_json TEXT,
+          recovery_epoch INTEGER NOT NULL DEFAULT 0,
+          recovery_state TEXT NOT NULL DEFAULT 'pending',
+          recovery_reason TEXT,
+          recovery_started_at REAL,
+          recovery_completed_at REAL,
+          updated_at REAL NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO gateway_state(id,condition,updated_at) VALUES(1,'degraded',0);
+        CREATE TABLE IF NOT EXISTS gateway_recovery_work (
+          epoch INTEGER NOT NULL,
+          thread_id TEXT NOT NULL,
+          owner_generation INTEGER NOT NULL,
+          state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          updated_at REAL NOT NULL,
+          completed_at REAL,
+          last_error_json TEXT,
+          PRIMARY KEY(epoch,thread_id,owner_generation)
+        );
+        CREATE INDEX IF NOT EXISTS gateway_recovery_queue
+        ON gateway_recovery_work(epoch,state,thread_id);
+        CREATE TABLE IF NOT EXISTS api_rate_limits (
+          route_key TEXT PRIMARY KEY,
+          bucket_key TEXT NOT NULL,
+          remaining INTEGER,
+          limit_total INTEGER,
+          reset_at REAL NOT NULL DEFAULT 0,
+          updated_at REAL NOT NULL
+        );
         """)
         db.execute("BEGIN IMMEDIATE")
         attempt_columns = {row[1] for row in db.execute("PRAGMA table_info(delivery_group_attempts)")}
@@ -489,6 +609,183 @@ class Watch:
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA foreign_keys=ON")
         return db
+
+    def gateway_session(self):
+        with contextlib.closing(self.database(create=False)) as db:
+            row = db.execute(
+                "SELECT condition,session_id,resume_url,sequence,session_start_total,"
+                "session_start_remaining,session_start_reset_at,last_identify_at,last_event_at,"
+                "recovery_epoch,recovery_state,recovery_reason,last_error_json "
+                "FROM gateway_state WHERE id=1").fetchone()
+        return {"condition": row[0], "session_id": row[1], "resume_url": row[2],
+                "sequence": row[3], "session_start_total": row[4],
+                "session_start_remaining": row[5], "session_start_reset_at": row[6],
+                "last_identify_at": row[7], "last_event_at": row[8],
+                "recovery_epoch": row[9], "recovery_state": row[10],
+                "recovery_reason": row[11],
+                "last_error": json.loads(row[12]) if row[12] else None}
+
+    def set_gateway_condition(self, condition, detail=None):
+        allowed = {"connected", "connecting", "degraded", "reconnecting",
+                   "fatal_configuration", "offline_rest"}
+        require(condition in allowed, "Invalid Gateway condition")
+        now = self.clock()
+        error_json = json.dumps({"detail": str(detail)[:300]}, separators=(",", ":")) if detail else None
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE gateway_state SET condition=?,last_error_json=?,"
+                           "last_event_at=CASE WHEN ?='connected' THEN ? ELSE last_event_at END,"
+                           "updated_at=? WHERE id=1",
+                           (condition, error_json, condition, now, now))
+
+    @staticmethod
+    def _begin_gateway_recovery_tx(db, reason, now):
+        row = db.execute("SELECT recovery_epoch FROM gateway_state WHERE id=1").fetchone()
+        epoch = row[0] + 1
+        threads = db.execute("SELECT thread_id,owner_generation FROM threads "
+                             "ORDER BY registered_at,thread_id").fetchall()
+        for thread_id, generation in threads:
+            db.execute("INSERT OR IGNORE INTO gateway_recovery_work("
+                       "epoch,thread_id,owner_generation,state,updated_at) VALUES(?,?,?,'queued',?)",
+                       (epoch, thread_id, generation, now))
+        state = "pending" if threads else "complete"
+        db.execute("UPDATE gateway_state SET recovery_epoch=?,recovery_state=?,recovery_reason=?,"
+                   "recovery_started_at=?,recovery_completed_at=?,updated_at=? WHERE id=1",
+                   (epoch, state, str(reason)[:100], now, now if not threads else None, now))
+        return epoch
+
+    def begin_gateway_recovery(self, reason):
+        now = self.clock()
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                epoch = self._begin_gateway_recovery_tx(db, reason, now)
+        return epoch
+
+    def save_gateway_start_limit(self, limit, now=None):
+        now = self.clock() if now is None else now
+        reset_at = now + limit["reset_after"] / 1000
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE gateway_state SET session_start_total=?,session_start_remaining=?,"
+                           "session_start_reset_at=?,updated_at=? WHERE id=1",
+                           (limit["total"], limit["remaining"], reset_at, now))
+
+    def reserve_gateway_identify(self, now, limit):
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                row = db.execute("SELECT session_start_remaining,session_start_reset_at "
+                                 "FROM gateway_state WHERE id=1").fetchone()
+                remaining = row[0] if row[0] is not None else limit["remaining"]
+                require(remaining > 0, "Discord Gateway session-start limit is exhausted")
+                db.execute("UPDATE gateway_state SET session_start_remaining=?,last_identify_at=?,"
+                           "updated_at=? WHERE id=1", (remaining - 1, now, now))
+
+    def clear_gateway_session(self, reset_sequence=True):
+        now = self.clock()
+        sequence_sql = ",sequence=NULL" if reset_sequence else ""
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE gateway_state SET session_id=NULL,resume_url=NULL" + sequence_sql +
+                           ",updated_at=? WHERE id=1", (now,))
+
+    def commit_gateway_dispatch(self, sequence, event_name, data, configured_user_id,
+                                validate_resume_url=None):
+        require(isinstance(sequence, int) and not isinstance(sequence, bool) and
+                0 <= sequence <= 10 ** 18, "Discord Gateway dispatch sequence is invalid")
+        sequence = str(sequence)
+        now = self.clock()
+        inserted = False
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                state = db.execute("SELECT sequence FROM gateway_state WHERE id=1").fetchone()
+                current = int(state[0]) if state[0] is not None else -1
+                if int(sequence) <= current:
+                    return {"committed": False, "duplicate": True, "ingested": False}
+                if event_name == "READY":
+                    require(isinstance(data, dict), "Discord Gateway READY payload is invalid")
+                    session_id = data.get("session_id")
+                    resume_url = data.get("resume_gateway_url")
+                    require(isinstance(session_id, str) and 1 <= len(session_id) <= 128 and
+                            not any(ord(char) < 32 for char in session_id),
+                            "Discord Gateway READY session ID is invalid")
+                    require(callable(validate_resume_url), "Discord Gateway resume URL validator is unavailable")
+                    resume_url = validate_resume_url(resume_url)
+                    self._begin_gateway_recovery_tx(db, "fresh_identify_ready", now)
+                    db.execute("UPDATE gateway_state SET session_id=?,resume_url=? WHERE id=1",
+                               (session_id, resume_url))
+                elif event_name == "RESUMED":
+                    self._begin_gateway_recovery_tx(db, "resume_ready", now)
+                elif event_name == "MESSAGE_CREATE":
+                    require(isinstance(data, dict), "Discord Gateway MESSAGE_CREATE payload is invalid")
+                    thread_id = snowflake(data.get("channel_id"), "Gateway message channel ID")
+                    known = db.execute("SELECT 1 FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
+                    if known:
+                        inserted = self._ingest_message(db, thread_id, data, configured_user_id, now,
+                                                        source="gateway")
+                db.execute("UPDATE gateway_state SET sequence=?,last_event_at=?,updated_at=? WHERE id=1",
+                           (sequence, now, now))
+        return {"committed": True, "duplicate": False, "ingested": inserted}
+
+    @staticmethod
+    def _prepare_api_limits(db, api, global_not_before=0.0):
+        if not hasattr(api, "load_route_limits"):
+            return
+        rows = db.execute("SELECT route_key,bucket_key,remaining,reset_at FROM api_rate_limits").fetchall()
+        api.load_route_limits(rows, global_not_before)
+
+    @staticmethod
+    def _persist_api_limits(db, api, thread_id=None, now=None):
+        updates = getattr(api, "rate_updates", None)
+        if not updates:
+            return
+        now = time.time() if now is None else now
+        with db:
+            for row in updates:
+                db.execute("INSERT INTO api_rate_limits(route_key,bucket_key,remaining,limit_total,reset_at,updated_at) "
+                           "VALUES(?,?,?,?,?,?) ON CONFLICT(route_key) DO UPDATE SET "
+                           "bucket_key=excluded.bucket_key,remaining=excluded.remaining,"
+                           "limit_total=excluded.limit_total,reset_at=excluded.reset_at,"
+                           "updated_at=excluded.updated_at",
+                           (row["route"], row["bucket_key"], row["remaining"],
+                            row["limit_total"], row["reset_at"], row["updated_at"]))
+                if thread_id is not None and row["remaining"] == 0 and row["reset_at"] > now:
+                    db.execute("UPDATE threads SET next_poll_at=MAX(next_poll_at,?) WHERE thread_id=?",
+                               (row["reset_at"], thread_id))
+            del updates[:]
+        global_until = getattr(api, "global_not_before", 0.0)
+        if global_until > now:
+            with db:
+                db.execute("INSERT INTO meta(key,value) VALUES('global_not_before',?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS REAL),CAST(excluded.value AS REAL))",
+                           (str(global_until),))
+
+    @staticmethod
+    def _api_deferred_until(db, api, path, now):
+        if hasattr(api, "deferred_until"):
+            return api.deferred_until(path, now)
+        return 0.0
+
+    def record_api_retry(self, api, path, retry_after, global_limit=False, now=None):
+        now = self.clock() if now is None else now
+        wait = retry_after if isinstance(retry_after, (int, float)) and math.isfinite(retry_after) else 0
+        deadline = now + min(MAX_RATE_LIMIT_WAIT, max(0, wait))
+        if global_limit:
+            self.global_not_before = max(self.global_not_before, deadline)
+            with contextlib.closing(self.database(create=False)) as db:
+                with db:
+                    db.execute("INSERT INTO meta(key,value) VALUES('global_not_before',?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS REAL),"
+                               "CAST(excluded.value AS REAL))", (str(deadline),))
+            if hasattr(api, "global_not_before"):
+                api.global_not_before = max(api.global_not_before, deadline)
+            return
+        route = api.route_key(path) if hasattr(api, "route_key") else "GET " + path
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("INSERT INTO api_rate_limits(route_key,bucket_key,remaining,limit_total,reset_at,updated_at) "
+                           "VALUES(?,?,0,NULL,?,?) ON CONFLICT(route_key) DO UPDATE SET "
+                           "remaining=0,reset_at=MAX(reset_at,excluded.reset_at),updated_at=excluded.updated_at",
+                           (route, route, deadline, now))
 
     def hailing_config(self):
         path = self.hailing_state / "config.json"
@@ -601,6 +898,7 @@ class Watch:
                            "updated_at,remote_json) VALUES(?,?,?,?,1,?,?,?)",
                            (thread_id, json.dumps(owner, separators=(",", ":")), cursor, cursor, now, now,
                             json.dumps(remote, separators=(",", ":"))))
+                self._ensure_gateway_recovery_coverage(db, now)
         return {"thread": thread_id, "registered": True, "already_registered": False,
                 "owner_session": owner["session"], "cursor": cursor,
                 "cursor_source": "explicit" if after is not None else "thread-created"}
@@ -700,6 +998,7 @@ class Watch:
                            "WHERE thread_id=? AND group_id IS NULL AND state='awaiting_receipt'", (thread_id,))
                 db.execute("UPDATE messages SET owner_generation=? WHERE thread_id=? AND group_id IS NULL "
                            "AND state!='received'", (generation, thread_id))
+                self._ensure_gateway_recovery_coverage(db, now)
         return {"thread": thread_id, "transferred": True, "from_session": old_session,
                 "to_session": current["session"], "pending_preserved": True}
 
@@ -765,9 +1064,11 @@ class Watch:
                            (latest_activity, subscription_state, thread_id))
         return inserted
 
-    def _api_pages(self, api, thread_id, cursor, owner_id, db):
+    def _api_pages(self, api, thread_id, cursor, owner_id, db, max_pages=MAX_CATCHUP_PAGES,
+                   stop_event=None):
         pages = 0
         total = 0
+        deferred_until = 0.0
         thread_row = db.execute("SELECT cursor,catchup_before,catchup_max FROM threads WHERE thread_id=?",
                                 (thread_id,)).fetchone()
         require(thread_row is not None, "Thread registration disappeared during polling")
@@ -804,12 +1105,19 @@ class Watch:
                 db.rollback()
                 raise
 
-        while pages < MAX_CATCHUP_PAGES:
+        while pages < max_pages:
+            if stop_event is not None and stop_event.is_set():
+                break
             if boundary:
                 query = {"before": boundary, "limit": MESSAGE_LIMIT}
             else:
                 query = {"after": current_cursor, "limit": MESSAGE_LIMIT}
-            rows = api.get(f"/channels/{thread_id}/messages", query)
+            path = f"/channels/{thread_id}/messages"
+            deferred_until = self._api_deferred_until(db, api, path, self.clock())
+            if deferred_until > self.clock():
+                break
+            rows = api.get(path, query)
+            self._persist_api_limits(db, api, thread_id, self.clock())
             require(isinstance(rows, list), "Discord messages response was not an array")
             require(len(rows) <= MESSAGE_LIMIT, "Discord returned more messages than requested")
             pages += 1
@@ -850,7 +1158,8 @@ class Watch:
         row = db.execute("SELECT cursor,catchup_before FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
         return {"pages": pages, "messages_seen": total, "cursor": row[0],
                 "catchup_before": row[1], "catchup_pending": row[1] is not None,
-                "catchup_limited": row[1] is not None and pages >= MAX_CATCHUP_PAGES}
+                "catchup_limited": row[1] is not None and pages >= max_pages,
+                "deferred_until": deferred_until}
 
     def _record_thread_error(self, db, thread_id, error, now):
         if isinstance(error, DiscordAPIError):
@@ -872,38 +1181,66 @@ class Watch:
                        (json.dumps(record, separators=(",", ":")), next_poll, now, thread_id))
         return record
 
-    def _poll_thread(self, db, thread, api, credentials, now):
+    def _poll_thread(self, db, thread, api, credentials, now, max_pages=MAX_CATCHUP_PAGES,
+                     routine=False, stop_event=None):
         thread_id = thread["thread_id"]
         try:
             with self.locked(timeout=0, name=f"poll-{thread_id}.lock"):
                 latest = self._thread(db, thread_id, require_open=False)
-                return self._poll_thread_locked(db, latest, api, credentials, now)
+                return self._poll_thread_locked(db, latest, api, credentials, now,
+                                                max_pages=max_pages, routine=routine,
+                                                stop_event=stop_event)
         except ValueError as error:
             if "operation owns this state" in str(error):
                 return {"thread": thread_id, "status": "poll_busy"}
             raise
 
-    def _poll_thread_locked(self, db, thread, api, credentials, now):
+    def _poll_thread_locked(self, db, thread, api, credentials, now, max_pages=MAX_CATCHUP_PAGES,
+                            routine=False, stop_event=None):
         thread_id = thread["thread_id"]
+        if stop_event is not None and stop_event.is_set():
+            return {"thread": thread_id, "status": "stopped"}
         if now < self.global_not_before:
             return {"thread": thread_id, "status": "global_backoff",
                     "retry_after": max(0, int(self.global_not_before - now))}
         if now < thread["next_poll_at"]:
             return {"thread": thread_id, "status": "backoff",
                     "retry_after": max(0, int(thread["next_poll_at"] - now))}
+        remote_path = f"/channels/{thread_id}"
+        deferred = self._api_deferred_until(db, api, remote_path, now)
+        if deferred > now:
+            with db:
+                db.execute("UPDATE threads SET next_poll_at=MAX(next_poll_at,?) WHERE thread_id=?",
+                           (deferred, thread_id))
+            return {"thread": thread_id, "status": "rate_limited", "retry_at": deferred}
         try:
             remote = self.remote_thread(api, thread_id)
+            self._persist_api_limits(db, api, thread_id, now)
+            if stop_event is not None and stop_event.is_set():
+                return {"thread": thread_id, "status": "stopped"}
             remote_closed = self.thread_closed(remote, credentials["closed_tag"])
             remote_json = json.dumps(remote, separators=(",", ":"))
             with db:
                 db.execute("UPDATE threads SET remote_json=?,remote_closed=?,updated_at=? WHERE thread_id=?",
                            (remote_json, int(remote_closed), now, thread_id))
-            result = self._api_pages(api, thread_id, thread["cursor"], credentials["user_id"], db)
+            result = self._api_pages(api, thread_id, thread["cursor"], credentials["user_id"], db,
+                                     max_pages=max_pages, stop_event=stop_event)
+            if stop_event is not None and stop_event.is_set():
+                return {"thread": thread_id, "status": "stopped", **result}
+            if result["deferred_until"] > self.clock():
+                with db:
+                    db.execute("UPDATE threads SET next_poll_at=MAX(next_poll_at,?) WHERE thread_id=?",
+                               (result["deferred_until"], thread_id))
+                return {"thread": thread_id, "status": "rate_limited",
+                        "retry_at": result["deferred_until"], **result}
             with db:
-                db.execute("UPDATE threads SET last_poll_at=?,next_poll_at=0,last_error_json=NULL,updated_at=? "
-                           "WHERE thread_id=?", (now, now, thread_id))
+                next_poll = now + ROUTINE_REST_INTERVAL if routine else 0
+                db.execute("UPDATE threads SET last_poll_at=?,next_poll_at=MAX(next_poll_at,?),"
+                           "last_error_json=NULL,updated_at=? "
+                           "WHERE thread_id=?", (now, next_poll, now, thread_id))
             return {"thread": thread_id, "status": "polled", "remote_closed": remote_closed, **result}
         except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+            self._persist_api_limits(db, api, thread_id, now)
             record = self._record_thread_error(db, thread_id, error, now)
             return {"thread": thread_id, "status": "error", "error": record}
 
@@ -1197,6 +1534,7 @@ class Watch:
             self._refresh_dormancy(db, now)
             global_row = db.execute("SELECT value FROM meta WHERE key='global_not_before'").fetchone()
             self.global_not_before = float(global_row[0]) if global_row else 0.0
+            self._prepare_api_limits(db, api, self.global_not_before)
             if only_thread is not None:
                 thread_ids = [snowflake(only_thread, "thread ID")]
             else:
@@ -1246,6 +1584,239 @@ class Watch:
                 report["threads"].append(row)
             api_success = any(item.get("status") == "polled" for item in report["threads"])
             self._record_scan_meta(db, report, api_success, send_scope)
+        return report
+
+    def _ensure_gateway_recovery_coverage(self, db, now):
+        state = db.execute("SELECT recovery_epoch FROM gateway_state WHERE id=1").fetchone()
+        epoch = state[0]
+        if epoch <= 0:
+            return epoch
+        rows = db.execute("SELECT thread_id,owner_generation FROM threads").fetchall()
+        for thread_id, generation in rows:
+            db.execute("UPDATE gateway_recovery_work SET state='superseded',updated_at=? "
+                       "WHERE epoch=? AND thread_id=? AND owner_generation!=? "
+                       "AND state NOT IN ('complete','superseded')",
+                       (now, epoch, thread_id, generation))
+            inserted = db.execute(
+                "INSERT OR IGNORE INTO gateway_recovery_work(epoch,thread_id,owner_generation,state,updated_at) "
+                "VALUES(?,?,?,'queued',?)", (epoch, thread_id, generation, now)).rowcount
+            if inserted:
+                db.execute("UPDATE gateway_state SET recovery_state='pending',recovery_completed_at=NULL,"
+                           "updated_at=? WHERE id=1", (now,))
+        return epoch
+
+    @staticmethod
+    def _refresh_gateway_recovery_state(db, epoch, now):
+        counts = dict(db.execute(
+            "SELECT w.state,COUNT(*) FROM gateway_recovery_work w JOIN threads t "
+            "ON t.thread_id=w.thread_id AND t.owner_generation=w.owner_generation "
+            "WHERE w.epoch=? GROUP BY w.state", (epoch,)))
+        incomplete = sum(value for state, value in counts.items() if state not in ("complete", "superseded"))
+        if incomplete == 0:
+            recovery_state = "complete"
+            completed_at = now
+        elif counts.get("blocked", 0):
+            recovery_state = "blocked"
+            completed_at = None
+        else:
+            recovery_state = "pending"
+            completed_at = None
+        db.execute("UPDATE gateway_state SET recovery_state=?,recovery_completed_at=?,updated_at=? "
+                   "WHERE id=1 AND recovery_epoch=?",
+                   (recovery_state, completed_at, now, epoch))
+        return recovery_state
+
+    @staticmethod
+    def _rest_condition(error):
+        if not isinstance(error, dict):
+            return "healthy"
+        if error.get("state") in ("rate_limited", "backoff", "global_backoff"):
+            return "rate_limited"
+        status = error.get("http_status")
+        if status == 404:
+            return "remote_missing"
+        if status == 403:
+            return "inaccessible"
+        if status == 429:
+            return "rate_limited"
+        if isinstance(status, int) and status >= 500:
+            return "unavailable"
+        if error.get("error"):
+            return "unavailable"
+        return "authentication_or_request_error"
+
+    def _rest_recovery_turn(self, only_thread=None, stop_event=None):
+        credentials, api = self.read_credentials()
+        now = self.clock()
+        results = []
+        with contextlib.closing(self.database(create=False)) as db:
+            self._refresh_dormancy(db, now)
+            global_row = db.execute("SELECT value FROM meta WHERE key='global_not_before'").fetchone()
+            self.global_not_before = float(global_row[0]) if global_row else 0.0
+            self._prepare_api_limits(db, api, self.global_not_before)
+            epoch = self._ensure_gateway_recovery_coverage(db, now)
+            rotation_row = db.execute("SELECT value FROM meta WHERE key='rest_rotation_after'").fetchone()
+            rotation_after = rotation_row[0] if rotation_row else None
+
+            due = {}
+            if epoch > 0:
+                for thread_id, generation, state in db.execute(
+                        "SELECT w.thread_id,w.owner_generation,w.state FROM gateway_recovery_work w "
+                        "JOIN threads t ON t.thread_id=w.thread_id AND t.owner_generation=w.owner_generation "
+                        "WHERE w.epoch=? "
+                        "AND w.state NOT IN ('complete','superseded') AND t.next_poll_at<=? "
+                        "ORDER BY t.registered_at,t.thread_id", (epoch, now)):
+                    due[thread_id] = {"recovery": True, "generation": generation, "state": state}
+            routine_rows = db.execute(
+                "SELECT thread_id,owner_generation FROM threads WHERE subscription_state='active' "
+                "AND next_poll_at<=? AND (last_poll_at IS NULL OR last_poll_at<=?) "
+                "ORDER BY registered_at,thread_id", (now, now - ROUTINE_REST_INTERVAL)).fetchall()
+            for thread_id, generation in routine_rows:
+                if only_thread is not None and thread_id != only_thread:
+                    continue
+                due.setdefault(thread_id, {"recovery": False, "generation": generation, "state": None})
+
+            ordered = [row[0] for row in db.execute(
+                "SELECT thread_id FROM threads ORDER BY registered_at,thread_id") if row[0] in due]
+            if rotation_after in ordered:
+                split = ordered.index(rotation_after) + 1
+                ordered = ordered[split:] + ordered[:split]
+            selected = ordered[:WORKER_REST_THREADS_PER_TURN]
+            with db:
+                self._ensure_gateway_recovery_coverage(db, now)
+
+            for thread_id in selected:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                thread = self._thread(db, thread_id, require_open=False)
+                work = due[thread_id]
+                current_generation = thread["owner_generation"]
+                if work["recovery"]:
+                    old_generation = work["generation"]
+                    if old_generation != current_generation:
+                        with db:
+                            db.execute("UPDATE gateway_recovery_work SET state='superseded',updated_at=? "
+                                       "WHERE epoch=? AND thread_id=? AND owner_generation=?",
+                                       (now, epoch, thread_id, old_generation))
+                            db.execute("INSERT OR IGNORE INTO gateway_recovery_work("
+                                       "epoch,thread_id,owner_generation,state,updated_at) "
+                                       "VALUES(?,?,?,'queued',?)",
+                                       (epoch, thread_id, current_generation, now))
+                        work["generation"] = current_generation
+                if self.global_not_before > self.clock():
+                    results.append({"thread": thread_id, "status": "global_backoff"})
+                    continue
+                with db:
+                    if work["recovery"]:
+                        db.execute("UPDATE gateway_recovery_work SET state='working',attempts=attempts+1,"
+                                   "updated_at=?,last_error_json=NULL WHERE epoch=? AND thread_id=? "
+                                   "AND owner_generation=? AND state NOT IN ('complete','superseded')",
+                                   (now, epoch, thread_id, work["generation"]))
+                polled = self._poll_thread(db, thread, api, credentials, self.clock(),
+                                           max_pages=WORKER_REST_PAGES_PER_THREAD,
+                                           routine=True, stop_event=stop_event)
+                results.append(polled)
+                latest = self._thread(db, thread_id, require_open=False)
+                if work["recovery"]:
+                    if latest["owner_generation"] != work["generation"]:
+                        state = "superseded"
+                        error_json = None
+                        with db:
+                            db.execute("INSERT OR IGNORE INTO gateway_recovery_work("
+                                       "epoch,thread_id,owner_generation,state,updated_at) "
+                                       "VALUES(?,?,?,'queued',?)",
+                                       (epoch, thread_id, latest["owner_generation"], self.clock()))
+                    elif polled.get("status") == "polled" and not polled.get("catchup_pending"):
+                        state = "complete"
+                        error_json = None
+                    elif polled.get("status") in ("error", "rate_limited", "backoff", "global_backoff"):
+                        state = "blocked"
+                        error_json = json.dumps(polled.get("error") or {"state": polled.get("status")},
+                                                separators=(",", ":"))
+                    else:
+                        state = "queued"
+                        error_json = None
+                    with db:
+                        db.execute("UPDATE gateway_recovery_work SET state=?,updated_at=?,completed_at=?,"
+                                   "last_error_json=? WHERE epoch=? AND thread_id=? AND owner_generation=? "
+                                   "AND state!='superseded'",
+                                   (state, self.clock(), self.clock() if state == "complete" else None,
+                                    error_json, epoch, thread_id, work["generation"]))
+                with db:
+                    db.execute("INSERT INTO meta(key,value) VALUES('rest_rotation_after',?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (thread_id,))
+            with db:
+                recovery_state = self._refresh_gateway_recovery_state(db, epoch, self.clock()) if epoch > 0 else "idle"
+                report = {"at": self.clock(), "mode": "recovery", "origin": "worker",
+                          "threads": results, "recovery_epoch": epoch,
+                          "recovery_state": recovery_state,
+                          "request_budget": WORKER_REST_THREADS_PER_TURN *
+                          (1 + WORKER_REST_PAGES_PER_THREAD)}
+                api_success = any(row.get("status") == "polled" for row in results)
+                values = {"last_rest_recovery_at": str(report["at"])}
+                if api_success:
+                    values["last_api_success_at"] = str(report["at"])
+                for key, value in values.items():
+                    db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        return report
+
+    def _dispatch_turn(self, send=False, only_thread=None):
+        now = self.clock()
+        result_rows = []
+        with contextlib.closing(self.database(create=False)) as db:
+            self._refresh_dormancy(db, now)
+            if only_thread is None:
+                rows = db.execute(
+                    "SELECT thread_id FROM threads WHERE EXISTS(SELECT 1 FROM messages "
+                    "WHERE messages.thread_id=threads.thread_id AND state IN "
+                    "('pending','awaiting_receipt','uncertain','stalled')) OR EXISTS("
+                    "SELECT 1 FROM delivery_groups WHERE delivery_groups.thread_id=threads.thread_id "
+                    "AND status!='received') ORDER BY registered_at,thread_id").fetchall()
+                thread_ids = [row[0] for row in rows]
+            else:
+                thread_ids = [snowflake(only_thread, "thread ID")]
+            send_scope = thread_ids if send else []
+            rotation_row = db.execute("SELECT value FROM meta WHERE key='sender_rotation_after'").fetchone()
+            rotation_after = rotation_row[0] if rotation_row else None
+            if rotation_after in thread_ids and only_thread is None:
+                split = thread_ids.index(rotation_after) + 1
+                thread_ids = thread_ids[split:] + thread_ids[:split]
+            for thread_id in thread_ids:
+                if not send:
+                    break
+                delay_row = db.execute("SELECT value FROM meta WHERE key=?",
+                                       (f"sender_retry_after:{thread_id}",)).fetchone()
+                if delay_row and float(delay_row[0]) > now:
+                    continue
+                try:
+                    thread = self._thread(db, thread_id, require_open=False)
+                    wake = self._wake_one(db, thread, now)
+                    state = wake.get("state") if wake else None
+                    with db:
+                        db.execute("INSERT INTO meta(key,value) VALUES('sender_rotation_after',?) "
+                                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (thread_id,))
+                    if wake and state not in ("forming",):
+                        with db:
+                            db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                       (f"sender_retry_after:{thread_id}", str(now + POLL_INTERVAL)))
+                    if wake and state not in ("forming",):
+                        result_rows.append({"thread": thread_id, "wake": wake})
+                    if wake and wake.get("submitted"):
+                        break
+                except (ValueError, OSError, subprocess.SubprocessError, sqlite3.Error) as error:
+                    with db:
+                        db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                   (f"sender_retry_after:{thread_id}", str(now + POLL_INTERVAL)))
+                    result_rows.append({"thread": thread_id, "wake_error": str(error)[:300]})
+                    with db:
+                        db.execute("INSERT INTO meta(key,value) VALUES('sender_rotation_after',?) "
+                                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (thread_id,))
+            report = {"at": now, "mode": "send" if send else "observe", "origin": "worker",
+                      "threads": result_rows, "send_scope": send_scope}
+            self._record_scan_meta(db, report, False, send_scope)
         return report
 
     def _record_scan_meta(self, db, report, api_success, send_scope=None):
@@ -1462,6 +2033,9 @@ class Watch:
         api_fresh = api_age is not None and api_age <= max(60, POLL_INTERVAL * 5)
         worker_running = self._lock_is_held("worker.lock")
         supervisor_running = self._lock_is_held("supervise.lock")
+        gateway_row = db.execute(
+            "SELECT condition,recovery_epoch,recovery_state,recovery_reason,last_event_at,last_error_json "
+            "FROM gateway_state WHERE id=1").fetchone()
         send_scope = []
         try:
             send_scope = json.loads(meta.get("last_send_scope", "[]"))
@@ -1501,6 +2075,10 @@ class Watch:
             "worker_running" if worker_running else "worker_stopped")
         return {"state": state, "ready_for_wakes": ready and thread_error is None,
                 "worker_running": worker_running, "supervisor_running": supervisor_running,
+                "gateway": {"condition": gateway_row[0], "recovery_epoch": gateway_row[1],
+                            "recovery_state": gateway_row[2], "recovery_reason": gateway_row[3],
+                            "last_event_at": gateway_row[4],
+                            "last_error": json.loads(gateway_row[5]) if gateway_row[5] else None},
                 "worker_heartbeat_age_seconds": worker_age,
                 "worker_heartbeat_fresh": heartbeat_fresh,
                 "api_last_success_age_seconds": api_age, "api_success_fresh": api_fresh,
@@ -1517,6 +2095,38 @@ class Watch:
 
     def status(self):
         with contextlib.closing(self.database(create=False)) as db:
+            gateway_row = db.execute(
+                "SELECT condition,sequence,session_id,recovery_epoch,recovery_state,recovery_reason,"
+                "recovery_started_at,recovery_completed_at,last_event_at,last_error_json,"
+                "session_start_total,session_start_remaining,session_start_reset_at "
+                "FROM gateway_state WHERE id=1").fetchone()
+            gateway_epoch = gateway_row[3]
+            coverage_counts = dict(db.execute(
+                "SELECT w.state,COUNT(*) FROM gateway_recovery_work w JOIN threads t "
+                "ON t.thread_id=w.thread_id AND t.owner_generation=w.owner_generation "
+                "WHERE w.epoch=? GROUP BY w.state", (gateway_epoch,))) if gateway_epoch else {}
+            gateway = {
+                "condition": gateway_row[0],
+                "has_resumable_session": bool(gateway_row[2]),
+                "last_committed_sequence": int(gateway_row[1]) if gateway_row[1] is not None else None,
+                "recovery": {"epoch": gateway_epoch, "state": gateway_row[4],
+                             "reason": gateway_row[5], "started_at": gateway_row[6],
+                             "completed_at": gateway_row[7],
+                             "threads_total": sum(coverage_counts.values()),
+                             "threads_complete": coverage_counts.get("complete", 0),
+                             "threads_pending": coverage_counts.get("queued", 0) +
+                             coverage_counts.get("working", 0),
+                             "threads_blocked": coverage_counts.get("blocked", 0)},
+                "session_start_limit": {"total": gateway_row[10], "remaining": gateway_row[11],
+                                        "reset_at": gateway_row[12]},
+                "last_event_at": gateway_row[8],
+                "last_error": json.loads(gateway_row[9]) if gateway_row[9] else None,
+                "coordinator_guidance": (
+                    "Restore the configured bot credentials and required Gateway intents in the existing application configuration."
+                    if gateway_row[0] == "fatal_configuration" else (
+                        "Restart serve without --rest-only after Gateway configuration is available."
+                        if gateway_row[0] == "offline_rest" else None))
+            }
             threads = []
             for row in db.execute("SELECT thread_id,owner_json,cursor,is_open,registered_at,last_poll_at,next_poll_at,"
                                   "last_error_json,owner_generation,subscription_state,last_activity_at,remote_closed,"
@@ -1529,6 +2139,19 @@ class Watch:
                                  "owner_generation": generation, "catchup_before": catchup_before,
                                  "catchup_max": catchup_max}
                 catchup_incomplete = self._catchup_incomplete(status_thread)
+                recovery_work = db.execute(
+                    "SELECT state,owner_generation,updated_at,completed_at,last_error_json "
+                    "FROM gateway_recovery_work WHERE epoch=? AND thread_id=? AND owner_generation=?",
+                    (gateway_epoch, thread_id, generation)).fetchone()
+                rest_recovery = None
+                if recovery_work:
+                    rest_recovery = {"state": recovery_work[0],
+                                     "condition": self._rest_condition(
+                                         json.loads(recovery_work[4]) if recovery_work[4] else None),
+                                     "covered_generation": recovery_work[1],
+                                     "updated_at": recovery_work[2],
+                                     "completed_at": recovery_work[3],
+                                     "last_error": json.loads(recovery_work[4]) if recovery_work[4] else None}
                 counts = {state: count for state, count in db.execute(
                     "SELECT state,COUNT(*) FROM messages WHERE thread_id=? GROUP BY state", (thread_id,))}
                 recent = [{"message": message_id, "state": state, "wake_attempts": attempts,
@@ -1616,6 +2239,27 @@ class Watch:
                                "first_at": first_at, "last_at": last_at, "eligible_at": eligible_at,
                                "hold_reason": "rest_catchup_incomplete" if catchup_incomplete else (
                                    "owner_generation_event_chain_invalid" if not generation_valid else None)}
+                thread_error_record = json.loads(last_error) if last_error else None
+                recovery_error_record = json.loads(recovery_work[4]) if recovery_work and recovery_work[4] else None
+                rest_condition = self._rest_condition(thread_error_record or recovery_error_record)
+                exact_owner_hold = any(group["hold_reason"] in
+                                       ("owner_generation_event_chain_invalid", "guard_or_owner_hold")
+                                       for group in delivery_groups)
+                exact_owner_hold = exact_owner_hold or bool(
+                    forming and forming["hold_reason"] == "owner_generation_event_chain_invalid")
+                if exact_owner_hold:
+                    coordinator_guidance = (
+                        "Restore the exact enrolled owner binding or arrange an explicit authorized transfer.")
+                elif rest_condition == "inaccessible":
+                    coordinator_guidance = "Restore the configured bot's access to this retained Discord thread."
+                elif rest_condition == "remote_missing":
+                    coordinator_guidance = "Restore access to the retained Discord thread before reconciliation can continue."
+                elif rest_condition == "rate_limited":
+                    coordinator_guidance = "Wait until the reported Discord route or global retry deadline."
+                elif rest_condition == "unavailable":
+                    coordinator_guidance = "Wait for the Discord REST route to recover; the thread remains retained."
+                else:
+                    coordinator_guidance = None
                 threads.append({"thread": thread_id, "owner": json.loads(owner_json), "cursor": cursor,
                                 "open": bool(is_open), "registered_at": registered_at,
                                 "subscription_state": subscription_state,
@@ -1623,12 +2267,15 @@ class Watch:
                                 "remote_closed": bool(remote_closed),
                                 "initial_cutoff": initial_cutoff,
                                 "last_poll_at": last_poll_at, "next_poll_at": next_poll_at,
-                                "last_error": json.loads(last_error) if last_error else None,
+                                "last_error": thread_error_record,
+                                "rest_condition": rest_condition,
+                                "coordinator_guidance": coordinator_guidance,
                                 "owner_generation": generation, "queue": counts, "recent": recent,
                                 "catchup_before": catchup_before, "catchup_max": catchup_max,
+                                "rest_recovery": rest_recovery,
                                 "forming_group": forming,
                                 "delivery_groups": delivery_groups})
-            return {"health": self._health(db), "threads": threads}
+            return {"health": self._health(db), "gateway": gateway, "threads": threads}
 
     def doctor(self):
         result = {"state_directory": str(self.directory), "state_initialized": False,
@@ -1658,7 +2305,7 @@ class Watch:
             result["checks"].append({"name": "hailing", "ok": False, "detail": str(error)[:300]})
         return result
 
-    def serve(self, send=False, only_thread=None):
+    def serve(self, send=False, only_thread=None, rest_only=False, *, gateway_factory=None, stop_event=None):
         with contextlib.closing(self.database(create=False)):
             pass
         lock_path = self.directory / "worker.lock"
@@ -1670,31 +2317,69 @@ class Watch:
             except BlockingIOError:
                 raise ValueError("A Discord Watch worker already owns this state") from None
             stopping = False
+            stop_event = stop_event or threading.Event()
             original_handlers = {}
             def stop(signum, frame):
                 nonlocal stopping
                 stopping = True
+                stop_event.set()
             for sig in (signal.SIGINT, signal.SIGTERM):
-                original_handlers[sig] = signal.signal(sig, stop)
+                try:
+                    original_handlers[sig] = signal.signal(sig, stop)
+                except ValueError:
+                    break
+            gateway = None
+            if rest_only:
+                self.set_gateway_condition("offline_rest", "Gateway disabled by explicit REST-only mode")
+            else:
+                from discord_gateway import GatewayClient
+                factory = gateway_factory or self.gateway_factory or GatewayClient
+                gateway = factory(self)
+            lanes = []
+            if gateway is not None:
+                lanes.append(threading.Thread(target=gateway.run, args=(stop_event,),
+                                              name="discord-watch-gateway", daemon=True))
+
+            def rest_loop():
+                while not stop_event.is_set():
+                    try:
+                        self._rest_recovery_turn(only_thread, stop_event)
+                    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+                        self._record_worker_failure(send, only_thread, error)
+                    stop_event.wait(REST_TURN_INTERVAL)
+
+            lanes.append(threading.Thread(target=rest_loop, name="discord-watch-rest", daemon=True))
+            for lane in lanes:
+                lane.start()
+            last_report = 0.0
             try:
                 while not stopping:
+                    if stop_event.is_set():
+                        stopping = True
+                        break
                     try:
-                        report = self.scan(send=send, only_thread=only_thread, origin="worker")
+                        report = self._dispatch_turn(send=send, only_thread=only_thread)
                     except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
                         report = {"at": self.clock(), "mode": "send" if send else "observe",
                                   "worker_error": str(error)[:500]}
                         self._record_worker_failure(send, only_thread, error)
-                    print(json.dumps(report, ensure_ascii=False), flush=True)
-                    deadline = time.monotonic() + POLL_INTERVAL
-                    while not stopping and time.monotonic() < deadline:
-                        time.sleep(min(1, max(0, deadline - time.monotonic())))
+                    now = time.monotonic()
+                    if report.get("threads") or now - last_report >= POLL_INTERVAL:
+                        print(json.dumps(report, ensure_ascii=False), flush=True)
+                        last_report = now
+                    stop_event.wait(SENDER_INTERVAL)
             finally:
+                stop_event.set()
+                if gateway is not None:
+                    gateway.stop()
+                for lane in lanes:
+                    lane.join(timeout=LANE_JOIN_TIMEOUT)
                 for sig, handler in original_handlers.items():
                     signal.signal(sig, handler)
                 fcntl.flock(lock, fcntl.LOCK_UN)
         return {"stopped": True}
 
-    def supervise(self, send=False, only_thread=None):
+    def supervise(self, send=False, only_thread=None, rest_only=False):
         with contextlib.closing(self.database(create=False)):
             pass
         lock_path = self.directory / "supervise.lock"
@@ -1725,6 +2410,8 @@ class Watch:
                         command.append("--send")
                     if only_thread:
                         command.extend(("--only-thread", only_thread))
+                    if rest_only:
+                        command.append("--rest-only")
                     child = subprocess.Popen(command)
                     code = child.wait()
                     if stopping:
@@ -1779,6 +2466,9 @@ def parser():
         child = sub.add_parser(name)
         child.add_argument("--send", action="store_true", help="Enable guarded CMUX wakes")
         child.add_argument("--only-thread", help="Limit polling and wakes to one registered thread")
+        if name in ("serve", "supervise"):
+            child.add_argument("--rest-only", action="store_true",
+                               help="Disable Gateway intake and report degraded REST-only operation")
     return command
 
 
@@ -1812,9 +2502,9 @@ def main(argv=None):
     elif args.command == "scan":
         result = app.scan(args.send, args.only_thread)
     elif args.command == "serve":
-        result = app.serve(args.send, args.only_thread)
+        result = app.serve(args.send, args.only_thread, args.rest_only)
     elif args.command == "supervise":
-        result = app.supervise(args.send, args.only_thread)
+        result = app.supervise(args.send, args.only_thread, args.rest_only)
     else:
         raise ValueError("Unknown command")
     print(json.dumps(result, ensure_ascii=False, indent=2))

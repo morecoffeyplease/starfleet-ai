@@ -1,6 +1,6 @@
 # Discord Watch setup guide
 
-Discord Watch polls registered agent-notify forum threads for replies from the configured Discord user and keeps those replies in a private local queue.
+Discord Watch receives configured-user replies through one Discord Gateway connection and reconciles retained agent-notify forum threads through REST.
 With `--send`, one supervised worker sends a guarded wake to the exact Claude or Codex session enrolled for each thread.
 The wake contains the exact `discord-watch receive` command and never contains the reply body.
 New replies are grouped by thread and exact owner generation after three seconds of quiet, with a maximum ten-second delay from the first queued reply.
@@ -11,7 +11,7 @@ Messages are ordered by numeric Discord message ID and retain their full bodies 
 
 ## Prerequisites
 
-Use Python 3.9 or newer on macOS or another POSIX host with `fcntl`.
+Use Python 3.10 or newer on macOS or another POSIX host with `fcntl`.
 Install or reuse `agent-notify`, Hailing Frequencies, and a current CMUX command that supports `current`, `surface.input_state`, and JSON `paste --submit` results.
 Run `agent-notify guide --print` first for complete Discord Community, Forum, webhook, bot, permission, and private credential setup.
 The recipient must already be enrolled in Hailing Frequencies from the exact current Claude or Codex session.
@@ -32,7 +32,7 @@ discord-watch guide --print
 ```
 
 The Discord Watch installer creates the `discord-watch` launcher and an immutable runtime under `~/.local/share/starfleet-ai/discord-watch/`.
-It packages the maintained guide, README, source, and a source copy of Hailing Frequencies' guarded CMUX binding.
+It packages the maintained guide, README, source, pinned Gateway dependency, and a source copy of Hailing Frequencies' guarded CMUX binding.
 Installation does not initialize state, register a thread, start a worker, or alter harness or CMUX settings.
 If either launcher is already installed, run its guide and continue with the setup below.
 To install into a different location, pass `--runtime-root PATH` and `--bin-dir PATH` to `install.py`.
@@ -100,9 +100,14 @@ discord-watch scan --send --only-thread THREAD_ID
 discord-watch supervise --send
 ```
 
-`serve --send` runs the single polling worker for a 12 second interval.
+`serve --send` runs the single Gateway receiver, fair REST recovery lane, and native sender.
+Routine REST reconciliation runs every 30 seconds with a bounded request budget and persistent rotation across due threads.
+The worker also reconciles every retained thread after Gateway disconnects, reconnects, and fresh Identify operations, including dormant subscriptions.
+Recovery can take longer under rate limits, slow API responses, incomplete catch-up, or owner holds, so 30 seconds is a scheduling interval rather than a delivery guarantee.
 `supervise --send` owns one supervisor lock and restarts a crashed worker with bounded backoff.
-Both commands support `--only-thread THREAD_ID` for a bounded pilot.
+Both commands support `--only-thread THREAD_ID` to bound the native send scope and `--rest-only` for an explicit Gateway-disabled mode.
+Reconnect recovery still covers every retained subscription, including when a thread-specific send scope is selected.
+REST-only operation reports Gateway degradation in status and continues reconciliation without claiming Gateway intake is healthy.
 Stop the supervising terminal with SIGINT or SIGTERM to stop future polling and wakes.
 There is no automatic service startup.
 
@@ -150,9 +155,11 @@ Dormancy preserves the thread, exact owner generation, REST cursor, catch-up bou
 The worker can still send a guarded wake for queued replies on dormant subscriptions.
 Missing or stale exact owners remain a hold, and replies stay available to the owner through `receive`.
 Use `discord-watch scan --only-thread THREAD_ID` for an explicit REST reconciliation of a dormant known thread.
-The narrow Gateway intake method stores messages through the same validation and deduplication path as REST without advancing the REST cursor.
-When Gateway intake is connected, reconnect recovery must reconcile every known retained thread, including dormant threads, before reporting the Gateway recovered.
-Until that integration exists, run the bounded explicit scan for a dormant thread when reconciling after a missed Gateway interval.
+The narrow `Watch.ingest_gateway_message` intake method stores one Gateway message through the shared REST validation and deduplication path without advancing the REST cursor.
+The production Gateway adapter commits each dispatch sequence atomically with eligible message intake and stores session resume state in the private database.
+Status reports Gateway condition, resumable-session availability, recovery coverage, and each thread's REST recovery and access condition separately.
+If an exact owner is missing or stale, restore that same Hailing Frequencies binding or arrange an explicit authorized transfer before delivery can continue.
+Discord Watch never reroutes replies to another owner automatically or starts a separate escalation service.
 
 ## Verification and delivery evidence
 
