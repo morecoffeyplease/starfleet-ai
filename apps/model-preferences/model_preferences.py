@@ -998,7 +998,7 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
         require(Path(git(cwd, "rev-parse", "--show-toplevel").decode().strip()).resolve() == cwd,
                 "OpenCode --cwd must be the exact Git worktree root so session and worktree identity remain distinct and verifiable.")
         # Confirm the exact provider/model/output/variant contract before creating a server-side session.
-        evidence = opencode_dispatch.preflight(connection, choice)
+        evidence = opencode_dispatch.preflight(connection, choice, directory=str(cwd))
         binary = opencode_dispatch.check_opencode_cli()
         destination = opencode_destination()
     except opencode_dispatch.OpenCodeDispatchError as exc:
@@ -1084,7 +1084,8 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
                 if (previous.get("choice", {}).get("harness") == "opencode"
                         and previous.get("cwd") == str(cwd) and previous.get("task_digest") == task_digest
                         and previous.get("choice", {}).get("selection") == choice["selection"]
-                        and previous.get("status") in ("session_create_pending", "session_created", "task_bound",
+                        and previous.get("status") in ("session_create_pending", "session_created",
+                                                        "session_move_pending", "task_bound",
                                                         "surface_opening", "native_binding_pending", "uncertain", "running")):
                     raise PreferenceError(f"Matching OpenCode launch {previous.get('id')} is unresolved or live; inspect it before retrying.")
 
@@ -1154,7 +1155,7 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
 
     try:
         # Recheck immediately before creation in case provider configuration or server identity changed.
-        evidence = opencode_dispatch.preflight(connection, choice)
+        evidence = opencode_dispatch.preflight(connection, choice, directory=str(cwd))
         if parent:
             parent_recheck = opencode_parent_caller(app, connection, owner_worktree=Path(parent["owner_worktree"]),
                                                     destination=destination)
@@ -1170,6 +1171,19 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
                       opencode_parent_session_id=created.get("parent_session_id"),
                       model=created["model"], session_directory=created["directory"])
         update_opencode_launch(app, launch)
+        if created["directory"] != str(cwd):
+            launch.update(status="session_move_pending",
+                          session_move_source_directory=created["directory"],
+                          session_move_target_directory=str(cwd))
+            update_opencode_launch(app, launch)
+            moved = opencode_dispatch.move_session(
+                connection, session, source_directory=created["directory"], directory=str(cwd),
+                choice=choice, launch_id=launch_id, task_digest=task_digest,
+                parent_task_id=connection.parent_task_id,
+                parent_session_id=opencode_parent["session_id"] if opencode_parent else None)
+            launch.update(status="session_created", session_directory=moved["directory"],
+                          session_move_confirmed_at=now())
+            update_opencode_launch(app, launch)
         if role == "orchestrator":
             assignment = assign_opencode_orchestrator_context(app, args, cwd, session)
             launch["context_injector"] = assignment
@@ -1844,7 +1858,8 @@ def resume_opencode_launch(app, args, brief):
             require(launch.get("execution_result") in ("turn_idle", "turn_failed"),
                     "The initial OpenCode task has not completed; managed continuation remains held.")
         try:
-            evidence = opencode_dispatch.preflight(connection, choice)
+            evidence = opencode_dispatch.preflight(
+                connection, choice, directory=launch["session_directory"])
             require(evidence.api_origin == launch["api_origin"] and evidence.server_pid == launch["expected_server_pid"],
                     "OpenCode server binding changed; nothing sent.")
             opencode_dispatch.verify_session(

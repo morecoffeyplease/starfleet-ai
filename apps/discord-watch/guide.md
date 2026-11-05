@@ -45,11 +45,16 @@ discord-watch doctor
 ```
 
 Use `--harness codex` and the exact `CODEX_THREAD_ID` for a Codex recipient.
-The surface, session, workspace, harness hook generation, receiving settings, and empty composer are checked at registration and before every wake.
+OpenCode registration, `managed`, `close`, and `receive` verify the exact Hailing Frequencies owner identity without checking composer readiness.
+Automatic wake checks the exact surface, session, workspace, hook generation, receiving settings, and native input state separately.
+The default `native_empty_composer` policy requires an explicitly empty composer with no human-input obligation.
+For OpenCode only, an explicitly selected `api_sidechannel` policy may also accept `draft` or `unknown` classifications when there is no blocking input or human-input obligation and all other native, API, lifecycle, receiving, and owner guards pass.
 The command must run in the recipient's own CMUX session with its normal `CMUX_AGENT_LAUNCH_KIND`, session ID, and `CMUX_SURFACE_ID` environment.
 For OpenCode, keep the session's exact `ses_` identity and API binding in Hailing Frequencies, and pass `--session ses_ID` to owner commands when needed.
 OpenCode owner commands also require `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, and the exact `CMUX_SURFACE_ID` and `CMUX_WORKSPACE_ID` values seeded for that session.
-The current native CMUX OpenCode input state is `unknown`, so OpenCode registration and wakes remain held until CMUX proves the composer empty.
+The current native CMUX OpenCode input state is `unknown`, so identity-only registration and owner commands can succeed while default-policy automatic wakes remain held until CMUX proves the composer empty.
+An explicitly configured `api_sidechannel` wake may accept that `unknown` state only with the full guard set above.
+This policy boundary does not qualify automatic wake delivery or prove a recipient received the reply.
 
 ## Register an exact thread
 

@@ -33,12 +33,16 @@ MAX_RESPONSE_BYTES = 128 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024
 MAX_PASSWORD_BYTES = 4096
 MAX_TUI_CHILD_COMMAND_BYTES = 512
+SESSION_MOVE_CONFIRM_TIMEOUT_SECONDS = 3.0
+SESSION_MOVE_POLL_INTERVAL_SECONDS = 0.05
 TUI_CHILD_DESCRIPTOR_SCHEMA = 1
 _BASIC_USER = "opencode"
 _MODEL_ID = re.compile(r"^[A-Za-z0-9_.:+/-]{1,200}$")
 _MESSAGE_ID = re.compile(r"^msg_[A-Za-z0-9]+$")
 _ACTIVE_LIFECYCLES = ("running", "idle", "backgroundWorkPending")
 _PRIVATE_XDG_KEYS = frozenset(("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"))
+_MODEL_PROVIDER_ONLY_SETTING_KEYS = frozenset(("timeout", "headerTimeout", "chunkTimeout", "transport"))
+_MISSING = object()
 
 
 class OpenCodeDispatchError(ValueError):
@@ -234,10 +238,12 @@ class _Client:
         self.last_headers = {}
 
     def request(self, method: str, path: str, payload: dict | None = None,
-                *, authenticated: bool = True) -> tuple[int, bytes]:
+                *, authenticated: bool = True, location_directory: str | None = None) -> tuple[int, bytes]:
         headers = {"Accept": "application/json"}
         if authenticated:
             headers["Authorization"] = self.authorization
+        if location_directory is not None:
+            headers["x-opencode-directory"] = urllib.parse.quote(location_directory, safe="")
         body = None
         if payload is not None:
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -283,8 +289,10 @@ class _Client:
         except (OSError, http.client.HTTPException):
             raise OpenCodeDispatchError("http_unavailable") from None
 
-    def get(self, path: str, *, authenticated: bool = True) -> tuple[int, bytes]:
-        return self.request("GET", path, authenticated=authenticated)
+    def get(self, path: str, *, authenticated: bool = True,
+            location_directory: str | None = None) -> tuple[int, bytes]:
+        return self.request("GET", path, authenticated=authenticated,
+                            location_directory=location_directory)
 
     def post(self, path: str, payload: dict) -> tuple[int, bytes]:
         return self.request("POST", path, payload)
@@ -322,7 +330,70 @@ def _provider_origin(value: object) -> str:
     return _loopback_origin(value, allow_path=True)
 
 
-def preflight(manifest_path: str | Path | Connection, choice: dict) -> Preflight:
+def _expected_directory(value: str | Path) -> str:
+    try:
+        path = Path(value).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError):
+        raise OpenCodeDispatchError("preflight_directory_unavailable") from None
+    if not path.is_dir():
+        raise OpenCodeDispatchError("preflight_directory_unavailable")
+    return str(path)
+
+
+def _location_query(path: str, directory: str) -> str:
+    separator = "&" if "?" in path else "?"
+    return path + separator + urllib.parse.urlencode({"location[directory]": directory})
+
+
+def _require_response_directory(value: dict, expected_directory: str, *, operation: str) -> None:
+    location = value.get("location")
+    directory = location.get("directory") if isinstance(location, dict) else None
+    if not isinstance(directory, str) or not directory:
+        raise OpenCodeDispatchError(f"{operation}_location_unverified")
+    try:
+        actual = str(Path(directory).expanduser().resolve(strict=True))
+    except (OSError, RuntimeError):
+        raise OpenCodeDispatchError(f"{operation}_location_unavailable") from None
+    if actual != expected_directory:
+        raise OpenCodeDispatchError(f"{operation}_location_mismatch")
+
+
+def _overlay_records(*values: dict) -> dict:
+    """Apply OpenCode's recursive right-hand JSON overlay rule to records."""
+    result = {}
+    for value in values:
+        if not isinstance(value, dict):
+            raise OpenCodeDispatchError("unsupported_model_overlay_schema")
+        result = _overlay_value(result, value)
+    return result
+
+
+def _overlay_value(base: object, overlay: object) -> object:
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        result = dict(base)
+        for key, value in overlay.items():
+            result[key] = _overlay_value(result.get(key, _MISSING), value)
+        return result
+    if base is _MISSING:
+        return overlay
+    return overlay
+
+
+def _optional_record(owner: dict, key: str, *, code: str) -> dict:
+    if key not in owner:
+        return {}
+    value = owner[key]
+    if not isinstance(value, dict):
+        raise OpenCodeDispatchError(code)
+    return value
+
+
+def _model_settings(value: dict, *, variant: bool = False) -> dict:
+    excluded = _MODEL_PROVIDER_ONLY_SETTING_KEYS | (frozenset(("cache",)) if variant else frozenset())
+    return {key: item for key, item in value.items() if key not in excluded}
+
+
+def preflight(manifest_path: str | Path | Connection, choice: dict, *, directory: str | Path) -> Preflight:
     """Verify exact API/provider/model configuration with GET requests only."""
     if not isinstance(choice, dict) or choice.get("harness") != "opencode":
         raise OpenCodeDispatchError("opencode_choice_required")
@@ -334,6 +405,7 @@ def preflight(manifest_path: str | Path | Connection, choice: dict) -> Preflight
         raise OpenCodeDispatchError("unsupported_local_provider_model")
     if choice.get("effort") != MAX_REASONING_EFFORT:
         raise OpenCodeDispatchError("unsupported_reasoning_effort")
+    expected_directory = _expected_directory(directory)
     connection = manifest_path if isinstance(manifest_path, Connection) else load_connection(manifest_path)
     for key, expected in (("provider_id", provider_id), ("model_id", model_id)):
         actual = connection.metadata.get(key)
@@ -353,7 +425,10 @@ def preflight(manifest_path: str | Path | Connection, choice: dict) -> Preflight
         raise OpenCodeDispatchError("opencode_server_pid_mismatch")
     # OpenCode 2.2.5 lazily initializes provider descriptors from the model catalog.
     # Read the catalog first so the exact provider route is available on a cold API process.
-    models_response = _json(*client.get("/api/model"), operation="model_catalog")
+    models_response = _json(*client.get(
+        _location_query("/api/model", expected_directory), location_directory=expected_directory),
+        operation="model_catalog")
+    _require_response_directory(models_response, expected_directory, operation="model_catalog")
     models = models_response.get("data")
     if not isinstance(models, list):
         raise OpenCodeDispatchError("unsupported_model_schema")
@@ -370,9 +445,6 @@ def preflight(manifest_path: str | Path | Connection, choice: dict) -> Preflight
     output = limit.get("output") if isinstance(limit, dict) else None
     if isinstance(output, bool) or not isinstance(output, int) or output < MAX_OUTPUT_TOKENS:
         raise OpenCodeDispatchError("model_output_limit_below_maximum_effort")
-    body = model.get("body")
-    if not isinstance(body, dict) or body.get("reasoning_effort") != MAX_REASONING_EFFORT:
-        raise OpenCodeDispatchError("max_reasoning_request_body_unverified")
     variants = model.get("variants")
     if not isinstance(variants, list):
         raise OpenCodeDispatchError("unsupported_model_variant_schema")
@@ -380,16 +452,32 @@ def preflight(manifest_path: str | Path | Connection, choice: dict) -> Preflight
     variant_settings = max_variant.get("settings") if isinstance(max_variant, dict) else None
     if not isinstance(variant_settings, dict) or variant_settings.get("reasoningEffort") != MAX_REASONING_EFFORT:
         raise OpenCodeDispatchError("max_reasoning_variant_unverified")
+    model_settings = _optional_record(model, "settings", code="unsupported_model_settings_schema")
+    effective_model_settings = _overlay_records(
+        {},
+        _model_settings(model_settings),
+        _model_settings(variant_settings, variant=True),
+    )
+    body = _overlay_records(
+        _optional_record(model, "body", code="unsupported_model_body_schema"),
+        _optional_record(max_variant, "body", code="unsupported_variant_body_schema"),
+    )
+    if body.get("reasoning_effort") != MAX_REASONING_EFFORT:
+        raise OpenCodeDispatchError("max_reasoning_request_body_unverified")
     provider_id_path = urllib.parse.quote(provider_id, safe="")
-    provider_response = _json(*client.get(f"/api/provider/{provider_id_path}"),
+    provider_response = _json(*client.get(
+        _location_query(f"/api/provider/{provider_id_path}", expected_directory),
+        location_directory=expected_directory),
                               operation="provider_config")
+    _require_response_directory(provider_response, expected_directory, operation="provider_config")
     provider = provider_response.get("data")
     if not isinstance(provider, dict) or provider.get("id") != provider_id:
         raise OpenCodeDispatchError("unsupported_provider_schema")
     settings = provider.get("settings")
     if not isinstance(settings, dict):
         raise OpenCodeDispatchError("local_provider_base_url_unavailable")
-    local_origin = _provider_origin(settings.get("baseURL"))
+    effective_settings = _overlay_records(settings, effective_model_settings)
+    local_origin = _provider_origin(effective_settings.get("baseURL"))
     final_info = _json(*client.get("/api/info"), operation="api_info")
     final_version, final_pid = _api_instance(final_info)
     if final_version != version or final_pid != pid:
@@ -408,19 +496,19 @@ def preflight(manifest_path: str | Path | Connection, choice: dict) -> Preflight
     )
 
 
-def verify_session(connection: Connection, session_id: str, *, expected_directory: str,
-                   choice: dict, launch_id: str, task_digest: str,
-                   parent_task_id: str | None = None,
-                   parent_session_id: str | None = None) -> dict:
+def _get_session(connection: Connection, session_id: str) -> dict:
     if not isinstance(session_id, str) or not re.fullmatch(r"^ses_[A-Za-z0-9]+$", session_id):
         raise OpenCodeDispatchError("invalid_created_session_id")
-    expected_directory = str(Path(expected_directory).resolve(strict=True))
     client = _Client(connection)
     quoted_id = urllib.parse.quote(session_id, safe="")
     value = _json(*client.get(f"/api/session/{quoted_id}"))
     session = value.get("data")
     if not isinstance(session, dict) or session.get("id") != session_id:
         raise OpenCodeDispatchError("created_session_identity_mismatch")
+    return session
+
+
+def _session_directory(session: dict) -> str:
     location = session.get("location")
     if not isinstance(location, dict) or not isinstance(location.get("directory"), str):
         raise OpenCodeDispatchError("created_session_location_unverified")
@@ -428,6 +516,16 @@ def verify_session(connection: Connection, session_id: str, *, expected_director
         actual_directory = str(Path(location["directory"]).resolve(strict=True))
     except (OSError, RuntimeError):
         raise OpenCodeDispatchError("created_session_location_unavailable") from None
+    return actual_directory
+
+
+def _verify_session_data(session: dict, session_id: str, *, expected_directory: str,
+                         choice: dict, launch_id: str, task_digest: str,
+                         parent_task_id: str | None = None,
+                         parent_session_id: str | None = None) -> dict:
+    if session.get("id") != session_id:
+        raise OpenCodeDispatchError("created_session_identity_mismatch")
+    actual_directory = _session_directory(session)
     if actual_directory != expected_directory:
         raise OpenCodeDispatchError("created_session_directory_mismatch")
     model = session.get("model")
@@ -449,6 +547,18 @@ def verify_session(connection: Connection, session_id: str, *, expected_director
     return {"session_id": session_id, "directory": actual_directory,
             "model": {"provider_id": model["providerID"], "id": model["id"], "variant": model["variant"]},
             "parent_session_id": session.get("parentID")}
+
+
+def verify_session(connection: Connection, session_id: str, *, expected_directory: str,
+                   choice: dict, launch_id: str, task_digest: str,
+                   parent_task_id: str | None = None,
+                   parent_session_id: str | None = None) -> dict:
+    expected_directory = str(Path(expected_directory).resolve(strict=True))
+    session = _get_session(connection, session_id)
+    return _verify_session_data(
+        session, session_id, expected_directory=expected_directory, choice=choice,
+        launch_id=launch_id, task_digest=task_digest,
+        parent_task_id=parent_task_id, parent_session_id=parent_session_id)
 
 
 def require_no_pending_interactions(connection: Connection, session_id: str) -> None:
@@ -657,6 +767,10 @@ def create_session(connection: Connection, *, directory: str, choice: dict, laun
         raise OpenCodeDispatchError("unsupported_opencode_version")
     if pid != connection.expected_server_pid:
         raise OpenCodeDispatchError("opencode_server_pid_mismatch")
+    parent_directory = None
+    if parent_session_id is not None:
+        parent = _get_session(connection, parent_session_id)
+        parent_directory = _session_directory(parent)
     metadata = {"starfleet.model-preferences": {
         "launch_id": launch_id,
         "selection": choice["selection"],
@@ -664,21 +778,105 @@ def create_session(connection: Connection, *, directory: str, choice: dict, laun
         "parent_task_id": parent_task_id,
         "parent_session_id": parent_session_id,
     }}
-    payload = {"location": {"directory": directory},
-               "model": {"providerID": choice["provider_id"], "id": choice["model"], "variant": "max"},
+    payload = {"model": {"providerID": choice["provider_id"], "id": choice["model"], "variant": "max"},
                "metadata": metadata}
     if parent_session_id is not None:
         payload["parentID"] = parent_session_id
+    else:
+        payload["location"] = {"directory": directory}
     client = _Client(connection)
     result = _json(*client.post("/api/session", payload))
     data = result.get("data")
     session_id = data.get("id") if isinstance(data, dict) else None
     if not isinstance(session_id, str) or not re.fullmatch(r"^ses_[A-Za-z0-9]+$", session_id):
         raise OpenCodeDispatchError("created_session_id_unverified")
-    verified = verify_session(connection, session_id, expected_directory=directory, choice=choice,
+    created_directory = parent_directory or directory
+    verified = verify_session(connection, session_id, expected_directory=created_directory, choice=choice,
+                               launch_id=launch_id, task_digest=task_digest,
+                               parent_task_id=parent_task_id, parent_session_id=parent_session_id)
+    return verified
+
+
+def move_session(connection: Connection, session_id: str, *, source_directory: str, directory: str,
+                 choice: dict, launch_id: str, task_digest: str,
+                 parent_task_id: str | None, parent_session_id: str) -> dict:
+    """Move a fresh parent-linked child with one API intent and bounded read-only confirmation."""
+    source_directory = _expected_directory(source_directory)
+    directory = _expected_directory(directory)
+    if source_directory == directory:
+        return verify_session(connection, session_id, expected_directory=directory, choice=choice,
                               launch_id=launch_id, task_digest=task_digest,
                               parent_task_id=parent_task_id, parent_session_id=parent_session_id)
-    return verified
+    initial = verify_session(connection, session_id, expected_directory=source_directory, choice=choice,
+                             launch_id=launch_id, task_digest=task_digest,
+                             parent_task_id=parent_task_id, parent_session_id=parent_session_id)
+    if initial["parent_session_id"] != parent_session_id:
+        raise OpenCodeDispatchError("created_session_parent_session_mismatch")
+
+    client = _Client(connection)
+    instance = _json(*client.get("/api/info"))
+    version, pid = _api_instance(instance)
+    if version != SUPPORTED_OPENCODE_VERSION:
+        raise OpenCodeDispatchError("unsupported_opencode_version")
+    if pid != connection.expected_server_pid:
+        raise OpenCodeDispatchError("opencode_server_pid_mismatch")
+    active = _json(*client.get("/api/session/active"))
+    active_data = active.get("data")
+    if not isinstance(active_data, dict):
+        raise OpenCodeDispatchError("created_session_activity_unverified")
+    if session_id in active_data:
+        raise OpenCodeDispatchError("created_session_move_busy")
+    quoted_id = urllib.parse.quote(session_id, safe="")
+    inbox = _json(*client.get(f"/api/session/{quoted_id}/inbox"))
+    inbox_data = inbox.get("data")
+    if not isinstance(inbox_data, list):
+        raise OpenCodeDispatchError("created_session_move_inbox_unverified")
+    if inbox_data:
+        raise OpenCodeDispatchError("created_session_move_pending_input")
+    require_no_pending_interactions(connection, session_id)
+
+    uncertain_post = False
+    try:
+        status, _ = client.post(f"/api/session/{quoted_id}/move",
+                                {"directory": directory, "delivery": "steer"})
+    except OpenCodeDispatchError as exc:
+        if exc.code not in ("http_timeout", "http_unavailable"):
+            raise
+        uncertain_post = True
+    else:
+        if status != 204:
+            if status < 500:
+                raise OpenCodeDispatchError(f"created_session_move_http_status_{status}")
+            uncertain_post = True
+
+    deadline = time.monotonic() + SESSION_MOVE_CONFIRM_TIMEOUT_SECONDS
+    last_read_error = None
+    while True:
+        try:
+            observed = _get_session(connection, session_id)
+            observed_directory = _session_directory(observed)
+            if observed_directory not in (source_directory, directory):
+                raise OpenCodeDispatchError("created_session_move_directory_mismatch")
+            verified = _verify_session_data(
+                observed, session_id, expected_directory=observed_directory, choice=choice,
+                launch_id=launch_id, task_digest=task_digest,
+                parent_task_id=parent_task_id, parent_session_id=parent_session_id)
+            if observed_directory == directory:
+                final_info = _json(*client.get("/api/info"))
+                final_version, final_pid = _api_instance(final_info)
+                if final_version != version or final_pid != pid:
+                    raise OpenCodeDispatchError("opencode_server_changed_during_session_move")
+                return verified
+        except OpenCodeDispatchError as exc:
+            if exc.code != "http_timeout" and exc.code != "http_unavailable":
+                raise
+            last_read_error = exc
+        if time.monotonic() >= deadline:
+            code = "created_session_move_uncertain" if uncertain_post else "created_session_move_unverified"
+            if last_read_error is not None:
+                code = "created_session_move_unobserved"
+            raise OpenCodeDispatchError(code) from None
+        time.sleep(SESSION_MOVE_POLL_INTERVAL_SECONDS)
 
 
 def _validate_cmux_capability(value: object) -> str:
@@ -859,7 +1057,7 @@ def tui_child(manifest_path: str, session_id: str, directory: str, prompt_file: 
     connection = load_connection(manifest_path)
     choice = {"harness": "opencode", "provider_id": provider_id, "model": model_id, "effort": "max",
               "selection": selection}
-    preflight(connection, choice)
+    preflight(connection, choice, directory=directory)
     verify_session(connection, session_id, expected_directory=directory, choice=choice,
                    launch_id=launch_id, task_digest=task_digest,
                    parent_task_id=connection.parent_task_id,
@@ -896,7 +1094,7 @@ def tui_child(manifest_path: str, session_id: str, directory: str, prompt_file: 
                         "workspace_uuid": workspace_uuid, "surface_uuid": surface_uuid}
     if release != expected_release:
         raise OpenCodeDispatchError("launch_barrier_release_unverified")
-    preflight(connection, choice)
+    preflight(connection, choice, directory=directory)
     verify_session(connection, session_id, expected_directory=directory, choice=choice,
                    launch_id=launch_id, task_digest=task_digest,
                    parent_task_id=connection.parent_task_id,

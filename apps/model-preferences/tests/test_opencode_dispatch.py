@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -63,16 +64,31 @@ class FakeAPIState:
         self.lazy_provider_registry = False
         self.provider_catalog_loaded = False
         self.provider_route_missing = False
+        self.server_directory = str(root)
         self.model_enabled = True
         self.model_tools = True
         self.model_output = 32768
         self.model_package = "@opencode/ai/providers/openai-compatible"
+        self.model_settings = {}
         self.model_body = {"reasoning_effort": "max"}
         self.variant_settings = {"reasoningEffort": "max"}
+        self.variant_body = {}
+        self.provider_urls_by_directory = {}
+        self.model_settings_by_directory = {}
+        self.catalog_response_directories = {}
+        self.provider_response_directories = {}
+        self.location_requests = []
         self.session_directory = str(root)
         self.session_model = {"providerID": PROVIDER, "id": MODEL, "variant": "max"}
         self.session_parent_id = None
         self.session_metadata = {}
+        self.session_records = {}
+        self.created_session_id = SESSION
+        self.session_create_payloads = []
+        self.move_payloads = []
+        self.move_http_status = 204
+        self.move_delay_reads = 0
+        self.move_reads = 0
         self.environment = None
         self.messages = []
         self.message_reads = 0
@@ -91,6 +107,10 @@ class FakeAPIState:
         self.wrong_create_id = False
 
     def session(self, session_id=SESSION):
+        if session_id in self.session_records:
+            return self.session_records[session_id]
+        if session_id != SESSION:
+            return None
         return {"id": session_id, "parentID": self.session_parent_id,
                 "location": {"directory": self.session_directory},
                 "model": self.session_model, "metadata": self.session_metadata,
@@ -135,11 +155,19 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
             self.respond(401)
         return False
 
+    def requested_directory(self):
+        query = parse_qs(urlsplit(self.path).query)
+        selected = query.get("location[directory]", [None])[0]
+        if selected is None:
+            selected = urllib.parse.unquote(self.headers.get("x-opencode-directory", "")) or None
+        return selected or self.state.server_directory
+
     def do_GET(self):
         self.state.calls.append(("GET", self.path, self.headers.get("Authorization")))
         if not self.authenticated():
             return
-        if self.path == "/api/info":
+        path = urlsplit(self.path).path
+        if path == "/api/info":
             if self.state.delay_info:
                 time.sleep(2.2)
             if self.state.large_info:
@@ -149,33 +177,65 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
                 return
             return self.respond(200, {"version": self.state.version, "pid": self.state.pid,
                                       "urls": [], "paths": {"tmp": str(self.state.root)}})
-        if self.path == f"/api/provider/{PROVIDER}":
+        if path == f"/api/provider/{PROVIDER}":
             if (self.state.provider_route_missing or
                     (self.state.lazy_provider_registry and not self.state.provider_catalog_loaded)):
                 return self.respond(404, {"error": "provider configuration unavailable"})
-            return self.respond(200, {"location": {"directory": str(self.state.root)}, "data": {
+            selected_directory = self.requested_directory()
+            self.state.location_requests.append({"path": path, "query": urlsplit(self.path).query,
+                                                 "header": self.headers.get("x-opencode-directory")})
+            response_directory = self.state.provider_response_directories.get(
+                selected_directory, selected_directory)
+            provider_url = self.state.provider_urls_by_directory.get(
+                selected_directory, self.state.provider_url)
+            return self.respond(200, {"location": {"directory": response_directory}, "data": {
                 "id": PROVIDER, "package": self.state.provider_package,
-                "settings": {"baseURL": self.state.provider_url, "apiKey": "synthetic-provider-key"}}})
-        if self.path == "/api/model":
+                "settings": {"baseURL": provider_url, "apiKey": "synthetic-provider-key"}}})
+        if path == "/api/model":
             if self.state.lazy_provider_registry:
                 self.state.provider_catalog_loaded = True
-            return self.respond(200, {"location": {"directory": str(self.state.root)}, "data": [{
+            selected_directory = self.requested_directory()
+            self.state.location_requests.append({"path": path, "query": urlsplit(self.path).query,
+                                                 "header": self.headers.get("x-opencode-directory")})
+            response_directory = self.state.catalog_response_directories.get(
+                selected_directory, selected_directory)
+            model_settings = self.state.model_settings_by_directory.get(
+                selected_directory, self.state.model_settings)
+            return self.respond(200, {"location": {"directory": response_directory}, "data": [{
                 "id": MODEL, "modelID": MODEL, "providerID": PROVIDER, "package": self.state.model_package,
                 "enabled": self.state.model_enabled, "body": self.state.model_body,
+                "settings": model_settings,
                 "capabilities": {"tools": self.state.model_tools, "input": ["text"], "output": ["text"]},
-                "variants": [{"id": "max", "settings": self.state.variant_settings}],
+                "variants": [{"id": "max", "settings": self.state.variant_settings,
+                              "body": self.state.variant_body}],
                 "limit": {"context": 131072, "output": self.state.model_output}}]})
-        if self.path == "/api/session/active":
+        if path == "/api/session/active":
             return self.respond(200, {"data": self.state.active_sessions})
-        if self.path == f"/api/session/{SESSION}":
-            return self.respond(200, {"data": self.state.session()})
-        if self.path == f"/api/session/{SESSION}/inbox":
+        if path.startswith("/api/session/"):
+            parts = path.split("/")
+            session_id = parts[3] if len(parts) > 3 else ""
+            session = self.state.session(session_id)
+            if session is None:
+                return self.respond(404)
+            if len(parts) == 4:
+                if self.state.move_delay_reads and session_id in self.state.session_records:
+                    self.state.move_reads += 1
+                    if self.state.move_reads >= self.state.move_delay_reads:
+                        session["location"]["directory"] = self.state.move_payloads[-1]["directory"]
+                return self.respond(200, {"data": session})
+            if len(parts) == 5 and parts[4] == "inbox":
+                return self.respond(200, {"data": self.state.pending_inbox})
+            if len(parts) == 5 and parts[4] == "permission":
+                return self.respond(200, {"data": self.state.pending_permissions})
+            if len(parts) == 5 and parts[4] == "form":
+                return self.respond(200, {"data": self.state.pending_forms})
+        if path == f"/api/session/{SESSION}/inbox":
             return self.respond(200, {"data": self.state.pending_inbox})
-        if self.path == f"/api/session/{SESSION}/permission":
+        if path == f"/api/session/{SESSION}/permission":
             return self.respond(200, {"data": self.state.pending_permissions})
-        if self.path == f"/api/session/{SESSION}/form":
+        if path == f"/api/session/{SESSION}/form":
             return self.respond(200, {"data": self.state.pending_forms})
-        if self.path.split("?", 1)[0] == f"/api/session/{SESSION}/message":
+        if path == f"/api/session/{SESSION}/message":
             self.state.message_reads += 1
             if self.state.delay_startup_messages and self.state.message_reads >= 2 and not self.state.messages:
                 self.state.messages = self.state.startup_messages(self.state.pending_startup_prompt)
@@ -201,20 +261,47 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
             return
         size = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(size).decode())
-        if self.path == "/api/session":
-            session_id = "ses_wrongcreate" if self.state.wrong_create_id else SESSION
+        path = urlsplit(self.path).path
+        if path == "/api/session":
+            self.state.session_create_payloads.append(payload)
+            session_id = "ses_wrongcreate" if self.state.wrong_create_id else self.state.created_session_id
+            parent_id = payload.get("parentID")
+            parent = self.state.session(parent_id) if parent_id else None
             location = payload.get("location", {})
-            self.state.session_directory = location.get("directory", "")
-            self.state.session_model = payload.get("model")
-            self.state.session_parent_id = payload.get("parentID")
-            self.state.session_metadata = payload.get("metadata", {})
+            directory = parent["location"]["directory"] if parent_id and parent else location.get("directory", "")
+            record = {"id": session_id, "parentID": parent_id,
+                      "location": {"directory": directory}, "model": payload.get("model"),
+                      "metadata": payload.get("metadata", {}),
+                      "time": {"created": 1, "updated": 1, "archived": None}}
+            if session_id == SESSION:
+                self.state.session_directory = directory
+                self.state.session_model = payload.get("model")
+                self.state.session_parent_id = parent_id
+                self.state.session_metadata = payload.get("metadata", {})
+            else:
+                self.state.session_records[session_id] = record
             if self.state.delay_create:
                 time.sleep(2.2)
             try:
                 return self.respond(200, {"data": self.state.session(session_id)})
             except OSError:
                 return
-        if self.path == f"/api/session/{SESSION}/prompt":
+        if len(path.split("/")) == 5 and path.startswith("/api/session/") and path.endswith("/move"):
+            session_id = path.split("/")[3]
+            self.state.move_payloads.append(payload)
+            if self.state.move_http_status != 204:
+                return self.respond(self.state.move_http_status)
+            session = self.state.session(session_id)
+            if session is None:
+                return self.respond(404)
+            if self.state.move_delay_reads:
+                self.state.move_reads = 0
+            else:
+                session["location"]["directory"] = payload.get("directory", "")
+            self.send_response(204)
+            self.end_headers()
+            return
+        if path == f"/api/session/{SESSION}/prompt":
             self.state.sent_prompts.append(payload)
             data = {"id": f"msg_user{len(self.state.sent_prompts)}", "sessionID": SESSION,
                     "type": "user", "time": {}, "payload": {},
@@ -516,7 +603,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
         return app, launch, args, current, hook_path, cmux
 
     def test_preflight_and_create_use_exact_model_without_prompt_or_permission_calls(self):
-        proof = dispatch.preflight(self.manifest, self.choice)
+        proof = dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
         self.assertEqual(proof.server_pid, 4242)
         self.assertEqual(proof.local_provider_origin, "http://127.0.0.1:11459")
         self.assertEqual(proof.output_limit, 32768)
@@ -549,7 +636,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
 
     def test_cold_provider_registry_is_initialized_by_model_catalog_read(self):
         self.state.lazy_provider_registry = True
-        proof = dispatch.preflight(self.manifest, self.choice)
+        proof = dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
         self.assertEqual(proof.provider_id, PROVIDER)
         paths = [path.split("?", 1)[0] for method, path, _ in self.state.calls if method == "GET"]
         self.assertLess(paths.index("/api/model"), paths.index(f"/api/provider/{PROVIDER}"))
@@ -557,7 +644,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
     def test_provider_http_diagnostic_exposes_only_operation_and_status(self):
         self.state.provider_route_missing = True
         with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
-            dispatch.preflight(self.manifest, self.choice)
+            dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
         self.assertEqual(raised.exception.code, "provider_config_http_status_404")
         self.assertNotIn("provider configuration unavailable", str(raised.exception))
         self.assertNotIn(CANARY, str(raised.exception))
@@ -588,6 +675,11 @@ class OpenCodeDispatchTest(unittest.TestCase):
     def test_child_session_keeps_native_parent_session_separate_from_parent_task(self):
         connection = dispatch.load_connection(self.manifest)
         parent_session = "ses_parentFixture123"
+        self.state.session_records[parent_session] = {
+            "id": parent_session, "parentID": None,
+            "location": {"directory": str(self.root)},
+            "model": {"providerID": PROVIDER, "id": MODEL, "variant": "max"},
+            "metadata": {}, "time": {"created": 1, "updated": 1, "archived": None}}
         created = dispatch.create_session(connection, directory=str(self.root), choice=self.choice,
                                           launch_id="d" * 32, task_digest="e" * 64,
                                           parent_task_id=connection.parent_task_id,
@@ -605,6 +697,61 @@ class OpenCodeDispatchTest(unittest.TestCase):
                                     launch_id="d" * 32, task_digest="e" * 64,
                                     parent_task_id=connection.parent_task_id,
                                     parent_session_id=parent_session)
+
+    def test_parent_linked_child_moves_to_distinct_worktree_before_returning(self):
+        owner = self.root / "owner-worktree"
+        child = self.root / "child-worktree"
+        owner.mkdir(); child.mkdir()
+        self.state.session_directory = str(owner)
+        self.state.created_session_id = "ses_childFixture456"
+        connection = dispatch.load_connection(self.manifest)
+        launch_id, task_digest = "a" * 32, "b" * 64
+        created = dispatch.create_session(
+            connection, directory=str(child), choice=self.choice, launch_id=launch_id,
+            task_digest=task_digest, parent_task_id=connection.parent_task_id,
+            parent_session_id=SESSION)
+        self.assertEqual(created["directory"], str(owner))
+        create_payload = self.state.session_create_payloads[-1]
+        self.assertEqual(create_payload["parentID"], SESSION)
+        self.assertNotIn("location", create_payload)
+
+        moved = dispatch.move_session(
+            connection, created["session_id"], source_directory=created["directory"], directory=str(child),
+            choice=self.choice, launch_id=launch_id, task_digest=task_digest,
+            parent_task_id=connection.parent_task_id, parent_session_id=SESSION)
+        self.assertEqual(moved["directory"], str(child))
+        self.assertEqual(moved["parent_session_id"], SESSION)
+        self.assertEqual(self.state.session(created["session_id"])["location"]["directory"], str(child))
+        self.assertEqual(self.state.move_payloads, [{"directory": str(child), "delivery": "steer"}])
+        self.assertEqual(sum(method == "POST" and path.endswith("/move")
+                             for method, path, _ in self.state.calls), 1)
+        self.assertNotIn("/prompt", [path.split("?", 1)[0] for _, path, _ in self.state.calls])
+
+    def test_uncertain_parent_child_move_is_not_replayed(self):
+        owner = self.root / "owner-worktree"
+        child = self.root / "child-worktree"
+        owner.mkdir(); child.mkdir()
+        self.state.session_directory = str(owner)
+        self.state.created_session_id = "ses_childUncertain789"
+        self.state.move_http_status = 500
+        connection = dispatch.load_connection(self.manifest)
+        launch_id, task_digest = "c" * 32, "d" * 64
+        created = dispatch.create_session(
+            connection, directory=str(child), choice=self.choice, launch_id=launch_id,
+            task_digest=task_digest, parent_task_id=connection.parent_task_id,
+            parent_session_id=SESSION)
+        with patch.object(dispatch, "SESSION_MOVE_CONFIRM_TIMEOUT_SECONDS", 0.0):
+            with self.assertRaisesRegex(dispatch.OpenCodeDispatchError, "created_session_move_uncertain"):
+                dispatch.move_session(
+                    connection, created["session_id"], source_directory=created["directory"],
+                    directory=str(child), choice=self.choice, launch_id=launch_id,
+                    task_digest=task_digest, parent_task_id=connection.parent_task_id,
+                    parent_session_id=SESSION)
+        self.assertEqual(created["session_id"], "ses_childUncertain789")
+        self.assertEqual(self.state.session(created["session_id"])["parentID"], SESSION)
+        self.assertEqual(self.state.session(created["session_id"])["location"]["directory"], str(owner))
+        self.assertEqual(sum(method == "POST" and path.endswith("/move")
+                             for method, path, _ in self.state.calls), 1)
 
     def test_startup_message_proof_requires_exact_prompt_and_completed_configured_model(self):
         connection = dispatch.load_connection(self.manifest)
@@ -982,11 +1129,13 @@ class OpenCodeDispatchTest(unittest.TestCase):
         child_choice = mp.resolve(mp.selection(config), "implementer", None)
         connection = dispatch.load_connection(self.manifest)
         parent_id, parent_digest = "a" * 32, "b" * 64
+        self.state.session_directory = str(owner)
         dispatch.create_session(connection, directory=str(owner), choice=parent_choice,
                                  launch_id=parent_id, task_digest=parent_digest,
                                  parent_task_id=connection.parent_task_id)
         workspace, caller_surface = str(uuid.uuid4()), str(uuid.uuid4())
         child_surface, child_session = str(uuid.uuid4()), "ses_childFixture456"
+        self.state.created_session_id = child_session
         parent_prompt = "Dispatch one bounded child during this exact first task."
         parent_prompt_digest = hashlib.sha256(parent_prompt.encode()).hexdigest()
         self.state.messages = [{"id": "msg_parentChildTask123", "type": "user", "text": parent_prompt,
@@ -1021,6 +1170,7 @@ class OpenCodeDispatchTest(unittest.TestCase):
         current_child = False
         hook_path = self.root / "child-hook-store.json"
         pb_actions = []
+        execution_order = []
         create_requests = []
 
         def current_for(session, surface, state):
@@ -1030,19 +1180,30 @@ class OpenCodeDispatchTest(unittest.TestCase):
                                "projections": [{"workspace_id": workspace, "panel_id": surface}],
                                "agents": [{"kind": "opencode", "session_id": session, "state": state}]}]}
 
-        def fake_create(conn, *, directory, choice, launch_id, task_digest, parent_task_id,
-                        parent_session_id=None):
+        original_create = dispatch.create_session
+        original_move = dispatch.move_session
+
+        def observed_create(conn, *, directory, choice, launch_id, task_digest, parent_task_id,
+                            parent_session_id=None):
             create_requests.append({"directory": directory, "parent_session_id": parent_session_id,
                                     "parent_task_id": parent_task_id, "choice": choice})
-            return {"session_id": child_session, "directory": str(child),
-                    "parent_session_id": parent_session_id,
-                    "model": {"provider_id": choice["provider_id"], "id": choice["model"], "variant": "max"}}
+            return original_create(conn, directory=directory, choice=choice, launch_id=launch_id,
+                                   task_digest=task_digest, parent_task_id=parent_task_id,
+                                   parent_session_id=parent_session_id)
+
+        def observed_move(conn, session, **kwargs):
+            execution_order.append("session_move_intent")
+            result = original_move(conn, session, **kwargs)
+            execution_order.append("session_move_confirmed")
+            return result
 
         def fake_cmux(argv, stdin=None):
             nonlocal current_child
             if argv[0] == sys.executable and argv[1] == str(pb_script):
                 action = next(item for item in ("prepare-dispatch", "bind-dispatch", "context") if item in argv)
                 pb_actions.append(action)
+                if action == "bind-dispatch":
+                    execution_order.append("pattern_buffer_bind")
                 if action == "context":
                     return parent_context if SESSION in argv else child_context
                 if action == "prepare-dispatch":
@@ -1117,7 +1278,8 @@ class OpenCodeDispatchTest(unittest.TestCase):
                 patch.object(mp, "run_json", side_effect=fake_cmux), \
                 patch.object(mp.opencode_dispatch, "native_hook_store_path", return_value=hook_path), \
                 patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"), \
-                patch.object(mp.opencode_dispatch, "create_session", side_effect=fake_create), \
+                patch.object(mp.opencode_dispatch, "create_session", side_effect=observed_create), \
+                patch.object(mp.opencode_dispatch, "move_session", side_effect=observed_move), \
                 patch.object(mp.opencode_dispatch, "startup_turn_observation", side_effect=startup_observation), \
                 patch.object(mp.opencode_dispatch, "inspect_session", side_effect=child_identity), \
                 patch.object(mp.opencode_dispatch, "set_session_environment", wraps=mp.opencode_dispatch.set_session_environment):
@@ -1126,12 +1288,81 @@ class OpenCodeDispatchTest(unittest.TestCase):
         self.assertEqual(result["session"], child_session)
         self.assertEqual(create_requests[0]["directory"], str(child))
         self.assertEqual(create_requests[0]["parent_session_id"], SESSION)
+        self.assertEqual(launch["session_move_source_directory"], str(owner))
+        self.assertEqual(launch["session_move_target_directory"], str(child))
+        self.assertEqual(launch["session_directory"], str(child))
+        self.assertIsNotNone(launch["session_move_confirmed_at"])
         self.assertEqual(launch["opencode_parent_session_id"], SESSION)
         self.assertEqual(launch["pattern_buffer_task_id"], child_ticket)
         self.assertEqual(launch["pattern_buffer_owner_worktree"], str(owner))
         self.assertEqual(launch["worktree_directory"], str(child))
+        self.assertLess(execution_order.index("session_move_confirmed"),
+                        execution_order.index("pattern_buffer_bind"))
         self.assertEqual(pb_actions, ["context", "prepare-dispatch", "context", "bind-dispatch", "context"])
         self.assertNotIn(CMUX_CANARY, json.dumps(launch))
+
+    def test_uncertain_child_move_persists_created_session_identity(self):
+        config_dir, state_dir = self.root / "move-uncertain-config", self.root / "move-uncertain-state"
+        config = mp.example_config(); config["active"] = "Qwen-only"
+        mp.write(config_dir / "profiles.json", config)
+        app = mp.App(config_dir, state_dir)
+        owner = self.root / "move-uncertain-owner"; owner.mkdir()
+        child = self.root / "move-uncertain-child"; child.mkdir()
+        for worktree in (owner, child):
+            subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+        task_file = self.root / "move-uncertain-task.txt"
+        task_file.write_text("Keep exact created session evidence after an uncertain move.")
+        choice = mp.resolve(mp.selection(config), "implementer", None)
+        connection = dispatch.load_connection(self.manifest)
+        parent = {"harness": "opencode", "session_id": "ses_parentMoveFixture123",
+                  "task_id": connection.parent_task_id, "launch_id": "f" * 32,
+                  "owner_worktree": str(owner)}
+        created_session = "ses_createdBeforeUncertainMove789"
+        workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+
+        def cmux(argv, stdin=None):
+            if "identify" in argv:
+                return {"caller": {"workspace_id": workspace, "surface_id": surface}}
+            if "tree" in argv:
+                return {"windows": [{"workspaces": [{"id": workspace, "panes": [
+                    {"id": "pane-move-uncertain", "surfaces": [{"id": surface}]}]}]}]}
+            raise AssertionError(argv)
+
+        adapter = {"task_id": "a" * 32, "owner_worktree": str(owner), "script": str(self.root / "pb.py")}
+        move_calls = []
+
+        def uncertain_move(conn, session_id, **kwargs):
+            move_calls.append((session_id, kwargs))
+            raise mp.opencode_dispatch.OpenCodeDispatchError("created_session_move_uncertain")
+
+        args = SimpleNamespace(role="implementer", opencode_manifest=str(self.manifest),
+                               context_injector=str(self.root / "pb.py"), owner_worktree=str(owner),
+                               receipt_file=str(self.root / "move-uncertain-receipt.json"),
+                               task_file=str(task_file), slot=None)
+        with patch.object(mp, "run_json", side_effect=cmux), \
+                patch.object(mp.opencode_dispatch, "check_opencode_cli", return_value="/fixture/bin/opencode"), \
+                patch.object(mp, "opencode_parent_caller", return_value=parent), \
+                patch.object(mp, "prepare_opencode_pattern_buffer", return_value=adapter), \
+                patch.object(mp.opencode_dispatch, "create_session", return_value={
+                    "session_id": created_session, "parent_session_id": parent["session_id"],
+                    "directory": str(owner), "model": choice["model"]}) as create_session, \
+                patch.object(mp.opencode_dispatch, "move_session", side_effect=uncertain_move), \
+                self.assertRaisesRegex(mp.PreferenceError, "created_session_move_uncertain"):
+            mp.dispatch_opencode(app, args, config, choice, child, task_file.read_bytes())
+
+        create_session.assert_called_once()
+        self.assertEqual(len(move_calls), 1)
+        launches = list((state_dir / "launches").glob("*.json"))
+        self.assertEqual(len(launches), 1)
+        launch = json.loads(launches[0].read_text())
+        self.assertEqual(launch["status"], "uncertain")
+        self.assertEqual(launch["native_session"], created_session)
+        self.assertEqual(launch["opencode_parent_session_id"], parent["session_id"])
+        self.assertEqual(launch["session_directory"], str(owner))
+        self.assertEqual(launch["session_move_source_directory"], str(owner))
+        self.assertEqual(launch["session_move_target_directory"], str(child))
+        self.assertEqual(launch["error_code"], "created_session_move_uncertain")
+        self.assertFalse(list((state_dir / "opencode-launches").glob("*.child.json")))
 
     def test_codex_and_claude_parent_cli_dispatch_uses_legacy_pattern_buffer_contract(self):
         cases = (("codex", "codex-thread-fixture", "CODEX_THREAD_ID", "codex"),
@@ -1399,14 +1630,71 @@ class OpenCodeDispatchTest(unittest.TestCase):
             with self.subTest(field=field):
                 setattr(self.state, field, value)
                 with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
-                    dispatch.preflight(self.manifest, self.choice)
+                    dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
                 self.assertEqual(raised.exception.code, code)
                 setattr(self.state, field, getattr(FakeAPIState(self.root), field))
+
+    def test_preflight_rejects_remote_model_and_max_variant_endpoint_overlays(self):
+        remote = "https://example.invalid/v1"
+        self.state.model_settings = {"baseURL": remote}
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
+        self.assertEqual(raised.exception.code, "invalid_loopback_url")
+
+        self.state.model_settings = {}
+        self.state.variant_settings = {"reasoningEffort": "max", "baseURL": remote}
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
+        self.assertEqual(raised.exception.code, "invalid_loopback_url")
+
+        self.state.variant_settings = {"reasoningEffort": "max"}
+        self.state.variant_body = {"reasoning_effort": "low"}
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
+        self.assertEqual(raised.exception.code, "max_reasoning_request_body_unverified")
+
+        self.state.variant_body = {}
+        proof = dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
+        self.assertEqual(proof.local_provider_origin, "http://127.0.0.1:11459")
+
+    def test_preflight_scopes_both_catalogs_to_the_exact_target_directory(self):
+        server_directory = self.root
+        target = self.root / "target-b"
+        target.mkdir()
+        self.state.server_directory = str(server_directory)
+        self.state.provider_urls_by_directory[str(target)] = "https://example.invalid/v1"
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.preflight(self.manifest, self.choice, directory=str(target))
+        self.assertEqual(raised.exception.code, "invalid_loopback_url")
+        requests = self.state.location_requests[-2:]
+        self.assertEqual([item["path"] for item in requests], ["/api/model", f"/api/provider/{PROVIDER}"])
+        for request in requests:
+            query = parse_qs(request["query"])
+            self.assertEqual(query.get("location[directory]"), [str(target)])
+            self.assertEqual(urllib.parse.unquote(request["header"]), str(target))
+
+        self.state.provider_urls_by_directory[str(target)] = self.state.provider_url
+        proof = dispatch.preflight(self.manifest, self.choice, directory=str(target))
+        self.assertEqual(proof.local_provider_origin, "http://127.0.0.1:11459")
+
+    def test_preflight_holds_if_either_catalog_reports_a_different_directory(self):
+        target = self.root / "target-b"
+        target.mkdir()
+        self.state.catalog_response_directories[str(target)] = str(self.root)
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.preflight(self.manifest, self.choice, directory=str(target))
+        self.assertEqual(raised.exception.code, "model_catalog_location_mismatch")
+
+        self.state.catalog_response_directories.clear()
+        self.state.provider_response_directories[str(target)] = str(self.root)
+        with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
+            dispatch.preflight(self.manifest, self.choice, directory=str(target))
+        self.assertEqual(raised.exception.code, "provider_config_location_mismatch")
 
     def test_authentication_manifest_permissions_and_nonloopback_are_rejected(self):
         self.state.challenge = False
         with self.assertRaisesRegex(dispatch.OpenCodeDispatchError, "authenticated_api_challenge_required"):
-            dispatch.preflight(self.manifest, self.choice)
+            dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
         self.state.challenge = True
         self.password_file.chmod(0o644)
         with self.assertRaisesRegex(dispatch.OpenCodeDispatchError, "private_password_file_required"):
@@ -1528,12 +1816,12 @@ class OpenCodeDispatchTest(unittest.TestCase):
     def test_timeout_and_large_response_are_bounded_without_secret_diagnostics(self):
         self.state.delay_info = True
         with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
-            dispatch.preflight(self.manifest, self.choice)
+            dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
         self.assertEqual(raised.exception.code, "http_timeout")
         self.state.delay_info = False
         self.state.large_info = True
         with self.assertRaises(dispatch.OpenCodeDispatchError) as raised:
-            dispatch.preflight(self.manifest, self.choice)
+            dispatch.preflight(self.manifest, self.choice, directory=str(self.root))
         self.assertEqual(raised.exception.code, "response_too_large")
         self.assertNotIn(CANARY, str(raised.exception))
 

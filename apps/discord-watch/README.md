@@ -27,8 +27,11 @@ The central worker checks that the same target remains enrolled and validates th
 OpenCode wakes also recheck the exact authenticated API session, server PID, worktree, running state, pending permissions, and pending forms before using the OpenCode prompt route.
 The worker never forces terminal input, reads or clears CMUX messages, launches another agent, or sends a reply body in a wake.
 The prompt names one exact `discord-watch receive --thread THREAD --message MESSAGE` command, with `--session ses_ID` for OpenCode.
-An explicitly empty composer with no human-input obligation is required by Hailing Frequencies for every harness.
-The current native CMUX OpenCode input state remains `unknown`, so OpenCode wakes hold until native state is explicitly empty.
+OpenCode registration, `managed`, `close`, and `receive` verify the exact enrolled owner without checking composer readiness.
+Automatic wake readiness is checked separately against the persisted Hailing Frequencies delivery policy.
+The default `native_empty_composer` policy requires an explicitly empty composer with no human-input obligation.
+For OpenCode only, the explicit `api_sidechannel` policy also permits `draft` or `unknown` composer classifications when there is no blocking input or human-input obligation and every other native, API, lifecycle, receiving, and owner guard passes.
+The current native CMUX OpenCode input state remains `unknown`, so default-policy automatic wakes hold until native state is explicitly empty.
 Attachment filenames and HTTPS URLs are printed to the exact recipient during `receive` without downloading the files.
 
 The worker recognizes a remote archived thread or the cached `Closed` forum tag and closes that local registration without sending more wakes.

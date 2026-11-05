@@ -121,9 +121,13 @@ Launch an implementer or researcher task from the exact Git worktree root while 
 
     model-preferences --config-dir /private/config --state-dir /private/state dispatch --role implementer --cwd /absolute/path/to/worktree --task-file /absolute/path/to/task.md --opencode-manifest /private/opencode-connection.json
 
+The helper scopes both catalog requests to the exact target or session directory and requires both API responses to report that directory.
+It resolves provider, model, and selected `max` variant settings and request bodies using OpenCode 2.2.5's overlay rules before checking the effective loopback endpoint and `reasoning_effort` body value.
 The helper checks the authenticated API version, server PID, exact provider and model, local provider URL, tools, the named `max` reasoning variant and a distinct output budget of at least 32768 tokens before creating a session.
-It creates the session through the API, records the returned native `ses_` ID, and verifies the session directory and selected model before opening an interactive TUI with its initial prompt.
-When Pattern Buffer dispatch is requested, its immutable task snapshot is prepared and bound to that exact native session before the initial prompt is released.
+An unlinked session is created directly at the target directory and its native `ses_` ID, directory, and model are verified before TUI startup.
+OpenCode 2.2.5 creates a parent-linked child at its parent's directory, so the helper first persists the returned native `ses_` ID and parent identity, then uses the supported session move API to relocate the idle child to its target directory.
+The helper confirms the exact session, parent, model, launch ticket, and final directory before it proceeds; an uncertain move is not repeated.
+When Pattern Buffer dispatch is requested, its immutable task snapshot is prepared before session creation and bound to that exact native session only after the final child directory is verified.
 The child TUI obtains its CMUX workspace and surface UUIDs from its own `cmux identify` result, and a private launch barrier requires those UUIDs to match the exact newly opened surface before the session-scoped CMUX environment is set and the initial prompt is released.
 The child transfers its own native `CMUX_SOCKET_CAPABILITY` through that mode-0600 handshake, and Model Preferences writes it only into the exact OpenCode session environment.
 The capability is never written to launch records, receipts, command arguments or diagnostics.
