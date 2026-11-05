@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -274,27 +275,78 @@ class LaneInstallTest(unittest.TestCase):
         value = json.loads(self.call('coverage', '--pr-url', self.url).stdout)
         self.assertEqual(value['binding']['state'], 'not-installed')
         self.assertIsNone(value['source_intact'])
+        self.assertEqual(value['setup_guidance']['action'], 'attach')
+        self.assertIn('proof-only work need no enrollment', value['setup_guidance']['reason'])
+        self.assertIn('guide --print', value['setup_guidance']['command'])
         self.assertEqual(set(value['fix_rounds']['paths'].values()), {'unverified'})
         self.assertFalse((self.repo / '.git/starfleet-delivery-lane').exists())
         self.assertEqual(self.git('status', '--porcelain').stdout, before)
         self.assertFalse(self.forwarded.exists())
 
+    def test_status_recommends_optional_attach_plan_with_actual_identity(self):
+        source = self.source_checkout('optional-attach-guidance')
+        owner_session = 'codex-optional-attach-fixture'
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID=owner_session)
+        result = self.call_source(source, 'status', env=owner_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recommendation = json.loads(result.stdout)['setup_guidance']
+        self.assertEqual(recommendation['action'], 'attach')
+        self.assertIn('proof-only work need no enrollment', recommendation['reason'])
+        self.assertIn('your chosen permanent owner seat', recommendation['reason'])
+        self.assertIn('--host fixture.invalid', recommendation['command'])
+        self.assertIn('--owner-session ' + owner_session, recommendation['command'])
+
+        plan = subprocess.run(shlex.split(recommendation['command']), cwd=self.repo, env=owner_env,
+                              capture_output=True, text=True)
+        self.assertEqual(plan.returncode, 0, plan.stderr)
+        self.assertEqual(json.loads(plan.stdout)['lane_owner']['session_id'], owner_session)
+        self.assertFalse((self.repo / '.git/starfleet-delivery-lane').exists())
+
+    def test_setup_guidance_help_and_printable_guide_explain_limits(self):
+        status_help = self.call('status', '--help').stdout
+        coverage_help = self.call('coverage', '--help').stdout
+        guide = self.call('guide', '--print').stdout
+        normalized_status_help = ' '.join(status_help.split())
+        normalized_coverage_help = ' '.join(coverage_help.split())
+        self.assertIn('one read-only setup recommendation', normalized_status_help)
+        self.assertIn('one setup recommendation', normalized_coverage_help)
+        self.assertIn('setup_guidance', guide)
+        self.assertIn('proof-only work do not need enrollment', guide)
+        self.assertIn('does not authorize transfer', guide)
+        self.assertIn('separate from setup', guide)
+
     def test_coverage_separates_old_pr_and_current_binding_without_writes(self):
-        self.install()
+        source = self.source_checkout('coverage-guidance')
+        self.install_from_source(source)
         state = self.repo / '.git/starfleet-delivery-lane/state.json'
         before = state.read_bytes()
-        value = json.loads(self.call('coverage').stdout)
+        value = json.loads(self.call_source(source, 'coverage').stdout)
         self.assertEqual(value['binding']['state'], 'local-binding-current-pr-unconfirmed')
+        self.assertEqual(value['setup_guidance']['action'], 'none')
+        self.assertIn('separate from setup', value['setup_guidance']['reason'])
+        self.assertIn('record --help', value['setup_guidance']['command'])
         other = self.url.replace('/901', '/902')
-        value = json.loads(self.call('coverage', '--pr-url', other).stdout)
+        value = json.loads(self.call_source(source, 'coverage', '--pr-url', other).stdout)
         self.assertEqual(value['binding']['state'], 'different-pr-bound')
         self.assertEqual(value['binding']['installed_pr'], self.url)
-        value = json.loads(self.call('coverage', '--pr-url', self.url).stdout)
+        value = json.loads(self.call_source(source, 'coverage', '--pr-url', self.url).stdout)
         self.assertEqual(value['binding']['state'], 'matches-declared-pr-and-local-branch')
         self.assertFalse(value['binding']['hosted_pr_checked'])
-        self.git('switch', '-c', 'another-branch')
-        value = json.loads(self.call('coverage', '--pr-url', self.url).stdout)
+        wrong_root = json.loads(before)
+        wrong_root['root'] = str(self.base / 'different-product-root')
+        state.write_text(json.dumps(wrong_root, indent=2) + '\n')
+        value = json.loads(self.call_source(source, 'coverage').stdout)
         self.assertEqual(value['binding']['state'], 'inactive-local-binding')
+        self.assertEqual(value['setup_guidance']['action'], 'inspect')
+        self.assertIsNone(value['setup_guidance']['command'])
+        summary = self.call_source(source, 'coverage', '--summary').stdout
+        self.assertIn('Policy Guard: inactive delivery installation', summary)
+        state.write_bytes(before)
+        self.git('switch', '-c', 'another-branch')
+        value = json.loads(self.call_source(source, 'coverage', '--pr-url', self.url).stdout)
+        self.assertEqual(value['binding']['state'], 'inactive-local-binding')
+        self.assertEqual(value['setup_guidance']['action'], 'inspect')
+        self.assertIsNone(value['setup_guidance']['command'])
         self.assertEqual(before, state.read_bytes())
         self.assertFalse(self.forwarded.exists())
 
@@ -310,6 +362,8 @@ class LaneInstallTest(unittest.TestCase):
             self.assertTrue(detail['installed_here'])
             self.assertEqual(detail['attachment_state'], 'active-here')
             self.assertEqual(detail['current_owner']['state'], 'matches')
+            self.assertEqual(detail['setup_guidance']['action'], 'none')
+            self.assertIn('No report or setup change is needed now', detail['setup_guidance']['reason'])
             self.assertIsNone(detail['pr_url'])
             self.assertEqual(detail['report_status']['state'], 'absent')
             self.assertFalse(lane_runtime.active(state, self.repo))
@@ -320,16 +374,22 @@ class LaneInstallTest(unittest.TestCase):
             self.assertTrue(coverage['installed_here'])
             self.assertEqual(coverage['attachment_state'], 'active-here')
             self.assertEqual(coverage['binding']['state'], 'lane-enrolled-no-pr-binding')
+            self.assertEqual(coverage['setup_guidance'], detail['setup_guidance'])
 
         summary = self.call('coverage', '--summary', env=owner_env).stdout
         self.assertIn('Policy Guard: delivery-only installation', summary)
         self.assertIn('bound=none (lane-enrolled-no-pr-binding', summary)
         self.assertIn('Report: absent', summary)
+        self.assertIn('Next setup: none - The owner lane is attached before a PR exists.', summary)
 
         wrong_owner = dict(owner_env, CODEX_THREAD_ID='another-codex-thread')
         wrong_owner_status = json.loads(self.call('status', env=wrong_owner).stdout)
         self.assertTrue(wrong_owner_status['installed_here'])
         self.assertEqual(wrong_owner_status['current_owner']['state'], 'mismatch')
+        self.assertEqual(wrong_owner_status['setup_guidance']['action'], 'handoff')
+        self.assertIn('does not authorize transfer', wrong_owner_status['setup_guidance']['reason'])
+        self.assertIn('--confirm-handoff', wrong_owner_status['setup_guidance']['command'])
+        self.assertIn('--from-session codex-fixture-thread', wrong_owner_status['setup_guidance']['command'])
         with mock.patch.dict(os.environ, wrong_owner):
             with self.assertRaisesRegex(ValueError, 'belongs to another native session'):
                 lane_runtime.require(state, self.repo)
@@ -338,6 +398,13 @@ class LaneInstallTest(unittest.TestCase):
                 lane_runtime, 'source_versions', return_value={'lane.py': 'changed-source'}):
             with self.assertRaisesRegex(ValueError, 'Pinned delivery adapter source changed'):
                 lane_runtime.require(state, self.repo)
+
+        authorized_handoff = subprocess.run(shlex.split(wrong_owner_status['setup_guidance']['command']),
+                                            cwd=self.repo, env=wrong_owner, capture_output=True, text=True)
+        self.assertEqual(authorized_handoff.returncode, 0, authorized_handoff.stderr)
+        rebound = lane_runtime.read(self.repo)
+        self.assertEqual(rebound['lane_owner']['session_id'], wrong_owner['CODEX_THREAD_ID'])
+        self.assertEqual(len(rebound['owner_history']), 1)
 
     def test_no_pr_legacy_migration_cli_preserves_lane_and_owner_history(self):
         source = self.source_checkout_same_fingerprints('no-pr-migration-cli')
@@ -1712,7 +1779,141 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(value['report_status']['state'], 'not-evaluated')
         self.assertIn('not evaluated', value['report_status']['reason'])
         self.assertIn('Do not use rebind-owner', value['successor_guidance'])
+        self.assertEqual(value['setup_guidance']['action'], 'upgrade')
+        self.assertIsNone(value['setup_guidance']['command'])
         self.assertNotIn('stale', value['report_status']['reason'])
+
+    def test_status_recommends_upgrade_plan_from_clean_distinct_source(self):
+        old_source = self.source_checkout('setup-guidance-old-pin')
+        new_source = self.source_checkout('setup-guidance-clean-source')
+        self.install_from_source(old_source)
+
+        status = self.call_source(new_source, 'status')
+        self.assertEqual(status.returncode, 0, status.stderr)
+        value = json.loads(status.stdout)
+        recommendation = value['setup_guidance']
+        self.assertEqual(recommendation['action'], 'upgrade')
+        self.assertIn('clean committed source', recommendation['reason'])
+        self.assertIn(str(new_source / 'lane.py'), recommendation['command'])
+        self.assertNotIn('PLAN_SHA256', recommendation['command'])
+
+        command = shlex.split(recommendation['command'])
+        planned = subprocess.run(command, cwd=self.repo, env=self.env, capture_output=True, text=True)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        self.assertEqual(json.loads(planned.stdout)['binding_type'], 'legacy-per-pr')
+
+    def test_status_recommends_migrate_plan_for_missing_legacy_source(self):
+        old_source = self.source_checkout('setup-guidance-missing-legacy-source')
+        clean_source = self.source_checkout('setup-guidance-migration-source')
+        self.install_from_source(old_source)
+        shutil.rmtree(old_source)
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-migration-reviewer')
+
+        status = self.call_source(clean_source, 'status', env=owner_env)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        value = json.loads(status.stdout)
+        recommendation = value['setup_guidance']
+        self.assertEqual(value['installed_source']['integrity'], 'missing')
+        self.assertEqual(recommendation['action'], 'migrate')
+        self.assertIn('without recreating them', recommendation['reason'])
+        self.assertIn('--confirm-owner', recommendation['command'])
+
+        command = shlex.split(recommendation['command'])
+        planned = subprocess.run(command, cwd=self.repo, env=owner_env, capture_output=True, text=True)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        self.assertEqual(json.loads(planned.stdout)['legacy_state']['phase'], 'active')
+
+    def test_status_bounds_malformed_native_owner_metadata(self):
+        source = self.source_checkout_same_fingerprints('malformed-owner-guidance')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        self.install_from_source(source, lane=True, env=owner_env)
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        state = json.loads(state_path.read_text())
+        state['lane_owner'] = {'harness': 'codex'}
+        state_path.write_text(json.dumps(state, indent=2) + '\n')
+
+        result = self.call('coverage', '--summary', env=owner_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Next setup: inspect - Recorded native-owner metadata is unrecognized.', result.stdout)
+        self.assertNotIn('Run:', result.stdout)
+        value = json.loads(self.call('status', env=owner_env).stdout)
+        self.assertEqual(value['current_owner']['state'], 'unrecognized')
+        self.assertEqual(value['setup_guidance']['action'], 'inspect')
+        self.assertIsNone(value['setup_guidance']['command'])
+
+    def test_status_recommends_readonly_inspection_for_missing_adapter(self):
+        source = self.source_checkout('missing-adapter-guidance')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        installed = self.install_from_source(source, lane=True, env=owner_env)
+        adapter = Path(installed['adapter'])
+        adapter_contents = adapter.read_bytes()
+        adapter.unlink()
+
+        status = self.call_source(source, 'status', env=owner_env)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        value = json.loads(status.stdout)
+        self.assertEqual(value['managed_adapter']['state'], 'missing')
+        self.assertEqual(value['setup_guidance']['action'], 'inspect')
+        self.assertIn('recover --inspect', value['setup_guidance']['command'])
+
+        inspected = subprocess.run(shlex.split(value['setup_guidance']['command']), cwd=self.repo,
+                                   env=owner_env, capture_output=True, text=True)
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertEqual(json.loads(inspected.stdout)['adapter']['state'], 'missing')
+
+        adapter.write_bytes(adapter_contents)
+        adapter.chmod(0o600)
+        status = self.call_source(source, 'status', env=owner_env)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        value = json.loads(status.stdout)
+        self.assertEqual(value['managed_adapter']['state'], 'changed')
+        inspected = subprocess.run(shlex.split(value['setup_guidance']['command']), cwd=self.repo,
+                                   env=owner_env, capture_output=True, text=True)
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertEqual(json.loads(inspected.stdout)['adapter']['state'], 'changed')
+        seat_status = self.call_source(source, '--seat-id', installed['seat_id'], 'status', env=owner_env)
+        self.assertEqual(seat_status.returncode, 0, seat_status.stderr)
+        self.assertEqual(json.loads(seat_status.stdout)['adapter_state'], 'changed')
+
+    def test_native_owner_upgrade_plan_summarizes_receipt_preimage(self):
+        old_source = self.source_checkout('native-owner-receipt-old-pin')
+        new_source = self.source_checkout('native-owner-receipt-new-pin')
+        owner_session = 'codex-fixture-thread'
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID=owner_session)
+        self.install_from_source(old_source, lane=True, env=owner_env, lane_pr_url=self.url)
+
+        discovered = self.call_source(old_source, 'discover', env=owner_env)
+        self.assertEqual(discovered.returncode, 0, discovered.stderr)
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        state = json.loads(state_path.read_text())
+        packet = json.loads(self.packet.read_text())
+        packet['base_ref'] = state['base_ref']
+        self.packet.write_text(json.dumps(packet, indent=2) + '\n')
+        recorded = self.call_source(old_source, 'record', '--evidence', self.packet, '--format', 'json', env=owner_env)
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        self.assertGreater(json.loads(recorded.stdout)['missing'], 0)
+
+        preimage = json.loads(state_path.read_text())
+        receipt = preimage['receipt']
+        self.assertEqual(len(preimage.get('history', [])), 0)
+        status = json.loads(self.call_source(old_source, 'status', '--session-id', owner_session, env=owner_env).stdout)
+        self.assertEqual(status['report_status']['state'], 'valid-local-snapshot')
+        self.assertEqual(status['setup_guidance']['action'], 'none')
+        self.assertIn('No setup change is recommended', status['setup_guidance']['reason'])
+
+        planned = self.call_source(new_source, 'upgrade-plan', env=owner_env)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        plan = json.loads(planned.stdout)
+        binding = next(row for row in plan['bindings'] if row['pr_url'] == self.url)
+        self.assertTrue(binding['receipt_will_be_archived'])
+        self.assertEqual(binding['history_count_before'], 0)
+
+        applied = self.call_source(new_source, 'upgrade', '--plan-sha256', plan['plan_sha256'], env=owner_env)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertTrue(json.loads(applied.stdout)['fresh_report_required'])
+        postimage = json.loads(state_path.read_text())
+        self.assertNotIn('receipt', postimage)
+        self.assertEqual(postimage['history'], [receipt])
 
     def test_status_reports_changed_and_missing_installed_pin_files(self):
         old_source = self.source_checkout('integrity-old-pin')
@@ -1722,6 +1923,8 @@ class LaneInstallTest(unittest.TestCase):
         changed = json.loads(self.call('status').stdout)
         self.assertEqual(changed['installed_source']['integrity'], 'changed')
         self.assertEqual(changed['installed_source']['changed_files'], ['lane_scope.py'])
+        self.assertEqual(changed['setup_guidance']['action'], 'inspect')
+        self.assertIsNone(changed['setup_guidance']['command'])
         self.assertFalse(changed['activation']['source_intact'])
         pinned_file.unlink()
         missing = json.loads(self.call('status').stdout)
@@ -1890,14 +2093,26 @@ class LaneInstallTest(unittest.TestCase):
 
     def test_codex_upgrade_recovery_requires_actual_native_owner(self):
         old_source = self.source_checkout('codex-recovery-old-pin')
+        new_source = self.source_checkout('codex-recovery-new-pin')
         self.settings.unlink()
         self.settings.parent.rmdir()
         owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
         self.install_from_source(old_source, lane=True, env=owner_env)
-        proposed = json.loads(self.call('upgrade-plan', env=owner_env).stdout)
-        self.interrupt_upgrade_after_settings(proposed['plan_sha256'], env=owner_env)
+        proposed = json.loads(self.call_source(new_source, 'upgrade-plan', env=owner_env).stdout)
+        with mock.patch.object(lane_runtime, 'APP', new_source), mock.patch.object(
+                lane_runtime, 'SELF', new_source / 'lane.py'):
+            self.interrupt_upgrade_after_settings(proposed['plan_sha256'], env=owner_env)
         journal = Path(lane_runtime.upgrade_journal_path(self.repo))
+        owner_status = json.loads(self.call('status', env=owner_env).stdout)
+        self.assertEqual(owner_status['setup_guidance']['action'], 'recover')
+        self.assertIn('upgrade-recover --rollback', owner_status['setup_guidance']['command'])
+        selected_other = json.loads(self.call('status', '--session-id', 'observation-only-id', env=owner_env).stdout)
+        self.assertEqual(selected_other['current_native_identity']['actual']['session_id'], owner_env['CODEX_THREAD_ID'])
+        self.assertEqual(selected_other['setup_guidance']['action'], 'recover')
         wrong_owner = dict(owner_env, CODEX_THREAD_ID='different-codex-thread')
+        wrong_owner_status = json.loads(self.call('status', env=wrong_owner).stdout)
+        self.assertEqual(wrong_owner_status['setup_guidance']['action'], 'inspect')
+        self.assertIsNone(wrong_owner_status['setup_guidance']['command'])
         denied = self.call('upgrade-recover', '--rollback', ok=False, env=wrong_owner)
         self.assertIn('belongs to another native session', denied.stderr)
         self.assertTrue(journal.exists())
