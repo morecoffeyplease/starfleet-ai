@@ -2959,6 +2959,12 @@ def test_opencode_native_owner_identity(temp):
     canonical = warp_drive.canonical_owner(first["harness"], first["session"], first["surface"].lower())
     check(canonical["session"] == "ses_AaZ9" and canonical["surface"] == first["surface"],
           "OpenCode native session case was changed or surface UUID stopped canonicalizing")
+    hailing_dir = temp / "opencode-hailing"
+    hailing_dir.mkdir()
+    target = {"label": "native-opencode", "harness": "opencode", "session": first["session"],
+              "surface": first["surface"], "workspace": uuid_text(), "started_at": 1.0, "cutoff": 1.0}
+    (hailing_dir / "config.json").write_text(json.dumps({"version": 1, "targets": [target]}))
+    owner_env = {"WARP_DRIVE_HAILING_STATE": str(hailing_dir)}
     for invalid in ("ses_", "SES_AaZ9", uuid_text(), "ses_bad-value"):
         try:
             warp_drive.canonical_owner("opencode", invalid, first["surface"])
@@ -2969,17 +2975,18 @@ def test_opencode_native_owner_identity(temp):
 
     submitted = parse_json(run_cli(state, "submit", "--key", "opencode-exact-owner", *owner_args(first),
         "--size", "light", "--family", "verify-opencode", "--workers", "1", "--expected-runtime", "30",
-        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass"))
+        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass", env=owner_env))
     request_id = submitted["request_id"]
     duplicate = parse_json(run_cli(state, "submit", "--key", "opencode-exact-owner", *owner_args(first),
         "--size", "light", "--family", "verify-opencode", "--workers", "1", "--expected-runtime", "30",
-        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass"))
+        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass", env=owner_env))
     check(duplicate["request_id"] == request_id,
           "identical OpenCode request key did not deduplicate to the original reservation")
     altered_case = dict(first, session="ses_aaz9")
     changed_owner = run_cli(state, "submit", "--key", "opencode-exact-owner", *owner_args(altered_case),
         "--size", "light", "--family", "verify-opencode", "--workers", "1", "--expected-runtime", "30",
-        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass", ok=False)
+        "--repo", worktree, "--worktree", worktree, "--", sys.executable, "-c", "pass",
+        env=owner_env, ok=False)
     check(changed_owner.returncode != 0,
           "case-changed OpenCode owner reused the original stable request key")
     with contextlib.closing(warp_drive.connect(state)) as db:
@@ -2991,11 +2998,6 @@ def test_opencode_native_owner_identity(temp):
     run_cli(state, "attach", request_id, *owner_args(first), timeout=20)
     check(parse_json(run_cli(state, "inspect", request_id))["reservation"]["state"] == "finished",
           "exact OpenCode owner could not attach and finish the harmless reserved command")
-    hailing_dir = temp / "opencode-hailing"
-    hailing_dir.mkdir()
-    target = {"label": "native-opencode", "harness": "opencode", "session": first["session"],
-              "surface": first["surface"], "workspace": uuid_text(), "started_at": 1.0, "cutoff": 1.0}
-    (hailing_dir / "config.json").write_text(json.dumps({"version": 1, "targets": [target]}))
     route_log = temp / "opencode-route.jsonl"
     fake_cmux = temp / "opencode-cmux"
     fake_cmux.write_text("""#!/usr/bin/env python3
