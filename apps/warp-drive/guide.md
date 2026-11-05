@@ -69,12 +69,23 @@ warp-drive run --key UNIQUE_REQUEST_KEY \
 ```
 
 Use `--size heavy` for a command with larger bounded CPU demand, and report the actual worker count.
-Submit one meaningful CPU phase per reservation, with the actual number of CPU workers that can run simultaneously during that phase.
-Do not sum worker counts across serial phases.
+`--workers` counts independent workload slots that can run at the same time, not threads used inside one slot.
+For example, count independent browser workers, the actual parallel task count for a build or test command, or one slot for a serial GPU inference job even when its backend uses many CPU threads.
+Submit one meaningful CPU phase per reservation, and do not add worker counts from serial phases.
 Within one checkout, make only one CPU-intensive request eligible at a time when commands share generated files, caches or a database, and enable the next dependent phase after its predecessor finishes.
 Independent requests and batches may run concurrently across checkouts when their shared inputs are safe.
 The initial fallback estimates are one core per light worker and four cores per heavy worker, capped to the configured target.
-These estimates are admission signals and do not throttle the command or prove actual utilization.
+You may provide `--cpu-cores` and `--cpu-basis` together to declare a finite positive CPU estimate and its evidence or bound basis.
+For example, add `--cpu-cores 0.8 --cpu-basis "measured peak 0.6 cores across three comparable runs plus 0.2 cores of headroom"` when a serial GPU inference phase has supporting measurements.
+The requested estimate is capped at the configured target, and heavy work still observes the reserved light-work headroom.
+Status and inspect show the requested estimate, basis, and effective `estimated_cores` used by admission and grant telemetry.
+An estimate is an admission signal, not a throttle or a peak-use guarantee, and a historical average is not a proven peak bound.
+When the fields are absent, the original light and heavy fallback estimates remain in effect for both new and existing requests.
+Explicit estimates are accepted only after the scheduler has reported policy version v7 in state; the CLI does not change that setting or start a scheduler to force compatibility.
+If the state reports an older or unknown policy, wait for the coordinator-authorized compatible scheduler rollout before submitting an explicit estimate.
+Before rolling back to an older scheduler, allow active explicit-estimate commands to finish and let waiting requests run under v7 or cancel them.
+Restore the older scheduler only after no waiting or active request has an explicit estimate because that scheduler will use the generic fallback for those rows.
+Batch items may add the optional `cpu_cores` and `cpu_basis` fields together.
 The target defaults to 95 percent and can be changed by the configured operator with `warp-drive config target 0.90 --actor OPERATOR_ID`.
 New grants stay in projected load until a host sample arrives at least ten seconds after their helper start or grant time.
 Fitting work receives its ordinary worktree turn before an aged request protects its worktree from heavy backfill.
@@ -93,7 +104,7 @@ The light reserve applies when light work is ready.
 A heavy command admitted while no light request is ready can consume that headroom until it exits, so a later light request may wait for that non-preemptible command.
 
 Use a stable request key for a client retry.
-An identical retry attaches to the same request, while changed command details under that key are rejected.
+An identical retry attaches to the same request, while changed command details, CPU estimate, or basis under that key are rejected.
 Use a new key only when you deliberately intend a new product-command run.
 
 To let the helper continue if your command-wait surface times out, add `--detach`.
