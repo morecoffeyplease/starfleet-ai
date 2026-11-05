@@ -32,7 +32,7 @@ OpenCode context recomputation covers both primary agent calls and the separate 
 The plugin throws when a bound child lacks its exact task/session state or when rendering fails.
 Pinned v2.2.5 source awaits these callbacks before returning the prepared provider request, but the native pilot must still verify that a failed callback produces zero provider requests.
 OpenCode checkpoint enrollment, successful tool-completion publication, context recovery guidance and compaction lifecycle observations use the shared Pattern Buffer checkpoint state and publication rules.
-Pressure warnings remain unqualified and disabled until exact same-session provider usage, usable context window and active compaction settings are reviewed.
+Exact occupancy warnings remain unqualified, and the conservative early reminder stays unknown until a fresh reviewed same-session descriptor is imported.
 The OpenCode event stream has no replay guarantee, so observed successful compaction events do not establish a complete generation count.
 The context callback asks the model to read the exact published note, but callback completion does not prove that the model read or reconciled it.
 The existing synthetic trial evidence proves only its own candidate fixture, denied actions, API call, tests, and rollback.
@@ -73,7 +73,8 @@ The input note must be durable private storage outside temporary directories and
 Enrollment reuses Pattern Buffer's exact session ownership, validated six-heading note, atomic publication, previous-version retention and ignored editable draft.
 It does not install the OpenCode plugin or change its settings or trust records.
 The result reports `pressure_qualified: false`, `hooks_loaded: unverified` and `recovery_observed: false`.
-OpenCode rejects `--compact-at`, `--reminders on` and lead configuration while pressure evidence remains unqualified.
+OpenCode rejects percentage-based `--compact-at`, `--reminders on` and lead-point configuration.
+An exact-session private descriptor can separately enable the conservative token-anchor reminder after its native evidence is reviewed.
 
 The context plugin adds the exact checkpoint path and recovery instructions to the enrolled session's context callback.
 Read the published note with OpenCode's normal file-reading tool, then reconcile its claims with current evidence.
@@ -85,9 +86,27 @@ The compaction `started` event records an attempt, `ended` records successful co
 The event stream has no replay guarantee, so status retains explicit uncertainty about missed compactions.
 
 In OpenCode v2.2.5, automatic compaction checks whether compaction is due and emits `session.compaction.started` before building the compaction model request.
-The `session.compaction` context callback is therefore too late to qualify a warning before that decision.
-The current integration sends no pressure warning and makes no advance-warning timing claim.
-Keep it disabled until the owner verifies same-session context usage, its exact provider/model/variant/agent, the usable model window and active compaction settings.
+The `session.compaction` context callback runs after that decision and is not used to warn on the same compaction attempt.
+An ordinary `context` callback for a request that proceeds below the automatic ceiling can read the latest assistant usage before that request, and a tool-completion callback publishes a changed valid draft before a later automatic-compaction decision.
+This ordering provides a useful earlier reminder path, but it does not guarantee a warning before every compaction because a large unseen context tail can cross the ceiling between measurements.
+The pressure adapter reads only the latest assistant's native input, output, reasoning, cache-read and cache-write token counts through `ctx.session.context`.
+It requires both that assistant and the current hook request to match the enrolled session, worktree, provider, model, variant and agent exactly.
+Missing, stale, nonpositive or mismatched usage and missing, expired or mismatched runtime configuration produce an explicit unknown status and no warning.
+Import a private owner-only descriptor only after observing the exact native API instance, session, model identity, usable window and merged automatic-compaction settings.
+The descriptor is limited to a fifteen-minute observation window and is imported into the existing exact-session checkpoint state with `checkpoint-pressure-config`.
+The version 1 JSON descriptor contains `native_api` (`origin`, `pid`, `started_at`), exact `session_id`, canonical `worktree`, `provider_id`, `model_id`, `variant` and `agent`, `observed_at`, `expires_at`, `usable_window_tokens`, `compaction` (`auto`, `buffer_setting`, `buffer_tokens`, `ceiling_tokens`, `config_sha256`) and `warning_lead_tokens`.
+The descriptor file must be a regular owner-only file outside temporary directories, Git checkouts and the worktree, and its observation must be no more than fifteen minutes old.
+Import it only for the already enrolled exact orchestrator session:
+
+```sh
+python3 apps/pattern-buffer/pattern_buffer.py --cwd /absolute/path/to/worktree checkpoint-pressure-config \
+  --harness opencode --session ses_EXACT_NATIVE_ID --descriptor-file /absolute/private/pressure-descriptor.json
+```
+
+For its early reminder, Pattern Buffer compares the sum of the last measured assistant token counts to the observed automatic-compaction ceiling minus the configured warning lead.
+The reminder labels this sum as a last-measured lower-bound token anchor, not exact current occupancy or guaranteed headroom.
+A sudden large unseen context tail can still trigger compaction without a warning.
+The source adapter is prepared, but live pressure remains unknown until the native probe provides reviewed same-session runtime evidence and the owner imports its descriptor.
 
 ## Two-phase task binding
 

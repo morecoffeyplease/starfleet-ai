@@ -27,7 +27,7 @@ function failContext(event, prior, code) {
   throw new Error(`Pattern Buffer OpenCode context failed (${code}).`);
 }
 
-function invokeCommand(directory, arguments_) {
+function invokeCommand(directory, arguments_, input) {
   const python = "python3";
   return spawnSync(python, [
     SCRIPT,
@@ -46,6 +46,7 @@ function invokeCommand(directory, arguments_) {
       GIT_OPTIONAL_LOCKS: "0",
     },
     encoding: "utf8",
+    ...(input === undefined ? {} : { input }),
     maxBuffer: MAX_OUTPUT,
     shell: false,
     timeout: TIMEOUT_MS,
@@ -79,7 +80,86 @@ function invoke(directory, sessionID) {
   if (payload.status !== "context" || typeof payload.text !== "string" || !payload.text) {
     return { status: "blocked", code: "invalid_context" };
   }
-  return { status: "context", text: payload.text };
+  return { status: "context", text: payload.text,
+    pressureStatus: payload.pressure_status || "unknown",
+    pressureReason: payload.pressure_reason || "descriptor_missing",
+    pressureObservationRequired: payload.pressure_observation_required === true };
+}
+
+function identityFromHook(event, directory, sessionID) {
+  const model = event?.model;
+  if (!model || typeof model !== "object") return null;
+  return {
+    session_id: sessionID,
+    worktree: directory,
+    provider_id: model.providerID,
+    model_id: model.id,
+    variant: model.variant,
+    agent: event.agent,
+  };
+}
+
+function assistantRecord(context, sessionID, worktree) {
+  const messages = Array.isArray(context) ? context : context?.messages;
+  if (!Array.isArray(messages)) return null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const row = messages[index];
+    const info = row?.info && typeof row.info === "object" ? row.info : row;
+    const role = info?.role || row?.type || row?.role;
+    if (role !== "assistant") continue;
+    const model = info.model && typeof info.model === "object" ? info.model : info;
+    const tokens = info.tokens;
+    const cache = tokens?.cache;
+    return {
+      identity: {
+        session_id: sessionID,
+        worktree,
+        provider_id: model.providerID || info.providerID,
+        model_id: model.id || info.modelID || info.modelId,
+        variant: model.variant ?? info.variant,
+        agent: info.agent,
+      },
+      completed_at_ms: info.time?.completed,
+      tokens: {
+        input: tokens?.input,
+        output: tokens?.output,
+        reasoning: tokens?.reasoning,
+        cache_read: cache?.read,
+        cache_write: cache?.write,
+      },
+    };
+  }
+  return null;
+}
+
+function pressureNotice(status, reason) {
+  if (status === "below_threshold") {
+    return "Pattern Buffer pressure status: the last measured usage anchor is below the configured reminder threshold; no warning was emitted.";
+  }
+  if (status === "warning_deduplicated") {
+    return "Pattern Buffer pressure status: this compaction generation already received its one early warning.";
+  }
+  if (status === "warning_emitted") {
+    return "Pattern Buffer pressure status: the early warning was emitted for this compaction generation.";
+  }
+  const detail = typeof reason === "string" ? ` (${reason.replaceAll("_", " ")})` : "";
+  return `Pattern Buffer pressure status: unknown${detail}; no pressure warning was emitted.`;
+}
+
+function invokePressure(directory, sessionID, payload) {
+  const result = invokeCommand(directory,
+    ["opencode-checkpoint-pressure", "--session", sessionID], JSON.stringify(payload));
+  const parsed = parsePayload(result, directory, sessionID);
+  if (parsed.status === "blocked") {
+    return { status: "unknown", reason: "observation_failed", warning: null };
+  }
+  return parsed;
+}
+
+function markPressureEmitted(directory, sessionID, correlationID) {
+  if (typeof correlationID !== "string") return;
+  invokeCommand(directory, ["opencode-checkpoint-pressure-emitted", "--session", sessionID,
+    "--correlation-id", correlationID]);
 }
 
 function invokeLifecycle(directory, sessionID, eventType, eventID, aggregateID, eventSequence) {
@@ -94,7 +174,7 @@ function invokeLifecycle(directory, sessionID, eventType, eventID, aggregateID, 
 export default {
   id: "starfleet-pattern-buffer",
   async setup(ctx) {
-    const refresh = (event) => {
+    const refresh = async (event, hookType) => {
       const prior = Array.isArray(event.system) ? event.system.filter((part) => !isOwnedPart(part)) : [];
       const directory = ctx.location?.directory;
       const sessionID = event.sessionID;
@@ -110,7 +190,39 @@ export default {
       }
       const result = invoke(currentDirectory, sessionID);
       if (result.status === "context") {
-        event.system = [...prior, contextPart(result.text)];
+        let text = result.text;
+        let warningCorrelationID;
+        if (hookType === "context" && result.pressureObservationRequired) {
+          let observation;
+          try {
+            if (typeof ctx.session.context !== "function") throw new Error("context_api_unavailable");
+            const history = await ctx.session.context({ sessionID }, {
+              signal: AbortSignal.timeout(3000),
+            });
+            const currentIdentity = identityFromHook(event, currentDirectory, sessionID);
+            const assistant = assistantRecord(history, sessionID, currentDirectory);
+            if (!assistant) {
+              observation = { read_error: "assistant_missing" };
+            } else {
+              observation = { request: currentIdentity, assistant };
+            }
+          } catch {
+            observation = { read_error: "context_read_failed" };
+          }
+          const pressure = invokePressure(currentDirectory, sessionID, observation);
+          if (typeof pressure.warning === "string" && pressure.warning) {
+            text += `\n\n${pressure.warning}`;
+            warningCorrelationID = pressure.correlation_id;
+          } else {
+            text += `\n\n${pressureNotice(pressure.status, pressure.reason)}`;
+          }
+        } else if (hookType === "context") {
+          text += `\n\n${pressureNotice(result.pressureStatus, result.pressureReason)}`;
+        }
+        event.system = [...prior, contextPart(text)];
+        if (warningCorrelationID) {
+          markPressureEmitted(currentDirectory, sessionID, warningCorrelationID);
+        }
       } else if (result.status === "blocked") {
         failContext(event, prior, result.code);
       } else {
@@ -118,8 +230,8 @@ export default {
       }
     };
     const registrations = [];
-    registrations.push(await ctx.session.hook("context", refresh));
-    registrations.push(await ctx.session.hook("compaction", refresh));
+    registrations.push(await ctx.session.hook("context", (event) => refresh(event, "context")));
+    registrations.push(await ctx.session.hook("compaction", (event) => refresh(event, "compaction")));
     if (ctx.tool?.hook) {
       registrations.push(await ctx.tool.hook("execute.after", async (event) => {
         if (event?.status !== "completed" || typeof event.sessionID !== "string" ||

@@ -297,7 +297,7 @@ def enroll(ci, checkpoints, root, gitdir, args):
               "approval_required": False, "briefing": BRIEFING.format(note_budget_bytes=checkpoints.NOTE_LIMIT),
               "note_budget_bytes": checkpoints.NOTE_LIMIT,
               "template": checkpoints._template(), "compact_at": compact,
-              "threshold_source": ("unqualified; live OpenCode pressure warnings are disabled"
+              "threshold_source": ("unqualified exact occupancy; no lower-bound descriptor is imported"
                   if harness == "opencode" else "explicit confirmation" if args.compact_at is not None else
                   "same-session native runtime" if observed.get("compact_at") is not None else
                   "Claude environment or fallback" if harness == "claude" else "unknown"),
@@ -333,7 +333,7 @@ def enroll(ci, checkpoints, root, gitdir, args):
         activation = {"plugin_setup": "requires the existing opt-in OpenCode context plugin",
                       "hooks_loaded": "unverified", "recovery_observed": False,
                       "pressure_qualified": False,
-                      "pressure_status": "unqualified; live warnings disabled"}
+                      "pressure_status": "unqualified; advisory unknown (descriptor_missing)"}
     else:
         activation = _activation(ci, checkpoints, root, gitdir, args, session, pid, argv, observed)
     folder = checkpoints._dir(gitdir, harness, session)
@@ -350,7 +350,7 @@ def enroll(ci, checkpoints, root, gitdir, args):
     result.update(activation, state="prepared", checkpoint=report)
     if harness == "opencode":
         result["next_action"] = ("Use the exact OpenCode context plugin in the same session. "
-                                 "Pressure warnings remain disabled until native usage and runtime settings are reviewed.")
+                                 "Keep pressure unknown until native usage and runtime settings are reviewed and a private exact-session descriptor is imported.")
     else:
         result["hook_installation"] = ["Reusing stable installed hooks; no definitions or trust records changed."]
         result["next_action"] = ("Read the activation instructions, preserve native trust and existing jobs, and "

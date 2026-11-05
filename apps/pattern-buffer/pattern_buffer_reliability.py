@@ -41,11 +41,17 @@ _DETAIL_TYPES = {
     "age_seconds": "number", "duration_seconds": "number", "note_age_seconds": "number",
     "warning_age_seconds": "number", "publication_age_seconds": "number",
     "compaction_gap_seconds": "number",
+    "usage_anchor_tokens": "integer", "warning_threshold_tokens": "integer",
+    "ceiling_tokens": "integer", "warning_lead_tokens": "integer",
+    "usage_age_seconds": "number", "pressure_basis": "token", "reason": "token",
+    "descriptor_sha256": "hash",
 }
 _MAX_EVENT_BYTES = 16 * 1024
 _LIFECYCLE_EVENTS = {
     "reminder.armed",
     "reminder.eligible",
+    "pressure.configured",
+    "pressure.observed",
     "delivery.emitted",
     "delivery.submitted",
     "delivery.held",

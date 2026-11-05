@@ -70,8 +70,11 @@ OpenCode sessions use the same private checkpoint state and atomic publication r
 Assign the exact native `ses_` session as an orchestrator before enrollment because OpenCode sessions do not inherit a worktree default role.
 The OpenCode plugin observes successful tool completion for draft publication and native compaction lifecycle events for bounded telemetry.
 Its event stream has no replay guarantee, so observed completion counts are explicitly uncertain when the plugin was inactive or disconnected.
-OpenCode pressure warnings, `--compact-at`, reminder thresholds and lead values remain disabled until same-session usage and the active provider, usable window and compaction configuration are independently verified.
-The `session.compaction` context callback runs after the current v2.2.5 automatic compaction decision, so it is not an advance warning seam.
+OpenCode percentage-based `--compact-at`, reminder thresholds and lead points remain disabled.
+After exact same-session usage and the active provider, usable window and merged compaction settings are independently verified, a private descriptor can enable a conservative token-anchor reminder through the ordinary context callback.
+The `session.compaction` context callback runs after the current v2.2.5 automatic compaction decision and is not used to warn on that same attempt.
+An ordinary context callback can warn before a later automatic-compaction decision when the request proceeds below the configured ceiling, but a large unseen context tail can still compact without warning.
+The reminder uses a last-measured lower-bound usage anchor and does not claim exact current occupancy or guaranteed headroom.
 See the [OpenCode plugin guide](opencode.md) for exact enrollment commands, behavior and limits.
 
 The briefing asks you to pause and re-read the mission, assigned roadmap, latest user direction and relevant guidance.

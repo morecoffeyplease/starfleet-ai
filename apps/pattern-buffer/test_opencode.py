@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import datetime
 import unittest
 import uuid
 
@@ -197,13 +198,13 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
         self.assertEqual(enrolled["state"], "prepared")
         self.assertEqual(enrolled["harness"], "opencode")
         self.assertFalse(enrolled["pressure_qualified"])
-        self.assertEqual(enrolled["pressure_status"], "unqualified; live warnings disabled")
+        self.assertEqual(enrolled["pressure_status"], "unqualified; advisory unknown (descriptor_missing)")
         report = enrolled["checkpoint"]
         self.assertIsNone(report["compact_at"])
         self.assertIsNone(report["reminder_threshold"])
         self.assertFalse(report["reminders"])
         self.assertFalse(report["pressure_qualified"])
-        self.assertIn("OpenCode pressure warnings remain unqualified and disabled", self.context(self.parent_session, self.owner)["text"])
+        self.assertIn("OpenCode pressure reminders require a fresh", self.context(self.parent_session, self.owner)["text"])
         self.assertIn(str(note_path), self.context(self.parent_session, self.owner)["text"])
         self.call(self.owner, "checkpoint-config", "--harness", "opencode", "--session",
                   self.parent_session, "--reminders", "on", success=False)
@@ -216,6 +217,153 @@ console.log(JSON.stringify({system:event.system,error,hooks:Object.keys(callback
         rejected_lead = self.call(self.owner, "checkpoint-init", "--harness", "opencode", "--session",
                                   pressure_session, "--lead-points", "5", success=False)
         self.assertIn("do not supply compact-at or lead values", rejected_lead.stderr)
+
+    def test_lower_bound_pressure_warning_uses_shared_episode_and_ordinary_context(self):
+        folder = tempfile.TemporaryDirectory(dir=Path.home(), prefix=".opencode-pb-pressure-")
+        self.addCleanup(folder.cleanup)
+        note_path = Path(folder.name) / "working-checkpoint.md"
+        self.enroll_checkpoint(note_path)
+        descriptor_path = Path(folder.name) / "pressure-descriptor.json"
+        observed = datetime.datetime.now(datetime.timezone.utc)
+        iso = lambda value: value.isoformat(timespec="seconds")
+        descriptor = {
+            "version": 1,
+            "native_api": {"origin": "http://127.0.0.1:4096", "pid": os.getpid(),
+                           "started_at": iso(observed - datetime.timedelta(minutes=1))},
+            "session_id": self.parent_session,
+            "worktree": str(self.owner.resolve()),
+            "provider_id": "local",
+            "model_id": "qwen3",
+            "variant": "high",
+            "agent": "build",
+            "observed_at": iso(observed),
+            "expires_at": iso(observed + datetime.timedelta(minutes=10)),
+            "usable_window_tokens": 10000,
+            "compaction": {"auto": True, "buffer_setting": 1000, "buffer_tokens": 1000,
+                           "ceiling_tokens": 9000, "config_sha256": "a" * 64},
+            "warning_lead_tokens": 1000,
+        }
+        descriptor_path.write_text(json.dumps(descriptor) + "\n")
+        descriptor_path.chmod(0o600)
+        configured = json.loads(self.call(self.owner, "checkpoint-pressure-config", "--harness",
+                                          "opencode", "--session", self.parent_session,
+                                          "--descriptor-file", str(descriptor_path)).stdout)
+        self.assertEqual(configured["status"], "configured")
+        self.assertTrue(self.context(self.parent_session, self.owner)["pressure_observation_required"])
+
+        identity = {"session_id": self.parent_session, "worktree": str(self.owner.resolve()),
+                    "provider_id": "local", "model_id": "qwen3", "variant": "high", "agent": "build"}
+
+        def observe(tokens, request_identity=None, completed_at_ms=None):
+            assistant = {"identity": identity, "completed_at_ms": completed_at_ms or int(
+                datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000), "tokens": tokens}
+            payload = {"request": request_identity or identity, "assistant": assistant}
+            result = subprocess.run([sys.executable, str(SCRIPT), "--cwd", str(self.owner),
+                                     "opencode-checkpoint-pressure", "--session", self.parent_session],
+                                    input=json.dumps(payload), capture_output=True, text=True, env=self.env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        below = observe({"input": 7000, "output": 100, "reasoning": 100,
+                         "cache_read": 100, "cache_write": 100})
+        self.assertEqual(below["status"], "below_threshold")
+        self.assertIsNone(below["warning"])
+        high_tokens = {"input": 7500, "output": 100, "reasoning": 100,
+                       "cache_read": 200, "cache_write": 200}
+        eligible = observe(high_tokens)
+        self.assertEqual(eligible["status"], "warning_eligible")
+        self.assertIn("lower-bound last-measured reminder", eligible["warning"])
+        self.assertIn("sudden large unseen context tail", eligible["warning"])
+        failed = json.loads(self.call(self.owner, "opencode-checkpoint-event", "--session",
+                                      self.parent_session, "--event", "compaction-failed",
+                                      "--event-id", "evt_failed001", "--aggregate-id", self.parent_session,
+                                      "--event-sequence", "1").stdout)
+        self.assertEqual(failed["status"], "failed")
+        deduplicated = observe(high_tokens)
+        self.assertEqual(deduplicated["status"], "warning_deduplicated")
+        self.assertIsNone(deduplicated["warning"])
+        emitted = json.loads(self.call(self.owner, "opencode-checkpoint-pressure-emitted", "--session",
+                                       self.parent_session, "--correlation-id",
+                                       eligible["correlation_id"]).stdout)
+        self.assertEqual(emitted["status"], "emitted")
+        pre_boundary_usage_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+        completed = json.loads(self.call(self.owner, "opencode-checkpoint-event", "--session",
+                                         self.parent_session, "--event", "compaction-ended",
+                                         "--event-id", "evt_completed001", "--aggregate-id", self.parent_session,
+                                         "--event-sequence", "2").stdout)
+        self.assertEqual(completed["status"], "completed")
+        old_generation = observe(high_tokens, completed_at_ms=pre_boundary_usage_ms)
+        self.assertEqual(old_generation["status"], "unknown")
+        self.assertEqual(old_generation["reason"], "new_generation")
+        new_generation = observe(high_tokens)
+        self.assertEqual(new_generation["status"], "warning_eligible")
+
+        wrong_identity = dict(identity, model_id="other-model")
+        mismatch = observe(high_tokens, wrong_identity)
+        self.assertEqual(mismatch["status"], "unknown")
+        self.assertEqual(mismatch["reason"], "identity_mismatch")
+        self.assertIsNone(mismatch["warning"])
+        zero_usage = observe({"input": 0, "output": 0, "reasoning": 0,
+                              "cache_read": 0, "cache_write": 0})
+        self.assertEqual(zero_usage["status"], "unknown")
+        self.assertEqual(zero_usage["reason"], "usage_invalid")
+        unreadable = subprocess.run([sys.executable, str(SCRIPT), "--cwd", str(self.owner),
+                                     "opencode-checkpoint-pressure", "--session", self.parent_session],
+                                    input=json.dumps({"read_error": "context_read_failed"}),
+                                    capture_output=True, text=True, env=self.env)
+        self.assertEqual(unreadable.returncode, 0, unreadable.stderr)
+        self.assertEqual(json.loads(unreadable.stdout)["reason"], "context_read_failed")
+        expired_descriptor = dict(descriptor, expires_at=iso(observed + datetime.timedelta(minutes=20)))
+        descriptor_path.write_text(json.dumps(expired_descriptor) + "\n")
+        descriptor_path.chmod(0o600)
+        rejected = self.call(self.owner, "checkpoint-pressure-config", "--harness", "opencode",
+                             "--session", self.parent_session, "--descriptor-file", str(descriptor_path),
+                             success=False)
+        self.assertIn("descriptor is expired", rejected.stderr)
+        next_boundary = json.loads(self.call(self.owner, "opencode-checkpoint-event", "--session",
+                                             self.parent_session, "--event", "compaction-ended",
+                                             "--event-id", "evt_completed002", "--aggregate-id", self.parent_session,
+                                             "--event-sequence", "3").stdout)
+        self.assertEqual(next_boundary["status"], "completed")
+
+        fixture = r'''import plugin from %s;
+const callbacks = {};
+let reads = 0;
+const ctx = {
+  location: { directory: %s },
+  session: {
+    hook: async (name, fn) => { callbacks[name] = fn; return { dispose: async () => {} }; },
+    context: async ({ sessionID }, options) => {
+      reads += 1;
+      if (sessionID !== %s || !options.signal) throw new Error("wrong context request");
+      return { messages: [{ info: { role: "assistant", providerID: "local", modelID: "qwen3",
+        variant: "high", agent: "build", time: { completed: Date.now() },
+        tokens: { input: 7500, output: 100, reasoning: 100, cache: { read: 200, write: 200 } } } }] };
+    },
+  },
+};
+await plugin.setup(ctx);
+const event = { sessionID: %s, agent: "build",
+  model: { providerID: "local", id: "qwen3", variant: "high" }, system: [] };
+await callbacks.compaction(event);
+const readsAfterCompaction = reads;
+const compactionText = event.system.map(part => part.text).join("\n");
+await callbacks.context(event);
+const first = event.system.map(part => part.text).join("\n");
+await callbacks.context(event);
+const second = event.system.map(part => part.text).join("\n");
+console.log(JSON.stringify({ readsAfterCompaction, reads, compactionText, first, second }));
+''' % (json.dumps(PLUGIN.as_uri()), json.dumps(str(self.owner)), json.dumps(self.parent_session),
+       json.dumps(self.parent_session))
+        node = subprocess.run([NODE, "--input-type=module", "-e", fixture], capture_output=True,
+                              text=True, env=self.env, timeout=20)
+        self.assertEqual(node.returncode, 0, node.stderr)
+        plugin_result = json.loads(node.stdout)
+        self.assertEqual(plugin_result["readsAfterCompaction"], 0)
+        self.assertEqual(plugin_result["reads"], 2)
+        self.assertNotIn("pressure status", plugin_result["compactionText"])
+        self.assertIn("last measured lower-bound usage anchor", plugin_result["first"])
+        self.assertIn("already received its one early warning", plugin_result["second"])
 
     def test_tool_completion_publishes_and_compaction_completion_is_deduplicated(self):
         folder = tempfile.TemporaryDirectory(dir=Path.home(), prefix=".opencode-pb-checkpoint-")

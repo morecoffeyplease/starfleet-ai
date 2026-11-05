@@ -1397,8 +1397,11 @@ def opencode_context(root, gitdir, session):
     assignment = state_path(gitdir, "opencode", session)
     assignment_sha256 = (hashlib.sha256(bounded(assignment, FILE_LIMIT).encode("utf-8")).hexdigest()
                          if assignment.exists() or assignment.is_symlink() else None)
+    pressure = checkpoints().opencode_pressure_status(sys.modules[__name__], root, gitdir, session)
     return {"status": "context", "harness": "opencode", "session_id": session,
-            "worktree": str(root), "text": text, "assignment_sha256": assignment_sha256}
+            "worktree": str(root), "text": text, "assignment_sha256": assignment_sha256,
+            "pressure_status": pressure["status"], "pressure_reason": pressure["reason"],
+            "pressure_observation_required": pressure["observation_required"]}
 
 
 def render_standing(root, source, harness, session, agent, role, origin, content):
@@ -1887,12 +1890,22 @@ def main():
                              help="Claude idle warning delay, default 50; 0 disables future arming")
         if name == "checkpoint-save":
             cmd.add_argument("--file", required=True, help="reviewed Markdown input; no automatic summarization")
+    cmd = sub.add_parser("checkpoint-pressure-config", help=argparse.SUPPRESS)
+    cmd.add_argument("--harness", choices=("opencode",), required=True)
+    cmd.add_argument("--session", required=True)
+    cmd.add_argument("--descriptor-file", required=True,
+                     help="private native runtime descriptor outside the worktree")
     cmd = sub.add_parser("opencode-checkpoint-event", help=argparse.SUPPRESS)
     cmd.add_argument("--session", required=True)
     cmd.add_argument("--event", choices=("tool-completed", "compaction-started", "compaction-ended", "compaction-failed"), required=True)
     cmd.add_argument("--event-id")
     cmd.add_argument("--aggregate-id")
     cmd.add_argument("--event-sequence", type=int)
+    cmd = sub.add_parser("opencode-checkpoint-pressure", help=argparse.SUPPRESS)
+    cmd.add_argument("--session", required=True)
+    cmd = sub.add_parser("opencode-checkpoint-pressure-emitted", help=argparse.SUPPRESS)
+    cmd.add_argument("--session", required=True)
+    cmd.add_argument("--correlation-id", required=True)
     cmd = sub.add_parser("statusline", help=argparse.SUPPRESS)
     cmd.add_argument("--delegate-json", default="null")
     cmd = sub.add_parser("compaction-settings", help="save Claude's auto-compaction percentage without restarting sessions")
@@ -1954,10 +1967,30 @@ def main():
             print(json.dumps(session_command(root, gitdir, args), indent=2, default=str))
         elif args.command == "checkpoint-enroll":
             print(json.dumps(self_enroll(root, gitdir, args), indent=2))
+        elif args.command == "checkpoint-pressure-config":
+            result = checkpoints().configure_opencode_pressure(
+                sys.modules[__name__], root, gitdir, args.session, args.descriptor_file)
+            print(json.dumps(result, ensure_ascii=False))
         elif args.command == "opencode-checkpoint-event":
             result = checkpoints().opencode_event(sys.modules[__name__], root, gitdir, args.session,
                                                   args.event, args.event_id, args.aggregate_id,
                                                   args.event_sequence)
+            print(json.dumps(result, ensure_ascii=False))
+        elif args.command == "opencode-checkpoint-pressure":
+            raw = sys.stdin.buffer.read(checkpoints().OPENCODE_PRESSURE_OBSERVATION_LIMIT + 1)
+            if len(raw) > checkpoints().OPENCODE_PRESSURE_OBSERVATION_LIMIT:
+                raise ValueError("pressure observation exceeds its bounded size")
+            try:
+                observation = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeError):
+                raise ValueError("pressure observation is not valid UTF-8 JSON") from None
+            result = checkpoints().opencode_pressure_observe(
+                sys.modules[__name__], root, gitdir, args.session, observation)
+            result.update(harness="opencode", session_id=args.session, worktree=str(root))
+            print(json.dumps(result, ensure_ascii=False))
+        elif args.command == "opencode-checkpoint-pressure-emitted":
+            result = checkpoints().opencode_pressure_emitted(
+                sys.modules[__name__], root, gitdir, args.session, args.correlation_id)
             print(json.dumps(result, ensure_ascii=False))
         elif args.command.startswith("checkpoint-"):
             print(json.dumps(checkpoints().handle_cli(sys.modules[__name__], root, gitdir, args), indent=2))
