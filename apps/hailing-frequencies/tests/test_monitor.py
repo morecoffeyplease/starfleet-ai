@@ -18,6 +18,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import hailing_frequencies as hf
 import install
+import service
 
 
 def uid():
@@ -56,14 +57,26 @@ class Host:
     def __init__(self):
         self.executable = "cmux"
         self.rows = []
+        self.rows_by_surface = {}
+        self.message_failures = {}
+        self.message_failure_after = {}
+        self.message_calls = {}
         self.sent = []
+        self.bindings = []
         self.hold = None
         self.failure = None
 
-    def messages(self, _target):
-        return copy.deepcopy(self.rows)
+    def messages(self, target):
+        surface = target["surface"]
+        self.message_calls[surface] = self.message_calls.get(surface, 0) + 1
+        if self.message_calls[surface] > self.message_failure_after.get(surface, 0) and \
+                surface in self.message_failures:
+            raise self.message_failures[surface]
+        rows = self.rows_by_surface.get(surface, self.rows)
+        return copy.deepcopy(rows)
 
-    def binding(self, _target):
+    def binding(self, target):
+        self.bindings.append(target)
         if self.hold:
             raise ValueError(self.hold)
 
@@ -233,6 +246,89 @@ class MonitorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "saturated"):
             self.app.scan(send=True)
         self.assertFalse(self.host.sent)
+
+        cmux = hf.Cmux()
+        cmux.command = lambda *_args: {"messages": [message(self.lane)] * hf.SCAN_LIMIT}
+        self.app.cmux = cmux
+        with self.assertRaisesRegex(ValueError, "saturated"):
+            self.app.scan(send=True)
+        self.assertFalse((self.directory / "last-scan.json").exists())
+
+    def test_missing_first_target_keeps_healthy_delivery_and_recovers_health(self):
+        missing = target("missing-first")
+        healthy = target("healthy")
+        self.config["targets"] = [missing, healthy]
+        self.save()
+        self.now = 1100
+        source = message(missing, at=100)
+        self.host.rows_by_surface[healthy["surface"]] = [
+            source,
+            reply(source, missing, at=200),
+            message(healthy, at=100),
+        ]
+        self.host.message_failures[missing["surface"]] = ValueError("not_found: surface is unavailable")
+
+        report = self.app.scan(send=True)
+
+        self.assertFalse(report["coverage_complete"])
+        self.assertEqual(report["target_errors"][0]["session"], missing["session"])
+        self.assertEqual(report["target_errors"][0]["stage"], "initial_scan")
+        self.assertNotIn("native_unread", report["targets"][0])
+        self.assertIn("not_found", report["targets"][0]["error"])
+        self.assertEqual(report["targets"][1]["attempts"][0]["outcome"], "submitted")
+        self.assertEqual([target["session"] for target, _ in self.host.sent], [healthy["session"]])
+        self.assertIn(healthy, self.host.bindings)
+        with closing(self.app.database()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM acknowledgements WHERE session=?",
+                                        (missing["session"],)).fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM attempts WHERE session=?",
+                                        (missing["session"],)).fetchone()[0], 0)
+
+        partial_health = service.health(self.directory, self.now)
+        self.assertFalse(partial_health["healthy"])
+        self.assertEqual(partial_health["target_errors"], 1)
+        self.host.message_failures.pop(missing["surface"])
+        self.host.rows_by_surface[missing["surface"]] = [message(missing, at=100)]
+        recovered = self.app.scan()
+        self.assertTrue(recovered["coverage_complete"])
+        self.assertTrue(service.health(self.directory, self.now)["healthy"])
+
+    def test_missing_later_target_does_not_abort_healthy_target(self):
+        healthy = target("healthy-first")
+        missing = target("missing-later")
+        self.config["targets"] = [healthy, missing]
+        self.save()
+        self.now = 1100
+        self.host.rows_by_surface[healthy["surface"]] = [message(healthy, at=100)]
+        self.host.message_failures[missing["surface"]] = TimeoutError("CMUX lookup timed out")
+
+        report = self.app.scan(send=True)
+
+        self.assertEqual(report["targets"][0]["attempts"][0]["outcome"], "submitted")
+        self.assertEqual(report["target_errors"][0]["session"], missing["session"])
+        self.assertEqual([target["session"] for target, _ in self.host.sent], [healthy["session"]])
+
+    def test_delivery_recheck_failure_does_not_abort_later_target(self):
+        disappearing = target("disappearing")
+        healthy = target("healthy-later")
+        self.config["targets"] = [disappearing, healthy]
+        self.save()
+        self.now = 1100
+        self.host.rows_by_surface[disappearing["surface"]] = [message(disappearing, at=100)]
+        self.host.rows_by_surface[healthy["surface"]] = [message(healthy, at=100)]
+        self.host.message_failures[disappearing["surface"]] = ValueError("not_found: surface disappeared")
+        self.host.message_failure_after[disappearing["surface"]] = 1
+
+        report = self.app.scan(send=True)
+
+        self.assertEqual(report["target_errors"][0]["session"], disappearing["session"])
+        self.assertEqual(report["target_errors"][0]["stage"], "delivery_recheck")
+        self.assertEqual(report["targets"][0]["attempts"][0]["outcome"], "held")
+        self.assertEqual(report["targets"][1]["attempts"][0]["outcome"], "submitted")
+        self.assertEqual([target["session"] for target, _ in self.host.sent], [healthy["session"]])
+        with closing(self.app.database()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM attempts WHERE session=?",
+                                        (disappearing["session"],)).fetchone()[0], 0)
 
     def test_young_messages_are_not_overdue(self):
         self.host.rows = [message(self.lane, at=499)]
