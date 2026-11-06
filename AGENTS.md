@@ -33,6 +33,7 @@ Run `git diff --check` and report the exact command, candidate revision, result,
 Configuration and a successful simulated submission do not prove actual recipient delivery.
 
 Before preparing OpenCode for Qwen or relaying a parent/child task brief, read the [Qwen inference and test observer preflight](docs/qwen-operating-guide.md#inference-and-test-observer-preflight).
+Claude, Codex, and Qwen orchestrators must also read the [observed orchestrator gotchas](docs/qwen-operating-guide.md#orchestrator-gotchas-from-observed-runs) before dispatching a Qwen task.
 Before costly inference, pin the runtime and reuse a maintained or generated client, then check configuration and API shapes without a model request.
 Replay sanitized event examples and review the observer's terminal-state, raw/rendered-content and failure-classification behavior before launch.
 

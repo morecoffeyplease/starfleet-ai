@@ -6,6 +6,8 @@ The model was tested as GGUF Q4_K_M with a 131,072-token context, 32,768-token o
 The observations came from one Apple M5 Max host with 128 GB of unified memory and are not a performance recommendation.
 Clean-host installation, clean-host model download and the full end-to-end Starfleet orchestration path have not been qualified.
 Use the [Qwen runtime lifecycle runbook](qwen-runtime-lifecycle.md) for the source-checked private runtime, profile, managed dispatch, worker scaling, and owned shutdown command sequence.
+For a native Claude parent, use its [private profile instructions](qwen-runtime-lifecycle.md#add-a-private-claude-parent-profile) and [dispatch procedure](qwen-runtime-lifecycle.md#dispatch-from-a-native-claude-parent).
+Read the [observed assisted Claude workflow and its limits](opencode-qwen-acceptance.md#native-claude-parent-with-assisted-result-reconciliation) before treating that recipe as qualified.
 Before costly inference, use Model Preferences `preflight` for a read-only active-role, worktree and OpenCode API configuration check, then follow the [Qwen inference and test observer preflight](qwen-operating-guide.md#inference-and-test-observer-preflight).
 This metadata check does not create a session, send a prompt or prove native TUI behavior.
 The current candidate includes source implementations for the opt-in Pattern Buffer pressure reminder and Policy Guard OpenCode Prime Directive plugin.

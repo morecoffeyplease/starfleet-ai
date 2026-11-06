@@ -31,6 +31,7 @@ The [acceptance observations](opencode-qwen-acceptance.md) record the tested run
 | Component | Candidate source behavior | Observed native boundary |
 | --- | --- | --- |
 | Model Preferences | Exact provider/model/variant preflight and managed dispatch path in candidate source | Fresh Codex-Qwen startup and one explicit-policy managed continuation preserved a visible synthetic draft; every parent route and Qwen-led orchestration remain unqualified |
+| Claude parent supervision | Existing native Claude caller checks and private profile configuration | Haiku 5.5 low assigned one Qwen 35B max file read and verified its result with explicit chief pointer assistance; native registration passed in a separate empty-session control, while the original managed startup and historical-session restoration remain unqualified |
 | Pattern Buffer | Explicit isolated plugin, exact session/task binding, current context and compaction hooks, opt-in lower-anchor pressure reminder, and checkpoint lifecycle accounting | Native v4 on `3c86383` observed the reviewed descriptor, one warning and checkpoint publication, one manual compaction, a new warning after the generation advanced, and lossless same-session recovery; accepted as scoped assisted evidence without a production timing guarantee |
 | Hailing Frequencies | Exact OpenCode identity, enrollment and guarded API delivery | Native self-enrollment, one experimental API-sidechannel wake, pending-inbox refusal and B12 bounded own-inbox receipt/body consumption passed on their recorded candidates; strict delivery still holds unknown composer state |
 | Discord Watch | Exact thread ownership and guarded Hailing delivery | DW1 reproduced busy receive refusal; DW2 on `ffd0a31` passed local-synthetic receipt and exclusive primary-model body attribution; remote Discord ingestion remains separate |
@@ -184,6 +185,70 @@ Keep the original partial observer result and any separately authorized same-ses
 A single synthetic exercise can establish observations about that exact candidate and run.
 It cannot establish general sandbox guarantees, Qwen reliability, or acceptance of another candidate.
 Record candidate-specific acceptance separately before describing any behavior as accepted.
+
+## Orchestrator gotchas from observed runs
+
+Apply these instructions whether the parent uses Claude, Codex, or Qwen.
+Keep the parent model's reasoning separate from the session, permission, and tool evidence.
+
+### Reconcile an uncertain launch before retrying
+
+A completed Qwen turn does not prove that Model Preferences confirmed the native CMUX binding.
+The Claude-Qwen follow-up on merged PR #9 observed one completed file read while the managed launch returned `native_binding_timeout`.
+The native parent stopped instead of dispatching another child.
+Inspect the existing launch record, exact child session, CMUX surface, and Pattern Buffer task before deciding whether another action is safe.
+Never repeat the initial prompt merely because the launch command returned uncertainty.
+
+### Prepare native hooks before startup
+
+Install the required project-scoped CMUX hooks in the disposable worktree before starting its private OpenCode server and TUI.
+Private XDG directories can exclude hooks installed in the normal user configuration.
+In the Claude-Qwen follow-up, the fixture lacked those project hooks when the task started.
+A later project-hook installation and same-session TUI reconnect did not establish the missing native binding.
+After the private API restarted with the project plugin present, its plugin metadata showed the CMUX server and TUI integration active.
+A new empty session selected through the real TUI produced an exact native CMUX session record without a user prompt or model reply.
+The older session still did not gain its missing record merely on reconnect.
+This control verifies plugin loading and one native registration path, while the cause of the historical-session recovery gap remains unverified.
+It does not qualify the original managed launch as successful.
+
+The supported installer also left a legacy plugin entry that the loader rejected for a duplicate `cmux.server` ID while the primary package remained active.
+Check the exact plugin ID, source path, features, and state before interpreting an aggregate plugin-failure indicator.
+Preserve generated files instead of editing them to suppress that indicator.
+Check actual native session records after setup instead of treating files on disk or a successful installer exit as proof of delivery.
+Do not weaken identity, composer, or permission guards to obtain a successful status.
+
+### Supply and verify task identifiers
+
+Include the assigned task reference explicitly in the worker brief when the worker must report it.
+The follow-up Qwen worker correctly reported its reference as unavailable because its model-visible context did not contain the task ID.
+Pattern Buffer independently showed the exact session bound to the task.
+Verify that metadata separately instead of asking a model to reconstruct an identifier from the brief hash.
+A missing identifier in the response does not by itself prove that task binding failed.
+
+### Require execution evidence for tests
+
+Require the actual test command, tool result, and exit status before accepting a claim that tests ran.
+In the assisted D5 coding case, Qwen produced a scoped diff but printed the test command instead of executing it.
+The supervising frontier agent ran the four behavior tests.
+Keep that intervention explicit when reporting the result.
+A plausible command or a statement that tests passed is not execution evidence.
+
+### Separate displayed rows from file records
+
+Define line-count success against the file content rather than a reader's numbered display.
+The Claude parent initially counted a trailing blank display row as a ninth record.
+The Qwen worker returned the correct eight records, and the parent corrected its comparison during reconciliation.
+Use literal, independently checkable expected values for bounded tasks.
+Do not turn this observation into a general claim that either model cannot count.
+
+### Label assisted supervision
+
+When a parent cannot obtain the normal dispatch result, reconcile the existing child through an explicitly authorized, exact session pointer.
+In the follow-up, the chief supplied only the observed child surface and task reference.
+The same native Claude parent read the actual Qwen screen and Pattern Buffer metadata, then verified both file markers and the eight-record count.
+That establishes assisted foreground supervision for the observed task.
+It does not establish successful managed startup, automatic result return, native wake delivery, or autonomous orchestration.
+Retain those limits instead of adding a relay framework or repeating the Qwen task solely to improve the report.
 
 ## Choose the operating role
 

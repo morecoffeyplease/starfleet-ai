@@ -1,7 +1,7 @@
 # Qwen runtime lifecycle
 
 This runbook describes the isolated OpenCode 2.2.5 and Ollama 0.32.14 command path for a bounded local Qwen task.
-It covers both a Codex-Qwen implementer and a Qwen-only orchestrator, including multiple worker sessions that share one owned runtime.
+It covers Codex or Claude parents supervising Qwen workers and a Qwen-only orchestrator, including worker sessions that share one owned runtime.
 
 ## Readiness gate
 
@@ -195,11 +195,13 @@ python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
   --source "operator-pinned local provider; native qualification is pending"
 ```
 
-Set `PROFILE` to exactly `Codex-Qwen` or `Qwen-only` after confirming that the private profile's other model choices match the operator's current approved configuration.
+For a Codex or Qwen parent, set `PROFILE` to `Codex-Qwen` or `Qwen-only` after checking the operator's approved model choices.
+For a Claude parent, skip the activation block below and create the private profile in the next subsection instead.
 The example Codex-Qwen profile uses Codex Sol medium orchestration and Qwen max implementation and research, with Codex Sol high review slots.
 The Qwen-only profile uses Qwen max for orchestration, implementation, and research, with Codex Sol high review slots.
 Every review launch still requires fresh explicit authorization.
-The existing Claude hold remains in effect, and the Claude-Qwen follow-up starts only after its supporting PR is merged.
+The private Claude mode does not authorize a shared Claude rollout or replace any running orchestrator.
+Preserve the operator's existing rollout and permission holds.
 
 ```sh
 # Choose exactly one value after checking the private profile's Codex choices.
@@ -214,6 +216,44 @@ python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
 python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
   resolve --role implementer
 ```
+
+### Add a private Claude parent profile
+
+Use this subsection only for a native Claude parent.
+The opt-in examples provide the `claude-haiku` model family but do not create a `Claude-Qwen` profile.
+The following authored input adds that profile through the supported CLI without editing its generated configuration.
+Use the example parent only when its exact model is available and approved for the account.
+The observed follow-up used first-party Claude Haiku 5.5 at low effort and local Qwen 35B at max thinking.
+That observation does not guarantee another account's availability.
+Do not substitute a provider or model silently after a rejection.
+
+```sh
+cat > "$RUN_ROOT/claude-qwen-profile.json" <<'JSON'
+{
+  "orchestrator": {"model": "claude-haiku", "effort": "low"},
+  "implementer": {"model": "local-qwen3.6-35b", "effort": "max"},
+  "researcher": {"model": "local-qwen3.6-35b", "effort": "max"},
+  "standard_review": [{"model": "codex-sol", "effort": "high"}],
+  "advanced_review": [{"model": "codex-sol", "effort": "high"}]
+}
+JSON
+python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
+  profile-put Claude-Qwen --file "$RUN_ROOT/claude-qwen-profile.json" \
+  --orchestrators future-only
+PROFILE="Claude-Qwen"
+python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
+  activate "$PROFILE" --orchestrators future-only
+python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" validate
+python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
+  startup --expect-profile "$PROFILE"
+python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
+  resolve --role orchestrator
+```
+
+Read the resolved model and effort before launching the parent.
+Keep review slots consistent with the operator's current approved choices.
+Creating or activating this private profile does not authorize any review launch.
+Use the existing first-party Claude login for this route instead of adding paid API credentials.
 
 For the owner worktree, opt Pattern Buffer into that exact worktree and install its plugin only into the private OpenCode settings file.
 Review the owner context produced or preserved by `init`, including its `# shared`, `# orchestrator`, and `# implementer` sections, then run the component's documented validation before dispatch.
@@ -409,6 +449,47 @@ python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
   --opencode-manifest "$RUN_ROOT/opencode-connection.json"
 ```
 
+### Dispatch from a native Claude parent
+
+Activate the private `Claude-Qwen` profile before starting the intended parent.
+Start the parent in a visible terminal tab of the existing task workspace through the installed CMUX Claude entrypoint.
+Preserve that entrypoint's native session and hook integration.
+For the observed smaller parent, the first-party CLI arguments were `--model claude-haiku-5-5 --effort low`.
+Use the resolved approved choice rather than those arguments when the account's choice differs.
+Do not use a bare mode or raw launcher that skips required hooks.
+Confirm the actual Claude session, surface, and workspace with `cmux current` before assigning a worker.
+
+Run the following implementer dispatch command from that Claude session's Bash tool.
+Supply the exact private configuration, state, manifest, owner, child, task, and receipt paths in the parent brief.
+Do not assume that a tool subprocess inherits variables defined in another terminal.
+Allow the specific dispatch command through normal native permissions when the operator has authorized it.
+A shell wrapper or a rejected permission is not proof that dispatch ran.
+Do not use another command envelope to evade a permission refusal.
+
+```sh
+python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
+  startup --expect-profile Claude-Qwen
+CHILD_WORKTREE="/absolute/path/to/the/assigned-qwen-child-worktree"
+CHILD_TASK="$RUN_ROOT/tasks/qwen-implementer.md"
+CHILD_RECEIPT="$RUN_ROOT/receipts/qwen-implementer.json"
+python3 "$MP" --config-dir "$MP_CONFIG" --state-dir "$MP_STATE" \
+  dispatch --role implementer --cwd "$CHILD_WORKTREE" \
+  --task-file "$CHILD_TASK" --pattern-buffer "$PB" \
+  --owner-worktree "$OWNER_WORKTREE" --receipt-file "$CHILD_RECEIPT" \
+  --opencode-manifest "$RUN_ROOT/opencode-connection.json"
+```
+
+The dispatcher validates the actual Claude caller identity and keeps its Qwen child in the same CMUX workspace.
+An OpenCode `parentID` is not expected for a cross-harness Claude parent.
+The explicit parent task reference and Pattern Buffer owner and task binding still apply.
+
+The observed useful workflow completed one Qwen file read and a native Haiku comparison with explicit chief pointer assistance.
+Its original managed startup timed out before native binding was confirmed.
+A separate empty-session control verified native hook registration after the project integration loaded, without a model prompt.
+Keep those observations separate and follow the [orchestrator gotchas](qwen-operating-guide.md#orchestrator-gotchas-from-observed-runs) when an older session lacks its record.
+Automatic repair of that incorrectly initialized historical session is deferred and does not block this supervised recipe.
+Do not infer automatic result return, unattended restart support, or full managed-startup qualification from these cases.
+
 For Codex-Qwen, select the private `Codex-Qwen` profile, run from the assigned Codex pane, and use the exact isolated child worktree and unique receipt path.
 The current Model Preferences child dispatch prepares and binds Pattern Buffer to the exact returned native session before it releases the task.
 Write the child task file before dispatch and replace its sample paths with the exact authorized scope.
@@ -438,7 +519,7 @@ An uncertain create or move is inspected using the recorded exact session and la
 Begin with one worker and one active Qwen inference.
 Each added worker needs a distinct task brief, child worktree, immutable receipt, and exclusive path set, and each dispatch remains a single-worker command.
 For a Qwen-only parent, the child command must run from that exact active Qwen orchestrator's current CMUX surface and workspace.
-For a Codex-Qwen parent, the owner worktree is the exact assigned Codex worktree.
+For a Codex or Claude parent, the owner worktree is that parent's exact assigned worktree.
 The Qwen-only parent prompt includes the exact Model Preferences script, private config and state paths, and dispatch prefix.
 Use that prompt's values instead of assuming the parent's shell variables such as `$MP`, `$MP_CONFIG`, `$MP_STATE`, or `$RUN_ROOT` exist in the child TUI.
 Replace the child worktree, task, receipt, and owner paths with the exact values authorized for that worker.
