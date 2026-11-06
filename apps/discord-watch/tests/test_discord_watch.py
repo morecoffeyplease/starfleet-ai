@@ -841,6 +841,24 @@ class DiscordWatchTests(unittest.TestCase):
         second_threads = [row[0] for row in observed]
         self.assertEqual(second_threads[:2], sorted(set(thread_ids) - set(first_threads)))
 
+    def test_rest_worker_keeps_rotation_when_last_thread_is_not_due(self):
+        thread_ids = [str(value) for value in range(1000, 1032)]
+        for thread_id in thread_ids:
+            self.app.register(thread_id)
+        self.app.begin_gateway_recovery("synthetic reconnect")
+
+        anchor = thread_ids[15]
+        anchor_turn = self.app._rest_recovery_turn(only_thread=anchor)
+        self.assertEqual([row["thread"] for row in anchor_turn["threads"]], [anchor])
+
+        self.clock[0] += 1
+        first = self.app._rest_recovery_turn()
+        self.assertEqual([row["thread"] for row in first["threads"]], thread_ids[16:24])
+
+        self.clock[0] += 1
+        second = self.app._rest_recovery_turn()
+        self.assertEqual([row["thread"] for row in second["threads"]], thread_ids[24:32])
+
     def test_recovery_turn_only_thread_scopes_requests_without_claiming_global_coverage(self):
         self.register()
         self.app.register("200")
