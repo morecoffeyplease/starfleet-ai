@@ -13,10 +13,31 @@ An assigned-item pointer may be updated only when the context owner has granted 
 The orchestrator supplies and explicitly updates task briefs within the work already authorized by the user.
 Task updates do not grant new scope or supersede later user instructions.
 
+## Parents with exact-session context
+
+An exact-session parent must not substitute a different worktree-default mission when dispatch refuses that source.
+Keep its enrollment and checkpoint intact.
+For the next authorized implementer, prepare a dedicated, directly initialized owner Git worktree in the same common repository as the child.
+Read the parent's selected standing source in full, copy that approved text to the dedicated owner's `.context-injector/context.md`, then run `init --default-role orchestrator` and inspect `validate` and `preview` there.
+This is deliberate owner preparation; dispatch itself does not copy or rewrite standing context, and no fake parent session is needed.
+Use that dedicated path as `dispatch --owner-worktree`.
+
+Inspect an existing child's `status` before reuse.
+If it is enabled but bound to a different `context_owner`, use a fresh unregistered child worktree at the intended verified candidate instead of moving its registration.
+Preserve existing tasks, their original owner and completion route; do not replay or retrofit a running or completed worker.
+Distinguish an owner mismatch from a disabled target, and never use a fresh path to bypass intentional disablement or a human hold.
+This route is for implementers; researchers and reviewers retain their configured role and normal launch workflow.
+
 ## Install the updated runtime
 
-If the adapter is missing or its runtime differs from the source you intend to use, install from a current main checkout.
-An orchestrator handoff to an already-installed harness usually needs the [handoff checks](../README.md#existing-installations-and-orchestrator-handoffs), not another installation.
+If a hook belongs to a different supported installation, dispatch remains refused until the CLI matches that installed bundle.
+When a compatible installed entrypoint is verified, the refusal prints a complete command that preserves the original dispatch arguments.
+Run the reported compatible command when one is available.
+If installation refuses an unowned or damaged entrypoint, preserve that runtime and run the reported same-settings recovery command into a new empty runtime.
+The recovery install updates only the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
+The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
+Review the harness's normal reload and trust controls after changing the hook command.
+An orchestrator handoff to an already-installed harness usually needs the [read-only handoff check](session-enrollments.md#read-only-handoff-check), not another installation.
 From this app's directory, install the updated adapter for each harness that needs it:
 
 ```sh
@@ -27,6 +48,8 @@ python3 pattern_buffer.py install --harness claude
 Use the harness's supported controls to review and trust the updated definition where required.
 Codex's handler now disables output spilling with `additionalContextLimit: 0`, while the app strictly caps combined output at 24 KiB.
 The dispatcher refuses a stale installed runtime or an unrecognized/missing/duplicated owned hook.
+An install refreshes recognized aliases already present inside its selected runtime directory, including aliases for the other supported harness.
+It does not search for, create or update aliases in a separate runtime directory.
 This preflight checks the settings file and runtime, not the harness's effective feature flags, trust state, or model reception.
 Keep hooks enabled and trusted; do not launch with bare/safe modes that omit hooks.
 For custom test settings, pass `dispatch --settings PATH` and also configure the harness itself to load that same file.

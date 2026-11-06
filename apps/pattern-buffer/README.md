@@ -18,9 +18,28 @@ Dispatch receipts, event logs and Hailing Frequencies receipts describe observed
 
 Read the [printable guide](guide.md) with the installed command pattern-buffer guide --print before configuring an installation.
 Install only the harness adapters you use.
+Installing one harness refreshes recognized aliases already present in that same runtime directory, while retaining their stable hook commands.
+For enabled events, an owned-only group is refreshed to canonical group settings in place, while a mixed group updates only the owned handler and preserves shared filters and metadata.
+Duplicate owned handlers retain the existing cleanup behavior.
+Preserving configured positions does not guarantee that a harness will trust or load the hook or deliver its output.
+It does not change another runtime directory, another harness's settings, or native trust.
 
     pattern-buffer install --harness codex
     pattern-buffer install --harness claude
+
+If installation refuses an unowned or damaged runtime entrypoint, preserve that runtime.
+From a source checkout, install the selected harness into a new empty runtime using the same settings file:
+
+    python3 apps/pattern-buffer/pattern_buffer.py install \
+        --harness codex \
+        --settings /absolute/path/to/codex-settings.json \
+        --runtime-dir /absolute/path/to/new-empty-runtime
+
+Use the matching harness name and settings file for Claude.
+The generated recovery command preserves whether checkpoint hooks were enabled for that settings file.
+This updates the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
+The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
+Review the harness's normal reload and trust controls after the install; installation does not confirm delivery.
 
 Initialize a directly managed Git worktree with an editable context file.
 
@@ -48,6 +67,8 @@ Session enrollment replaces the worktree context for that exact identity and fai
 Use the [session enrollment guide](docs/session-enrollments.md) for replacement handoffs, identity checks, trust limits and recovery.
 Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery notes, pressure reminders and Hailing Frequencies idle receipts.
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
+The read-only `handoff-check` distinguishes approved context and optional checkpoint state from installed-hook compatibility, native binding evidence and actual model delivery.
+Unknown native or delivery evidence stays unknown and does not add a readiness gate.
 
 ## Dispatch and task replay
 
@@ -56,6 +77,8 @@ The CLI does not infer a broader sandbox, role, model or repository permission f
 The task owner can update or finish a task explicitly, and recovery never replays a changed or finished task implicitly.
 The [implementer dispatch guide](docs/implementer-dispatch.md) documents the supported launch, update, recovery and ownership boundaries.
 Use a unique --receipt-file path when an immutable local snapshot is useful; a receipt is not live task status.
+For an exact-session parent or a child already bound to another owner, use the [supported owner and fresh-child route](docs/implementer-dispatch.md#parents-with-exact-session-context).
+Keep existing enrollments, tasks and human holds intact rather than substituting another mission or moving private registration metadata.
 
 ## Storage and event behavior
 
@@ -75,6 +98,10 @@ Run the canonical isolated suite from the repository root.
 
 The compatibility suite checks the former Context Injector source entrypoint against the maintained Pattern Buffer behavior.
 If context does not appear, inspect status, validate and preview, then check the harness's own trust and hook controls.
+Validation and status report the exact rendered header overhead, usable content bytes and remaining UTF-8 budget for each role.
+Pass the exact session ID when available so the calculation uses the enrolled file path and identity.
+Session enrollment and handoff checks use the same calculation before reviewed text is adopted.
+Oversized or malformed required sources still fail closed and are never truncated.
 Doctor reads local registration and content only; it does not certify hook activation, model reception or compliance.
 After installation changes, restart or resume the harness according to its own configuration reload behavior.
 Native delivery checks require a separate bounded pilot in disposable state and are not established by these local tests.

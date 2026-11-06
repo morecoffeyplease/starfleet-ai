@@ -8,7 +8,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 GUIDE = SCRIPT.with_name("guide.md")
@@ -354,13 +356,158 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("WARNING: orchestrator", result.stderr)
         # A longer actual identity can exceed the cap even when the sample fits.
         result = self.cli("validate", "--session", "s" * 512, success=False)
-        self.assertIn("orchestrator context uses", result.stderr)
-        self.assertIn("over)", result.stderr)
+        self.assertRegex(result.stderr,
+                         r"orchestrator: Header \d+ bytes; content 7607 / \d+ usable bytes; -\d+ bytes remaining\.")
         source.write_text(text + "é" * 500)
         result = self.cli("validate", success=False)
-        self.assertIn("orchestrator context uses", result.stderr)
+        self.assertRegex(result.stderr,
+                         r"orchestrator: Header \d+ bytes; content 8607 / \d+ usable bytes; -\d+ bytes remaining\.")
         # The active implementer still fits; lint must catch the other role too.
         self.assertIn("implementer:", result.stdout)
+
+    def test_enrollment_validation_distinguishes_missing_role_section_from_oversize(self):
+        self.cli("init")
+        source = (self.root.parent / "reviewed-context.md").resolve()
+        source.write_text("# shared\nApproved mission.\n")
+        missing = self.cli("session-enroll", "--harness", "codex", "--session", "validation-missing",
+                           "--context-file", str(source), "--role", "orchestrator", success=False)
+        self.assertIn("standing context validation failed", missing.stderr)
+        self.assertIn("missing section for assigned role: orchestrator", missing.stderr)
+        self.assertNotIn("exceeds its exact rendered UTF-8 byte budget", missing.stderr)
+
+        source.write_text("# shared\n" + "x" * 9000 +
+                          "\n# implementer\ny\n# orchestrator\nz\n")
+        oversized = self.cli("session-enroll", "--harness", "codex", "--session", "validation-oversized",
+                             "--context-file", str(source), "--role", "orchestrator", success=False)
+        self.assertIn("standing context validation failed", oversized.stderr)
+        self.assertIn("content", oversized.stderr)
+        self.assertRegex(oversized.stderr, r"-\d+ bytes remaining")
+
+    def test_exact_budget_matches_render_for_both_harnesses_with_long_unicode_paths(self):
+        long_root = self.root.parent / ("worktree-" + "x" * 96 + "é" * 55) / "nested" / "checkout"
+        self.create_repo(long_root)
+        self.cli("init", "--default-role", "orchestrator", root=long_root)
+        source = long_root / ".context-injector/context.md"
+        source.write_text("# shared\n" + "Shared-é-🛰️\n" * 20 +
+                          "# implementer\n" + "Implementation-ø\n" * 12 +
+                          "# orchestrator\n" + "Decision-Ω\n" * 13)
+        gitdir = Path(self.git_at(long_root, "rev-parse", "--absolute-git-dir").stdout.strip())
+        session = "session-" + "é" * 35
+
+        for harness in ("codex", "claude"):
+            with self.subTest(harness=harness):
+                for role in ci.ROLES:
+                    with self.subTest(role=role):
+                        self.cli("init", "--default-role", role, root=long_root)
+                        report = ci.current_context_budgets(long_root.resolve(), gitdir, harness, session)
+                        rendered = ci.render(long_root, harness, session)
+                        budget = report["roles"][role]
+                        self.assertEqual(len(rendered.encode("utf-8")), budget["bytes_used"])
+                        self.assertEqual(budget["header_bytes"] + budget["content_bytes"], budget["bytes_used"])
+                        self.assertEqual(budget["usable_content_bytes"], ci.LIMIT - budget["header_bytes"])
+                        self.assertEqual(budget["remaining_bytes"], ci.LIMIT - budget["bytes_used"])
+                        self.assertLessEqual(budget["bytes_used"], ci.LIMIT)
+
+                future = ci.auxiliary("sessions")._session_path(long_root.resolve(), harness, session)
+                validator = ci.context_validator(long_root.resolve(), harness, session)
+                validation = validator(source.read_text(), future, "orchestrator")
+                self.assertEqual(validation["budgets"]["source"], str(future))
+                future_header = ci.standing_parts(long_root.resolve(), future, harness, session, "",
+                                                  "orchestrator", "session enrollment",
+                                                  ci.sections_text(source.read_text()))[0]
+                future_budget = validation["budgets"]["roles"]["orchestrator"]
+                self.assertEqual(future_budget["header_bytes"], len(future_header.encode("utf-8")))
+                self.assertNotEqual(future, source)
+
+    def test_unassigned_budget_validation_and_render_agree_for_both_harnesses(self):
+        self.cli("init")
+        source = self.root / ".context-injector/context.md"
+        session = "unassigned-budget-check"
+
+        for harness in ("codex", "claude"):
+            with self.subTest(harness=harness):
+                seed = "# shared\nseed\n# implementer\ny\n# orchestrator\nz\n"
+                content = ci.sections_text(seed)
+                assigned_header = ci.standing_parts(
+                    self.root.resolve(), source.resolve(), harness, session, "",
+                    "orchestrator", "unassigned", content)[0]
+                shared_bytes = ci.LIMIT - len(assigned_header.encode("utf-8")) - len("\n\nz".encode("utf-8"))
+                source.write_text("# shared\n" + "x" * shared_bytes +
+                                  "\n# implementer\ny\n# orchestrator\nz\n")
+                unassigned_header = ci.standing_parts(
+                    self.root.resolve(), source.resolve(), harness, session, "",
+                    None, "unassigned", ci.sections_text(source.read_text()))[0]
+                expected_unassigned_bytes = len(unassigned_header.encode("utf-8")) + shared_bytes
+
+                validation = self.cli("validate", "--harness", harness, "--session", session, success=False)
+                self.assertIn("implementer: 8191 / 8192 bytes", validation.stdout)
+                self.assertIn("orchestrator: 8192 / 8192 bytes", validation.stdout)
+                self.assertIn("unassigned:", validation.stderr)
+                self.assertIn("remaining", validation.stderr)
+                doctor = self.cli("doctor", "--harness", harness, "--session", session, success=False)
+                self.assertIn("unassigned:", doctor.stderr)
+
+                status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
+                budgets = status["standing_context_budgets"]
+                self.assertFalse(budgets["ok"])
+                self.assertEqual(set(budgets["roles"]), {"implementer", "orchestrator", "unassigned"})
+                self.assertFalse(budgets["roles"]["unassigned"]["ok"])
+                self.assertEqual(budgets["roles"]["unassigned"]["bytes_used"], expected_unassigned_bytes)
+
+                preview = self.cli("preview", "--harness", harness, "--session", session, success=False)
+                self.assertEqual(preview.stdout, "")
+                self.assertIn(f"unassigned context uses {expected_unassigned_bytes} / 8192 bytes", preview.stderr)
+
+    def test_enrolled_session_budgets_still_match_preview_for_both_harnesses(self):
+        self.cli("init")
+        source = self.root.parent / "approved-standing-context.md"
+        source.write_text("# shared\nApproved mission.\n# implementer\nImplement assigned work.\n"
+                          "# orchestrator\nPreserve current authority and holds.\n")
+        sessions = {
+            "codex": "11111111-1111-4111-8111-111111111111",
+            "claude": "22222222-2222-4222-8222-222222222222",
+        }
+
+        for harness, session in sessions.items():
+            with self.subTest(harness=harness):
+                enrolled = json.loads(self.cli(
+                    "session-enroll", "--harness", harness, "--session", session,
+                    "--context-file", str(source.resolve()), "--role", "orchestrator").stdout)
+                expected = enrolled["standing_context_budgets"]["roles"]["orchestrator"]["bytes_used"]
+                self.assertNotIn("unassigned", enrolled["standing_context_budgets"]["roles"])
+
+                preview = self.cli("preview", "--harness", harness, "--session", session)
+                self.assertTrue(preview.stdout.endswith("\n"))
+                self.assertEqual(len(preview.stdout[:-1].encode("utf-8")), expected)
+                status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
+                budgets = status["standing_context_budgets"]
+                self.assertEqual(budgets["role"], "orchestrator")
+                self.assertEqual(budgets["source"], enrolled["path"])
+                self.assertEqual(budgets["roles"]["orchestrator"]["bytes_used"], expected)
+                self.assertNotIn("unassigned", budgets["roles"])
+                self.cli("validate", "--harness", harness, "--session", session)
+
+    def test_install_preflights_missing_helper_source_before_creating_settings_or_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            runtime = folder / "runtime"
+            settings = folder / "hooks.json"
+            missing = folder / "missing-sessions.py"
+            args = SimpleNamespace(command="install", harness="claude", settings=str(settings),
+                                   runtime_dir=str(runtime), bin_dir=str(runtime), checkpoints=True)
+            original = ci.auxiliary_source
+
+            def source(name, script=None):
+                if name == "sessions" and script is None:
+                    return missing
+                return original(name, script)
+
+            with mock.patch.object(ci, "auxiliary_source", side_effect=source):
+                with self.assertRaisesRegex(ValueError, "expected a regular, non-symlink file"):
+                    ci.configure_hooks(args)
+            self.assertFalse(runtime.exists())
+            self.assertFalse(settings.exists())
+            self.assertFalse(settings.with_name(settings.name + ".context-injector.lock").exists())
 
     def test_concurrent_sessions_and_harness_namespace(self):
         self.cli("init")
@@ -465,10 +612,16 @@ class PatternBufferTests(unittest.TestCase):
         self.assertTrue(report["configuration_ready"])
         self.assertEqual(report["resolved_role"], {"role": "orchestrator", "source": "worktree default"})
         self.assertTrue(all(check["ok"] for check in report["checks"].values()))
+        self.assertTrue(all(check.get("next_action") for check in report["checks"].values()))
         self.assertEqual(set(report["checks"]["context"]["budgets"]), {"implementer", "orchestrator"})
         for budget in report["checks"]["context"]["budgets"].values():
             self.assertLessEqual(budget["bytes_used"], budget["limit_bytes"])
         self.assertEqual(report["delivery_state"], "not_tracked")
+        self.assertEqual(report["checkpoint"]["state"], "not_enrolled")
+        self.assertFalse(report["checkpoint"]["required"])
+        self.assertEqual(report["native_binding"]["state"], "unknown")
+        self.assertEqual(report["delivery_evidence"]["state"], "unknown")
+        self.assertEqual(report["installed_hooks"]["state"], "compatible")
         self.assertIn("actual harness cwd must match", " ".join(report["notes"]).lower())
         self.assertIn("manual observation", " ".join(report["notes"]))
         self.assertIn("Hook trust", " ".join(report["notes"]))
@@ -477,6 +630,90 @@ class PatternBufferTests(unittest.TestCase):
 
         preview = self.cli("preview", "--harness", "codex", "--session", "successor-1").stdout
         self.assertIn("role: orchestrator | source: worktree default", preview)
+
+    def test_handoff_check_reads_enrollment_without_creating_registry_lock(self):
+        self.cli("init", "--default-role", "implementer")
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        source = self.root / ".context-injector/context.md"
+        source.write_text("# shared\nApproved session context.\n# implementer\nImplement this session.\n"
+                          "# orchestrator\nPreserve this session's holds.\n")
+        self.cli("session-enroll", "--harness", "codex", "--session", "successor-enrolled",
+                 "--context-file", str(source.resolve()), "--role", "orchestrator")
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
+        registry_lock = gitdir / "context-injector/session-enrollments/registry.lock"
+        self.assertTrue(registry_lock.exists())
+        registry_lock.unlink()
+        before = self.snapshot(self.root.parent)
+
+        result = self.cli("handoff-check", "--harness", "codex", "--session", "successor-enrolled",
+                          "--settings", str(settings))
+        report = json.loads(result.stdout)
+
+        self.assertTrue(report["configuration_ready"])
+        self.assertEqual(report["resolved_role"], {"role": "orchestrator", "source": "session enrollment"})
+        self.assertEqual(report["standing_context"]["enrollment_binding"]["state"], "active")
+        self.assertEqual(report["standing_context"]["source"],
+                         str((self.root / ".context-injector/sessions/codex-successor-enrolled.md").resolve()))
+        self.assertFalse(registry_lock.exists())
+        self.assertEqual(self.snapshot(self.root.parent), before)
+
+    def test_handoff_check_does_not_fall_back_when_read_only_binding_lookup_fails(self):
+        self.cli("init", "--default-role", "orchestrator")
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
+        registry = gitdir / "context-injector/session-enrollments/registry.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text("not a registry")
+
+        result = self.cli("handoff-check", "--harness", "codex", "--session", "successor-corrupt",
+                          "--settings", str(settings), success=False)
+        report = json.loads(result.stdout)
+
+        self.assertEqual(report["resolved_role"], {"role": None, "source": None})
+        self.assertIn("binding could not be read", report["checks"]["resolved_role"]["detail"])
+        self.assertFalse(report["checks"]["context"]["ok"])
+        self.assertEqual(report["standing_context"]["enrollment_binding"]["state"], "unknown")
+        self.assertEqual(report["checkpoint"]["state"], "unknown")
+        self.assertFalse(report["checkpoint"]["required"])
+        self.assertIn("checkpoint-status", report["checkpoint"]["next_action"])
+        self.assertFalse(report["configuration_ready"])
+
+    def test_handoff_check_reports_existing_claude_idle_warning_disabled_without_changing_it(self):
+        home = self.root.parent / "isolated-home"
+        launcher = home / ".local/bin/hailing-frequencies"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!" + sys.executable + "\n" + '''import json, sys
+if sys.argv[2] == "set":
+    print(json.dumps({"timer": {"id": "11111111-1111-4111-8111-111111111111", "due_at": 1800003000}}))
+else:
+    print(json.dumps({"status": "canceled"}))
+''')
+        launcher.chmod(0o700)
+        session = "11111111-1111-4111-8111-111111111111"
+        env = {"HOME": str(home), "CMUX_AGENT_LAUNCH_KIND": "claude", "CLAUDE_CODE_SESSION_ID": session}
+        self.cli("init", "--default-role", "orchestrator")
+        settings = self.root.parent / "claude-settings.json"
+        runtime = self.root.parent / "claude-runtime"
+        self.cli("install", "--harness", "claude", "--settings", str(settings),
+                 "--runtime-dir", str(runtime), env=env)
+        self.cli("checkpoint-init", "--harness", "claude", "--session", session,
+                 "--compact-at", "60", env=env)
+        self.cli("checkpoint-config", "--harness", "claude", "--session", session,
+                 "--idle-warning-minutes", "0", env=env)
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
+        checkpoint_before = ci.checkpoints()._state_path(gitdir, "claude", session).read_bytes()
+
+        report = json.loads(self.cli("handoff-check", "--harness", "claude", "--session", session,
+                                     "--settings", str(settings), env=env).stdout)
+
+        self.assertTrue(report["configuration_ready"])
+        self.assertEqual(report["checkpoint"]["state"], "invalid")
+        self.assertEqual(report["checkpoint"]["idle_warning"]["state"], "disabled")
+        self.assertIn("checkpoint-config", report["checkpoint"]["idle_warning"]["next_action"])
+        self.assertIn("--idle-warning-minutes 50", report["checkpoint"]["idle_warning"]["next_action"])
+        self.assertEqual(ci.checkpoints()._state_path(gitdir, "claude", session).read_bytes(), checkpoint_before)
 
     def test_handoff_check_reports_registration_enabled_role_context_and_hook_failures(self):
         settings, runtime, options = self.install_args()
@@ -487,6 +724,9 @@ class PatternBufferTests(unittest.TestCase):
         self.assertFalse(report["configuration_ready"])
         self.assertFalse(report["checks"]["registration"]["ok"])
         self.assertIn("No Pattern Buffer registration", report["checks"]["registration"]["detail"])
+        self.assertEqual(report["checkpoint"]["state"], "unknown")
+        self.assertFalse(report["checkpoint"]["required"])
+        self.assertIn("checkpoint-status", report["checkpoint"]["next_action"])
 
         self.cli("init", "--default-role", "orchestrator")
         self.cli("disable")
@@ -502,6 +742,7 @@ class PatternBufferTests(unittest.TestCase):
         self.assertFalse(report["checks"]["resolved_role"]["ok"])
         self.assertEqual(report["resolved_role"], {"role": "implementer", "source": "session assignment"})
         self.assertIn("expected orchestrator", report["checks"]["resolved_role"]["detail"])
+        self.assertEqual(report["checkpoint"]["state"], "not_applicable")
 
         self.assign("successor", "orchestrator")
         source = self.root / ".context-injector/context.md"
@@ -515,23 +756,87 @@ class PatternBufferTests(unittest.TestCase):
     def test_handoff_check_reports_absent_stale_and_malformed_hook_settings(self):
         self.cli("init", "--default-role", "orchestrator")
         settings, runtime, options = self.install_args()
+        recovery_only_options = (*options, "--no-checkpoints")
+        recovery_home = self.root.parent / "recovery home"
+        recovery_env = {"HOME": str(recovery_home), "XDG_DATA_HOME": str(recovery_home / "data"),
+                        "CODEX_HOME": str(recovery_home / ".codex")}
+        subprocess_env = {**os.environ, **recovery_env}
+        settings.write_text(json.dumps({"unrelated": {"setting": True}, "hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": "echo untouched"}]}]}}))
         absent = self.cli("handoff-check", "--harness", "codex", "--session", "successor",
                           "--settings", str(settings), success=False)
         report = json.loads(absent.stdout)
         self.assertFalse(report["checks"]["hook_runtime"]["ok"])
         self.assertIn("exactly one installed Pattern Buffer hook", report["checks"]["hook_runtime"]["detail"])
 
-        self.cli("install", *options, "--runtime-dir", str(runtime))
-        (runtime / "context_injector_codex.py").write_text("stale runtime")
+        self.cli("install", *recovery_only_options, "--runtime-dir", str(runtime))
+        old_launcher = runtime / "pattern-buffer"
+        old_launcher_bytes = old_launcher.read_bytes()
+        damaged_entrypoints = [runtime / "context_injector_codex.py", runtime / "pattern_buffer_codex.py",
+                               runtime / "pattern_buffer.py"]
+        for entrypoint in damaged_entrypoints:
+            entrypoint.write_text("stale runtime")
+        damaged_bytes = [entrypoint.read_bytes() for entrypoint in damaged_entrypoints]
+        old_launcher_before = subprocess.run([str(old_launcher), "guide", "--print"],
+                                             capture_output=True, text=True, env=subprocess_env)
+        self.assertNotEqual(old_launcher_before.returncode, 0)
         stale = self.cli("handoff-check", "--harness", "codex", "--session", "successor",
-                         "--settings", str(settings), success=False)
+                         "--settings", str(settings), success=False, env=recovery_env)
         report = json.loads(stale.stdout)
         self.assertFalse(report["checks"]["hook_runtime"]["ok"])
         self.assertIn("runtime differs", report["checks"]["hook_runtime"]["detail"])
+        self.assertIn("Same-settings recovery command:", report["checks"]["hook_runtime"]["next_action"])
+        self.assertIn(str(settings), report["checks"]["hook_runtime"]["next_action"])
+        next_action = report["checks"]["hook_runtime"]["next_action"]
+        recovery_text, recovery_command = next_action.split("Same-settings recovery command: ", 1)
+        recovery_args = shlex.split(recovery_command)
+        recovery_runtime = Path(recovery_args[recovery_args.index("--runtime-dir") + 1])
+        self.assertIn("Any existing PATH launcher remains unchanged", recovery_text)
+        self.assertIn(shlex.quote(str(recovery_runtime / "pattern-buffer")), recovery_text)
+        self.assertIn("--no-checkpoints", recovery_args)
 
-        self.cli("install", *options, "--runtime-dir", str(runtime))
+        settings_before_refusal = settings.read_bytes()
+        refused = self.cli("install", *recovery_only_options, "--runtime-dir", str(runtime),
+                           success=False, env=recovery_env)
+        self.assertIn("refusing to update unowned runtime entrypoint", refused.stderr)
+        self.assertIn("Same-settings recovery command:", refused.stderr)
+        self.assertIn("--no-checkpoints", refused.stderr)
+        self.assertEqual(settings.read_bytes(), settings_before_refusal)
+        self.assertEqual([entrypoint.read_bytes() for entrypoint in damaged_entrypoints], damaged_bytes)
+
+        self.assertEqual(old_launcher.read_bytes(), old_launcher_bytes)
+        self.assertFalse(recovery_runtime.exists())
+        recovery = subprocess.run(recovery_args, capture_output=True, text=True, env=subprocess_env)
+        self.assertEqual(recovery.returncode, 0, recovery.stdout + recovery.stderr)
+        self.assertNotEqual(settings.read_bytes(), settings_before_refusal)
+        self.assertEqual([entrypoint.read_bytes() for entrypoint in damaged_entrypoints], damaged_bytes)
+        old_launcher_after = subprocess.run([str(old_launcher), "guide", "--print"],
+                                            capture_output=True, text=True, env=subprocess_env)
+        self.assertEqual((old_launcher_after.returncode, old_launcher_after.stdout, old_launcher_after.stderr),
+                         (old_launcher_before.returncode, old_launcher_before.stdout, old_launcher_before.stderr))
+        self.assertEqual(old_launcher.read_bytes(), old_launcher_bytes)
         data = json.loads(settings.read_text())
+        self.assertEqual(data["unrelated"], {"setting": True})
+        self.assertEqual(data["hooks"]["Stop"], [{"hooks": [{"type": "command", "command": "echo untouched"}]}])
         handler = data["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertIn(str(recovery_runtime / "context_injector_codex.py"), handler["command"])
+        new_launcher = recovery_runtime / "pattern-buffer"
+        guide = subprocess.run([str(new_launcher), "guide", "--print"], capture_output=True, text=True,
+                               env=subprocess_env)
+        self.assertEqual(guide.returncode, 0, guide.stdout + guide.stderr)
+        self.assertTrue(guide.stdout.startswith("# Pattern Buffer guide\n"))
+        status = subprocess.run([str(new_launcher), "--cwd", str(self.root), "status", "--harness", "codex",
+                                 "--settings", str(settings)], capture_output=True, text=True, env=subprocess_env)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertTrue(json.loads(status.stdout)["registered"])
+        self.assertEqual(json.loads(status.stdout)["owned_hook_handlers"], 1)
+        recovered = subprocess.run([str(new_launcher), "--cwd", str(self.root), "handoff-check",
+                                    "--harness", "codex", "--session", "successor", "--settings", str(settings)],
+                                   capture_output=True, text=True, env=subprocess_env)
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        recovered_report = json.loads(recovered.stdout)
+        self.assertTrue(recovered_report["checks"]["hook_runtime"]["ok"])
+        self.assertTrue(recovered_report["configuration_ready"])
         command, marker = handler["command"].rsplit(" # ", 1)
         argv = shlex.split(command)
         argv[0] = str(self.root.parent / "missing-interpreter")
@@ -554,6 +859,76 @@ class PatternBufferTests(unittest.TestCase):
         settings = self.root.parent / f"{harness} settings.json"
         runtime = self.root.parent / "runtime with spaces"
         return settings, runtime, ("--harness", harness, "--settings", str(settings))
+
+    def test_install_preserves_owned_hook_slot_and_mixed_group_fields(self):
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        data = json.loads(settings.read_text())
+        groups = data["hooks"]["SessionStart"]
+        self.assertEqual(len(groups), 1)
+        groups[0]["customFilter"] = {"source": "fixture"}
+        groups[0]["hooks"][0]["timeout"] = 1
+        groups[0]["hooks"][0]["additionalContextLimit"] = 16384
+        mixed_group_handler = {"type": "command", "command": "echo same-group foreign handler"}
+        groups[0]["hooks"].append(mixed_group_handler)
+        foreign_after_group = {"matcher": "custom-event", "customGroup": "keep",
+                               "hooks": [{"type": "command", "command": "echo later foreign group"}]}
+        groups.append(foreign_after_group)
+        settings.write_text(json.dumps(data))
+        expected_groups = json.loads(settings.read_text())["hooks"]["SessionStart"]
+        expected_groups[0]["hooks"][0]["timeout"] = 5
+        expected_groups[0]["hooks"][0]["additionalContextLimit"] = 0
+
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+
+        installed_groups = json.loads(settings.read_text())["hooks"]["SessionStart"]
+        self.assertEqual(installed_groups, expected_groups)
+        self.assertTrue(ci.owned(installed_groups[0]["hooks"][0], "codex"))
+        self.assertEqual(installed_groups[0]["hooks"][1], mixed_group_handler)
+        self.assertEqual(installed_groups[0]["customFilter"], {"source": "fixture"})
+        self.assertEqual(installed_groups[1], foreign_after_group)
+
+    def test_install_refreshes_owned_only_group_fields_at_the_existing_slot(self):
+        cases = (
+            ("claude", "SessionStart", "startup|resume|compact", "startup|resume|compact|fork|clear"),
+            ("codex", "PreCompact", "legacy-checkpoint-filter", None),
+        )
+        for harness, event, stale_matcher, expected_matcher in cases:
+            with self.subTest(harness=harness, event=event):
+                settings, _, options = self.install_args(harness)
+                old_runtime = self.root.parent / f"{harness} old runtime"
+                new_runtime = self.root.parent / f"{harness} new runtime"
+                self.cli("install", *options, "--runtime-dir", str(old_runtime))
+                data = json.loads(settings.read_text())
+                groups = data["hooks"][event]
+                owned_index = next(index for index, group in enumerate(groups)
+                                   if any(ci.owned(handler, harness) for handler in group["hooks"]))
+                owned_group = groups[owned_index]
+                self.assertEqual(len(owned_group["hooks"]), 1)
+                owned_handler = owned_group["hooks"][0]
+                old_command = owned_handler["command"]
+                owned_handler["timeout"] = 1
+                owned_group["matcher"] = stale_matcher
+                foreign_after_group = {"matcher": "foreign-after-owned", "customGroup": event,
+                                       "hooks": [{"type": "command", "command": "echo later group"}]}
+                groups.insert(owned_index + 1, foreign_after_group)
+                settings.write_text(json.dumps(data))
+
+                self.cli("install", *options, "--runtime-dir", str(new_runtime))
+
+                updated_groups = json.loads(settings.read_text())["hooks"][event]
+                canonical_group = ci.hook_config(harness, new_runtime / f"context_injector_{harness}.py", True)["hooks"][event][0]
+                self.assertEqual(updated_groups[owned_index], canonical_group)
+                self.assertEqual(updated_groups[owned_index + 1], foreign_after_group)
+                updated_handler = updated_groups[owned_index]["hooks"][0]
+                self.assertTrue(ci.owned(updated_handler, harness))
+                self.assertNotEqual(updated_handler["command"], old_command)
+                self.assertEqual(updated_handler["timeout"], 5)
+                if expected_matcher is None:
+                    self.assertNotIn("matcher", updated_groups[owned_index])
+                    self.assertNotIn("additionalContextLimit", updated_handler)
+                else:
+                    self.assertEqual(updated_groups[owned_index]["matcher"], expected_matcher)
 
     def test_install_preserves_existing_settings_and_is_idempotent(self):
         for harness in ("codex", "claude"):
@@ -711,6 +1086,35 @@ class PatternBufferTests(unittest.TestCase):
             list(pool.map(lambda _: self.cli("install", *options, "--runtime-dir", str(runtime)), range(4)))
         self.assertEqual(json.loads(self.cli("status", *options).stdout)["owned_hook_handlers"], 1)
 
+    def test_parallel_cross_harness_installs_share_runtime_lock(self):
+        codex_settings, runtime, codex_options = self.install_args("codex")
+        claude_settings, claude_runtime, claude_options = self.install_args("claude")
+        self.assertEqual(runtime, claude_runtime)
+        installs = [("install", *codex_options, "--runtime-dir", str(runtime)),
+                    ("install", *claude_options, "--runtime-dir", str(runtime))]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda args: self.cli(*args), installs))
+
+        codex_status = json.loads(self.cli("status", *codex_options).stdout)
+        claude_status = json.loads(self.cli("status", *claude_options).stdout)
+        self.assertEqual(codex_status["owned_hook_handlers"], 1)
+        self.assertEqual(claude_status["owned_hook_handlers"], 1)
+        cores = [(runtime / "pattern_buffer.py").read_bytes()]
+        for harness in ("codex", "claude"):
+            for script in (runtime / f"context_injector_{harness}.py",
+                           runtime / f"pattern_buffer_{harness}.py"):
+                self.assertTrue(script.is_file())
+                self.assertIn("def configure_hooks(args):", script.read_text())
+                cores.append(script.read_bytes())
+        self.assertTrue(all(core == cores[0] for core in cores[1:]))
+        for helper in ("checkpoint", "enrollment", "sessions", "reliability"):
+            copies = [runtime / f"{prefix}_{harness}_{helper}.py"
+                      for harness in ("codex", "claude")
+                      for prefix in ("context_injector", "pattern_buffer")]
+            self.assertTrue(all(path.is_file() for path in copies))
+            contents = [path.read_bytes() for path in copies]
+            self.assertTrue(all(content == contents[0] for content in contents[1:]))
+
     def implementer(self, brief="Implement the assigned change. Verify the result."):
         self.cli("init", "--default-role", "orchestrator")
         worker = self.root.parent / "worker"
@@ -836,6 +1240,98 @@ class PatternBufferTests(unittest.TestCase):
         self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
                  "--task-file", str(task_file), "--prepare-only", root=worker, success=False)
         self.assertFalse((worker / ".context-injector").exists())
+
+    def test_dispatch_preflights_uuid_session_assignment_budget_before_launch(self):
+        worker, task_file = self.implementer()
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        source = self.root / ".context-injector/context.md"
+        source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\nz\n")
+        session = "11111111-1111-4111-8111-111111111111"
+        content = ci.sections_text(source.read_text())
+        preview_header = ci.standing_parts(
+            worker.resolve(), source.resolve(), "codex", "dispatch-validation", "",
+            "implementer", "preview override", content)[0]
+        shared_bytes = ci.LIMIT - len(preview_header.encode("utf-8")) - len("\n\ny".encode("utf-8"))
+        source.write_text("# shared\n" + "x" * shared_bytes +
+                          "\n# implementer\ny\n# orchestrator\nz\n")
+        content = ci.sections_text(source.read_text())
+        old_text, old_budget = ci.render_standing_details(
+            worker.resolve(), source.resolve(), "codex", "dispatch-validation", "",
+            "implementer", "preview override", content)
+        self.assertEqual(len(old_text.encode("utf-8")), ci.LIMIT)
+        self.assertEqual(old_budget["bytes_used"], ci.LIMIT)
+        _actual_text, actual_budget = ci.render_standing_details(
+            worker.resolve(), source.resolve(), "codex", session, "",
+            "implementer", "session assignment", content)
+        self.assertEqual(actual_budget["bytes_used"] - ci.LIMIT, 19)
+
+        started = self.root.parent / "codex-started"
+        harness = self.root.parent / "codex"
+        harness.write_text("#!" + sys.executable + "\nfrom pathlib import Path\n" +
+                           f"Path({str(started)!r}).write_text('started')\n")
+        harness.chmod(0o700)
+        rejected = self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
+                            "--task-file", str(task_file), "--settings", str(settings), "--",
+                            str(harness), "exec", "-C", str(worker), "-", root=worker, success=False)
+        self.assertIn(f"{actual_budget['bytes_used']} / 8192 bytes", rejected.stderr)
+        self.assertFalse(started.exists())
+        self.assertTrue(self.registration(worker).exists())
+
+    def test_dispatch_preflights_composed_task_limit_before_launch_with_shorter_control(self):
+        worker, task_file = self.implementer()
+        settings, runtime, options = self.install_args()
+        self.cli("install", *options, "--runtime-dir", str(runtime))
+        source = self.root / ".context-injector/context.md"
+        source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\nz\n")
+        session = "88888888-8888-4888-8888-888888888888"
+        content = ci.sections_text(source.read_text())
+        header = ci.standing_parts(
+            worker.resolve(), source.resolve(), "codex", session, "",
+            "implementer", "session assignment", content)[0]
+        shared_bytes = 8111 - len(header.encode("utf-8")) - len("\n\ny".encode("utf-8"))
+        source.write_text("# shared\n" + "x" * shared_bytes +
+                          "\n# implementer\ny\n# orchestrator\nz\n")
+        content = ci.sections_text(source.read_text())
+        standing, standing_budget = ci.render_standing_details(
+            worker.resolve(), source.resolve(), "codex", session, "",
+            "implementer", "session assignment", content)
+        self.assertEqual(len(standing.encode("utf-8")), 8111)
+        self.assertEqual(standing_budget["bytes_used"], 8111)
+
+        started = self.root.parent / "codex-combined-started"
+        harness = self.root.parent / "codex"
+        harness.write_text("#!" + sys.executable + "\n" + f'''import json, os, subprocess, sys
+from pathlib import Path
+Path({str(started)!r}).write_text("started")
+task = sys.stdin.read()
+settings = json.loads(Path({str(settings)!r}).read_text())
+command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+payload = {{"hook_event_name": "SessionStart", "source": "startup",
+           "session_id": {session!r}, "cwd": os.getcwd()}}
+result = subprocess.run(command, shell=True, input=json.dumps(payload), capture_output=True, text=True)
+print(json.dumps({{"task": task, "hook_returncode": result.returncode, "hook_stdout": result.stdout}}))
+''')
+        harness.chmod(0o700)
+
+        task_file.write_text("x" * ci.TASK_LIMIT)
+        rejected = self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
+                            "--task-file", str(task_file), "--settings", str(settings), "--",
+                            str(harness), "exec", "-C", str(worker), "-", root=worker, success=False)
+        self.assertIn("combined reminder and task exceed the 24 KiB injection limit", rejected.stderr)
+        self.assertFalse(started.exists())
+
+        task_file.write_text("y" * 15884)
+        accepted = self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
+                            "--task-file", str(task_file), "--settings", str(settings), "--",
+                            str(harness), "exec", "-C", str(worker), "-", root=worker)
+        self.assertTrue(started.exists())
+        result = json.loads(accepted.stdout)
+        self.assertEqual(result["task"], "y" * 15884)
+        self.assertEqual(result["hook_returncode"], 0)
+        hook = json.loads(result["hook_stdout"])
+        self.assertIn("additionalContext", hook["hookSpecificOutput"])
+        self.assertTrue(hook["hookSpecificOutput"]["additionalContext"].endswith("y" * 15884))
 
     def test_dispatch_exec_preserves_path_shim_arguments_and_exact_stdin(self):
         worker, task_file = self.implementer("The exact original task.\n")
@@ -977,7 +1473,8 @@ print(json.dumps({{'stdin':sys.stdin.read(),'argv':sys.argv,'context':json.loads
         worker, task_file = self.implementer()
         settings, runtime, options = self.install_args()
         self.cli("install", *options, "--runtime-dir", str(runtime))
-        (runtime / "context_injector_codex.py").write_text("stale runtime")
+        for name in ("context_injector_codex.py", "pattern_buffer_codex.py", "pattern_buffer.py"):
+            (runtime / name).write_text("stale runtime")
         harness = self.root.parent / "codex"
         started = self.root.parent / "harness-started"
         harness.write_text("#!/bin/sh\nprintf launched > " + shlex.quote(str(started)) + "\nexit 99\n")
@@ -986,6 +1483,16 @@ print(json.dumps({{'stdin':sys.stdin.read(),'argv':sys.argv,'context':json.loads
                           "--task-file", str(task_file), "--settings", str(settings), "--",
                           str(harness), "exec", "-C", str(worker), "-", root=worker, success=False)
         self.assertIn("runtime differs", result.stderr)
+        self.assertIn("Same-settings recovery command:", result.stderr)
+        recovery = shlex.split(result.stderr.split("Same-settings recovery command: ", 1)[1])
+        self.assertIn("--settings", recovery)
+        self.assertEqual(recovery[recovery.index("--settings") + 1], str(settings))
+        recovery_runtime = Path(recovery[recovery.index("--runtime-dir") + 1])
+        recovery_guidance_text = result.stderr.split("Same-settings recovery command: ", 1)[0]
+        self.assertIn("Any existing PATH launcher remains unchanged", recovery_guidance_text)
+        self.assertIn(shlex.quote(str(recovery_runtime / "pattern-buffer")), recovery_guidance_text)
+        self.assertNotEqual(recovery_runtime, runtime)
+        self.assertFalse(recovery_runtime.exists())
         self.assertFalse(started.exists())
         self.assertFalse(json.loads(self.cli("status", root=worker).stdout)["registered"])
 
