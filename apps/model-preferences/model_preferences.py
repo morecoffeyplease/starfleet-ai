@@ -31,6 +31,11 @@ _opencode_spec = importlib.util.spec_from_file_location("model_preferences_openc
 opencode_dispatch = importlib.util.module_from_spec(_opencode_spec)
 sys.modules[_opencode_spec.name] = opencode_dispatch
 _opencode_spec.loader.exec_module(opencode_dispatch)
+_reviewer_guidance_path = Path(__file__).resolve().with_name("reviewer_guidance.py")
+_reviewer_guidance_spec = importlib.util.spec_from_file_location(
+    "model_preferences_reviewer_guidance", _reviewer_guidance_path)
+reviewer_guidance = importlib.util.module_from_spec(_reviewer_guidance_spec)
+_reviewer_guidance_spec.loader.exec_module(reviewer_guidance)
 
 
 def now():
@@ -1057,6 +1062,9 @@ def parser():
     init.add_argument("--examples", action="store_true",
                       help="include the opt-in sample model families and profiles; no profile is activated")
     sub.add_parser("examples", help="print the opt-in sample model families and profiles as JSON")
+    print_guidance = sub.add_parser("review-guidance", help="print reviewer judgment guidance without reading configuration or state")
+    print_guidance.add_argument("--print", action="store_true", required=True,
+                                help="print the maintained guidance")
     sub.add_parser("list")
     status = sub.add_parser("status")
     status.add_argument("--review-target")
@@ -2186,6 +2194,8 @@ def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
 
 
 def execute(args):
+    if args.command == "review-guidance":
+        return {"guidance": reviewer_guidance.REVIEWER_GUIDANCE}
     app = App(args.config_dir, args.state_dir)
     command = args.command
     if command == "preflight":
@@ -2468,6 +2478,7 @@ def execute(args):
                             "--context-injector, --owner-worktree or --receipt-file, putting required context in --task-file "
                             "and retaining applicable review/permission flags. "
                             "Guide: apps/model-preferences/README.md#pattern-buffer-support")
+                prompt = reviewer_guidance.compose_reviewer_prompt(args.role, prompt)
                 prompt = DELEGATION + " Use the current researcher role for authorized research. Verify its findings.\n\n" + prompt
                 argv = argv_for(choice, prompt, cwd)
                 launch_id = uuid.uuid4().hex
@@ -2859,7 +2870,8 @@ def resume_launch(app, args):
                 require(updated.get("session_id") == session and updated.get("owner") == original_task["owner"]
                         and updated.get("brief_sha256") == attempt["task_digest"], "Pattern Buffer update could not be verified; inspect the attempt.")
                 attempt["context_injector_task"] = task_id
-            prompt = DELEGATION + " Use the current researcher role for authorized research.\n\n" + brief.decode()
+            prompt = reviewer_guidance.compose_reviewer_prompt(choice["role"], brief.decode())
+            prompt = DELEGATION + " Use the current researcher role for authorized research.\n\n" + prompt
             env = dict(os.environ, STARFLEET_MODEL_LAUNCH=launch_id)
             env.pop("STARFLEET_CONTEXT_DISPATCH", None)
             print(json.dumps({"launch": launch_id, "continuation": attempt["id"], "session": session, "choice": choice}), file=sys.stderr, flush=True)
@@ -3031,7 +3043,11 @@ def handoff(app, config, args):
 
 def main():
     try:
-        result = execute(parser().parse_args())
+        args = parser().parse_args()
+        if args.command == "review-guidance":
+            sys.stdout.write(reviewer_guidance.REVIEWER_GUIDANCE)
+            return 0
+        result = execute(args)
         print(json.dumps(result, indent=2))
         if result.get("exit_code"):
             return result["exit_code"] if result["exit_code"] > 0 else 1

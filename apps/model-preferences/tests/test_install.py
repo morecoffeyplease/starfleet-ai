@@ -88,6 +88,10 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(printed.returncode, 0, printed.stderr)
         self.assertIn("Reviewer judgment guidance", printed.stdout)
         self.assertIn("The parent owns repair acceptance", printed.stdout)
+        through_cli = subprocess.run([str(self.command), "review-guidance", "--print"],
+                                     capture_output=True, text=True, timeout=10, env=self.env)
+        self.assertEqual(through_cli.returncode, 0, through_cli.stderr)
+        self.assertEqual(through_cli.stdout, printed.stdout)
         for harness, path, event in (("claude", self.claude, "UserPromptSubmit"),
                                      ("codex", self.codex, "SessionStart")):
             command = json.loads(path.read_text())["hooks"][event][0]["hooks"][0]["command"]
@@ -99,6 +103,18 @@ class InstallTest(unittest.TestCase):
             context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
             self.assertIn("active profile Claude-Codex", context)
             self.assertIn("gpt-6-luna", context)
+
+    def test_installed_reviewer_guidance_command_needs_no_config_state_or_source_checkout(self):
+        self.install()
+        self.source.rename(self.root / "removed-source")
+        self.assertFalse(self.config.exists())
+        self.assertFalse(self.state.exists())
+        result = subprocess.run([str(self.command), "review-guidance", "--print"],
+                                capture_output=True, text=True, timeout=10, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Reviewer judgment guidance", result.stdout)
+        self.assertFalse(self.config.exists())
+        self.assertFalse(self.state.exists())
 
     def test_preserves_other_hooks_exact_backup_and_idempotency(self):
         self.active()

@@ -23,6 +23,8 @@ class ResumeTest(unittest.TestCase):
     repo = fixtures.PreferencesTest.repo
     plan = fixtures.PreferencesTest.plan
     facts = fixtures.PreferencesTest.facts
+    fake_native_provider = fixtures.PreferencesTest.fake_native_provider
+    run_cli = fixtures.PreferencesTest.run_cli
 
     def fixture(self, role="researcher"):
         self.activate("Codex-only")
@@ -179,3 +181,36 @@ class ResumeTest(unittest.TestCase):
         (repo / "app.py").write_text("changed scope\n")
         with self.assertRaisesRegex(mp.PreferenceError, "scope/profile changed"):
             self.resume("--review-plan", plan["id"], "--approval", approval["id"])
+
+    def test_real_cli_resume_composes_for_codex_reviewer_continuations(self):
+        repo = self.repo()
+        for role in ("standard_review", "advanced_review"):
+            with self.subTest(role=role):
+                launch, session = self.fixture(role)
+                launch_record = self.app.state(f"launches/{launch['id']}", None)
+                launch_record["cwd"] = str(repo)
+                self.app.save_state(f"launches/{launch['id']}", launch_record)
+                plan = self.plan(repo, repairing_previous_fix=role == "advanced_review")
+                args = ["resume", launch["id"], "--task-file", str(self.brief), "--review-plan", plan["id"]]
+                if role == "advanced_review":
+                    approval = self.call("approve-review", plan["id"], "--authorization", "Fixture authority approved this continuation.")
+                    args.extend(("--approval", approval["id"]))
+                task_bytes = (f"Updated {role} continuation.\r\n"
+                              "Preserve this complete brief: ✓.\r\n").encode("utf-8")
+                self.brief.write_bytes(task_bytes)
+                capture, env = self.fake_native_provider("codex")
+                env["MODEL_PREFERENCES_TEST_SESSION"] = session
+                result = self.run_cli(env, *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                received = json.loads(capture.read_text())
+                task_text = task_bytes.decode("utf-8")
+                expected = (mp.DELEGATION + " Use the current researcher role for authorized research.\n\n" +
+                            mp.reviewer_guidance.compose_reviewer_prompt(role, task_text))
+                self.assertEqual(received["prompt"], expected)
+                self.assertTrue(received["prompt"].endswith(task_text))
+                result_start = result.stdout.rfind('{\n  "launch"')
+                self.assertGreaterEqual(result_start, 0, result.stdout)
+                output = json.loads(result.stdout[result_start:])
+                attempt = self.app.state(f"attempts/{output['continuation']}", None)
+                self.assertEqual(attempt["choice"]["role"], role)
+                self.assertEqual(attempt["task_digest"], mp.hashlib.sha256(task_bytes).hexdigest())
