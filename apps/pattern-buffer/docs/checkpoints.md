@@ -5,13 +5,23 @@ It is separate from the approved mission and standing rules in the worktree defa
 For multiple orchestrators sharing a checkout and for replacement ownership, follow the [session enrollment guide](session-enrollments.md).
 The standing context injection supplies stable mission, role, rules and authoritative references; its changes follow the lane's approval requirements.
 The letter to yourself is the agent-maintained current implementation snapshot, updated within existing work authority.
-On recovery the injected message directs the agent to read and reconcile that letter; the letter cannot change standing policy or grant permission.
+When a checkpoint is enrolled, its recovery reminder directs the agent to read and reconcile that letter; the letter cannot change standing policy or grant permission.
 Update it after a meaningful decision, worker result, verification outcome, blocker or authority change changes what you should do next.
 Batch related changes into one update; do not rewrite it after every tool call or unchanged feedback message.
 Refresh it as a current snapshot and replace outdated state rather than appending.
 Remove completed work, superseded decisions and obsolete commands.
 Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
 Link useful history instead of repeating it.
+
+## Shared recovery reminder
+
+Every rendered context includes a short PStack reminder for every role, even when no checkpoint is enrolled.
+It asks agents to use the installed PStack runtime and Poteto Mode.
+After compaction, it asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
+The reminder does not install PStack, change role or authority, or rewrite custom context files.
+It is outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
+Oversized context fails rather than being truncated.
+The reminder is configured context, not proof of native loading or model receipt.
 
 ## Pilot and installation authority
 

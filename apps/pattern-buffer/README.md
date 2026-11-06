@@ -67,6 +67,12 @@ Session enrollment replaces the worktree context for that exact identity and fai
 Use the [session enrollment guide](docs/session-enrollments.md) for replacement handoffs, identity checks, trust limits and recovery.
 Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery notes, pressure reminders and Hailing Frequencies idle receipts.
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
+Every rendered context includes a short PStack reminder for every role, whether or not a checkpoint is enrolled.
+The reminder asks agents to use the installed PStack runtime and Poteto Mode.
+After compaction, it asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
+It does not install PStack, change roles or authority, or rewrite custom context files.
+The reminder is outside the 8192-byte standing-context budget and counts toward the existing 24 KiB combined injection limit.
+See the [printable guide](guide.md) for the recovery limits.
 The read-only `handoff-check` distinguishes approved context and optional checkpoint state from installed-hook compatibility, native binding evidence and actual model delivery.
 Unknown native or delivery evidence stays unknown and does not add a readiness gate.
 

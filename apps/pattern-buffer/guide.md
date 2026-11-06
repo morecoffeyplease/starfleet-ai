@@ -124,6 +124,16 @@ If an existing warning is disabled, its next action shows the supported `checkpo
 New Claude checkpoints default to 50 minutes, while existing checkpoints remain unchanged until their owner enables a warning.
 An armed timer is configuration evidence, not proof that its wake was received.
 
+## Shared recovery reminder
+
+Every rendered context includes the same short PStack reminder for every role, whether or not a checkpoint is enrolled.
+It asks agents to use the installed PStack runtime and Poteto Mode.
+After compaction, it asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
+The reminder does not install PStack, change roles or authority, or rewrite custom context files.
+It stays outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
+Oversized combined context fails instead of being truncated.
+Hook output remains configuration evidence, not proof that the harness loaded or delivered the reminder.
+
 ## Checkpoints for orchestrators
 
 If several agents share this worktree with different missions, first use `session-enroll --harness HARNESS --session SESSION_UUID --context-file /absolute/private/reviewed-standing.md`.

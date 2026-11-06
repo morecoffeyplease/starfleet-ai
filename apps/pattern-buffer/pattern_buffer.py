@@ -260,6 +260,10 @@ TEMPLATE = """# shared
 - If no tracker or assignment applies, record the user's explicit agreement.
 - Stay within the user's authorized scope.
 
+**PStack guidance**
+- Use the installed PStack runtime and Poteto Mode.
+- After compaction, read the sections relevant to current work in full and confirm completion in your own chat.
+
 **Agents**
 - Before launching any agent, read the saved active profile in Model Preferences and resolve its configured reviewers.
 - A pilot preference or old startup summary doesn't prove the active selection or reviewer count.
@@ -1917,6 +1921,8 @@ def render(cwd, harness, session, agent="", forced_role=None):
 
 
 def compose_task_context(text, task_id=None, task_data=None, brief=None):
+    text += ("\n\nUse the installed PStack runtime and Poteto Mode. "
+             "After compaction, read the sections relevant to current work in full and confirm completion in your own chat.")
     if task_id is not None:
         if task_data["status"] == "finished":
             text += f"\n\nTask {task_id} is finished. No task is restored; await a new assignment."

@@ -10,6 +10,10 @@
 - If no tracker or assignment applies, record the user's explicit agreement.
 - Stay within the user's authorized scope.
 
+**PStack guidance**
+- Use the installed PStack runtime and Poteto Mode.
+- After compaction, read the sections relevant to current work in full and confirm completion in your own chat.
+
 **Agents**
 - Before launching any agent, read the saved active profile in Model Preferences and resolve its configured reviewers.
 - A pilot preference or old startup summary doesn't prove the active selection or reviewer count.
