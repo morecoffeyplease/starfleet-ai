@@ -677,6 +677,43 @@ def lookup(root, gitdir, harness, session_id):
         return None
 
 
+def lookup_readonly(root, gitdir, harness, session_id):
+    """Inspect one binding without creating or acquiring a registry lock file."""
+    session_id = _normalize_session(session_id, strict=False)
+    if session_id is None:
+        return None
+    harness = _harness(harness)
+    root, gitdir = _root_gitdir(root, gitdir)
+    meta = _meta_path(gitdir)
+    if not _lexists(meta):
+        return None
+    _check_path(meta)
+    registry = _read_registry(meta)
+    if registry is None:
+        if _lexists(meta / "bindings"):
+            marker = _read_marker(meta, harness, session_id)
+            if marker is not None:
+                raise ValueError("required-binding marker references missing enrollment metadata")
+        return None
+    _validate_registry(registry, root, gitdir)
+    record, binding = _find_record(registry, harness, session_id)
+    if binding:
+        _check_marker(meta, root, record["enrollment_id"], binding)
+        return _public(root, gitdir, record["enrollment_id"], record, binding)
+    record, outgoing = _pending_record(registry, harness, session_id)
+    if record:
+        marker = _read_marker(meta, harness, session_id)
+        if (marker is None or marker.get("root") != str(root)
+                or marker.get("enrollment_id") != record["enrollment_id"]
+                or marker.get("state") != "pending" or marker.get("role") != outgoing["role"]
+                or marker.get("predecessor") != outgoing["identity"]):
+            raise ValueError("pending successor marker is missing or inconsistent")
+        return _pending_binding(root, gitdir, record["enrollment_id"], record, outgoing)
+    if _read_marker(meta, harness, session_id) is not None:
+        raise ValueError("required-binding marker references missing enrollment metadata")
+    return None
+
+
 def status(root, gitdir, harness, session_id):
     """Return status for one exact native identity."""
     return lookup(root, gitdir, harness, session_id)

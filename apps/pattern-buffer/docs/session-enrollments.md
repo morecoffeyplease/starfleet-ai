@@ -32,6 +32,8 @@ Session context files are private working files, excluded through the repository
 Do not commit them or remove another session's file.
 For reviewed updates, edit a private input file and repeat `session-enroll` with `--reviewed-update` and an evidence reference.
 The supported command validates the final rendered budgets before atomically publishing the update.
+The validation result reports header overhead, usable content bytes and remaining bytes for both roles using the future session file path.
+If either role exceeds the limit, the command reports those exact values and writes no enrollment.
 Direct changes to the registered file are treated as unreviewed until adopted through the supported command.
 
 ```sh
@@ -89,6 +91,29 @@ pattern-buffer --cwd /absolute/worktree enrollment-status --harness claude --ses
 Adoption does not copy the predecessor's private checkpoint metadata, timers, native approvals or permissions.
 Follow the printed checkpoint setup command and verify configuration and eventual model reception separately.
 Do not close the predecessor's tab or restart another agent merely because release or adoption succeeded.
+
+## Read-only handoff check
+
+```sh
+pattern-buffer --cwd /absolute/worktree handoff-check --harness codex --session SESSION_UUID
+```
+
+The result separates current standing-context validity, exact-session checkpoint ownership/state and installed hook/runtime compatibility.
+Each standing-context role includes the same exact rendered header and content budget used by validation and final rendering.
+A missing checkpoint is reported as optional and does not block handoff readiness.
+Native session binding and actual model reception are reported as unknown when this local command has no direct evidence.
+Use each finding's `next_action` field for the supported follow-up; a settings file or hook preview does not prove native loading or model receipt.
+For an exact Claude checkpoint owner the result also shows the existing idle-warning minutes and timer state, if available.
+When that warning is disabled, the result prints the supported `checkpoint-config` command as a next action without enabling it.
+New Claude checkpoints default to 50 minutes, and existing checkpoints remain unchanged until their owner enables a warning.
+An armed timer does not prove that its wake was received.
+When the selected hook belongs to another supported runtime, the refusal includes a complete command for an installed compatible CLI only when its bundle and interpreter can be verified locally.
+This command does not install, repair, enroll, restart or change native trust.
+When no compatible entrypoint is available and installation refuses a damaged or unowned file, preserve that runtime and use the reported same-settings recovery command to install into a new empty runtime.
+The recovery command updates the selected harness's owned hook setting while leaving worktree enrollment and checkpoint files in place.
+The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
+Review the harness's normal reload and trust controls after changing the hook command.
+The local handoff result still does not prove native hook delivery or model receipt.
 
 ## Reliability history
 

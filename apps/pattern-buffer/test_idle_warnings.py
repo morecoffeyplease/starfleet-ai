@@ -58,6 +58,10 @@ else:
         self.assertEqual(len(self.calls()), 1)
         self.assertIn("--after-idle", self.calls()[0])
         self.assertIn("50m", self.calls()[0])
+        message = self.calls()[0][self.calls()[0].index("--message") + 1]
+        self.assertEqual(message.count("Refresh this as a current snapshot."), 1)
+        self.assertIn("Keep the next action and active work, current decisions and relevant rejected approaches", message)
+        self.assertIn("Link useful history instead of repeating it.", message)
         self.prompt("Continue the authorized work")
         self.assertEqual(len(self.calls()), 2)
         self.prompt("Temporal Beacon timer 11111111-1111-4111-8111-111111111111 is due. Retrieve it.")
