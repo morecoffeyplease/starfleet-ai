@@ -1924,18 +1924,18 @@ def render(cwd, harness, session, agent="", forced_role=None):
 
 
 def compose_task_context(text, task_id=None, task_data=None, brief=None):
-    if task_id is not None:
-        if task_data["status"] == "finished":
-            text += f"\n\nTask {task_id} is finished. No task is restored; await a new assignment."
-        else:
-            text += (f"\n\n# Active task {task_id}\nTask brief SHA-256: {task_data['brief_sha256']}\n"
-                     "Repeat of the dispatched assignment, subject to later user direction; this does not reset progress.\n\n" + brief)
     text += ("\n\nAfter compaction or recovery, reread the installed `pstack-runtime` and `poteto-mode` entry points "
              "and relevant playbook and skill references, then use PStack `recall` as documented there. "
              "Do not rely on remembered or summarized instructions. Reconcile the active brief, latest user direction, "
              "role and optional checkpoint before continuing. If a reference is unavailable, "
              "report that limit and continue within current authority without guessing its contents or installing it. "
              "This reminder changes no role or authority.")
+    if task_id is not None:
+        if task_data["status"] == "finished":
+            text += f"\n\nTask {task_id} is finished. No task is restored; await a new assignment."
+        else:
+            text += (f"\n\n# Active task {task_id}\nTask brief SHA-256: {task_data['brief_sha256']}\n"
+                     "Repeat of the dispatched assignment, subject to later user direction; this does not reset progress.\n\n" + brief)
     if len(text.encode("utf-8")) > INJECTION_LIMIT:
         raise ValueError("combined reminder and task exceed the 24 KiB injection limit")
     return text

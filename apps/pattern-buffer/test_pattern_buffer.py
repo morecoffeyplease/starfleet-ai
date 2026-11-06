@@ -123,13 +123,22 @@ class PatternBufferTests(unittest.TestCase):
         for role in ci.ROLES:
             with self.subTest(role=role):
                 source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\ny\n")
-                baseline = len(ci.render(self.root, "codex", session, forced_role=role).encode("utf-8"))
+                content = ci.sections_text(source.read_text())
+                baseline, _budget = ci.render_standing_details(
+                    self.root.resolve(), source.resolve(), "codex", session, "", role,
+                    "preview override", content)
+                baseline = len(baseline.encode("utf-8"))
                 fill = 8192 - baseline + 1
                 source.write_text("# shared\n" + "x" * fill + "\n# implementer\ny\n# orchestrator\ny\n")
-                exact = ci.render(self.root, "codex", session, forced_role=role)
+                content = ci.sections_text(source.read_text())
+                exact, exact_budget = ci.render_standing_details(
+                    self.root.resolve(), source.resolve(), "codex", session, "", role,
+                    "preview override", content)
                 self.assertEqual(len(exact.encode("utf-8")), 8192)
-                self.cli("preview", "--harness", "codex", "--session", session,
-                         "--role", role)
+                self.assertEqual(exact_budget["bytes_used"], 8192)
+                preview = self.cli("preview", "--harness", "codex", "--session", session,
+                                   "--role", role)
+                self.assertTrue(preview.stdout.startswith(exact))
                 source.write_text("# shared\n" + "x" * (fill + 1) + "\n# implementer\ny\n# orchestrator\ny\n")
                 over = self.cli("preview", "--harness", "codex", "--session", session,
                                 "--role", role, success=False)
@@ -441,9 +450,20 @@ class PatternBufferTests(unittest.TestCase):
                     with self.subTest(role=role):
                         self.cli("init", "--default-role", role, root=long_root)
                         report = ci.current_context_budgets(long_root.resolve(), gitdir, harness, session)
+                        config, source = ci.load(long_root.resolve(), gitdir)
+                        selected_role, origin, _saved = ci.resolve_role(
+                            long_root.resolve(), gitdir, config, harness, session)
+                        standing, standing_budget = ci.render_standing_details(
+                            long_root.resolve(), source.resolve(), harness, session, "",
+                            selected_role, origin, ci.sections_text(source.read_text()))
                         rendered = ci.render(long_root, harness, session)
                         budget = report["roles"][role]
-                        self.assertEqual(len(rendered.encode("utf-8")), budget["bytes_used"])
+                        self.assertEqual(selected_role, role)
+                        self.assertEqual(len(standing.encode("utf-8")), budget["bytes_used"])
+                        self.assertEqual(standing_budget["bytes_used"], budget["bytes_used"])
+                        self.assertTrue(rendered.startswith(standing))
+                        self.assertGreater(len(rendered.encode("utf-8")), budget["bytes_used"])
+                        self.assertLessEqual(len(rendered.encode("utf-8")), ci.INJECTION_LIMIT)
                         self.assertEqual(budget["header_bytes"] + budget["content_bytes"], budget["bytes_used"])
                         self.assertEqual(budget["usable_content_bytes"], ci.LIMIT - budget["header_bytes"])
                         self.assertEqual(budget["remaining_bytes"], ci.LIMIT - budget["bytes_used"])
@@ -519,7 +539,11 @@ class PatternBufferTests(unittest.TestCase):
 
                 preview = self.cli("preview", "--harness", harness, "--session", session)
                 self.assertTrue(preview.stdout.endswith("\n"))
-                self.assertEqual(len(preview.stdout[:-1].encode("utf-8")), expected)
+                preview_text = preview.stdout[:-1]
+                self.assertEqual(len(preview_text.encode("utf-8")),
+                                 expected + len(ci.compose_task_context("").encode("utf-8")))
+                self.assertIn("After compaction or recovery", preview_text)
+                self.assertLessEqual(len(preview_text.encode("utf-8")), ci.INJECTION_LIMIT)
                 status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
                 budgets = status["standing_context_budgets"]
                 self.assertEqual(budgets["role"], "orchestrator")
@@ -1362,17 +1386,20 @@ print(json.dumps({{"task": task, "hook_returncode": result.returncode, "hook_std
         self.assertIn("combined reminder and task exceed the 24 KiB injection limit", rejected.stderr)
         self.assertFalse(started.exists())
 
-        task_file.write_text("y" * 15884)
+        recovery_bytes = len(ci.compose_task_context("").encode("utf-8"))
+        shorter_brief = "y" * (15884 - recovery_bytes)
+        self.assertGreater(len(shorter_brief), 0)
+        task_file.write_text(shorter_brief)
         accepted = self.cli("dispatch", "--harness", "codex", "--owner-worktree", str(self.root),
                             "--task-file", str(task_file), "--settings", str(settings), "--",
                             str(harness), "exec", "-C", str(worker), "-", root=worker)
         self.assertTrue(started.exists())
         result = json.loads(accepted.stdout)
-        self.assertEqual(result["task"], "y" * 15884)
+        self.assertEqual(result["task"], shorter_brief)
         self.assertEqual(result["hook_returncode"], 0)
         hook = json.loads(result["hook_stdout"])
         self.assertIn("additionalContext", hook["hookSpecificOutput"])
-        self.assertTrue(hook["hookSpecificOutput"]["additionalContext"].endswith("y" * 15884))
+        self.assertTrue(hook["hookSpecificOutput"]["additionalContext"].endswith(shorter_brief))
 
     def test_dispatch_exec_preserves_path_shim_arguments_and_exact_stdin(self):
         worker, task_file = self.implementer("The exact original task.\n")
