@@ -655,10 +655,21 @@ class PatternBufferTests(unittest.TestCase):
 
     def test_claude_protocol_and_bad_payload(self):
         self.cli("init")
+        source = self.root / ".context-injector/context.md"
+        source.write_text(
+            "# shared\nCLAUDE_SHARED_MARKER\n"
+            "# implementer\nCLAUDE_IMPLEMENTER_ONLY_MARKER\n"
+            "# orchestrator\nCLAUDE_ORCHESTRATOR_ONLY_MARKER\n"
+            "# confirmation\nCLAUDE_CONFIRMATION_MARKER\n"
+        )
         result = self.cli("hook", "--harness", "claude", payload={
             "hook_event_name": "SessionStart", "source": "compact", "session_id": "c",
             "cwd": str(self.root)})
-        self.assertIn("shared context", self.content(result))
+        delivered = self.content(result)
+        self.assertIn("CLAUDE_SHARED_MARKER", delivered)
+        self.assertNotIn("CLAUDE_IMPLEMENTER_ONLY_MARKER", delivered)
+        self.assertNotIn("CLAUDE_ORCHESTRATOR_ONLY_MARKER", delivered)
+        self.assertIn("CLAUDE_CONFIRMATION_MARKER", delivered)
         result = self.cli("hook", "--harness", "codex", payload={
             "hook_event_name": "SessionStart", "source": "compact", "cwd": str(self.root)})
         self.assertEqual(result.stdout, "")
