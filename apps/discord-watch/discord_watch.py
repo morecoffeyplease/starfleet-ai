@@ -1797,10 +1797,11 @@ class Watch:
                 due.setdefault(thread_id, {"recovery": False, "generation": generation, "state": None})
 
             ordered = [row[0] for row in db.execute(
-                "SELECT thread_id FROM threads ORDER BY registered_at,thread_id") if row[0] in due]
+                "SELECT thread_id FROM threads ORDER BY registered_at,thread_id")]
             if rotation_after in ordered:
                 split = ordered.index(rotation_after) + 1
                 ordered = ordered[split:] + ordered[:split]
+            ordered = [thread_id for thread_id in ordered if thread_id in due]
             selected = ordered[:WORKER_REST_THREADS_PER_TURN]
             with db:
                 self._ensure_gateway_recovery_coverage(db, now)

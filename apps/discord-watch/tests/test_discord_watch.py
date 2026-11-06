@@ -841,23 +841,38 @@ class DiscordWatchTests(unittest.TestCase):
         second_threads = [row[0] for row in observed]
         self.assertEqual(second_threads[:2], sorted(set(thread_ids) - set(first_threads)))
 
-    def test_rest_worker_keeps_rotation_when_last_thread_is_not_due(self):
+    def test_rest_worker_rotates_active_and_dormant_recovery_when_cursor_is_not_due(self):
         thread_ids = [str(value) for value in range(1000, 1032)]
         for thread_id in thread_ids:
             self.app.register(thread_id)
         self.app.begin_gateway_recovery("synthetic reconnect")
 
         anchor = thread_ids[15]
-        anchor_turn = self.app._rest_recovery_turn(only_thread=anchor)
-        self.assertEqual([row["thread"] for row in anchor_turn["threads"]], [anchor])
 
-        self.clock[0] += 1
-        first = self.app._rest_recovery_turn()
-        self.assertEqual([row["thread"] for row in first["threads"]], thread_ids[16:24])
+        def assert_rotation_continues():
+            anchor_turn = self.app._rest_recovery_turn(only_thread=anchor)
+            self.assertEqual([row["thread"] for row in anchor_turn["threads"]], [anchor])
+            self.assertEqual(anchor_turn["threads"][0]["status"], "polled")
 
-        self.clock[0] += 1
-        second = self.app._rest_recovery_turn()
-        self.assertEqual([row["thread"] for row in second["threads"]], thread_ids[24:32])
+            self.clock[0] += 1
+            first = self.app._rest_recovery_turn()
+            self.assertEqual([row["thread"] for row in first["threads"]], thread_ids[16:24])
+            self.assertTrue(all(row["status"] == "polled" for row in first["threads"]))
+
+            self.clock[0] += 1
+            second = self.app._rest_recovery_turn()
+            self.assertEqual([row["thread"] for row in second["threads"]], thread_ids[24:32])
+            self.assertTrue(all(row["status"] == "polled" for row in second["threads"]))
+
+        assert_rotation_continues()
+
+        self.clock[0] += dw.DORMANT_AFTER + 1
+        self.app.begin_gateway_recovery("synthetic reconnect while dormant")
+        assert_rotation_continues()
+
+        with contextlib.closing(self.app.database(create=False)) as db:
+            states = {row[0] for row in db.execute("SELECT DISTINCT subscription_state FROM threads")}
+        self.assertEqual(states, {"dormant"})
 
     def test_recovery_turn_only_thread_scopes_requests_without_claiming_global_coverage(self):
         self.register()
