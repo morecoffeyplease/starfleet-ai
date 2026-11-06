@@ -101,6 +101,56 @@ class OpenCodeTest(unittest.TestCase):
         self.assertEqual(forged.returncode, 2)
         self.assertIn('actual native OpenCode server tool context', forged.stderr)
 
+    def test_status_and_coverage_require_the_recorded_opencode_context(self):
+        session_id = 'ses_StatusOwner123'
+        event = self.event(session_id)
+        self.plan_and_install(event, self.f.repo, self.seat_root)
+
+        def inspect(current_event):
+            status = json.loads(self.bridge(current_event, [
+                '--cwd', self.f.repo, 'status', '--session-id', session_id]).stdout)
+            coverage = json.loads(self.bridge(current_event, [
+                '--cwd', self.f.repo, 'coverage', '--pr-url', self.f.url]).stdout)
+            return status, coverage
+
+        status, coverage = inspect(event)
+        self.assertEqual(status['current_owner']['state'], 'matches')
+        self.assertEqual(status['current_owner']['actual_context'], {
+            'session_parent_id': None,
+            'session_project_id': 'project_fixture',
+            'session_directory': str(self.f.repo),
+        })
+        self.assertEqual(status['setup_guidance']['action'], 'none')
+        self.assertTrue(coverage['native_session']['matches_installed_owner'])
+        self.assertEqual(coverage['setup_guidance']['action'], 'none')
+
+        for label, changed_session in (
+                ('project', dict(event['session'], projectID='project_elsewhere')),
+                ('location', dict(event['session'], location={'directory': str(self.f.base / 'elsewhere')}))):
+            with self.subTest(context=label):
+                changed_event = dict(event, session=changed_session)
+                status, coverage = inspect(changed_event)
+                self.assertEqual(status['current_owner']['state'], 'mismatch')
+                self.assertEqual(status['setup_guidance']['action'], 'handoff')
+                self.assertIsNone(status['setup_guidance']['command'])
+                self.assertIn('plain-shell command', status['setup_guidance']['reason'])
+                self.assertFalse(coverage['native_session']['matches_installed_owner'])
+                self.assertEqual(coverage['setup_guidance'], status['setup_guidance'])
+
+        owner = json.loads(self.checkout_state_path(self.f.repo).read_text())['lane_owner']
+        self.assertTrue(fixtures.lane_runtime.valid_recorded_owner(owner))
+        self.assertFalse(fixtures.lane_runtime.valid_recorded_owner(
+            dict(owner, session_id='SES_' + session_id[4:])))
+
+        plain_env = dict(self.f.env)
+        for key in ('CMUX_AGENT_LAUNCH_KIND', 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID',
+                    'OPENCODE_SESSION_ID'):
+            plain_env.pop(key, None)
+        selector = json.loads(self.f.call_source(self.source, 'status', '--session-id', session_id,
+                                                 env=plain_env).stdout)
+        self.assertIsNone(selector['current_native_identity']['actual'])
+        self.assertEqual(selector['activation']['session_id'], session_id)
+
     def test_parent_child_seats_are_distinct_and_explicit_handoff_preserves_history(self):
         parent_id = 'ses_NativeParent123'
         parent_event = self.event(parent_id)
