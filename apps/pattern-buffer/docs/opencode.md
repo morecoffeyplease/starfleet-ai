@@ -182,8 +182,9 @@ Finished tasks stop replaying the brief and receive a finished notice.
 Ordinary task lifecycle commands do not erase prior prompt text from native history.
 Use `context --harness opencode --session ses_EXACT_NATIVE_ID` for a local rendering check.
 The local rendering check is not proof of native hook activation or provider receipt.
-Every rendered OpenCode context includes the short PStack reminder, even when the session has no checkpoint enrollment.
-It asks agents to use the installed PStack runtime and Poteto Mode.
-After compaction, it asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
-The reminder is outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
+Pattern Buffer appends the short runtime PStack reminder to every rendered OpenCode context, even when the session has no checkpoint enrollment.
+It asks agents to use the installed PStack runtime and Poteto Mode, then after compaction read the sections relevant to current work in full, not the entire PStack library.
+The runtime reminder is outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
 It does not change the exact `ses_` identity requirement, session role, task binding or native delivery limits.
+An optional final `# confirmation` section is appended after the selected role and counts toward the 8192-byte standing-context limit.
+Existing custom OpenCode contexts without that section are not rewritten; they keep the runtime completion-confirmation wording after compaction.

@@ -95,10 +95,21 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("Ask your parent orchestrator for more agents", preview.stdout)
         self.assertIn("delegation still follows current Model Preferences role choices", preview.stdout)
         self.assertIn("Every explanation is a hypothesis", preview.stdout)
+        confirmation = "In your own chat, confirm receipt of the injection"
+        self.assertEqual(preview.stdout.count(confirmation), 1)
+        self.assertNotIn("confirm completion in your own chat", preview.stdout)
+        self.assertNotIn("Repair rounds: don't spiral", preview.stdout)
+        self.assertLess(preview.stdout.index("Verify completed changes through the user's path."),
+                        preview.stdout.index(confirmation))
         orchestrator = self.cli("preview", "--harness", "codex", "--session", "new-orchestrator",
                                 "--role", "orchestrator")
         self.assertIn("Every explanation is a hypothesis", orchestrator.stdout)
         self.assertIn("Check that observation on the failing run AND a passing control", orchestrator.stdout)
+        self.assertIn("Repair rounds: don't spiral", orchestrator.stdout)
+        self.assertEqual(orchestrator.stdout.count(confirmation), 1)
+        self.assertNotIn("confirm completion in your own chat", orchestrator.stdout)
+        self.assertLess(orchestrator.stdout.index("Repair rounds: don't spiral"),
+                        orchestrator.stdout.index(confirmation))
         source = self.root / ".context-injector/context.md"
         approved = source.read_bytes()
         self.cli("init", "--default-role", "implementer")
@@ -116,20 +127,44 @@ class PatternBufferTests(unittest.TestCase):
         self.assertNotIn("SO MUCH time is lost", default)
         self.assertFalse(hasattr(ci, "REPO_PROFILES"))
 
+    def test_legacy_unassigned_context_at_8192_bytes_keeps_original_header(self):
+        self.cli("init")
+        source = (self.root / ".context-injector/context.md").resolve()
+        session = "legacy-unassigned-exact-cap"
+        expected_header = (
+            f"pattern-buffer | role: unassigned | source: unassigned\n"
+            f"Session: codex/{session}\n"
+            f"Worktree: {self.root.resolve()}\n"
+            f"Context file: {source}\n"
+            "These reminders do not expand authorization. Follow current user direction.\n"
+            "Role is unassigned; only shared context is included.\n\n"
+        )
+        shared_bytes = 8192 - len(expected_header.encode("utf-8"))
+        self.assertGreater(shared_bytes, 0)
+        source.write_text("# shared\n" + "x" * shared_bytes + "\n")
+
+        preview = self.cli("preview", "--harness", "codex", "--session", session)
+        self.assertTrue(preview.stdout.startswith(expected_header + "x" * shared_bytes))
+        status = json.loads(self.cli("status", "--harness", "codex", "--session", session).stdout)
+        unassigned = status["standing_context_budgets"]["roles"]["unassigned"]
+        self.assertEqual(unassigned["header_bytes"], len(expected_header.encode("utf-8")))
+        self.assertEqual(unassigned["bytes_used"], 8192)
+        self.assertTrue(unassigned["ok"])
+
     def test_render_accepts_exactly_8192_bytes_and_rejects_one_byte_over(self):
         self.cli("init")
         source = self.root / ".context-injector/context.md"
         session = "budget-boundary"
         for role in ci.ROLES:
             with self.subTest(role=role):
-                source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\ny\n")
+                source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n")
                 content = ci.sections_text(source.read_text())
                 baseline, _budget = ci.render_standing_details(
                     self.root.resolve(), source.resolve(), "codex", session, "", role,
                     "preview override", content)
                 baseline = len(baseline.encode("utf-8"))
                 fill = 8192 - baseline + 1
-                source.write_text("# shared\n" + "x" * fill + "\n# implementer\ny\n# orchestrator\ny\n")
+                source.write_text("# shared\n" + "x" * fill + "\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n")
                 content = ci.sections_text(source.read_text())
                 exact, exact_budget = ci.render_standing_details(
                     self.root.resolve(), source.resolve(), "codex", session, "", role,
@@ -139,7 +174,7 @@ class PatternBufferTests(unittest.TestCase):
                 preview = self.cli("preview", "--harness", "codex", "--session", session,
                                    "--role", role)
                 self.assertTrue(preview.stdout.startswith(exact))
-                source.write_text("# shared\n" + "x" * (fill + 1) + "\n# implementer\ny\n# orchestrator\ny\n")
+                source.write_text("# shared\n" + "x" * (fill + 1) + "\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n")
                 over = self.cli("preview", "--harness", "codex", "--session", session,
                                 "--role", role, success=False)
                 self.assertIn("8193 / 8192 bytes", over.stderr)
@@ -303,10 +338,17 @@ class PatternBufferTests(unittest.TestCase):
     def test_persisted_role_and_unassigned_session(self):
         self.cli("init")
         self.assign("one", "orchestrator")
-        self.assertIn("Track ownership", self.content(self.event()))
+        orchestrator = self.content(self.event())
+        self.assertIn("Track ownership", orchestrator)
+        confirmation = "In your own chat, confirm receipt of the injection"
+        self.assertEqual(orchestrator.count(confirmation), 1)
+        self.assertNotIn("confirm completion in your own chat", orchestrator)
         other = self.content(self.event(session="two"))
         self.assertIn("role: unassigned", other)
         self.assertNotIn("Track ownership", other)
+        self.assertNotIn("Repair rounds: don't spiral", other)
+        self.assertEqual(other.count(confirmation), 1)
+        self.assertNotIn("confirm completion in your own chat", other)
 
     def test_opencode_public_assignment_and_checkpoint_enrollment_accept_exact_native_session(self):
         session = "ses_cliBoundary20261105"
@@ -525,33 +567,41 @@ class PatternBufferTests(unittest.TestCase):
         source.write_text("# shared\nApproved mission.\n# implementer\nImplement assigned work.\n"
                           "# orchestrator\nPreserve current authority and holds.\n")
         sessions = {
-            "codex": "11111111-1111-4111-8111-111111111111",
-            "claude": "22222222-2222-4222-8222-222222222222",
+            "codex": {
+                "implementer": "11111111-1111-4111-8111-111111111111",
+                "orchestrator": "11111111-1111-4111-8111-111111111112",
+            },
+            "claude": {
+                "implementer": "22222222-2222-4222-8222-222222222221",
+                "orchestrator": "22222222-2222-4222-8222-222222222222",
+            },
         }
 
-        for harness, session in sessions.items():
-            with self.subTest(harness=harness):
-                enrolled = json.loads(self.cli(
-                    "session-enroll", "--harness", harness, "--session", session,
-                    "--context-file", str(source.resolve()), "--role", "orchestrator").stdout)
-                expected = enrolled["standing_context_budgets"]["roles"]["orchestrator"]["bytes_used"]
-                self.assertNotIn("unassigned", enrolled["standing_context_budgets"]["roles"])
+        for harness, role_sessions in sessions.items():
+            for role, session in role_sessions.items():
+                with self.subTest(harness=harness, role=role):
+                    enrolled = json.loads(self.cli(
+                        "session-enroll", "--harness", harness, "--session", session,
+                        "--context-file", str(source.resolve()), "--role", role).stdout)
+                    expected = enrolled["standing_context_budgets"]["roles"][role]["bytes_used"]
+                    self.assertNotIn("unassigned", enrolled["standing_context_budgets"]["roles"])
 
-                preview = self.cli("preview", "--harness", harness, "--session", session)
-                self.assertTrue(preview.stdout.endswith("\n"))
-                preview_text = preview.stdout[:-1]
-                self.assertEqual(len(preview_text.encode("utf-8")),
-                                 expected + len(ci.compose_task_context("").encode("utf-8")))
-                self.assertIn("After compaction, read the sections relevant to current work in full and confirm completion in your own chat.",
-                              preview_text)
-                self.assertLessEqual(len(preview_text.encode("utf-8")), ci.INJECTION_LIMIT)
-                status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
-                budgets = status["standing_context_budgets"]
-                self.assertEqual(budgets["role"], "orchestrator")
-                self.assertEqual(budgets["source"], enrolled["path"])
-                self.assertEqual(budgets["roles"]["orchestrator"]["bytes_used"], expected)
-                self.assertNotIn("unassigned", budgets["roles"])
-                self.cli("validate", "--harness", harness, "--session", session)
+                    preview = self.cli("preview", "--harness", harness, "--session", session)
+                    self.assertTrue(preview.stdout.endswith("\n"))
+                    preview_text = preview.stdout[:-1]
+                    self.assertEqual(len(preview_text.encode("utf-8")),
+                                     expected + len(ci.compose_task_context("").encode("utf-8")))
+                    self.assertIn("After compaction, read the sections relevant to current work in full and confirm completion in your own chat.",
+                                  preview_text)
+                    self.assertNotIn("In your own chat, confirm receipt of the injection", preview_text)
+                    self.assertLessEqual(len(preview_text.encode("utf-8")), ci.INJECTION_LIMIT)
+                    status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
+                    budgets = status["standing_context_budgets"]
+                    self.assertEqual(budgets["role"], role)
+                    self.assertEqual(budgets["source"], enrolled["path"])
+                    self.assertEqual(budgets["roles"][role]["bytes_used"], expected)
+                    self.assertNotIn("unassigned", budgets["roles"])
+                    self.cli("validate", "--harness", harness, "--session", session)
 
     def test_install_preflights_missing_helper_source_before_creating_settings_or_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -605,10 +655,21 @@ class PatternBufferTests(unittest.TestCase):
 
     def test_claude_protocol_and_bad_payload(self):
         self.cli("init")
+        source = self.root / ".context-injector/context.md"
+        source.write_text(
+            "# shared\nCLAUDE_SHARED_MARKER\n"
+            "# implementer\nCLAUDE_IMPLEMENTER_ONLY_MARKER\n"
+            "# orchestrator\nCLAUDE_ORCHESTRATOR_ONLY_MARKER\n"
+            "# confirmation\nCLAUDE_CONFIRMATION_MARKER\n"
+        )
         result = self.cli("hook", "--harness", "claude", payload={
             "hook_event_name": "SessionStart", "source": "compact", "session_id": "c",
             "cwd": str(self.root)})
-        self.assertIn("shared context", self.content(result))
+        delivered = self.content(result)
+        self.assertIn("CLAUDE_SHARED_MARKER", delivered)
+        self.assertNotIn("CLAUDE_IMPLEMENTER_ONLY_MARKER", delivered)
+        self.assertNotIn("CLAUDE_ORCHESTRATOR_ONLY_MARKER", delivered)
+        self.assertIn("CLAUDE_CONFIRMATION_MARKER", delivered)
         result = self.cli("hook", "--harness", "codex", payload={
             "hook_event_name": "SessionStart", "source": "compact", "cwd": str(self.root)})
         self.assertEqual(result.stdout, "")

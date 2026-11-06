@@ -67,12 +67,19 @@ Session enrollment replaces the worktree context for that exact identity and fai
 Use the [session enrollment guide](docs/session-enrollments.md) for replacement handoffs, identity checks, trust limits and recovery.
 Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery notes, pressure reminders and Hailing Frequencies idle receipts.
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
-Every rendered context includes a short PStack reminder for every role, whether or not a checkpoint is enrolled.
-The reminder asks agents to use the installed PStack runtime and Poteto Mode.
-After compaction, it asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
+Pattern Buffer appends a short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
+The runtime reminder asks agents to use the installed PStack runtime and Poteto Mode.
+After compaction, the composed guidance asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
 It does not install PStack, change roles or authority, or rewrite custom context files.
-The reminder is outside the 8192-byte standing-context budget and counts toward the existing 24 KiB combined injection limit.
+The runtime reminder is outside the 8192-byte standing-context budget and counts toward the existing 24 KiB combined injection limit.
 See the [printable guide](guide.md) for the recovery limits.
+The default context template also includes a final `# confirmation` section that Pattern Buffer appends after the selected role for every role.
+That section counts toward the 8192-byte standing-context limit.
+It asks agents to confirm injection receipt, completion of relevant PStack and Poteto reading, and mission or tracker updates in their own chat.
+Existing custom context files are not rewritten; they keep the runtime completion-confirmation wording until an owner-reviewed update adds the optional section.
+Owners must adjust their own context if it exceeds either existing limit; Pattern Buffer provides no length exception.
+The default context template includes shared review judgment and orchestrator repair-round guidance.
+Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](../starfleet-policy-guard/guide.md#review-and-fix-cycles) in full and revisit the relevant rule before each repair decision.
 The read-only `handoff-check` distinguishes approved context and optional checkpoint state from installed-hook compatibility, native binding evidence and actual model delivery.
 Unknown native or delivery evidence stays unknown and does not add a readiness gate.
 
