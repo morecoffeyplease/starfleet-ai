@@ -20,7 +20,7 @@ class InstallTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.source = self.root / "source checkout"
         self.source.mkdir()
-        for name in ("install.py", "model_preferences.py", "opencode_dispatch.py"):
+        for name in ("install.py", "model_preferences.py", "opencode_dispatch.py", "reviewer_guidance.py"):
             shutil.copyfile(APP / name, self.source / name)
         shutil.copyfile(APP / "cmux_transport.py", self.source / "cmux_transport.py")
         shutil.copyfile(APP.parent / "opencode-adapter" / "opencode_adapter.py", self.source / "opencode_adapter.py")
@@ -83,6 +83,11 @@ class InstallTest(unittest.TestCase):
         self.install("--harness", "claude", "--harness", "codex")
         self.source.rename(self.root / "removed-source")
         self.assertEqual(self.run_command("status")["active"]["profile"], "Claude-Codex")
+        printed = subprocess.run([sys.executable, str(self.runtime / "reviewer_guidance.py"), "--print"],
+                                 capture_output=True, text=True, timeout=10, env=self.env)
+        self.assertEqual(printed.returncode, 0, printed.stderr)
+        self.assertIn("Reviewer judgment guidance", printed.stdout)
+        self.assertIn("The parent owns repair acceptance", printed.stdout)
         for harness, path, event in (("claude", self.claude, "UserPromptSubmit"),
                                      ("codex", self.codex, "SessionStart")):
             command = json.loads(path.read_text())["hooks"][event][0]["hooks"][0]["command"]
@@ -110,6 +115,7 @@ class InstallTest(unittest.TestCase):
         backup = Path(next(x["backup"] for x in first["changed_settings"] if x["harness"] == "claude"))
         self.assertEqual(backup.read_bytes(), original)
         paths = (self.claude, self.codex, self.command, self.runtime / "model_preferences.py",
+                 self.runtime / "reviewer_guidance.py",
                  self.runtime / "opencode_dispatch.py", self.runtime / "opencode_adapter.py")
         before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
         second = self.install("--harness", "claude", "--harness", "codex")
@@ -131,6 +137,16 @@ class InstallTest(unittest.TestCase):
         error = self.install(ok=False)
         self.assertIn("transport runtime is unowned or modified", error)
         self.assertEqual(helper.read_text(), "modified helper")
+        self.assertEqual((self.runtime / "model_preferences.py").read_bytes(), before)
+
+    def test_modified_reviewer_guidance_runtime_is_not_overwritten(self):
+        self.active()
+        helper = self.runtime / "reviewer_guidance.py"
+        helper.write_text("locally modified reviewer guidance")
+        before = (self.runtime / "model_preferences.py").read_bytes()
+        error = self.install(ok=False)
+        self.assertIn("reviewer guidance runtime is unowned or modified", error)
+        self.assertEqual(helper.read_text(), "locally modified reviewer guidance")
         self.assertEqual((self.runtime / "model_preferences.py").read_bytes(), before)
 
     def test_malformed_settings_leave_existing_runtime_and_settings_untouched(self):
