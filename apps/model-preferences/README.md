@@ -31,6 +31,7 @@ Use model-set to add a family or update its exact harness, provider slug, suppor
 Create a profile JSON whose role choices reference configured model family keys and supported effort values.
 Each profile must define orchestrator, implementer, researcher, standard_review and advanced_review.
 Review groups contain one reviewer or two independently configured reviewers.
+The `claude-codex-light` profile also defines `standard_review_policy` with the fixed values `{"initial_slots": [1, 2], "later_slots": [1]}`.
 Use profile-put to save the reviewed profile.
 
     model-preferences profile-put team-default --file /absolute/path/to/profile.json
@@ -71,6 +72,67 @@ Dispatch records the exact profile, role, model slug, effort and selection diges
 Existing sessions retain their launch records even if a later profile changes.
 Review plans bind to the current selection and repository scope, and any relevant change requires a new plan.
 Advanced review needs an authorization record matching both the current review scope and selection.
+
+### Track light-profile reviews by target and cycle
+
+The opt-in `claude-codex-light` profile keeps the Claude-Codex launch choices and advanced-review pair.
+Its first standard-review cycle requires Codex Sol high in slot 1 and Claude Opus high in slot 2.
+Later cycles use Codex Sol high in slot 1 only after every required slot in the linked predecessor chain exits successfully.
+The cycle policy never changes the active profile or advances from a changed scope.
+
+For an existing installation, copy your saved `Claude-Codex` role choices before you add the light profile.
+Keep the orchestrator, implementer, researcher and advanced-review entries from `model-preferences show Claude-Codex`.
+Keep your configured family keys for Codex Sol high and Claude Opus high in the standard-review pair.
+Add the policy field shown above, then save the file with `profile-put`.
+Do not replace your saved model family keys with the example keys.
+
+    model-preferences show Claude-Codex > /absolute/path/to/claude-codex-light.json
+    model-preferences profile-put claude-codex-light --file /absolute/path/to/claude-codex-light.json
+    model-preferences activate claude-codex-light --orchestrators future-only
+
+Create one review target for the pull request and carry its UUID across worktrees and handoffs.
+Use an HTTPS PR locator when you want to bind the target to a remote pull request.
+The target accepts one PR locator, and the locator cannot be changed after binding.
+
+    REVIEW_TARGET_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    model-preferences review-target create --cwd /absolute/path/to/worktree --id "$REVIEW_TARGET_ID" \
+      --pr-locator https://github.com/owner/repository/pull/27
+
+Start the first standard-review cycle with a stable cycle key.
+The plan output includes the saved plan ID and cycle ID.
+
+    model-preferences review-plan --cwd /absolute/path/to/worktree --base main \
+      --facts /absolute/path/to/review-facts.json --target "$REVIEW_TARGET_ID" \
+      --cycle-key first-review
+
+Resolve the contextual slot with the same target, cycle and plan IDs that you pass to dispatch.
+Plain `resolve` and `status` output describe configured reviewer candidates without choosing a cycle slot.
+Pass `--review-target` and `--review-cycle` to `status` to inspect a saved cycle.
+
+    model-preferences resolve --role standard_review --slot 1 --review-target "$REVIEW_TARGET_ID" \
+      --review-cycle CYCLE_ID --review-plan PLAN_ID
+    model-preferences dispatch --role standard_review --slot 1 --cwd /absolute/path/to/worktree \
+      --task-file /absolute/path/to/review-task.md --review-target "$REVIEW_TARGET_ID" \
+      --review-cycle CYCLE_ID --review-plan PLAN_ID
+
+Dispatch slot 2 with the same plan to complete the first cycle.
+Create a later cycle with a new key and the exact predecessor cycle ID only after both first-cycle slots succeed.
+
+    model-preferences review-plan --cwd /absolute/path/to/worktree --base main \
+      --facts /absolute/path/to/review-facts.json --target "$REVIEW_TARGET_ID" \
+      --cycle-key second-review --previous-cycle CYCLE_ID
+
+Repeat `review-plan` with the same target and cycle key to refresh an unfinished cycle after a scope change.
+The refresh keeps that cycle's frozen slot set and requires each slot to complete the new plan.
+The command holds while a linked launch is active or uncertain.
+Use a new cycle key and predecessor after a completed cycle for an intentional repeat review.
+
+Repeat a dispatch to inspect or reuse the saved slot launch.
+Pass `--retry-failed` only after the exact slot's recorded launch exits with a nonzero code.
+The tool does not retry a launch whose state is missing, active, failed without an observed exit code, or uncertain.
+
+Standard-review cycles do not change advanced-review approval rules.
+Other profiles keep their configured standard-review behavior and do not require target or cycle IDs.
 
 Pattern Buffer can provide exact task replay to temporary worktrees.
 Use the --pattern-buffer script option and owner worktree only when the child should share that owner's approved context.

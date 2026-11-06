@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 
 
@@ -83,6 +84,9 @@ def locked(directory):
 
 
 ROLES = ("orchestrator", "implementer", "researcher", "standard_review", "advanced_review")
+LIGHT_PROFILE = "claude-codex-light"
+LIGHT_REVIEW_POLICY = {"initial_slots": [1, 2], "later_slots": [1]}
+REVIEW_TARGET_SCHEMA = 1
 QWEN_OBSERVER_GUIDE_URL = (
     "https://github.com/morecoffeyplease/starfleet-ai/blob/main/docs/qwen-operating-guide.md"
     "#inference-and-test-observer-preflight"
@@ -139,9 +143,13 @@ def example_config():
     qwen_max = choice("local-qwen3.6-35b", "max")
     sol_medium = choice("codex-sol", "medium")
     sol_high = choice("codex-sol", "high")
+    light = profile("claude-opus", "codex-luna", ["codex-sol", "claude-opus"],
+                    ["claude-fable", "codex-astra"])
+    light["standard_review_policy"] = copy.deepcopy(LIGHT_REVIEW_POLICY)
     return {"schema_version": 1, "active": None, "activation": None, "models": models, "profiles": {
         "Claude-Codex": profile("claude-opus", "codex-luna", ["codex-sol", "claude-opus"],
                                 ["claude-fable", "codex-astra"]),
+        LIGHT_PROFILE: light,
         "Codex-only": profile("codex-sol", "codex-luna", ["codex-sol"], ["codex-astra"]),
         "Claude-only": profile("claude-opus", "claude-haiku", ["claude-opus"], ["claude-fable"]),
         "Claude-Muse": profile("claude-opus", "muse-spark", ["claude-opus"] * 2, ["claude-fable"] * 2),
@@ -195,9 +203,32 @@ def validate(config):
         else:
             require("provider_id" not in model, f"Only OpenCode models may define provider_id ({key}).")
     for name, profile in profiles.items():
-        require(isinstance(name, str) and name and isinstance(profile, dict) and set(profile) == set(ROLES),
-                f"Profile {name} must define exactly {', '.join(ROLES)}.")
-        for role, entries in profile.items():
+        expected_keys = set(ROLES) | ({"standard_review_policy"} if isinstance(profile, dict)
+                                     and "standard_review_policy" in profile else set())
+        require(isinstance(name, str) and name and isinstance(profile, dict) and set(profile) == expected_keys
+                and set(ROLES).issubset(profile),
+                f"Profile {name} must define exactly {', '.join(ROLES)} and supported policy metadata.")
+        if "standard_review_policy" in profile:
+            policy = profile["standard_review_policy"]
+            require(name == LIGHT_PROFILE and type(policy) is dict and set(policy) == {"initial_slots", "later_slots"}
+                    and type(policy.get("initial_slots")) is list and type(policy.get("later_slots")) is list
+                    and all(type(slot) is int for slot in policy["initial_slots"] + policy["later_slots"])
+                    and policy == LIGHT_REVIEW_POLICY,
+                    f"{name}/standard_review_policy must select slots 1 and 2 first, then slot 1.")
+            reviewers = profile["standard_review"]
+            require(isinstance(reviewers, list) and len(reviewers) == 2
+                    and all(isinstance(entry, dict) for entry in reviewers),
+                    f"{name}/standard_review_policy requires two configured reviewers.")
+            first, second = [models.get(entry.get("model"), {}) for entry in reviewers]
+            require(first.get("harness") == "codex" and first.get("slug") == "gpt-6.1-sol"
+                    and reviewers[0].get("effort") == "high"
+                    and second.get("harness") == "claude" and second.get("slug") == "claude-opus-5-5"
+                    and reviewers[1].get("effort") == "high",
+                    f"{name}/standard_review_policy requires Codex Sol high followed by Claude Opus high.")
+        require((name == LIGHT_PROFILE) == ("standard_review_policy" in profile),
+                f"{LIGHT_PROFILE} must define its standard-review cycle policy.")
+        for role in ROLES:
+            entries = profile[role]
             group = role.endswith("_review")
             require(isinstance(entries, list) if group else isinstance(entries, dict), f"Invalid {name}/{role}.")
             if group:
@@ -239,8 +270,10 @@ def validate(config):
 def selection(config):
     name = config["active"]
     require(name is not None, "No active profile. Activate one first.")
+    profile = config["profiles"][name]
     roles = {}
-    for role, entries in config["profiles"][name].items():
+    for role in ROLES:
+        entries = profile[role]
         group = role.endswith("_review")
         resolved = []
         for entry in entries if group else [entries]:
@@ -252,6 +285,8 @@ def selection(config):
         roles[role] = resolved if group else resolved[0]
     result = {"profile": name, "roles": roles, "review_rules": config["review_rules"],
               "approval_authority": config["approval_authority"]}
+    if "standard_review_policy" in profile:
+        result["standard_review_policy"] = profile["standard_review_policy"]
     return {**result, "selection": digest({**result, "activation": config.get("activation")})}
 
 
@@ -486,6 +521,483 @@ def review_summary(plan):
     return result
 
 
+def review_target_id(value):
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PreferenceError("Review target IDs must be UUIDs.") from exc
+
+
+def review_cycle_key(value):
+    require(isinstance(value, str) and value == value.strip() and 1 <= len(value) <= 128
+            and all(char.isprintable() for char in value),
+            "Review cycle keys must be 1 to 128 printable characters without surrounding whitespace.")
+    return value
+
+
+def review_pr_locator(value):
+    try:
+        parsed = urllib.parse.urlsplit(value) if isinstance(value, str) else None
+    except ValueError as exc:
+        raise PreferenceError("PR locators must be portable HTTPS URLs without credentials, query strings, or fragments.") from exc
+    require(parsed and parsed.scheme == "https" and parsed.hostname and parsed.path not in ("", "/")
+            and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
+            and not any(char.isspace() for char in value),
+            "PR locators must be portable HTTPS URLs without credentials, query strings, or fragments.")
+    return value
+
+
+def repository_identity(cwd):
+    root = Path(git(cwd, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+    remotes = git(root, "remote").decode().splitlines()
+    if "origin" in remotes:
+        origin = git(root, "remote", "get-url", "origin").decode().strip()
+        require(origin, "The repository origin URL is empty.")
+        value = None
+        try:
+            parsed = urllib.parse.urlsplit(origin) if "://" in origin else None
+            if parsed and parsed.hostname:
+                host = parsed.hostname.casefold()
+                if parsed.port:
+                    host += f":{parsed.port}"
+                path = parsed.path.strip("/")
+                if path.endswith(".git"):
+                    path = path[:-4]
+                if path:
+                    value = f"{host}/{path}"
+        except ValueError:
+            value = None
+        if value is None and "@" in origin and ":" in origin:
+            host_path = origin.rsplit("@", 1)[1]
+            if ":" in host_path:
+                host, path = host_path.split(":", 1)
+                path = path.strip("/")
+                if path.endswith(".git"):
+                    path = path[:-4]
+                if host and path:
+                    value = f"{host.casefold()}/{path}"
+        if value:
+            return {"kind": "origin", "value": value}
+    common = Path(git(root, "rev-parse", "--git-common-dir").decode().strip())
+    if not common.is_absolute():
+        common = root / common
+    return {"kind": "git-common-dir", "value": str(common.resolve())}
+
+
+def target_file(app, target_id):
+    return app.state_dir / "review-targets" / f"{target_id}.json"
+
+
+def save_target(app, target):
+    validate_target(app, target, target["id"])
+    app.save_state(f"review-targets/{target['id']}", target)
+
+
+def load_target(app, target_id):
+    target_id = review_target_id(target_id)
+    target = app.state(f"review-targets/{target_id}", None)
+    require(target, "Unknown review target.")
+    validate_target(app, target, target_id)
+    return target
+
+
+def cycle_plan_refs(cycle):
+    return [*cycle["prior_plans"], cycle["current_plan"]]
+
+
+def launch_for_link(app, target, cycle, slot, link):
+    launch = app.state(f"launches/{link['launch_id']}", None)
+    membership = launch.get("review_cycle") if isinstance(launch, dict) else None
+    require(isinstance(launch, dict) and launch.get("id") == link["launch_id"] and
+            membership == {"target_id": target["id"], "cycle_id": cycle["id"],
+                           "plan_id": link["plan_id"], "slot": slot["number"]} and
+            launch.get("choice") == slot["choice"] and launch.get("slot") == slot["number"] and
+            isinstance(launch.get("task_digest"), str) and len(launch["task_digest"]) == 64,
+            "Review cycle launch membership is missing or conflicting; inspect the target before continuing.")
+    return launch
+
+
+def cycle_completion(app, target, cycle):
+    plan_ids = {plan["id"] for plan in cycle_plan_refs(cycle)}
+    require(cycle["current_plan"]["id"] in plan_ids, "Review cycle current plan is missing from its history.")
+    result = []
+    for slot in cycle["slots"]:
+        grouped = {plan_id: [] for plan_id in plan_ids}
+        for link in slot["launches"]:
+            grouped[link["plan_id"]].append(launch_for_link(app, target, cycle, slot, link))
+        for plan_id, attempts in grouped.items():
+            if plan_id != cycle["current_plan"]["id"]:
+                for launch in attempts:
+                    require(launch.get("status") == "exited" and type(launch.get("exit_code")) is int,
+                            "A previous-plan reviewer launch is unresolved; review plan refresh is held.")
+        current = grouped[cycle["current_plan"]["id"]]
+        if not current:
+            return None
+        for launch in current[:-1]:
+            require(launch.get("status") == "exited" and type(launch.get("exit_code")) is int
+                    and launch["exit_code"] != 0,
+                    "Review cycle has duplicate or unresolved launch attempts for one slot.")
+        latest = current[-1]
+        require(latest.get("status") == "exited" and type(latest.get("exit_code")) is int,
+                "A reviewer launch is active or uncertain; the review cycle cannot advance.")
+        if latest["exit_code"] != 0:
+            return None
+        result.append({"number": slot["number"], "launch_id": latest["id"]})
+    return result
+
+
+def predecessor_snapshot(app, target, cycle):
+    completed = cycle_completion(app, target, cycle)
+    require(completed is not None, "The predecessor review cycle is incomplete; all required slots must exit successfully.")
+    return {"cycle_id": cycle["id"], "plan_id": cycle["current_plan"]["id"],
+            "selection": cycle["selection"], "slots": completed}
+
+
+def cycle_slot_status(app, target, cycle, slot):
+    all_launches = [launch_for_link(app, target, cycle, slot, link) for link in slot["launches"]]
+    if any(launch.get("status") != "exited" or type(launch.get("exit_code")) is not int
+           for launch in all_launches):
+        return "unresolved", all_launches[-1]["id"] if all_launches else None
+    current = [launch for link, launch in zip(slot["launches"], all_launches)
+               if link["plan_id"] == cycle["current_plan"]["id"]]
+    if not current:
+        return "not_started", None
+    if any(launch["exit_code"] == 0 for launch in current[:-1]):
+        return "conflict", current[-1]["id"]
+    latest = current[-1]
+    return ("complete" if latest["exit_code"] == 0 else "failed"), latest["id"]
+
+
+def cycle_summary(app, target, cycle):
+    slots = []
+    for slot in cycle["slots"]:
+        status, launch_id = cycle_slot_status(app, target, cycle, slot)
+        slots.append({"number": slot["number"], "choice": slot["choice"],
+                      "status": status, "launch": launch_id})
+    return {"id": cycle["id"], "key": cycle["key"],
+            "previous_cycle_id": cycle["previous_cycle_id"],
+            "plan_id": cycle["current_plan"]["id"], "scope": cycle["current_plan"]["scope"],
+            "slots": slots, "complete": all(slot["status"] == "complete" for slot in slots)}
+
+
+def bind_target_pr(app, target, locator):
+    locator = review_pr_locator(locator)
+    for path in sorted((app.state_dir / "review-targets").glob("*.json")):
+        other = read(path)
+        require(isinstance(other, dict), "A review target record is malformed; PR binding is held.")
+        if other.get("id") != target["id"] and other.get("pr_locator") == locator:
+            raise PreferenceError("This PR locator is already bound to another review target.")
+    require(target["pr_locator"] in (None, locator),
+            "Review target PR locator is already bound and cannot be changed.")
+    target["pr_locator"] = locator
+    save_target(app, target)
+    return target
+
+
+def create_review_target(app, args):
+    target_id = review_target_id(args.id)
+    repository = repository_identity(args.cwd)
+    path = target_file(app, target_id)
+    if path.exists():
+        target = load_target(app, target_id)
+        require(target["repository"] == repository,
+                "Review target belongs to a different repository.")
+        if args.pr_locator:
+            bind_target_pr(app, target, args.pr_locator)
+        return {**target, "created": False}
+    target = {"schema_version": REVIEW_TARGET_SCHEMA, "id": target_id, "repository": repository,
+              "pr_locator": None, "cycles": []}
+    save_target(app, target)
+    if args.pr_locator:
+        target = bind_target_pr(app, target, args.pr_locator)
+    return {**target, "created": True}
+
+
+def review_target_command(app, args):
+    if args.review_target_action == "create":
+        return create_review_target(app, args)
+    target = load_target(app, args.target)
+    if args.review_target_action == "bind-pr":
+        return bind_target_pr(app, target, args.pr_locator)
+    return {**target, "cycles": [cycle_summary(app, target, cycle) for cycle in target["cycles"]]}
+
+
+def cycle_for_target(target, cycle_id):
+    cycle_id = safe_id(cycle_id)
+    cycle = next((item for item in target["cycles"] if item["id"] == cycle_id), None)
+    require(cycle, "Review cycle does not belong to this target.")
+    return cycle
+
+
+def saved_review_plan(app, plan_id):
+    plan = app.state(f"reviews/{safe_id(plan_id)}", None)
+    require(isinstance(plan, dict), "Unknown or malformed review plan.")
+    return plan
+
+
+def cycle_review_context(app, config, args, cwd=None):
+    target_id = review_target_id(getattr(args, "review_target", None))
+    cycle_id = safe_id(getattr(args, "review_cycle", None))
+    plan_id = safe_id(getattr(args, "review_plan", None))
+    target = load_target(app, target_id)
+    cycle = cycle_for_target(target, cycle_id)
+    plan = saved_review_plan(app, plan_id)
+    active = selection(config)
+    require(active["profile"] == LIGHT_PROFILE and cycle["profile"] == LIGHT_PROFILE
+            and active["selection"] == cycle["selection"] == plan.get("selection"),
+            "Current profile selection does not match this review cycle.")
+    require(plan.get("role") == "standard_review" and plan.get("review_target") == target_id
+            and plan.get("review_cycle") == cycle_id
+            and plan.get("review_cycle_key") == cycle["key"]
+            and plan.get("review_repository") == target["repository"]
+            and cycle["current_plan"]["id"] == plan_id
+            and cycle["current_plan"]["scope"] == plan.get("scope"),
+            "Review plan does not match the saved target and current cycle.")
+    if cwd is not None:
+        require(repository_identity(cwd) == target["repository"],
+                "Review worktree belongs to a different repository than the target.")
+    requested_slot = getattr(args, "slot", None)
+    if requested_slot is None and len(cycle["slots"]) == 1:
+        requested_slot = cycle["slots"][0]["number"]
+    slot = next((item for item in cycle["slots"] if item["number"] == requested_slot), None)
+    require(slot, "Reviewer slot is not required by this review cycle.")
+    choice = resolve(active, "standard_review", requested_slot)
+    require(choice == slot["choice"],
+            "Configured reviewer choice conflicts with the frozen review cycle slot.")
+    return target, cycle, plan, slot, choice
+
+
+def find_cycle_plans(app, target_id, cycle_key):
+    directory = app.state_dir / "reviews"
+    if not directory.is_dir():
+        return []
+    plans = []
+    for path in sorted(directory.glob("*.json")):
+        plan = read(path)
+        require(isinstance(plan, dict), "A review plan record is malformed; cycle recovery is held.")
+        if plan.get("review_target") == target_id and plan.get("review_cycle_key") == cycle_key:
+            plans.append(plan)
+    return plans
+
+
+def make_light_review_plan(app, config, args, plan):
+    target_id = review_target_id(args.target)
+    cycle_key = review_cycle_key(args.cycle_key)
+    target = load_target(app, target_id)
+    require(repository_identity(args.cwd) == target["repository"],
+            "Review worktree belongs to a different repository than the target.")
+    active = selection(config)
+    require(active["profile"] == LIGHT_PROFILE, "Review targets with cycles are supported only by claude-codex-light.")
+    cycle = next((item for item in target["cycles"] if item["key"] == cycle_key), None)
+    if cycle:
+        require(args.previous_cycle in (None, cycle["previous_cycle_id"]),
+                "Review cycle key is already bound to a different predecessor.")
+        require(cycle["selection"] == active["selection"],
+                "The active selection changed during this cycle; start a new cycle after resolving it.")
+        if cycle["current_plan"]["scope"] == plan["scope"]:
+            saved = saved_review_plan(app, cycle["current_plan"]["id"])
+            return saved
+        require(cycle_completion(app, target, cycle) is None,
+                "This review cycle is complete; use a new cycle key for another review pass.")
+        for slot in cycle["slots"]:
+            for link in slot["launches"]:
+                launch = launch_for_link(app, target, cycle, slot, link)
+                require(launch.get("status") == "exited" and type(launch.get("exit_code")) is int,
+                        "A reviewer launch is active or uncertain; review plan refresh is held.")
+        cycle_id = cycle["id"]
+        previous_cycle = cycle["previous_cycle_id"]
+    else:
+        if target["cycles"]:
+            previous = target["cycles"][-1]
+            require(args.previous_cycle == previous["id"],
+                    "A new review cycle requires the exact latest --previous-cycle ID.")
+            completed = predecessor_snapshot(app, target, previous)
+            slots = LIGHT_REVIEW_POLICY["later_slots"]
+            predecessor = completed
+            previous_cycle = previous["id"]
+        else:
+            require(args.previous_cycle is None, "The first review cycle cannot name a predecessor.")
+            slots = LIGHT_REVIEW_POLICY["initial_slots"]
+            predecessor = None
+            previous_cycle = None
+        orphaned = find_cycle_plans(app, target_id, cycle_key)
+        if orphaned:
+            require(len(orphaned) == 1 and orphaned[0].get("scope") == plan["scope"]
+                    and orphaned[0].get("selection") == active["selection"]
+                    and orphaned[0].get("review_previous_cycle") == previous_cycle,
+                    "An incomplete review-cycle plan write conflicts with the requested scope or predecessor.")
+            plan = orphaned[0]
+            cycle_id = safe_id(plan.get("review_cycle"))
+        else:
+            cycle_id = uuid.uuid4().hex
+        cycle = {"id": cycle_id, "key": cycle_key, "previous_cycle_id": previous_cycle,
+                 "predecessor": predecessor, "profile": LIGHT_PROFILE,
+                 "selection": active["selection"], "policy": copy.deepcopy(LIGHT_REVIEW_POLICY),
+                 "slots": [{"number": slot, "choice": resolve(active, "standard_review", slot), "launches": []}
+                           for slot in slots],
+                 "prior_plans": [], "current_plan": {"id": plan["id"], "scope": plan["scope"]}}
+    if cycle and cycle["current_plan"]["scope"] != plan["scope"]:
+        orphaned = find_cycle_plans(app, target_id, cycle_key)
+        current_ids = {item["id"] for item in cycle_plan_refs(cycle)}
+        pending = [item for item in orphaned if item.get("id") not in current_ids]
+        if pending:
+            require(len(pending) == 1 and pending[0].get("scope") == plan["scope"]
+                    and pending[0].get("selection") == active["selection"],
+                    "An incomplete review plan refresh conflicts with the requested scope.")
+            plan = pending[0]
+        else:
+            cycle["prior_plans"].append(cycle["current_plan"])
+            cycle["current_plan"] = {"id": plan["id"], "scope": plan["scope"]}
+    if plan.get("review_cycle") != cycle_id:
+        plan.update(review_target=target_id, review_cycle=cycle_id, review_cycle_key=cycle_key,
+                    review_previous_cycle=previous_cycle, review_repository=target["repository"])
+        app.save_state(f"reviews/{plan['id']}", plan)
+    if not any(item["id"] == cycle_id for item in target["cycles"]):
+        target["cycles"].append(cycle)
+    elif cycle["current_plan"]["id"] != plan["id"]:
+        cycle["prior_plans"].append(cycle["current_plan"])
+        cycle["current_plan"] = {"id": plan["id"], "scope": plan["scope"]}
+    save_target(app, target)
+    return plan
+
+
+def reconcile_review_launch(app, target, cycle, slot, plan_id, task_digest):
+    links = [link for link in slot["launches"] if link["plan_id"] == plan_id]
+    if not links:
+        matches = []
+        launches_dir = app.state_dir / "launches"
+        if launches_dir.is_dir():
+            for path in sorted(launches_dir.glob("*.json")):
+                launch = read(path)
+                require(isinstance(launch, dict), "A launch record is malformed; review dispatch is held.")
+                if launch.get("review_cycle") == {"target_id": target["id"], "cycle_id": cycle["id"],
+                                                   "plan_id": plan_id, "slot": slot["number"]}:
+                    matches.append(launch)
+        require(len(matches) <= 1,
+                "Multiple unlinked launches claim this target, cycle, plan, and slot; inspect before retrying.")
+        if matches:
+            launch = matches[0]
+            require(launch.get("choice") == slot["choice"] and launch.get("task_digest") == task_digest,
+                    "Unlinked review launch conflicts with the requested slot or task.")
+            slot["launches"].append({"plan_id": plan_id, "launch_id": launch["id"]})
+            save_target(app, target)
+            return launch
+        return None
+    latest = launch_for_link(app, target, cycle, slot, links[-1])
+    require(latest.get("task_digest") == task_digest,
+            "This review slot already has a different task brief under the saved plan.")
+    if latest.get("status") != "exited" or type(latest.get("exit_code")) is not int:
+        return latest
+    if latest["exit_code"] == 0:
+        return latest
+    return latest
+
+
+def record_review_launch(app, target, cycle, slot, plan_id, launch):
+    app.save_state(f"launches/{launch['id']}", launch)
+    slot["launches"].append({"plan_id": plan_id, "launch_id": launch["id"]})
+    save_target(app, target)
+
+
+def validate_target(app, target, target_id):
+    require(isinstance(target, dict) and set(target) == {"schema_version", "id", "repository", "pr_locator", "cycles"}
+            and target.get("schema_version") == REVIEW_TARGET_SCHEMA and target.get("id") == target_id
+            and isinstance(target.get("repository"), dict)
+            and set(target["repository"]) == {"kind", "value"}
+            and target["repository"].get("kind") in ("origin", "git-common-dir")
+            and isinstance(target["repository"].get("value"), str) and target["repository"]["value"]
+            and isinstance(target.get("cycles"), list),
+            "Review target record is malformed; progression is held.")
+    if target["pr_locator"] is not None:
+        review_pr_locator(target["pr_locator"])
+    cycle_ids, cycle_keys, launch_ids = set(), set(), set()
+    for index, cycle in enumerate(target["cycles"]):
+        expected_fields = {"id", "key", "previous_cycle_id", "predecessor", "profile", "selection",
+                           "policy", "slots", "prior_plans", "current_plan"}
+        require(isinstance(cycle, dict) and set(cycle) == expected_fields and
+                isinstance(cycle.get("slots"), list) and isinstance(cycle.get("prior_plans"), list) and
+                isinstance(cycle.get("current_plan"), dict) and
+                isinstance(cycle.get("id"), str) and len(cycle["id"]) == 32 and
+                all(char in "0123456789abcdef" for char in cycle["id"]) and
+                cycle["id"] not in cycle_ids and cycle.get("profile") == LIGHT_PROFILE and
+                cycle.get("policy") == LIGHT_REVIEW_POLICY and isinstance(cycle.get("selection"), str)
+                and len(cycle["selection"]) == 64 and
+                all(char in "0123456789abcdef" for char in cycle["selection"]),
+                "Review target cycle record is malformed or conflicting; progression is held.")
+        review_cycle_key(cycle["key"])
+        require(cycle["key"] not in cycle_keys, "Review target has duplicate cycle keys; progression is held.")
+        cycle_ids.add(cycle["id"])
+        cycle_keys.add(cycle["key"])
+        expected_slots = LIGHT_REVIEW_POLICY["initial_slots"] if index == 0 else LIGHT_REVIEW_POLICY["later_slots"]
+        require([slot.get("number") if isinstance(slot, dict) else None for slot in cycle["slots"]] == expected_slots,
+                "Review cycle required slots conflict with the light policy; progression is held.")
+        if index == 0:
+            require(cycle["previous_cycle_id"] is None and cycle["predecessor"] is None,
+                    "The first review cycle cannot have a predecessor.")
+        else:
+            require(cycle["previous_cycle_id"] == target["cycles"][index - 1].get("id")
+                    and isinstance(cycle["predecessor"], dict),
+                    "Review target predecessor chain is missing or conflicting; progression is held.")
+        require(isinstance(cycle["prior_plans"], list) and isinstance(cycle["current_plan"], dict),
+                "Review cycle plan history is malformed or conflicting; progression is held.")
+        plan_refs = cycle_plan_refs(cycle)
+        require(plan_refs and all(isinstance(plan, dict) and set(plan) == {"id", "scope"} and
+                                  isinstance(plan.get("id"), str) and len(plan["id"]) == 32 and
+                                  all(char in "0123456789abcdef" for char in plan["id"]) and
+                                  isinstance(plan.get("scope"), str) and len(plan["scope"]) == 64 and
+                                  all(char in "0123456789abcdef" for char in plan["scope"])
+                                  for plan in plan_refs) and
+                len({plan["id"] for plan in plan_refs}) == len(plan_refs) and
+                len(cycle["prior_plans"]) == len(plan_refs) - 1,
+                "Review cycle plan history is malformed or conflicting; progression is held.")
+        for plan in plan_refs:
+            saved = app.state(f"reviews/{plan['id']}", None)
+            require(isinstance(saved, dict) and saved.get("id") == plan["id"]
+                    and saved.get("role") == "standard_review"
+                    and saved.get("selection") == cycle["selection"] and saved.get("scope") == plan["scope"]
+                    and saved.get("review_target") == target_id and saved.get("review_cycle") == cycle["id"]
+                    and saved.get("review_cycle_key") == cycle["key"]
+                    and saved.get("review_previous_cycle") == cycle["previous_cycle_id"]
+                    and saved.get("review_repository") == target["repository"],
+                    "Review cycle plan record is missing or conflicts with its target; progression is held.")
+        plan_ids = {plan["id"] for plan in plan_refs}
+        for slot in cycle["slots"]:
+            number = slot["number"]
+            expected_model = ("gpt-6.1-sol", "codex", "high") if number == 1 else \
+                ("claude-opus-5-5", "claude", "high")
+            choice = slot.get("choice")
+            require(set(slot) == {"number", "choice", "launches"} and isinstance(choice, dict)
+                    and choice.get("profile") == cycle["profile"]
+                    and choice.get("selection") == cycle["selection"]
+                    and choice.get("role") == "standard_review"
+                    and (choice.get("model"), choice.get("harness"), choice.get("effort")) == expected_model
+                    and isinstance(slot.get("launches"), list),
+                    "Review cycle slot choice is malformed or conflicts with the light policy.")
+            references = set()
+            for link in slot["launches"]:
+                require(isinstance(link, dict) and set(link) == {"plan_id", "launch_id"}
+                        and link.get("plan_id") in plan_ids and isinstance(link.get("launch_id"), str)
+                        and len(link["launch_id"]) == 32 and
+                        all(char in "0123456789abcdef" for char in link["launch_id"]) and
+                        link["launch_id"] not in launch_ids and link["launch_id"] not in references,
+                        "Review target has duplicate or conflicting launch membership; progression is held.")
+                references.add(link["launch_id"])
+                launch_ids.add(link["launch_id"])
+                launch_for_link(app, target, cycle, slot, link)
+            for plan_id in plan_ids:
+                attempts = [link for link in slot["launches"] if link["plan_id"] == plan_id]
+                for link in attempts[:-1]:
+                    launch = launch_for_link(app, target, cycle, slot, link)
+                    require(launch.get("status") == "exited" and type(launch.get("exit_code")) is int
+                            and launch["exit_code"] != 0,
+                            "Review cycle has an unapproved retry or unresolved earlier attempt.")
+    for index in range(1, len(target["cycles"])):
+        previous = target["cycles"][index - 1]
+        cycle = target["cycles"][index]
+        require(cycle["predecessor"] == predecessor_snapshot(app, target, previous),
+                "Review cycle predecessor completion snapshot conflicts with launch history; progression is held.")
+
+
 def startup_report(config, expected=None):
     require(expected is None or expected in config["profiles"], "Unknown intended profile.")
     active = selection(config) if config["active"] else None
@@ -544,7 +1056,9 @@ def parser():
                       help="include the opt-in sample model families and profiles; no profile is activated")
     sub.add_parser("examples", help="print the opt-in sample model families and profiles as JSON")
     sub.add_parser("list")
-    sub.add_parser("status")
+    status = sub.add_parser("status")
+    status.add_argument("--review-target")
+    status.add_argument("--review-cycle")
     startup = sub.add_parser("startup"); startup.add_argument("--expect-profile")
     preflight = sub.add_parser(
         "preflight",
@@ -591,12 +1105,28 @@ def parser():
     self_enroll.add_argument("--replace", action="store_true", help="Replace this lane's registration with the verified caller, without stopping its outgoing owner.")
     adopt = sub.add_parser("adopt"); adopt.add_argument("name"); adopt.add_argument("--selection", required=True)
     remove = sub.add_parser("unenroll"); remove.add_argument("name")
+    review_target = sub.add_parser("review-target")
+    target_actions = review_target.add_subparsers(dest="review_target_action", required=True)
+    target_create = target_actions.add_parser("create")
+    target_create.add_argument("--cwd", required=True)
+    target_create.add_argument("--id", required=True)
+    target_create.add_argument("--pr-locator")
+    target_show = target_actions.add_parser("show")
+    target_show.add_argument("target")
+    target_bind = target_actions.add_parser("bind-pr")
+    target_bind.add_argument("target")
+    target_bind.add_argument("--pr-locator", required=True)
     for name in ("resolve", "dispatch"):
         s = sub.add_parser(name); s.add_argument("--role", choices=ROLES, required=True)
         s.add_argument("--slot", type=int, choices=(1, 2))
+        s.add_argument("--review-target")
+        s.add_argument("--review-cycle")
+        s.add_argument("--review-plan")
         if name == "dispatch":
             s.add_argument("--cwd", required=True); s.add_argument("--task-file", required=True)
-            s.add_argument("--review-plan"); s.add_argument("--approval")
+            s.add_argument("--retry-failed", action="store_true",
+                           help="Retry a reviewer slot only after its prior launch exited nonzero.")
+            s.add_argument("--approval")
             s.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review launch.")
             s.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for guarded preflight.")
             s.add_argument("--pattern-buffer", "--context-injector", dest="context_injector", help="Pattern Buffer script; --context-injector is a compatibility alias."); s.add_argument("--owner-worktree")
@@ -605,9 +1135,11 @@ def parser():
     resume.add_argument("launch"); resume.add_argument("--task-file", required=True)
     resume.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for a guarded continuation.")
     resume.add_argument("--review-plan"); resume.add_argument("--approval")
+    resume.add_argument("--review-target"); resume.add_argument("--review-cycle")
     resume.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review continuation.")
     review = sub.add_parser("review-plan"); review.add_argument("--cwd", required=True)
     review.add_argument("--base", required=True); review.add_argument("--facts", required=True)
+    review.add_argument("--target"); review.add_argument("--cycle-key"); review.add_argument("--previous-cycle")
     review.add_argument("--full", action="store_true", help="Print every path; default output is a bounded preview of the full saved scope.")
     inspect = sub.add_parser("review-inspect"); inspect.add_argument("plan"); inspect.add_argument("--full", action="store_true")
     approve = sub.add_parser("approve-review"); approve.add_argument("plan")
@@ -1678,18 +2210,33 @@ def execute(args):
         if command == "startup":
             report = startup_report(config, args.expect_profile)
             return {**report, "exit_code": 0 if report["ready_for_dispatch"] else 2}
+        if command == "review-target":
+            return review_target_command(app, args)
         if command == "status":
             active = selection(config) if config["active"] else None
             notice = app.state("notification", {})
             handoffs = [read(p) for p in sorted((app.state_dir / "handoffs").glob("*.json"))]
             recipients = app.state("orchestrators", {})
-            return {"active": active,
-                    "notification": notice,
-                    "notification_pending": bool(active and notice.get("selection") != active["selection"]),
-                    "handoffs": handoffs,
-                    "orchestrators": recipients, "adoption": adoption_status(app, active, recipients),
-                    "adoption_note": "Explicit owner acknowledgment of saved choices for future dispatches, not proof of subsequent behavior or a live session.",
-                    "coverage": "Only explicitly enrolled roles; all active orchestrators must enroll."}
+            result = {"active": active,
+                      "notification": notice,
+                      "notification_pending": bool(active and notice.get("selection") != active["selection"]),
+                      "handoffs": handoffs,
+                      "orchestrators": recipients, "adoption": adoption_status(app, active, recipients),
+                      "adoption_note": "Explicit owner acknowledgment of saved choices for future dispatches, not proof of subsequent behavior or a live session.",
+                      "coverage": "Only explicitly enrolled roles; all active orchestrators must enroll."}
+            if active and "standard_review_policy" in active:
+                result["review_selection"] = {"kind": "configured_candidates",
+                                               "configured_standard_review": active["roles"]["standard_review"],
+                                               "contextual_cycle": None}
+            if args.review_target or args.review_cycle:
+                require(args.review_target and args.review_cycle and active
+                        and "standard_review_policy" in active,
+                        "Contextual review status requires a light profile, --review-target, and --review-cycle.")
+                target = load_target(app, args.review_target)
+                cycle = cycle_for_target(target, args.review_cycle)
+                result["review_selection"]["contextual_cycle"] = cycle_summary(app, target, cycle)
+                result["review_selection"]["selection_matches_active"] = cycle["selection"] == active["selection"]
+            return result
         if command in ("activate", "model-set", "profile-put", "authority-set"):
             original = copy.deepcopy(config)
             before = selection(config) if config["active"] else None
@@ -1758,7 +2305,17 @@ def execute(args):
         elif command == "review-plan":
             plan = review_scope(config, args.cwd, args.base, read(args.facts))
             plan.update(selection=selection(config)["selection"], id=uuid.uuid4().hex)
-            app.save_state(f"reviews/{plan['id']}", plan)
+            has_cycle_context = bool(args.target or args.cycle_key or args.previous_cycle)
+            active = selection(config)
+            light_standard = ("standard_review_policy" in active and plan["role"] == "standard_review")
+            if light_standard:
+                require(args.target and args.cycle_key,
+                        "claude-codex-light standard reviews require --target and --cycle-key.")
+                plan = make_light_review_plan(app, config, args, plan)
+            else:
+                require(not has_cycle_context,
+                        "Target cycle options apply only to standard reviews under claude-codex-light.")
+                app.save_state(f"reviews/{plan['id']}", plan)
             return plan if args.full else review_summary(plan)
         elif command == "review-inspect":
             plan = app.state(f"reviews/{safe_id(args.plan)}", None)
@@ -1775,7 +2332,25 @@ def execute(args):
             app.save_state(f"approvals/{approval['id']}", approval)
             return approval
         elif command == "resolve":
-            return resolve(selection(config), args.role, args.slot)
+            active = selection(config)
+            has_context = bool(args.review_target or args.review_cycle or args.review_plan)
+            if args.role == "standard_review" and "standard_review_policy" in active:
+                if has_context:
+                    require(args.review_target and args.review_cycle and args.review_plan,
+                            "Contextual light review resolution requires --review-target, --review-cycle, and --review-plan.")
+                    target, cycle, plan, slot, choice = cycle_review_context(app, config, args)
+                    return {**choice, "selection_kind": "cycle", "review_target": target["id"],
+                            "review_cycle": cycle["id"], "review_plan": plan["id"],
+                            "slot": slot["number"]}
+                if args.slot is not None:
+                    return {**resolve(active, args.role, args.slot),
+                            "selection_kind": "configured_candidate", "slot": args.slot}
+                return {"profile": active["profile"], "selection": active["selection"],
+                        "role": args.role, "selection_kind": "configured_candidates",
+                        "configured_candidates": active["roles"]["standard_review"],
+                        "contextual_cycle": None}
+            require(not has_context, "Review target context applies only to standard reviews under claude-codex-light.")
+            return resolve(active, args.role, args.slot)
         elif command == "context":
             active = selection(config)
             result = {"active": active, "instruction": "Read saved preferences before new dispatches. Running tasks retain their recorded choice."}
@@ -1822,21 +2397,42 @@ def execute(args):
                     "Check model-preferences startup --expect-profile NAME against session-specific intent; a pilot preference or your own harness does not activate it. "
                     "Advanced reviewers require explicit permission from the configured human authority; delegated research uses the current researcher role. "
                     "Preferences do not expand permissions or change existing running jobs.")
+            if "standard_review_policy" in active:
+                text += (" The standard-review choices above are configured candidates. A contextual review uses only the slot "
+                         "saved for its target, cycle, and exact plan.")
             if binding:
                 launch = app.state(f"launches/{safe_id(binding['launch'])}", None)
                 require(launch, "Running task choice is missing.")
                 choice = launch["choice"]
                 text += (f" This running task actually launched with profile {choice['profile']}, role {choice['role']}, "
                          f"model {choice['model']}, effort {choice['effort']}, selection {choice['selection'][:12]}.")
+                membership = launch.get("review_cycle")
+                if membership:
+                    text += (f" Its contextual review slot is target {membership['target_id']}, cycle "
+                             f"{membership['cycle_id']}, plan {membership['plan_id']}, slot {membership['slot']}.")
                 text += " " + DELEGATION
             return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
         elif command == "dispatch":
             require(not args.receipt_file or (args.context_injector and args.owner_worktree),
                     "--receipt-file requires --context-injector and --owner-worktree.")
-            choice = resolve(selection(config), args.role, args.slot)
+            active = selection(config)
+            cwd = Path(args.cwd).resolve(); require(cwd.is_dir(), "Task directory is missing.")
+            has_cycle_context = bool(args.review_target or args.review_cycle)
+            review_cycle = None
+            target = cycle = review_slot = None
+            if args.role == "standard_review" and "standard_review_policy" in active:
+                require(args.review_target and args.review_cycle and args.review_plan,
+                        "claude-codex-light standard review dispatch requires --review-target, --review-cycle, and --review-plan.")
+                target, cycle, plan, review_slot, choice = cycle_review_context(app, config, args, cwd)
+                args.slot = review_slot["number"]
+                review_cycle = {"target_id": target["id"], "cycle_id": cycle["id"],
+                                "plan_id": plan["id"], "slot": review_slot["number"]}
+            else:
+                require(not has_cycle_context and not args.retry_failed,
+                        "Review target context and --retry-failed apply only to standard reviews under claude-codex-light.")
+                choice = resolve(active, args.role, args.slot)
             require(args.role != "orchestrator" or choice["harness"] == "opencode",
                     "Fresh successor orchestration remains outside Model Preferences handoff authority.")
-            cwd = Path(args.cwd).resolve(); require(cwd.is_dir(), "Task directory is missing.")
             task_bytes = Path(args.task_file).read_bytes()
             try:
                 prompt = task_bytes.decode("utf-8")
@@ -1844,6 +2440,21 @@ def execute(args):
                 raise PreferenceError("Task brief must be UTF-8.") from exc
             require(0 < len(task_bytes) <= 16384 and prompt.strip(), "Task brief must be 1 to 16384 bytes of nonempty UTF-8.")
             validate_review(app, config, args, choice, cwd)
+            task_digest = hashlib.sha256(task_bytes).hexdigest()
+            if review_cycle:
+                existing = reconcile_review_launch(app, target, cycle, review_slot,
+                                                   review_cycle["plan_id"], task_digest)
+                if args.retry_failed:
+                    require(existing and existing.get("status") == "exited"
+                            and type(existing.get("exit_code")) is int and existing["exit_code"] != 0,
+                            "--retry-failed requires the exact slot's latest launch to have a known nonzero exit.")
+                elif existing:
+                    return {"launch": existing["id"], "status": existing.get("status"),
+                            "exit_code": existing.get("exit_code"), "reused": True,
+                            "review_cycle": review_cycle}
+                else:
+                    require(not args.retry_failed,
+                            "--retry-failed requires an existing known nonzero launch for this exact slot.")
             if choice["harness"] == "opencode":
                 opencode_task = task_bytes
             else:
@@ -1873,10 +2484,15 @@ def execute(args):
                             "--receipt-file", str(receipt), "--", *argv]
                 launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
                           "context_injector": adapter, "slot": args.slot,
-                          "task_digest": hashlib.sha256(task_bytes).hexdigest(), "status": "starting"}
+                          "task_digest": task_digest, "status": "starting"}
+                if review_cycle:
+                    launch["review_cycle"] = review_cycle
                 if choice["profile"] in ("Codex-Qwen", "Qwen-only") and choice["role"].endswith("_review"):
                     launch["review_authorization_sha256"] = hashlib.sha256(args.review_authorization.encode()).hexdigest()
-                app.save_state(f"launches/{launch['id']}", launch)
+                if review_cycle:
+                    record_review_launch(app, target, cycle, review_slot, review_cycle["plan_id"], launch)
+                else:
+                    app.save_state(f"launches/{launch['id']}", launch)
         elif command.startswith("handoff-"):
             return handoff(app, config, args)
         else:
@@ -1913,8 +2529,7 @@ def validate_review(app, config, args, choice, cwd):
         require(isinstance(authorization, str) and authorization.strip(),
                 "Every review launch in a Qwen profile requires a fresh --review-authorization on this command, including standard review.")
     require(args.review_plan, "Review dispatch requires a review-plan, including standard review.")
-    plan = app.state(f"reviews/{safe_id(args.review_plan)}", None)
-    require(plan, "Unknown review plan.")
+    plan = saved_review_plan(app, args.review_plan)
     current = review_scope(config, cwd, plan["base"], plan["facts"])
     require(current["scope"] == plan["scope"] and plan["selection"] == choice["selection"],
             "Review scope/profile changed; create a fresh plan.")
@@ -1926,6 +2541,20 @@ def validate_review(app, config, args, choice, cwd):
                 and approval["role"] == choice["role"], "Review decision does not cover this scope, profile and reviewer group.")
     else:
         require(choice["role"] == "standard_review", "Create an advanced review plan before asking for advanced reviewers.")
+        if "standard_review_policy" in config["profiles"][choice["profile"]]:
+            target, cycle, bound_plan, slot, contextual_choice = cycle_review_context(app, config, args, cwd)
+            require(bound_plan["id"] == plan["id"] and contextual_choice == choice
+                    and getattr(args, "slot", None) == slot["number"],
+                    "Resolved reviewer does not match the saved target, cycle, plan, and slot.")
+            launch_id = getattr(args, "review_launch_id", None)
+            if launch_id:
+                link = next((item for item in slot["launches"]
+                             if item["plan_id"] == plan["id"] and item["launch_id"] == launch_id), None)
+                require(link, "Codex resume launch is not a member of this exact review cycle slot.")
+                launch_for_link(app, target, cycle, slot, link)
+        else:
+            require(not (getattr(args, "review_target", None) or getattr(args, "review_cycle", None)),
+                    "Review target context applies only to claude-codex-light.")
 
 
 def bind_native(app, launch_id, session):
@@ -2185,6 +2814,17 @@ def resume_launch(app, args):
             launch = app.state(f"launches/{launch_id}", None)
             require(launch["status"] == "exited", "Original launch has not exited; nothing resumed.")
             choice = launch["choice"]
+            membership = launch.get("review_cycle")
+            if membership:
+                require(args.review_target == membership["target_id"]
+                        and args.review_cycle == membership["cycle_id"]
+                        and args.review_plan == membership["plan_id"],
+                        "Codex resume must name the launch's original review target, cycle, and plan.")
+                args.slot = membership["slot"]
+                args.review_launch_id = launch_id
+            else:
+                require(not args.review_target and not args.review_cycle,
+                        "This launch has no review-cycle membership.")
             active = selection(config)
             require(choice["selection"] == active["selection"], "Current profile instructions conflict with this launch; use a fresh dispatch or coordinate the profile first.")
             require(resolve(active, choice["role"], launch.get("slot")) == choice, "Recorded role choice changed; nothing resumed.")
@@ -2202,6 +2842,8 @@ def resume_launch(app, args):
             attempt = {"id": uuid.uuid4().hex, "launch": launch_id, "session": session, "choice": choice,
                        "task_digest": hashlib.sha256(brief).hexdigest(), "created_at": now(), "status": "starting",
                        "previous": previous.get("id") if previous else None}
+            if membership:
+                attempt["review_cycle"] = membership
             if choice["profile"] in ("Codex-Qwen", "Qwen-only") and choice["role"].endswith("_review"):
                 attempt["review_authorization_sha256"] = hashlib.sha256(args.review_authorization.encode()).hexdigest()
             app.save_state(f"continuations/{session}", attempt)

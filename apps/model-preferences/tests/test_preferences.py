@@ -74,8 +74,261 @@ class PreferencesTest(unittest.TestCase):
     def plan(self, repo, **changes):
         return self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(self.facts(**changes)))
 
-    def test_seven_profiles_and_muse_and_qwen_roles(self):
-        self.assertEqual(len(self.call("list")["profiles"]), 7)
+    def create_review_target(self, repo, target_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"):
+        return self.call("review-target", "create", "--cwd", str(repo), "--id", target_id)
+
+    def light_plan(self, repo, target, key, previous=None, **changes):
+        args = ["review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(self.facts(**changes)),
+                "--target", target, "--cycle-key", key]
+        if previous:
+            args.extend(("--previous-cycle", previous))
+        return self.call(*args)
+
+    def dispatch_light_review(self, repo, target, cycle, plan, slot, exit_code=0, retry=False, brief_text=None):
+        brief = self.root / f"light-review-{slot}.txt"
+        brief.write_text(brief_text or f"Review slot {slot} for the saved plan.")
+        args = ["dispatch", "--role", "standard_review", "--slot", str(slot), "--cwd", str(repo),
+                "--task-file", str(brief), "--review-plan", plan, "--review-target", target,
+                "--review-cycle", cycle]
+        if retry:
+            args.append("--retry-failed")
+        original_run = subprocess.run
+
+        def run(argv, *positional, **keywords):
+            if argv and argv[0] in ("codex", "claude"):
+                return subprocess.CompletedProcess(argv, exit_code)
+            return original_run(argv, *positional, **keywords)
+
+        with patch.object(mp.shutil, "which", return_value="native"), \
+                patch.object(mp.subprocess, "run", side_effect=run), \
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd:
+                             subprocess.CompletedProcess(argv, exit_code)):
+            return self.call(*args)
+
+    def target_state(self, target):
+        return self.app.state(f"review-targets/{target}", None)
+
+    def test_light_review_cycle_requires_pair_and_uses_sol_after_proven_predecessor(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        first = self.light_plan(repo, target, "first-review")
+        repeated = self.light_plan(repo, target, "first-review")
+        self.assertEqual(first["id"], repeated["id"])
+        cycle = self.target_state(target)["cycles"][0]
+        self.assertEqual(first["review_cycle"], cycle["id"])
+        self.assertEqual([slot["number"] for slot in cycle["slots"]], [1, 2])
+        self.assertEqual([slot["choice"]["model"] for slot in cycle["slots"]],
+                         ["gpt-6.1-sol", "claude-opus-5-5"])
+        self.dispatch_light_review(repo, target, cycle["id"], first["id"], 1)
+        reused = self.dispatch_light_review(repo, target, cycle["id"], first["id"], 1)
+        self.assertTrue(reused["reused"])
+        with self.assertRaisesRegex(mp.PreferenceError, "predecessor|complete|slot"):
+            self.light_plan(repo, target, "second-review", cycle["id"])
+        self.dispatch_light_review(repo, target, cycle["id"], first["id"], 2)
+        second = self.light_plan(repo, target, "second-review", cycle["id"])
+        next_cycle = self.target_state(target)["cycles"][1]
+        self.assertEqual(second["review_cycle"], next_cycle["id"])
+        self.assertEqual([slot["number"] for slot in next_cycle["slots"]], [1])
+        self.assertEqual(next_cycle["slots"][0]["choice"]["model"], "gpt-6.1-sol")
+        with self.assertRaisesRegex(mp.PreferenceError, "slot|unavailable|required"):
+            self.call("resolve", "--role", "standard_review", "--slot", "2", "--review-target", target,
+                      "--review-cycle", next_cycle["id"], "--review-plan", second["id"])
+
+    def test_light_cycle_refresh_keeps_pair_and_old_scope_launches_do_not_complete_new_plan(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        first = self.light_plan(repo, target, "same-pass")
+        cycle = self.target_state(target)["cycles"][0]
+        self.dispatch_light_review(repo, target, cycle["id"], first["id"], 1)
+        (repo / "app.py").write_text("changed scope\n")
+        refreshed = self.light_plan(repo, target, "same-pass")
+        current = self.target_state(target)["cycles"][0]
+        self.assertEqual(current["id"], cycle["id"])
+        self.assertEqual([slot["number"] for slot in current["slots"]], [1, 2])
+        self.assertNotEqual(refreshed["id"], first["id"])
+        self.assertNotEqual(refreshed["scope"], first["scope"])
+        with self.assertRaisesRegex(mp.PreferenceError, "predecessor|complete|slot"):
+            self.light_plan(repo, target, "later-pass", current["id"])
+        self.dispatch_light_review(repo, target, current["id"], refreshed["id"], 1)
+        self.dispatch_light_review(repo, target, current["id"], refreshed["id"], 2)
+        later = self.light_plan(repo, target, "later-pass", current["id"])
+        self.assertEqual([slot["number"] for slot in self.target_state(target)["cycles"][1]["slots"]], [1])
+        self.assertNotEqual(later["id"], refreshed["id"])
+
+    def test_light_cycle_retries_only_a_known_nonzero_exit(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        plan = self.light_plan(repo, target, "retry-pass")
+        cycle = self.target_state(target)["cycles"][0]
+        failed = self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1, exit_code=7)
+        duplicate = self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1, exit_code=0)
+        self.assertEqual(failed["launch"], duplicate["launch"])
+        with self.assertRaisesRegex(mp.PreferenceError, "retry|failed|known|different task brief"):
+            self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1, exit_code=0,
+                                       retry=True, brief_text="A changed review brief.")
+        retried = self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1, exit_code=0, retry=True)
+        self.assertNotEqual(failed["launch"], retried["launch"])
+        slot = self.target_state(target)["cycles"][0]["slots"][0]
+        self.assertEqual(len(slot["launches"]), 2)
+        launch = self.app.state(f"launches/{failed['launch']}", None)
+        launch["status"] = "starting"
+        self.app.save_state(f"launches/{failed['launch']}", launch)
+        with self.assertRaisesRegex(mp.PreferenceError, "uncertain|unresolved|starting"):
+            self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1, exit_code=0, retry=True)
+
+    def test_light_cycle_plan_refresh_holds_an_active_or_uncertain_launch(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        plan = self.light_plan(repo, target, "held-refresh")
+        cycle = self.target_state(target)["cycles"][0]
+        launch = self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1)
+        record = self.app.state(f"launches/{launch['launch']}", None)
+        record["status"] = "starting"
+        self.app.save_state(f"launches/{launch['launch']}", record)
+        (repo / "app.py").write_text("changed scope\n")
+        with self.assertRaisesRegex(mp.PreferenceError, "active|uncertain|unresolved"):
+            self.light_plan(repo, target, "held-refresh")
+        self.assertEqual(self.target_state(target)["cycles"][0]["current_plan"]["id"], plan["id"])
+
+    def test_light_cycle_recovers_plan_and_launch_writes_before_aggregate_links(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        plan = self.light_plan(repo, target, "recover-write")
+        state = self.target_state(target)
+        state["cycles"] = []
+        self.app.save_state(f"review-targets/{target}", state)
+        recovered_plan = self.light_plan(repo, target, "recover-write")
+        self.assertEqual(recovered_plan["id"], plan["id"])
+        cycle = self.target_state(target)["cycles"][0]
+        first = self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1)
+        state = self.target_state(target)
+        state["cycles"][0]["slots"][0]["launches"] = []
+        self.app.save_state(f"review-targets/{target}", state)
+        recovered_launch = self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1)
+        self.assertEqual(recovered_launch["launch"], first["launch"])
+        self.assertTrue(recovered_launch["reused"])
+        self.assertEqual(len(self.target_state(target)["cycles"][0]["slots"][0]["launches"]), 1)
+
+    def test_light_cycle_duplicate_dispatches_serialize_to_one_launch(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        plan = self.light_plan(repo, target, "concurrent-slot")
+        cycle = self.target_state(target)["cycles"][0]
+        brief = self.root / "concurrent-review.txt"
+        brief.write_text("Review the saved scope.")
+        args = ("dispatch", "--role", "standard_review", "--slot", "1", "--cwd", str(repo),
+                "--task-file", str(brief), "--review-plan", plan["id"], "--review-target", target,
+                "--review-cycle", cycle["id"])
+        with patch.object(mp.shutil, "which", return_value="native"), \
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd:
+                             subprocess.CompletedProcess(argv, 0)):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _: self.call(*args), range(2)))
+        self.assertEqual(results[0]["launch"], results[1]["launch"])
+        self.assertEqual(len(self.target_state(target)["cycles"][0]["slots"][0]["launches"]), 1)
+
+    def test_light_target_creation_binding_and_plan_survive_app_restart(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        first = self.call("review-target", "create", "--cwd", str(repo), "--id", target_id,
+                          "--pr-locator", "https://example.invalid/org/repo/pull/27")
+        repeated = self.call("review-target", "create", "--cwd", str(repo), "--id", target_id,
+                             "--pr-locator", "https://example.invalid/org/repo/pull/27")
+        self.assertEqual(first["id"], repeated["id"])
+        with self.assertRaisesRegex(mp.PreferenceError, "already|conflict|bound"):
+            self.call("review-target", "bind-pr", target_id, "--pr-locator",
+                      "https://example.invalid/org/repo/pull/28")
+        plan = self.light_plan(repo, target_id, "handoff-pass")
+        restarted = mp.App(self.config_dir, self.state_dir)
+        self.assertEqual(restarted.state(f"review-targets/{target_id}", None)["cycles"][0]["current_plan"]["id"],
+                         plan["id"])
+        self.assertEqual(restarted.state(f"reviews/{plan['id']}", None)["review_target"], target_id)
+
+    def test_light_target_and_cycle_follow_another_worktree_and_outputs_name_selection_kind(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        first = self.light_plan(repo, target, "handoff")
+        cycle = self.target_state(target)["cycles"][0]
+        other = self.root / "other-worktree"
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", str(other), "HEAD"],
+                       check=True, capture_output=True)
+        handed_off = self.light_plan(other, target, "handoff")
+        self.assertEqual(handed_off["review_cycle"], cycle["id"])
+        self.assertNotEqual(handed_off["id"], first["id"])
+        self.assertEqual([slot["number"] for slot in self.target_state(target)["cycles"][0]["slots"]], [1, 2])
+        configured = self.call("resolve", "--role", "standard_review")
+        self.assertEqual(configured["selection_kind"], "configured_candidates")
+        status = self.call("status")
+        self.assertEqual(status["review_selection"]["kind"], "configured_candidates")
+        self.assertEqual(configured["configured_candidates"], status["active"]["roles"]["standard_review"])
+        contextual = self.call("resolve", "--role", "standard_review", "--review-target", target,
+                               "--review-cycle", cycle["id"], "--review-plan", handed_off["id"], "--slot", "1")
+        self.assertEqual(contextual["selection_kind"], "cycle")
+        self.assertEqual(contextual["model"], "gpt-6.1-sol")
+        status = self.call("status", "--review-target", target, "--review-cycle", cycle["id"])
+        self.assertTrue(status["review_selection"]["selection_matches_active"])
+        self.assertEqual(status["review_selection"]["contextual_cycle"]["slots"][0]["status"], "not_started")
+        payload = {"session_id": "fixture-session", "hook_event_name": "SessionStart",
+                   "source": "startup", "cwd": str(other)}
+        with patch.object(mp.sys, "stdin", io.StringIO(json.dumps(payload))):
+            hook = self.call("hook", "--harness", "codex")
+        text = hook["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("configured candidates", text)
+        launch = self.dispatch_light_review(other, target, cycle["id"], handed_off["id"], 1)
+        with patch.dict(mp.os.environ, {"STARFLEET_MODEL_LAUNCH": launch["launch"]}), \
+                patch.object(mp.sys, "stdin", io.StringIO(json.dumps(payload))):
+            hook = self.call("hook", "--harness", "codex")
+        text = hook["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"cycle {cycle['id']}", text)
+        self.assertIn(f"plan {handed_off['id']}", text)
+
+    def test_light_predecessor_conflicts_hold_and_advanced_approval_stays_required(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        first = self.light_plan(repo, target, "first")
+        cycle = self.target_state(target)["cycles"][0]
+        self.dispatch_light_review(repo, target, cycle["id"], first["id"], 1)
+        self.dispatch_light_review(repo, target, cycle["id"], first["id"], 2)
+        state = self.target_state(target)
+        state["cycles"][0]["slots"][1]["launches"][0]["launch_id"] = \
+            state["cycles"][0]["slots"][0]["launches"][0]["launch_id"]
+        self.app.save_state(f"review-targets/{target}", state)
+        with self.assertRaisesRegex(mp.PreferenceError, "conflict|slot|membership"):
+            self.light_plan(repo, target, "later", cycle["id"])
+        advanced = self.plan(repo, money=True)
+        with self.assertRaisesRegex(mp.PreferenceError, "explicit permission|approval"):
+            self.call("dispatch", "--role", "advanced_review", "--slot", "1", "--cwd", str(repo),
+                      "--task-file", str(self.facts()), "--review-plan", advanced["id"])
+        approval = self.call("approve-review", advanced["id"], "--authorization", "Fixture approval")
+        brief = self.root / "advanced-review.txt"
+        brief.write_text("Review this advanced scope.")
+        original_run = subprocess.run
+
+        def run(argv, *positional, **keywords):
+            if argv and argv[0] in ("codex", "claude"):
+                return subprocess.CompletedProcess(argv, 0)
+            return original_run(argv, *positional, **keywords)
+
+        with patch.object(mp.shutil, "which", return_value="native"), \
+                patch.object(mp.subprocess, "run", side_effect=run), \
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd:
+                             subprocess.CompletedProcess(argv, 0)):
+            result = self.call("dispatch", "--role", "advanced_review", "--slot", "1", "--cwd", str(repo),
+                               "--task-file", str(brief), "--review-plan", advanced["id"],
+                               "--approval", approval["id"])
+        self.assertEqual(self.app.state(f"launches/{result['launch']}", None)["choice"]["role"], "advanced_review")
+
+    def test_eight_profiles_and_muse_and_qwen_roles(self):
+        self.assertEqual(len(self.call("list")["profiles"]), 8)
         examples = mp.example_config()
         self.assertIsNone(examples["active"])
         self.assertEqual(examples["models"]["local-qwen3.6-35b"], {
@@ -85,6 +338,10 @@ class PreferencesTest(unittest.TestCase):
         self.assertEqual(examples["profiles"]["Codex-Qwen"]["implementer"], {"model": "local-qwen3.6-35b", "effort": "max"})
         self.assertEqual(examples["profiles"]["Qwen-only"]["orchestrator"], {"model": "local-qwen3.6-35b", "effort": "max"})
         self.assertEqual(examples["profiles"]["Qwen-only"]["standard_review"], [{"model": "codex-sol", "effort": "high"}])
+        self.assertEqual(examples["profiles"]["claude-codex-light"]["standard_review_policy"],
+                         {"initial_slots": [1, 2], "later_slots": [1]})
+        self.assertEqual(examples["profiles"]["claude-codex-light"]["advanced_review"],
+                         examples["profiles"]["Claude-Codex"]["advanced_review"])
         claude = self.call("show", "Claude-only")
         self.assertEqual(claude["implementer"], {"model": "claude-haiku", "effort": "xhigh"})
         self.assertEqual(claude["researcher"], {"model": "claude-haiku", "effort": "high"})
