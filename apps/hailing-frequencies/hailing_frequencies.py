@@ -51,6 +51,14 @@ class LockBusyError(ValueError):
     """A state operation already owns the monitor lock."""
 
 
+class InboxScanSaturatedError(ValueError):
+    """A native inbox reached the scan limit and cannot be evaluated safely."""
+
+
+class TargetInboxError(ValueError):
+    """A native inbox lookup failed for one enrolled target."""
+
+
 class DeliveryHoldError(ValueError):
     """The final guarded binding check held delivery before paste began."""
 
@@ -304,7 +312,9 @@ class Cmux:
         # Omitting state requests the full inbox, including native read records
         # needed to correlate exact replies. Never change native read state.
         rows = self.rpc("agent.message.list", surface=target["surface"], limit=SCAN_LIMIT)["messages"]
-        require(len(rows) < SCAN_LIMIT, "Inbox scan saturated; no nudges sent. Reconcile native inboxes first.")
+        if len(rows) >= SCAN_LIMIT:
+            raise InboxScanSaturatedError(
+                "Inbox scan saturated; no nudges sent. Reconcile native inboxes first.")
         return rows
 
     def activity(self, target):
@@ -1024,6 +1034,17 @@ class Monitor:
             "acknowledged_ids": acknowledged_ids,
         }
 
+    def target_messages(self, target):
+        try:
+            rows = self.cmux.messages(target)
+        except InboxScanSaturatedError:
+            raise
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            raise TargetInboxError(str(exc)[:500]) from None
+        if len(rows) >= SCAN_LIMIT:
+            raise InboxScanSaturatedError("Inbox scan saturated")
+        return rows
+
     def acknowledgement_command(self, target, message_id):
         return shlex.join([sys.executable, str(Path(__file__).resolve()),
                            "--state-dir", str(self.directory), "--cmux", self.cmux.executable,
@@ -1062,7 +1083,7 @@ class Monitor:
     def deliver(self, db, target, messages, kind, destination, now, remind_after):
         # Recheck source and reply evidence after planning; the recipient may have
         # acknowledged, read, or answered the message while the scan was running.
-        current_rows = self.cmux.messages(target)
+        current_rows = self.target_messages(target)
         current_sources = self.source_messages(target, current_rows)
         reply_ids = self.reply_acknowledgements(target, current_sources, current_rows)
         if reply_ids:
@@ -1114,16 +1135,33 @@ class Monitor:
             require(only_sessions <= {t["session"] for t in config["targets"]},
                     "Send scope contains a session that is not enrolled")
         messages_by_id = {}
+        rows_by_session = {}
+        initial_errors_by_session = {}
+        target_errors = []
         for target in config["targets"]:
-            rows = self.cmux.messages(target)
-            require(len(rows) < SCAN_LIMIT, "Inbox scan saturated")
+            try:
+                rows = self.target_messages(target)
+            except TargetInboxError as exc:
+                error = {"label": target["label"], "session": target["session"],
+                         "stage": "initial_scan", "error": str(exc)[:500]}
+                initial_errors_by_session[target["session"]] = error
+                target_errors.append(error)
+                continue
+            rows_by_session[target["session"]] = rows
             messages_by_id.update((row["id"], row) for row in rows)
         messages = list(messages_by_id.values())
         results = []
         with contextlib.closing(self.database()) as db:
             for target in config["targets"]:
                 sending = send and (only_sessions is None or target["session"] in only_sessions)
-                sources = self.source_messages(target, messages)
+                initial_error = initial_errors_by_session.get(target["session"])
+                if initial_error:
+                    results.append({"label": target["label"], "session": target["session"],
+                                    "inbox_status": "incomplete", "error": initial_error["error"],
+                                    "sending_enabled": sending, "attempts": []})
+                    continue
+                rows = rows_by_session[target["session"]]
+                sources = self.source_messages(target, rows)
                 reply_ids = self.reply_acknowledgements(target, sources, messages)
                 binding_checked = False
                 reply_hold = None
@@ -1140,6 +1178,7 @@ class Monitor:
                 snapshot = self.target_snapshot(sources, acknowledged, now, config["remind_after"])
                 overdue = snapshot["overdue_messages"]
                 result = {"label": target["label"], "session": target["session"],
+                          "inbox_status": "complete",
                           "native_unread": snapshot["native_unread"],
                           "acknowledged": snapshot["acknowledged"],
                           "overdue": snapshot["overdue"],
@@ -1185,8 +1224,16 @@ class Monitor:
                             result["escalation_hold"] = str(exc)
                             continue
                     if sending:
-                        attempt = self.deliver(db, target, eligible, kind, destination, now,
-                                               config["remind_after"])
+                        try:
+                            attempt = self.deliver(db, target, eligible, kind, destination, now,
+                                                   config["remind_after"])
+                        except TargetInboxError as exc:
+                            detail = str(exc)[:500]
+                            target_errors.append({"label": target["label"], "session": target["session"],
+                                                  "stage": "delivery_recheck", "error": detail})
+                            result.update(inbox_status="incomplete", inbox_error=detail)
+                            result["attempts"].append({"kind": kind, "outcome": "held", "detail": detail})
+                            break
                         fresh = attempt.pop("_snapshot")
                         result.update({key: fresh[key] for key in
                                        ("native_unread", "acknowledged", "overdue", "oldest_seconds")})
@@ -1196,7 +1243,7 @@ class Monitor:
                         result["attempts"].append({"kind": kind, "outcome": "would_submit", "ids": [m["id"] for m in eligible]})
         report = {"at": now, "completed_at": self.clock(), "mode": "send" if send else "observe",
                   "sending_sessions": sorted(only_sessions) if only_sessions is not None else None,
-                  "targets": results}
+                  "coverage_complete": not target_errors, "target_errors": target_errors, "targets": results}
         atomic_json(self.directory / "last-scan.json", report)
         return report
 

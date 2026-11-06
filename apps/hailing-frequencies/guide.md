@@ -3,7 +3,8 @@
 This guide helps you confirm your exact CMUX identity and use the machine's existing Hailing Frequencies installation safely.
 Use the machine's existing `~/.local/bin/hailing-frequencies` launcher and default state directory.
 Do not create a second state directory or start a duplicate `supervise` worker.
-Use `hailing-frequencies status` to inspect saved enrollment and `hailing-frequencies health` for recent successful scans.
+Use `hailing-frequencies status` to inspect saved enrollment and `hailing-frequencies health` for recent scans with complete target coverage.
+If health reports incomplete coverage, inspect `status` for targets whose inboxes could not be read.
 Neither establishes permission to start another worker; if worker availability is unclear, ask the existing owner or operator instead.
 
 The Hailing Frequencies installer also installs the `agent-notify` Discord conversation command and its skill.

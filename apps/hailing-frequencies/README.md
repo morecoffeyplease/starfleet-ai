@@ -148,6 +148,9 @@ hailing-frequencies health-service status
 The launchd health reader runs every 30 seconds, persists its findings in `health.json`, and requests a local notification after the larger of 120 seconds or four scan intervals without success.
 Notification presentation depends on macOS notification settings; a requested notification is not proof that the operator saw it.
 A failed latest scan is unhealthy immediately.
+Partial scans record a fresh heartbeat and list targets with incomplete inbox coverage.
+Health remains unhealthy until every enrolled inbox can be listed successfully.
+The scan report's `inbox_status` describes inbox coverage, not prompt delivery or recipient acknowledgment.
 Notifications repeat at most hourly per unhealthy episode; recovery permits the next failure to notify again.
 The watcher cannot access CMUX, send prompts, restart a closed terminal, or establish coverage after reboot.
 After login, it warns until the operator starts `supervise` in CMUX again.

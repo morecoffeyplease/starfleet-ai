@@ -273,6 +273,7 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(report["coverage_complete"])
         self.assertEqual(report["target_errors"][0]["session"], missing["session"])
         self.assertEqual(report["target_errors"][0]["stage"], "initial_scan")
+        self.assertEqual(report["targets"][0]["inbox_status"], "incomplete")
         self.assertNotIn("native_unread", report["targets"][0])
         self.assertIn("not_found", report["targets"][0]["error"])
         self.assertEqual(report["targets"][1]["attempts"][0]["outcome"], "submitted")
@@ -323,6 +324,7 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(report["target_errors"][0]["session"], disappearing["session"])
         self.assertEqual(report["target_errors"][0]["stage"], "delivery_recheck")
+        self.assertEqual(report["targets"][0]["inbox_status"], "incomplete")
         self.assertEqual(report["targets"][0]["attempts"][0]["outcome"], "held")
         self.assertEqual(report["targets"][1]["attempts"][0]["outcome"], "submitted")
         self.assertEqual([target["session"] for target, _ in self.host.sent], [healthy["session"]])
