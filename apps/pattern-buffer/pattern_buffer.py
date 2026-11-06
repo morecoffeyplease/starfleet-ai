@@ -2022,7 +2022,9 @@ def standing_parts(root, source, harness, session, agent, role, origin, content)
               f"Worktree: {root}\nContext file: {source}\n"
               "These reminders do not expand authorization. Follow current user direction.\n")
     if not role:
-        header += "Role is unassigned; no role-specific section is included.\n"
+        header += ("Role is unassigned; no role-specific section is included.\n"
+                   if content.get("confirmation") else
+                   "Role is unassigned; only shared context is included.\n")
     return header + "\n", selected
 
 

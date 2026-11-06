@@ -127,6 +127,30 @@ class PatternBufferTests(unittest.TestCase):
         self.assertNotIn("SO MUCH time is lost", default)
         self.assertFalse(hasattr(ci, "REPO_PROFILES"))
 
+    def test_legacy_unassigned_context_at_8192_bytes_keeps_original_header(self):
+        self.cli("init")
+        source = (self.root / ".context-injector/context.md").resolve()
+        session = "legacy-unassigned-exact-cap"
+        expected_header = (
+            f"pattern-buffer | role: unassigned | source: unassigned\n"
+            f"Session: codex/{session}\n"
+            f"Worktree: {self.root.resolve()}\n"
+            f"Context file: {source}\n"
+            "These reminders do not expand authorization. Follow current user direction.\n"
+            "Role is unassigned; only shared context is included.\n\n"
+        )
+        shared_bytes = 8192 - len(expected_header.encode("utf-8"))
+        self.assertGreater(shared_bytes, 0)
+        source.write_text("# shared\n" + "x" * shared_bytes + "\n")
+
+        preview = self.cli("preview", "--harness", "codex", "--session", session)
+        self.assertTrue(preview.stdout.startswith(expected_header + "x" * shared_bytes))
+        status = json.loads(self.cli("status", "--harness", "codex", "--session", session).stdout)
+        unassigned = status["standing_context_budgets"]["roles"]["unassigned"]
+        self.assertEqual(unassigned["header_bytes"], len(expected_header.encode("utf-8")))
+        self.assertEqual(unassigned["bytes_used"], 8192)
+        self.assertTrue(unassigned["ok"])
+
     def test_render_accepts_exactly_8192_bytes_and_rejects_one_byte_over(self):
         self.cli("init")
         source = self.root / ".context-injector/context.md"
