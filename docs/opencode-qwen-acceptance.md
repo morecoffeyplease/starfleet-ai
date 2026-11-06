@@ -1,6 +1,6 @@
 # OpenCode and Qwen acceptance observations
 
-These observations describe bounded local trials on November 4 and 5, 2026.
+These observations describe bounded local trials on November 4, 5, and 6, 2026.
 They are not a benchmark, security certification or a claim that every Starfleet component supports OpenCode.
 Private connection data, transcripts and native identifiers are excluded.
 See the [setup guide](opencode-qwen-setup.md) for a portable summary of the observed runtime configuration and prerequisites.
@@ -48,6 +48,34 @@ The owned API and model processes stopped after the bounded test.
 Model Preferences still reported delivery held because native composer state was not proven empty; the experiment did not remove that production guard.
 This qualifies the tested fresh managed startup and experimental draft-preservation cases, not Hailing wake reception, every parent route, negative delivery control or general Qwen-only orchestration.
 No uncertain session or prompt was replayed.
+
+## Native Claude parent with assisted result reconciliation
+
+The November 6 follow-up exercised the merged PR #9 source at `041d2b2` with first-party Claude Haiku 5.5 at low effort and local Qwen 35B at the observed `max` variant.
+It used the existing caller checks, private Model Preferences configuration, experimental API-sidechannel choice, isolated owner and child worktrees, and explicit Pattern Buffer task binding.
+The first shell dispatch stopped at native permissions before creating a Qwen child.
+After the operator approved that exact dispatch, the same native Claude session assigned one bounded file-read task through Model Preferences.
+Qwen made one actual Read call, returned the correct first and last markers and eight physical records, and completed its turn.
+It reported its task reference as unavailable instead of inventing one.
+Pattern Buffer independently showed the exact session bound to the expected task.
+
+The managed launch returned `native_binding_timeout` because the native CMUX association was not confirmed.
+The fixture had started without its required project CMUX hooks, and its private XDG configuration excluded the global integration.
+The chief supplied only the observed child surface and task pointers to the same Claude parent.
+That parent read the existing Qwen screen and Pattern Buffer metadata and verified the returned values.
+This establishes one assisted native Claude-to-Qwen task and foreground result reconciliation, not successful managed startup or automatic result return.
+No uncertain task or initial prompt was replayed.
+
+A separate metadata-only check restarted the private API with the project integration present.
+Plugin metadata showed the primary CMUX package active for server and TUI integration.
+Reconnecting the older session did not recreate its missing native record.
+While the real TUI listener was active, a new empty API session was created and selected through the native session picker.
+CMUX then recorded that exact session on the expected surface and workspace.
+Read-only persisted message checks found no user or assistant messages in the empty control and unchanged assistant message IDs in the original Qwen session.
+That verifies one native hook-registration path without another model prompt.
+It does not qualify unattended restart, automatic restoration of an incorrectly initialized historical session, or the complete managed-startup path.
+Automatic repair of that historical-session case is deferred.
+The owned temporary services stopped, and the completed trial tabs closed.
 
 ## Explicit API-sidechannel candidate
 
