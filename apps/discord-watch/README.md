@@ -30,7 +30,8 @@ The upgrade migration uses each existing registration's committed cursor as its 
 Local registration closure and Discord conversation closure are recorded separately from reply-subscription eligibility.
 Closing a registration or observing a Closed tag or archived thread does not unsubscribe it, reset its cursor, or discard its catch-up boundary.
 The worker continues reconciling closed and archived threads while their subscriptions are active, and status reports local `open`, remote `remote_closed`, and `subscription_state` independently.
-Routine active subscriptions become REST-due every 30 seconds, while each worker turn has a bounded page and request budget and rotates fairly across due threads.
+Routine active subscriptions become REST-due every 30 seconds, while each worker turn has a bounded page and request budget.
+Rotation follows the stable retained-thread order before filtering due threads, so the last-serviced thread remains a rotation anchor while it waits for its next poll.
 An explicit scan that completes a thread's full REST catch-up also satisfies that thread's current recovery coverage without marking unselected threads complete.
 Dormant subscriptions skip routine REST work but remain in every Gateway reconnect recovery sweep.
 Meaningful activity means a newly stored message from the configured Discord user, using that message's Discord timestamp.

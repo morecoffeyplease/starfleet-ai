@@ -120,7 +120,8 @@ discord-watch supervise --send
 ```
 
 `serve --send` runs the single Gateway receiver, fair REST recovery lane, and native sender.
-Routine REST reconciliation runs every 30 seconds with a bounded request budget and persistent rotation across due threads.
+Routine REST reconciliation runs every 30 seconds with a bounded request budget.
+Rotation follows the stable retained-thread order before filtering due threads, so the last-serviced thread remains a rotation anchor while it waits for its next poll.
 An explicit scan that completes one thread's full REST catch-up also satisfies that thread's current recovery coverage while unselected threads remain queued.
 The worker also reconciles every retained thread after Gateway disconnects, reconnects, and fresh Identify operations, including dormant subscriptions.
 Recovery can take longer under rate limits, slow API responses, incomplete catch-up, or owner holds, so 30 seconds is a scheduling interval rather than a delivery guarantee.
