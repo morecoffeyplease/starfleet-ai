@@ -1,8 +1,9 @@
 # Discord Watch
 
-Discord Watch receives replies from the configured Discord user through one supervised Discord Gateway connection and reconciles retained threads through fair, bounded REST recovery.
-One worker process owns the Gateway receiver, the REST recovery lane, and the sole native sender independently of per-thread `agent-notify listen` processes.
+Discord Watch receives replies from the configured Discord user through one supervised Discord Gateway connection and keeps them in a private local queue.
+One worker process owns the Gateway receiver, fair bounded REST recovery, and the sole native sender independently of per-thread `agent-notify listen` processes.
 Each registered thread retains one exact owner copied from that session's Hailing Frequencies enrollment, including after local closure or remote archiving.
+An OpenCode owner also retains its exact authenticated API and session binding.
 
 Read the [setup guide](guide.md) for installation, enrollment, a bounded pilot, and day-to-day commands.
 Print the same guide from any working directory with `discord-watch guide --print`.
@@ -68,7 +69,13 @@ For each thread, registration stores the exact Hailing Frequencies harness, surf
 The central worker checks that the same target remains enrolled and validates the current CMUX projection and input guard before each wake.
 It never forces input, reads or clears CMUX messages, launches another agent, or sends a reply body in a wake.
 The prompt names one exact `discord-watch receive --thread THREAD --group GROUP` command for the frozen group.
-An empty composer with no human-input obligation is required by Hailing Frequencies' existing `Cmux.submit` guard.
+Claude and Codex wakes require an empty composer with no human-input obligation under Hailing Frequencies' existing `Cmux.submit` guard.
+For OpenCode, group wake commands include the exact `--session ses_ID` owner so receipt does not depend on a guessed terminal or tab title.
+OpenCode registration, `managed`, `close`, and `receive` verify the exact enrolled owner without checking composer readiness.
+Automatic wake readiness is checked separately against the persisted Hailing Frequencies delivery policy.
+The default `native_empty_composer` policy requires an explicitly empty composer with no human-input obligation.
+For OpenCode only, the explicit `api_sidechannel` policy also permits `draft` or `unknown` composer classifications when there is no blocking input or human-input obligation and every other native, API, lifecycle, receiving, and owner guard passes.
+The current native CMUX OpenCode input state remains `unknown`, so default-policy automatic wakes hold until native state is explicitly empty.
 Attachment filenames and HTTPS URLs are printed to the exact recipient during `receive` without downloading the files.
 
 The worker records a remote archived thread or the cached `Closed` forum tag without closing the local registration or stopping reply intake.
@@ -78,7 +85,7 @@ A global rate limit defers all thread requests until its retry time, while a per
 One thread's API error does not stop polling other registered threads.
 Each request has a finite timeout, response and message sizes are bounded, and catch-up is limited to 50 pages per scan.
 
-A confirmed CMUX submit moves each unread group member to `awaiting_receipt`.
+A confirmed guarded CMUX submit or exact OpenCode API user-message admission moves each unread group member to `awaiting_receipt`.
 A confirmed group is not submitted again while awaiting receipt.
 A transport failure after CMUX begins submission is `uncertain` and is never retried automatically.
 Existing stalled, confirmed, uncertain, and per-message attempt evidence remains visible after migration.

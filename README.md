@@ -15,16 +15,19 @@ The repository does not promise publication to npm, PyPI, Homebrew, or another p
 | [Agent Notify](apps/hailing-frequencies/agent-notify-guide.md) | Opens one Discord forum post per conversation and can register the thread for its exact enrolled owner. |
 | [Discord Watch](apps/discord-watch/README.md) | Uses one reply worker to queue responses from registered Discord threads for their exact enrolled owners. |
 | [Away Mode](apps/away-mode/README.md) | Records explicit availability and routes human contact through the configured Discord workflow. |
-| [Pattern Buffer](apps/pattern-buffer/README.md) | Restores worktree context for Claude Code and Codex sessions. |
+| [Pattern Buffer](apps/pattern-buffer/README.md) | Restores worktree context for Claude Code and Codex sessions, with opt-in OpenCode context, checkpoint support and lower-anchor pressure reminders. |
 | [Model Preferences](apps/model-preferences/README.md) | Saves local model preferences for supported agent roles. |
 | [Warp-drive](apps/warp-drive/README.md) | Reserves local CPU capacity for agent-owned commands. |
-| [Starfleet Policy Guard](apps/starfleet-policy-guard/README.md) | Records local delivery evidence and provides separately scoped workflow tools. |
+| [Starfleet Policy Guard](apps/starfleet-policy-guard/README.md) | Records local delivery evidence and provides separately scoped workflow tools, including an opt-in OpenCode Prime Directive plugin candidate. |
 | [Starfleet Markup](apps/starfleet-markup/README.md) | Reviews local HTML, Markdown, and images with versioned comments. |
 | [Context Injector compatibility](apps/context-injector/README.md) | Preserves a compatibility path for the former Pattern Buffer name. |
 
 Each component has its own setup, supported platforms, verification command, and limits.
 Start with the component README and its printable guide when available.
 Installation is opt-in, and components do not start workers or change hooks merely because the source is present.
+The [OpenCode and local Qwen setup guide](docs/opencode-qwen-setup.md) records prerequisites, isolated configuration and qualification limits, with the [runtime lifecycle runbook](docs/qwen-runtime-lifecycle.md) for bounded startup and shutdown.
+The [Qwen operating guide](docs/qwen-operating-guide.md) covers task framing, supervision, evidence, secrets and escalation for orchestrators and implementers.
+Qwen dispatch requires accepted Pattern Buffer pressure-warning evidence for the selected mode and an installed, enabled Policy Guard route for each covered action; see the runbook for scope and limits.
 
 ## Prerequisites
 

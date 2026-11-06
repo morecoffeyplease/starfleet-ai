@@ -310,6 +310,49 @@ class AwayTest(unittest.TestCase):
         with self.assertRaises(am.Error):
             am.active_agent(recipient, stale)
 
+    def test_opencode_context_requires_scoped_exact_native_identity(self):
+        recipient = {"workspace": str(uuid.uuid4()), "surface": str(uuid.uuid4()),
+                     "session": "ses_AbC123", "harness": "opencode"}
+        self.inventory["items"].append({"lifecycle": "running", "freshness": {"state": "current"},
+            "projections": [{"workspace_id": recipient["workspace"], "panel_id": recipient["surface"]}],
+            "agents": [{"session_id": recipient["session"], "kind": "opencode", "state": "working"}]})
+        self.call("enroll", "opencode", "--worktree", str(self.repo),
+                  *[x for k, v in recipient.items() for x in ("--" + k, v)])
+        env = {"CMUX_AGENT_LAUNCH_KIND": "opencode", "OPENCODE_SESSION_ID": recipient["session"],
+               "CMUX_WORKSPACE_ID": recipient["workspace"], "CMUX_SURFACE_ID": recipient["surface"]}
+        native_caller = {"caller": {"workspace_id": recipient["workspace"], "surface_id": recipient["surface"]}}
+        with patch.dict(os.environ, env, clear=False), patch.object(am.mp, "run_json", return_value=native_caller):
+            before = self.app.read()["presence"]
+            result = self.call("opencode-context")
+            self.assertEqual(result["owner"], {key: recipient[key] for key in ("harness", "session", "workspace", "surface")})
+            self.assertEqual(result["presence"], before)
+            self.assertIn("Only explicit user intent changes presence", result["instructions"])
+            self.assertEqual(am.active_agent(recipient, self.inventory)["session_id"], "ses_AbC123")
+            report = self.request("opencode-lane-report")
+            source = self.root / "opencode-update.json"
+            source.write_text(json.dumps(self.update))
+            submitted = self.call("report-submit", report, "--lane", "opencode", "--file", str(source))
+            self.assertEqual(submitted["evidence"], "lane-reported")
+            for changed in ({"OPENCODE_SESSION_ID": "ses_abc123"},
+                            {"CMUX_AGENT_LAUNCH_KIND": "codex"},
+                            {"CMUX_SURFACE_ID": str(uuid.uuid4())},
+                            {"CMUX_WORKSPACE_ID": str(uuid.uuid4())}):
+                with patch.dict(os.environ, changed, clear=False), self.assertRaises(am.Error):
+                    self.call("opencode-context")
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(am.mp, "run_json", return_value={"caller": {"workspace_id": recipient["workspace"],
+                                                                            "surface_id": str(uuid.uuid4())}}), \
+                self.assertRaises(am.Error):
+            self.call("opencode-context")
+
+    def test_opencode_identity_rejects_unscoped_or_non_native_session(self):
+        for env in ({}, {"CMUX_AGENT_LAUNCH_KIND": "opencode", "OPENCODE_SESSION_ID": str(uuid.uuid4()),
+                       "CMUX_WORKSPACE_ID": self.lane["workspace"], "CMUX_SURFACE_ID": self.lane["surface"]},
+                    {"CMUX_AGENT_LAUNCH_KIND": "codex", "OPENCODE_SESSION_ID": "ses_abc",
+                     "CMUX_WORKSPACE_ID": self.lane["workspace"], "CMUX_SURFACE_ID": self.lane["surface"]}):
+            with patch.dict(os.environ, env, clear=True), self.assertRaises(am.Error):
+                am.opencode_identity()
+
 
 if __name__ == "__main__":
     unittest.main()

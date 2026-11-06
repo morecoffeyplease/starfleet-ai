@@ -13,6 +13,11 @@ python3 apps/away-mode/away_mode.py --state-dir /absolute/private/state init --s
 away-mode --state-dir /absolute/private/state context
 ```
 
+OpenCode callers can read scoped lane context with `away-mode --state-dir /absolute/private/state opencode-context`.
+That command requires `CMUX_AGENT_LAUNCH_KIND=opencode`, the exact case-preserved native `OPENCODE_SESSION_ID`, and the exact `CMUX_WORKSPACE_ID` and `CMUX_SURFACE_ID` UUIDs.
+It confirms the current native CMUX caller and active enrolled owner before returning context, and it does not change presence or install a hook.
+Missing or mismatched identity fails closed; generic `context` remains available for ordinary operator inspection.
+
 The default state is private and lives outside the repository.
 Pass `--state-dir` to every source CLI command during an isolated trial.
 The printable guide works without state, credentials or enrollment and describes setup, authority limits and verification.

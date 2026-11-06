@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Monitor native CMUX inboxes and nudge explicitly enrolled Claude/Codex sessions."""
+"""Monitor native CMUX inboxes and nudge explicitly enrolled Claude, Codex, and OpenCode sessions."""
 import argparse
+import base64
 import contextlib
 import fcntl
 import hashlib
+import http.client
+import importlib.util
 import json
 import math
 import os
@@ -12,9 +15,13 @@ import re
 import shlex
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 DEFAULT_STATE = Path.home() / ".local/state/starfleet-ai/hailing-frequencies"
@@ -25,8 +32,19 @@ ATTENTION_MESSAGE_LIMIT = 4 * 1024
 ACTIVE_LIFECYCLES = ("running", "idle", "backgroundWorkPending")
 INSTALL_MARKER = "# starfleet-hailing-frequencies:v1"
 RUNTIME_SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py", "guide.md",
-                        "agent-notify", "agent-notify-guide.md")
+                        "agent-notify", "agent-notify-guide.md", "opencode_adapter.py")
 RUNTIME_SKILL_NAMES = ("skills/temporal-beacon/SKILL.md", "skills/agent-notify/SKILL.md")
+OPENCODE_SESSION = re.compile(r"^ses_[A-Za-z0-9]+$")
+OPENCODE_MESSAGE = re.compile(r"^msg_[A-Za-z0-9]+$")
+OPENCODE_MANIFEST_FIELDS = frozenset((
+    "api_url", "password_file", "session_id", "expected_server_pid", "session_directory",
+    "worktree_directory", "cmux_workspace_uuid", "cmux_surface_uuid", "parent_task_id",
+))
+OPENCODE_MANIFEST_OPTIONAL_FIELDS = frozenset(("delivery_policy",))
+OPENCODE_DEFAULT_DELIVERY_POLICY = "native_empty_composer"
+OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY = "api_sidechannel"
+OPENCODE_HTTP_TIMEOUT = 5
+OPENCODE_RESPONSE_LIMIT = 128 * 1024
 
 
 class LockBusyError(ValueError):
@@ -44,6 +62,212 @@ def require(condition, message):
 
 def identity(value):
     return str(uuid.UUID(value)).upper()
+
+
+def session_identity(value, harness=None):
+    if harness == "opencode":
+        require(isinstance(value, str) and OPENCODE_SESSION.fullmatch(value) is not None,
+                "OpenCode session ID must be the exact ses_ identity")
+        return value
+    if harness in ("claude", "codex"):
+        return identity(value)
+    require(isinstance(value, str), "Session identity is invalid")
+    if OPENCODE_SESSION.fullmatch(value):
+        return value
+    return identity(value)
+
+
+def _read_private_file(path, label, limit):
+    require(isinstance(path, str) and Path(path).is_absolute(), f"{label} path must be absolute")
+    candidate = Path(path)
+    require(not candidate.is_symlink(), f"Refusing symlink {label}")
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate, flags)
+        try:
+            info = os.fstat(descriptor)
+            require(stat.S_ISREG(info.st_mode), f"{label} is not a regular file")
+            require(info.st_uid == os.getuid(), f"{label} is not owned by this user")
+            require(info.st_mode & 0o177 == 0, f"{label} must be private to this user")
+            chunks = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(4096, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                require(total <= limit, f"{label} exceeds the bounded file size")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise ValueError(f"Could not read private {label} ({type(exc).__name__})") from None
+
+
+def load_opencode_manifest(path):
+    raw = _read_private_file(str(Path(path).expanduser().absolute()), "OpenCode manifest", 16 * 1024)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        raise ValueError("OpenCode manifest is not valid JSON") from None
+    require(isinstance(value, dict), "OpenCode manifest must be a JSON object")
+    require(OPENCODE_MANIFEST_FIELDS.issubset(value) and
+            set(value).issubset(OPENCODE_MANIFEST_FIELDS | OPENCODE_MANIFEST_OPTIONAL_FIELDS),
+            "OpenCode manifest fields do not match the supported session binding contract")
+    value["delivery_policy"] = opencode_delivery_policy(value)
+    require(isinstance(value.get("api_url"), str), "OpenCode API URL is missing")
+    require(isinstance(value.get("password_file"), str), "OpenCode password file path is missing")
+    for key in ("password_file", "session_directory", "worktree_directory"):
+        require(isinstance(value.get(key), str) and Path(value[key]).is_absolute(),
+                f"OpenCode manifest {key} must be an absolute path")
+    return value
+
+
+def opencode_delivery_policy(target):
+    require(isinstance(target, dict), "OpenCode delivery policy target is malformed")
+    if "delivery_policy" not in target:
+        return OPENCODE_DEFAULT_DELIVERY_POLICY
+    adapter = opencode_adapter_module()
+    validator = getattr(adapter, "validate_delivery_policy", None)
+    require(callable(validator), "OpenCode delivery policy validator is unavailable")
+    try:
+        return validator(target["delivery_policy"])
+    except ValueError:
+        raise ValueError("OpenCode delivery policy is invalid") from None
+
+
+def opencode_adapter_module():
+    candidates = (
+        Path(__file__).resolve().with_name("opencode_adapter.py"),
+        Path(__file__).resolve().parent.parent / "opencode-adapter" / "opencode_adapter.py",
+    )
+    for candidate in candidates:
+        if candidate.is_file() and not candidate.is_symlink():
+            name = "starfleet_hailing_opencode_adapter"
+            loaded = sys.modules.get(name)
+            if loaded is not None and Path(getattr(loaded, "__file__", "")).resolve() == candidate.resolve():
+                return loaded
+            spec = importlib.util.spec_from_file_location(name, candidate)
+            require(spec is not None and spec.loader is not None,
+                    "OpenCode session adapter could not be loaded")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(name, None)
+                raise
+            return module
+    raise ValueError("OpenCode session adapter is unavailable; reinstall Hailing Frequencies")
+
+
+def _opencode_api_binding(target, *, identity_only):
+    adapter = opencode_adapter_module()
+    password_path = target.get("password_file")
+    raw_password = _read_private_file(password_path, "OpenCode password file", 4096)
+    if raw_password.endswith(b"\n"):
+        raw_password = raw_password[:-1]
+        if raw_password.endswith(b"\r"):
+            raw_password = raw_password[:-1]
+    try:
+        password = raw_password.decode("utf-8")
+    except UnicodeError:
+        raise ValueError("OpenCode password file is not valid UTF-8") from None
+    require(bool(password), "OpenCode password file is empty")
+    binding = adapter.SessionBinding(
+        session_id=target["session"],
+        expected_server_pid=target["expected_server_pid"],
+        session_directory=target["session_directory"],
+        worktree_directory=target["worktree_directory"],
+        cmux_workspace_uuid=target["workspace"],
+        cmux_surface_uuid=target["surface"],
+        parent_task_id=target["parent_task_id"],
+    )
+    client = adapter.OpenCodeSessionAdapter(target["api_url"], password)
+    inspection = client.inspect_identity(binding) if identity_only else client.inspect(binding)
+    expected_disposition = "identity_verified" if identity_only else "clear"
+    require(inspection.disposition == expected_disposition,
+            ("OpenCode API identity held: " if identity_only else "OpenCode API inspection held: ")
+            + ", ".join(inspection.hold_codes or ("unknown_state",)))
+    return password, inspection
+
+
+def opencode_binding(target):
+    return _opencode_api_binding(target, identity_only=False)
+
+
+def opencode_identity_binding(target):
+    return _opencode_api_binding(target, identity_only=True)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def opencode_prompt(target, password, prompt):
+    adapter = opencode_adapter_module()
+    policy = opencode_delivery_policy(target)
+    origin = adapter.OpenCodeSessionAdapter._validate_origin(target["api_url"])
+    quoted_session = urllib.parse.quote(target["session"], safe="")
+    payload = {"text": prompt}
+    if policy == OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY:
+        payload.update({"delivery": "queue", "resume": True})
+    request = urllib.request.Request(
+        origin + f"/api/session/{quoted_session}/prompt",
+        data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Authorization": "Basic " + base64.b64encode(
+                f"opencode:{password}".encode("utf-8")).decode("ascii"),
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    try:
+        response = opener.open(request, timeout=OPENCODE_HTTP_TIMEOUT)
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise ValueError("OpenCode prompt response was not confirmed") from None
+    except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException):
+        raise ValueError("OpenCode prompt response was not confirmed") from None
+    try:
+        with response:
+            if getattr(response, "status", None) != 200:
+                raise ValueError("OpenCode prompt response was not confirmed")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except ValueError:
+                    raise ValueError("OpenCode prompt response was not confirmed") from None
+                require(declared_length <= OPENCODE_RESPONSE_LIMIT,
+                        "OpenCode prompt response exceeded the bounded response size")
+            body = response.read(OPENCODE_RESPONSE_LIMIT + 1)
+            require(len(body) <= OPENCODE_RESPONSE_LIMIT,
+                    "OpenCode prompt response exceeded the bounded response size")
+            value = json.loads(body.decode("utf-8"))
+            require(isinstance(value, dict), "OpenCode prompt response was not confirmed")
+            data = value.get("data")
+            require(isinstance(data, dict), "OpenCode prompt response was not confirmed")
+            message_id = data.get("id")
+            require(isinstance(message_id, str) and OPENCODE_MESSAGE.fullmatch(message_id) is not None,
+                    "OpenCode prompt response was not confirmed")
+            require(data.get("sessionID") == target["session"] and data.get("type") == "user",
+                    "OpenCode prompt response was not associated with the exact session")
+            require(all(key in data for key in ("time", "payload", "delivery")),
+                    "OpenCode prompt response was not confirmed")
+            if policy == OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY:
+                require(data.get("delivery") == "queue",
+                        "OpenCode queue admission was not confirmed")
+    except (UnicodeError, ValueError) as error:
+        raise ValueError(str(error) or "OpenCode prompt response was not confirmed") from None
+    except (OSError, TimeoutError, http.client.HTTPException):
+        raise ValueError("OpenCode prompt response was not confirmed") from None
+    return {"submitted": True, "transport": "opencode_api", "admission": "confirmed",
+            "message_id": message_id, "session_id": target["session"]}
 
 
 def atomic_json(path, value):
@@ -95,13 +319,18 @@ class Cmux:
                            and p.get("workspace_id", "").upper() == target["workspace"]
                            for p in item.get("projections", []))
                    for agent in item.get("agents", [])
-                   if agent.get("session_id", "").upper() == target["session"]
+                   if ((agent.get("session_id") == target["session"] if target["harness"] == "opencode"
+                        else agent.get("session_id", "").upper() == target["session"]))
                    and agent.get("kind") == target["harness"]]
         require(len(matches) == 1, "Exact session activity is unavailable or ambiguous")
         return {"state": matches[0].get("state"), "last_activity_at": matches[0].get("last_activity_at")}
 
     def binding(self, target):
         """Require a live projection AND its owning harness's exact hook binding."""
+        if target.get("harness") == "opencode":
+            opencode_binding(target)
+            self._opencode_native_binding(target)
+            return True
         current = self.command("current", "--limit", "200")
         require(not current.get("truncated", True), "CMUX current snapshot is incomplete")
         require(current.get("owner_availability", {}).get("agent_sessions") == "available",
@@ -143,7 +372,130 @@ class Cmux:
                 "Native messaging is disabled")
         return True
 
+    def enrollment_binding(self, target):
+        """Verify exact OpenCode identity without requiring the session to be idle."""
+        require(target.get("harness") == "opencode", "Enrollment identity check requires OpenCode")
+        opencode_identity_binding(target)
+        return self._opencode_native_binding(target, require_delivery_readiness=False)
+
+    def owner_identity_binding(self, target):
+        """Verify an exact OpenCode owner without requiring prompt receiving to be enabled."""
+        require(target.get("harness") == "opencode", "Owner identity check requires OpenCode")
+        opencode_identity_binding(target)
+        return self._opencode_native_binding(target, require_delivery_readiness=False,
+                                             require_message_receiving=False)
+
+    def _opencode_native_binding(self, target, *, require_delivery_readiness=True,
+                                 require_message_receiving=True):
+        current = self.command("current", "--limit", "200")
+        require(isinstance(current, dict), "CMUX current snapshot is unknown")
+        require(not current.get("truncated", True), "CMUX current snapshot is incomplete")
+        availability = current.get("owner_availability")
+        require(isinstance(availability, dict) and availability.get("agent_sessions") == "available",
+                "CMUX agent identities unavailable")
+        items = current.get("items")
+        require(isinstance(items, list), "CMUX current item projection is unavailable")
+        matches = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            placement = item.get("placement")
+            if not isinstance(placement, dict) or placement.get("kind") != "local":
+                continue
+            projections = item.get("projections")
+            require(isinstance(projections, list), "CMUX surface projection is unknown")
+            for projection in projections:
+                if isinstance(projection, dict) and isinstance(projection.get("panel_id"), str) and \
+                        projection["panel_id"].upper() == target["surface"]:
+                    matches.append((item, projection))
+        require(len(matches) == 1, "OpenCode surface is missing or ambiguous")
+        item, projection = matches[0]
+        workspace_id = projection.get("workspace_id")
+        require(isinstance(workspace_id, str) and identity(workspace_id) == target["workspace"],
+                "OpenCode CMUX workspace changed")
+
+        hook_path = self.hook_directory / "opencode-hook-sessions.json"
+        try:
+            hook_raw = _read_private_file(str(hook_path), "OpenCode hook store", 2 * 1024 * 1024)
+            store = json.loads(hook_raw.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            raise ValueError("OpenCode visible-TUI hook identity is unavailable") from None
+        sessions = store.get("sessions") if isinstance(store, dict) else None
+        require(isinstance(sessions, dict), "OpenCode hook identity store is malformed")
+        record = sessions.get(target["session"])
+        require(isinstance(record, dict), "Exact OpenCode ses_ identity is absent from the native hook store")
+        surface_id = record.get("surfaceId")
+        workspace_id = record.get("workspaceId")
+        require(isinstance(surface_id, str) and surface_id.upper() == target["surface"] and
+                isinstance(workspace_id, str) and workspace_id.upper() == target["workspace"],
+                "OpenCode native hook surface or workspace changed")
+        require(record.get("agentLifecycle") in ACTIVE_LIFECYCLES,
+                "OpenCode session is not running or idle")
+        started = record.get("startedAt")
+        require(type(started) in (int, float) and math.isfinite(started),
+                "OpenCode native session generation is unavailable")
+        require(started == target["started_at"], "OpenCode native session generation changed")
+        cwd = record.get("cwd") or record.get("workingDirectory")
+        require(isinstance(cwd, str) and cwd, "OpenCode native worktree is unavailable")
+        try:
+            native_worktree = str(Path(cwd).expanduser().resolve(strict=True))
+            expected_worktree = str(Path(target["worktree_directory"]).expanduser().resolve(strict=True))
+        except (OSError, RuntimeError):
+            raise ValueError("OpenCode native worktree is unavailable") from None
+        require(native_worktree == expected_worktree, "OpenCode native worktree changed")
+
+        agents = item.get("agents")
+        require(isinstance(agents, list), "CMUX OpenCode agent projection is unknown")
+        require(all(isinstance(agent, dict) for agent in agents), "CMUX OpenCode agent projection is malformed")
+        visible_agents = [agent for agent in agents
+                          if isinstance(agent, dict) and agent.get("kind") == "opencode" and
+                          agent.get("session_id") == target["session"]]
+        require(len(visible_agents) == 1 and visible_agents[0].get("state") in ("working", "idle"),
+                "Exact OpenCode CMUX session projection is missing, ambiguous or inactive")
+
+        if not require_delivery_readiness:
+            if require_message_receiving:
+                return self._require_opencode_message_receiving(target)
+            return True
+
+        guard = self.rpc("surface.input_state", surface_id=target["surface"])
+        require(isinstance(guard, dict), "OpenCode input state is unknown")
+        input_surface = guard.get("surface_id")
+        input_workspace = guard.get("workspace_id")
+        require(isinstance(input_surface, str) and input_surface.upper() == target["surface"] and
+                isinstance(input_workspace, str) and input_workspace.upper() == target["workspace"],
+                "OpenCode input owner changed")
+        policy = opencode_delivery_policy(target)
+        state = guard.get("state")
+        guard_lifecycle = guard.get("lifecycle")
+        if policy == OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY:
+            eligible_composer_state = state in ("empty", "draft", "unknown")
+        else:
+            eligible_composer_state = state == "empty"
+        require(guard.get("agent") is True and guard.get("terminal") is True and
+                eligible_composer_state and guard.get("blocks_typing") is False and
+                guard.get("waiting_on_human") is False and guard_lifecycle in ACTIVE_LIFECYCLES,
+                "OpenCode human draft, approval, unknown input state or inactive session")
+        return self._require_opencode_message_receiving(target)
+
+    def _require_opencode_message_receiving(self, target):
+        settings = self.rpc("agent.message.settings", target=target["surface"])
+        require(isinstance(settings, dict), "Native messaging settings are unknown")
+        require(all(settings.get(key) is True for key in
+                    ("messages_enabled", "receiving", "workspace_receiving")),
+                "Native messaging is disabled")
+        return True
+
     def submit(self, target, text, on_transport_start=None):
+        if target.get("harness") == "opencode":
+            try:
+                password, _inspection = opencode_binding(target)
+                self._opencode_native_binding(target)
+            except (ValueError, OSError, subprocess.SubprocessError, KeyError, TypeError, AttributeError) as exc:
+                raise DeliveryHoldError(str(exc)) from exc
+            if on_transport_start is not None:
+                on_transport_start()
+            return opencode_prompt(target, password, text)
         # One host paste/submit operation, never a force flag or separate Escape/Ctrl-C.
         # A multiline Claude paste selects the host's agent-aware submit key.
         try:
@@ -203,12 +555,30 @@ class Monitor:
         require(isinstance(value.get("targets"), list), "Targets must be an array")
         surfaces, sessions = set(), set()
         for target in value["targets"]:
-            require(target["harness"] in ("claude", "codex"), "Unsupported harness")
-            for key in ("surface", "workspace", "session"):
+            harness = target.get("harness")
+            require(harness in ("claude", "codex", "opencode"), "Unsupported harness")
+            for key in ("surface", "workspace"):
                 require(identity(target[key]) == target[key], "Use canonical UUIDs")
+            require(session_identity(target["session"], harness) == target["session"],
+                    "Session identity does not match its exact harness")
             for key in ("cutoff", "started_at"):
                 require(type(target[key]) in (int, float) and math.isfinite(target[key]) and target[key] >= 0,
                         f"Invalid {key}")
+            if harness == "opencode":
+                require(all(isinstance(target.get(key), str) and target[key] for key in
+                            ("api_url", "password_file", "session_directory", "worktree_directory",
+                             "parent_task_id")), "OpenCode target binding is incomplete")
+                require(all(Path(target[key]).is_absolute() for key in
+                            ("password_file", "session_directory", "worktree_directory")),
+                        "OpenCode target paths must be absolute")
+                require(type(target.get("expected_server_pid")) is int and target["expected_server_pid"] > 0,
+                        "Invalid OpenCode API server PID")
+                if "delivery_policy" in target:
+                    require(opencode_delivery_policy(target) == target["delivery_policy"],
+                            "Invalid OpenCode delivery policy")
+            else:
+                require("delivery_policy" not in target,
+                        "Delivery policy is supported only for OpenCode targets")
             require(target["surface"] not in surfaces and target["session"] not in sessions,
                     "Duplicate surface or session enrollment")
             surfaces.add(target["surface"])
@@ -247,13 +617,76 @@ class Monitor:
         return {"outcome": outcome, "attempted": bool(attempted),
                 "detail": str(detail)[:500], "event_key": str(event_key)[:128]}
 
+    def enroll_opencode(self, manifest_path, label, include_existing=False):
+        require(isinstance(label, str) and label.strip(), "Enrollment label is required")
+        manifest = load_opencode_manifest(manifest_path)
+        target = {
+            "harness": "opencode",
+            "session": session_identity(manifest["session_id"], "opencode"),
+            "surface": identity(manifest["cmux_surface_uuid"]),
+            "workspace": identity(manifest["cmux_workspace_uuid"]),
+            "api_url": manifest["api_url"],
+            "password_file": manifest["password_file"],
+            "expected_server_pid": manifest["expected_server_pid"],
+            "session_directory": manifest["session_directory"],
+            "worktree_directory": manifest["worktree_directory"],
+            "parent_task_id": manifest["parent_task_id"],
+            "delivery_policy": manifest["delivery_policy"],
+            "label": label.strip(),
+        }
+        require(os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().casefold() == "opencode",
+                "OpenCode enrollment must run from an OpenCode TUI-launched command")
+        require(os.environ.get("CMUX_SURFACE_ID", "").upper() == target["surface"],
+                "CMUX_SURFACE_ID does not match the OpenCode manifest")
+        require(os.environ.get("CMUX_WORKSPACE_ID", "").upper() == target["workspace"],
+                "CMUX_WORKSPACE_ID does not match the OpenCode manifest")
+        caller_session = os.environ.get("OPENCODE_SESSION_ID")
+        require(isinstance(caller_session, str) and caller_session,
+                "OpenCode enrollment requires the exact OPENCODE_SESSION_ID")
+        require(session_identity(caller_session, "opencode") == target["session"],
+                "OPENCODE_SESSION_ID does not match the OpenCode manifest")
+        hook_path = self.cmux.hook_directory / "opencode-hook-sessions.json"
+        try:
+            hook_raw = _read_private_file(str(hook_path), "OpenCode hook store", 2 * 1024 * 1024)
+            store = json.loads(hook_raw.decode("utf-8"))
+            record = store["sessions"][target["session"]]
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+            raise ValueError("Exact OpenCode session needs a current native TUI hook record") from None
+        require(isinstance(record, dict), "OpenCode native hook record is malformed")
+        record_surface = record.get("surfaceId")
+        record_workspace = record.get("workspaceId")
+        require(isinstance(record_surface, str) and record_surface.upper() == target["surface"] and
+                isinstance(record_workspace, str) and record_workspace.upper() == target["workspace"],
+                "OpenCode native hook surface or workspace differs from the manifest")
+        started = record.get("startedAt")
+        require(type(started) in (int, float) and math.isfinite(started) and started >= 0,
+                "OpenCode native session generation is unavailable")
+        target["started_at"] = started
+        target["cutoff"] = started if include_existing else self.clock()
+        self.cmux.enrollment_binding(target)
+        config = self.config()
+        existing = next((item for item in config["targets"] if item["session"] == target["session"]), None)
+        expected = {**target, "cutoff": existing["cutoff"]} if existing else target
+        existing_binding = ({**existing, "delivery_policy": opencode_delivery_policy(existing)}
+                            if existing else None)
+        require(existing is None or existing_binding == expected,
+                "OpenCode enrollment differs; unenroll explicitly before changing its binding")
+        require(not any(item["surface"] == target["surface"] and
+                        item["session"] != target["session"] for item in config["targets"]),
+                "CMUX surface has another enrolled session")
+        if existing is None:
+            config["targets"].append(target)
+        atomic_json(self.directory / "config.json", config)
+        return {"enrolled": existing or target, "self_enrollment": True,
+                "identity_source": "private_manifest_and_native_opencode_hook"}
+
     def attention_once(self, session_id, event_key, body, surface_id):
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", event_key) is None:
             return self.attention_result("rejected", False,
                                          "Event key must be 1-128 ASCII letters, digits, dots, underscores, colons or hyphens",
                                          event_key)
-        session = identity(session_id)
         config = self.config()
+        session = session_identity(session_id)
         target = next((item for item in config["targets"] if item["session"] == session), None)
         if target is None:
             return self.attention_result("unavailable", False, "Session is not enrolled", event_key)
@@ -266,17 +699,34 @@ class Monitor:
         if surface != target["surface"]:
             return self.attention_result("unavailable", False,
                                          "CMUX_SURFACE_ID does not match the enrolled surface", event_key)
+        if target["harness"] == "opencode":
+            workspace_value = os.environ.get("CMUX_WORKSPACE_ID")
+            try:
+                workspace = identity(workspace_value) if workspace_value else None
+            except ValueError:
+                workspace = None
+            if workspace != target["workspace"]:
+                return self.attention_result("unavailable", False,
+                                             "CMUX_WORKSPACE_ID does not match the enrolled OpenCode workspace",
+                                             event_key)
         launch_kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().casefold()
         # Native Claude team surfaces identify their launcher as "claudeTeams".
         launch_kind = {"claudeteams": "claude"}.get(launch_kind, launch_kind)
+        if target["harness"] == "opencode" and launch_kind != "opencode":
+            return self.attention_result("unavailable", False,
+                                         "OpenCode attention must run from the exact OpenCode TUI", event_key)
         if launch_kind and launch_kind != target["harness"]:
             return self.attention_result("unavailable", False,
                                          "Caller launch kind does not match the enrolled session", event_key)
-        session_env = "CLAUDE_CODE_SESSION_ID" if target["harness"] == "claude" else "CODEX_THREAD_ID"
+        session_env = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
+                       "opencode": "OPENCODE_SESSION_ID"}[target["harness"]]
         caller_session = os.environ.get(session_env)
+        if target["harness"] == "opencode" and not caller_session:
+            return self.attention_result("unavailable", False,
+                                         "OpenCode attention requires the exact OPENCODE_SESSION_ID", event_key)
         if caller_session:
             try:
-                caller_session = identity(caller_session)
+                caller_session = session_identity(caller_session, target["harness"])
             except ValueError:
                 return self.attention_result("unavailable", False,
                                              f"Caller {session_env} is invalid", event_key)
@@ -291,20 +741,38 @@ class Monitor:
             if saved_hash != body_sha256:
                 return self.attention_result("rejected", False,
                                              "Event key was already used with a different message", event_key)
-            return self.attention_result(outcome, attempted, detail, event_key)
+            if target["harness"] != "opencode" or outcome != "held" or attempted:
+                return self.attention_result(outcome, attempted, detail, event_key)
 
         try:
             self.cmux.binding(target)
-        except (ValueError, OSError, subprocess.SubprocessError) as error:
+        except (ValueError, OSError, subprocess.SubprocessError, KeyError, TypeError, AttributeError) as error:
+            if target["harness"] == "opencode":
+                now = self.clock()
+                detail = f"{error}; no OpenCode prompt sent and no attempt consumed"
+                with contextlib.closing(self.database()) as db, db:
+                    db.execute("INSERT INTO attention_intents VALUES (?,?,?,?,?,?,?,?) "
+                               "ON CONFLICT(session,started_at,event_key) DO UPDATE SET "
+                               "outcome='held',attempted=0,at=excluded.at,detail=excluded.detail",
+                               (session, target["started_at"], event_key, body_sha256,
+                                "held", 0, now, detail[:500]))
+                return self.attention_result("held", False, detail, event_key)
             return self.attention_result("held", False, f"{error}; no intent recorded", event_key)
 
         message = body.decode("utf-8")
         now = self.clock()
         with contextlib.closing(self.database()) as db:
             with db:
-                db.execute("INSERT INTO attention_intents VALUES (?,?,?,?,?,?,?,?)",
-                           (session, target["started_at"], event_key, body_sha256,
-                            "uncertain", 0, now, "Intent committed before submit"))
+                if target["harness"] == "opencode":
+                    db.execute("INSERT INTO attention_intents VALUES (?,?,?,?,?,?,?,?) "
+                               "ON CONFLICT(session,started_at,event_key) DO UPDATE SET "
+                               "outcome='uncertain',attempted=0,at=excluded.at,detail=excluded.detail",
+                               (session, target["started_at"], event_key, body_sha256,
+                                "uncertain", 0, now, "Intent committed before OpenCode API request"))
+                else:
+                    db.execute("INSERT INTO attention_intents VALUES (?,?,?,?,?,?,?,?)",
+                               (session, target["started_at"], event_key, body_sha256,
+                                "uncertain", 0, now, "Intent committed before submit"))
 
             attempted = False
 
@@ -318,12 +786,21 @@ class Monitor:
             try:
                 self.cmux.submit(target, message, on_transport_start=mark_transport_start)
             except DeliveryHoldError as error:
-                outcome, detail, attempted = "held", f"{error}; event key is reserved and will not be retried", False
+                if target["harness"] == "opencode":
+                    outcome, detail, attempted = "held", f"{error}; no OpenCode prompt sent and no attempt consumed", False
+                else:
+                    outcome, detail, attempted = "held", f"{error}; event key is reserved and will not be retried", False
             except Exception:
                 outcome = "uncertain"
-                detail = "CMUX submit was not confirmed; delivery is uncertain"
+                detail = ("OpenCode API response was not confirmed; delivery is uncertain"
+                          if target["harness"] == "opencode" else
+                          "CMUX submit was not confirmed; delivery is uncertain")
             else:
-                outcome, detail, attempted = "submitted", "CMUX confirmed submit", True
+                if target["harness"] == "opencode":
+                    outcome, detail, attempted = "submitted", (
+                        "OpenCode API confirmed exact user-message admission; model receipt is unconfirmed"), True
+                else:
+                    outcome, detail, attempted = "submitted", "CMUX confirmed submit", True
             with db:
                 db.execute("UPDATE attention_intents SET outcome=?,attempted=?,detail=? "
                            "WHERE session=? AND started_at=? AND event_key=?",
@@ -350,7 +827,7 @@ class Monitor:
 
     def enrolled_target(self, session_id, surface_id):
         config = self.config()
-        session = identity(session_id)
+        session = session_identity(session_id)
         require(surface_id, "CMUX_SURFACE_ID is required")
         surface = identity(surface_id)
         target = next((item for item in config["targets"] if item["session"] == session), None)
@@ -442,13 +919,19 @@ class Monitor:
                    for offset in range(0, len(message_ids), INBOX_MESSAGE_LIMIT))
         return "\n".join(self._inbox_command(target, batch, launcher) for batch in batches)
 
+    def _inbox_binding(self, target):
+        if target.get("harness") == "opencode":
+            # A recipient tool is already running while reading its own inbox.
+            return self.cmux.enrollment_binding(target)
+        return self.cmux.binding(target)
+
     def consume_inbox(self, session_id, message_ids, surface_id, output, details=False):
         require(isinstance(message_ids, list) and 0 < len(message_ids) <= INBOX_MESSAGE_LIMIT,
                 f"Select between 1 and {INBOX_MESSAGE_LIMIT} message IDs")
         normalized_ids = [identity(message_id) for message_id in message_ids]
         require(len(set(normalized_ids)) == len(normalized_ids), "Duplicate message IDs are not allowed")
         target = self.enrolled_target(session_id, surface_id)
-        self.cmux.binding(target)
+        self._inbox_binding(target)
         rows = self.cmux.messages(target)
         require(len(rows) < SCAN_LIMIT, "Inbox scan saturated; no messages output or acknowledged")
         selected = self.select_inbox_messages(target, normalized_ids, rows)
@@ -462,7 +945,7 @@ class Monitor:
 
         current_target = self.enrolled_target(session_id, surface_id)
         require(current_target == target, "Enrollment changed; no messages acknowledged")
-        self.cmux.binding(current_target)
+        self._inbox_binding(current_target)
         current_rows = self.cmux.messages(current_target)
         require(len(current_rows) < SCAN_LIMIT, "Inbox scan saturated; no messages acknowledged")
         current = self.select_inbox_messages(current_target, normalized_ids, current_rows)
@@ -471,7 +954,7 @@ class Monitor:
                              "recipient_surface_id", "recipient_workspace_id", "created_at", "in_reply_to")
             require(all(previous.get(field) == latest.get(field) for field in stable_fields),
                     "Message changed during output; no messages acknowledged")
-        self.cmux.binding(current_target)
+        self._inbox_binding(current_target)
 
         acknowledged_at = self.clock()
         with contextlib.closing(self.database()) as db:
@@ -548,7 +1031,7 @@ class Monitor:
 
     def acknowledge(self, session_id, message_id, surface_id):
         config = self.config()
-        session = identity(session_id)
+        session = session_identity(session_id)
         source_id = identity(message_id)
         require(surface_id, "CMUX_SURFACE_ID is required")
         surface = identity(surface_id)
@@ -627,7 +1110,7 @@ class Monitor:
         now = self.clock()
         config = self.config()
         if only_sessions is not None:
-            only_sessions = {identity(s) for s in only_sessions}
+            only_sessions = {session_identity(session) for session in only_sessions}
             require(only_sessions <= {t["session"] for t in config["targets"]},
                     "Send scope contains a session that is not enrolled")
         messages_by_id = {}
@@ -759,6 +1242,11 @@ def parser():
     enroll.add_argument("--label", required=True)
     enroll.add_argument("--include-existing", action="store_true", help="Include this session's existing messages")
     enroll.add_argument("--coordinator", action="store_true", help="Receive escalation prompts")
+    opencode_enroll = sub.add_parser("opencode-enroll",
+                                     help="Self-enroll one exact OpenCode session from a private binding manifest")
+    opencode_enroll.add_argument("--manifest", type=Path, required=True)
+    opencode_enroll.add_argument("--label", required=True)
+    opencode_enroll.add_argument("--include-existing", action="store_true")
     remove = sub.add_parser("unenroll")
     remove.add_argument("--session", required=True)
     for name in ("scan", "serve", "supervise"):
@@ -883,10 +1371,10 @@ def main(argv=None):
         beacon = TemporalBeacon(app)
         if args.temporal_command == "doctor":
             return beacon.doctor()
-        target, owner_key, _worktree = beacon.owner()
         if args.temporal_command == "set":
             return beacon.set(args.after, args.at, args.every, args.until, args.message,
                               args.request_id, args.replace_key, after_idle=args.after_idle)
+        target, owner_key, _worktree = beacon.owner()
         if args.temporal_command == "list":
             return beacon.list(owner_key)
         if args.temporal_command == "inspect":
@@ -933,8 +1421,10 @@ def main(argv=None):
                 config["coordinator"] = session
             atomic_json(app.directory / "config.json", config)
             return {"enrolled": existing or target}
+        if args.command == "opencode-enroll":
+            return app.enroll_opencode(args.manifest, args.label, args.include_existing)
         if args.command == "unenroll":
-            session = identity(args.session)
+            session = session_identity(args.session)
             config["targets"] = [t for t in config["targets"] if t["session"] != session]
             if config.get("coordinator") == session:
                 config["coordinator"] = None

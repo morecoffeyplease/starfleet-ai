@@ -2,15 +2,18 @@
 import datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import selectors
 import re
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
 import uuid
+from urllib.parse import urlsplit
 
 NOTE_LIMIT = 8192
 TRACE_LIMIT = 256 * 1024
@@ -21,6 +24,21 @@ ATTENTION_TIMEOUT_SECONDS = 3
 ATTENTION_DETAIL_LIMIT = 512
 SECTIONS = ("Current state", "Next action", "Decisions and uncertainty",
             "Active work", "Evidence", "Holds and guidance")
+OPENCODE_SESSION_ID = re.compile(r"^ses_[A-Za-z0-9]+$")
+OPENCODE_EVENT_TYPES = {"compaction-started", "compaction-ended", "compaction-failed"}
+OPENCODE_USAGE_MAX_AGE_SECONDS = 300
+OPENCODE_PRESSURE_DESCRIPTOR_MAX_AGE_SECONDS = 900
+OPENCODE_PRESSURE_DESCRIPTOR_LIMIT = 16 * 1024
+OPENCODE_PRESSURE_OBSERVATION_LIMIT = 8 * 1024
+OPENCODE_PRESSURE_STATUSES = {
+    "unknown", "configured", "awaiting_usage", "below_threshold",
+    "warning_eligible", "warning_emitted", "warning_deduplicated",
+}
+OPENCODE_PRESSURE_REASONS = {
+    None, "descriptor_missing", "descriptor_expired", "context_read_failed",
+    "assistant_missing", "usage_invalid", "usage_stale", "identity_mismatch",
+    "auto_compaction_disabled", "new_generation", "checkpoint_disabled",
+}
 SNAPSHOT_PRUNING = (
     "Refresh this as a current snapshot. Replace outdated state rather than append. "
     "Remove completed work, superseded decisions and obsolete commands. Keep the next action and active work, "
@@ -484,6 +502,9 @@ def _draft_digest(state):
 
 
 def _generation_text(state):
+    if state.get("identity", {}).get("harness") == "opencode":
+        return (f"Observed {state.get('observed_generation', 0)} successful OpenCode compaction completion event(s) "
+                "since enrollment; complete event coverage remains uncertain.")
     if state.get("generation_uncertain") or state.get("pending_compact_boundary"):
         return "Compaction count not yet confirmed. This does not mean no compaction occurred."
     return f"Observed compaction generation since enrollment: {state.get('observed_generation', 0)}."
@@ -618,6 +639,425 @@ def _read_note(state, ci):
     return note, None
 
 
+def _empty_opencode_pressure():
+    return {"descriptor": None, "descriptor_sha256": None, "status": "unknown",
+            "reason": "descriptor_missing", "last_observed_at": None,
+            "last_anchor_tokens": None, "last_threshold_tokens": None,
+            "last_usage_age_seconds": None, "warning_correlation_id": None,
+            "warning_output_emitted": False, "generation_started_at_ms": None}
+
+
+def _timestamp_seconds(value, label):
+    if not isinstance(value, str):
+        raise ValueError(label + " must be an ISO timestamp with a timezone")
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(label + " must be an ISO timestamp with a timezone") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(label + " must include a timezone")
+    return parsed.timestamp()
+
+
+def _pressure_token_count(value, label, positive=False):
+    if isinstance(value, bool) or not isinstance(value, int) or value < (1 if positive else 0):
+        raise ValueError(label + " must be a positive token count" if positive else
+                         label + " must be a nonnegative token count")
+    return value
+
+
+def _validate_opencode_pressure_descriptor(value, root, session, require_fresh=False, now=None):
+    required = {"version", "native_api", "session_id", "worktree", "provider_id", "model_id",
+                "variant", "agent", "observed_at", "expires_at", "usable_window_tokens",
+                "compaction", "warning_lead_tokens"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("pressure descriptor fields do not match the reviewed schema")
+    if isinstance(value.get("version"), bool) or value.get("version") != 1:
+        raise ValueError("unsupported pressure descriptor version")
+    if value.get("session_id") != session or not OPENCODE_SESSION_ID.fullmatch(str(value.get("session_id", ""))):
+        raise ValueError("pressure descriptor does not match the exact OpenCode session")
+    if value.get("worktree") != str(root):
+        raise ValueError("pressure descriptor does not match the canonical worktree")
+    for key in ("provider_id", "model_id", "variant", "agent"):
+        item = value.get(key)
+        if (not isinstance(item, str) or not item or item.strip() != item or len(item) > 256
+                or any(ord(character) < 32 for character in item)):
+            raise ValueError("pressure descriptor " + key + " is invalid")
+    api = value.get("native_api")
+    if not isinstance(api, dict) or set(api) != {"origin", "pid", "started_at"}:
+        raise ValueError("pressure descriptor native API identity is incomplete")
+    origin = api.get("origin")
+    if not isinstance(origin, str) or len(origin) > 512:
+        raise ValueError("pressure descriptor native API origin is invalid")
+    try:
+        parsed_origin = urlsplit(origin)
+        valid_origin = (parsed_origin.scheme in ("http", "https") and bool(parsed_origin.hostname)
+                        and parsed_origin.username is None and parsed_origin.password is None
+                        and parsed_origin.path in ("", "/") and not parsed_origin.query
+                        and not parsed_origin.fragment)
+        _ = parsed_origin.port
+    except ValueError:
+        valid_origin = False
+    if not valid_origin:
+        raise ValueError("pressure descriptor native API origin must be a credential-free HTTP origin")
+    pid = api.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        raise ValueError("pressure descriptor native API process identity is invalid")
+    started_at = _timestamp_seconds(api.get("started_at"), "native API start time")
+    observed_at = _timestamp_seconds(value.get("observed_at"), "descriptor observation time")
+    expires_at = _timestamp_seconds(value.get("expires_at"), "descriptor expiry time")
+    now = time.time() if now is None else now
+    if expires_at <= observed_at or observed_at > now + 60 or started_at > observed_at:
+        raise ValueError("pressure descriptor timestamps are inconsistent")
+    if (expires_at - observed_at > OPENCODE_PRESSURE_DESCRIPTOR_MAX_AGE_SECONDS
+            or require_fresh and (expires_at <= now or now - observed_at > OPENCODE_PRESSURE_DESCRIPTOR_MAX_AGE_SECONDS)):
+        raise ValueError("pressure descriptor is expired")
+    usable_window = _pressure_token_count(value.get("usable_window_tokens"), "usable context window", True)
+    compaction = value.get("compaction")
+    if not isinstance(compaction, dict) or set(compaction) != {
+            "auto", "buffer_setting", "buffer_tokens", "ceiling_tokens", "config_sha256"}:
+        raise ValueError("pressure descriptor compaction settings are incomplete")
+    if type(compaction.get("auto")) is not bool:
+        raise ValueError("pressure descriptor automatic compaction setting is invalid")
+    buffer_setting = compaction.get("buffer_setting")
+    if (buffer_setting is not None and
+            (isinstance(buffer_setting, bool) or not isinstance(buffer_setting, (str, int, float))
+             or isinstance(buffer_setting, float) and not math.isfinite(buffer_setting))):
+        raise ValueError("pressure descriptor merged buffer setting is invalid")
+    buffer_tokens = _pressure_token_count(compaction.get("buffer_tokens"), "effective buffer", False)
+    ceiling = _pressure_token_count(compaction.get("ceiling_tokens"), "automatic compaction ceiling", True)
+    if ceiling >= usable_window or usable_window - buffer_tokens != ceiling:
+        raise ValueError("pressure descriptor window, effective buffer and compaction ceiling are inconsistent")
+    config_sha = compaction.get("config_sha256")
+    if not isinstance(config_sha, str) or re.fullmatch(r"[0-9a-f]{64}", config_sha) is None:
+        raise ValueError("pressure descriptor merged compaction settings digest is invalid")
+    lead = _pressure_token_count(value.get("warning_lead_tokens"), "warning lead", True)
+    if lead >= ceiling:
+        raise ValueError("warning lead must leave a positive lower-bound warning threshold")
+    return {
+        "version": 1,
+        "native_api": {"origin": origin, "pid": pid, "started_at": api["started_at"]},
+        "session_id": session,
+        "worktree": str(root),
+        "provider_id": value["provider_id"],
+        "model_id": value["model_id"],
+        "variant": value["variant"],
+        "agent": value["agent"],
+        "observed_at": value["observed_at"],
+        "expires_at": value["expires_at"],
+        "usable_window_tokens": usable_window,
+        "compaction": {"auto": compaction["auto"], "buffer_setting": buffer_setting,
+                       "buffer_tokens": buffer_tokens, "ceiling_tokens": ceiling,
+                       "config_sha256": config_sha},
+        "warning_lead_tokens": lead,
+    }
+
+
+def _read_opencode_pressure_descriptor(path, root, session):
+    candidate = Path(path).expanduser().absolute()
+    if any(part.is_symlink() for part in (candidate, *candidate.parents)):
+        raise ValueError("pressure descriptor path must not contain symlinks")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("pressure descriptor file is unavailable: " + type(error).__name__) from None
+    if resolved != candidate or not resolved.is_file():
+        raise ValueError("pressure descriptor must be a canonical regular file")
+    temp_roots = {Path(tempfile.gettempdir()).resolve(), Path("/tmp"), Path("/private/tmp")}
+    if any(resolved == temporary or temporary in resolved.parents for temporary in temp_roots):
+        raise ValueError("pressure descriptor must be durable and outside temporary directories")
+    if resolved == root or root in resolved.parents:
+        raise ValueError("pressure descriptor must be stored outside the worktree")
+    for parent in resolved.parents:
+        if (parent / ".git").exists():
+            raise ValueError("pressure descriptor must be stored outside Git checkouts")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(resolved, flags)
+    except OSError as error:
+        raise ValueError("pressure descriptor could not be opened safely: " + type(error).__name__) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("pressure descriptor must be a private owner-only regular file")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError("pressure descriptor must be owned by the current user")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(OPENCODE_PRESSURE_DESCRIPTOR_LIMIT + 1)
+        if len(raw) > OPENCODE_PRESSURE_DESCRIPTOR_LIMIT:
+            raise ValueError("pressure descriptor exceeds its bounded size")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            raise ValueError("pressure descriptor is not valid UTF-8 JSON") from None
+        descriptor = _validate_opencode_pressure_descriptor(value, root, session, require_fresh=True)
+        return descriptor, _digest(raw)
+    finally:
+        os.close(fd)
+
+
+def _pressure_unknown(state, reason, now=None):
+    pressure = state["opencode_pressure"]
+    pressure.update(status="unknown", reason=reason,
+                    last_observed_at=_now() if now is None else now,
+                    last_anchor_tokens=None, last_threshold_tokens=None,
+                    last_usage_age_seconds=None)
+
+
+def configure_opencode_pressure(ci, root, gitdir, session, descriptor_path):
+    """Import a private, evidence-backed descriptor for one enrolled native session."""
+    if not _opencode_checkpoint_owner(ci, root, gitdir, session):
+        raise ValueError("pressure configuration requires this exact session's orchestrator assignment")
+    descriptor, descriptor_sha = _read_opencode_pressure_descriptor(descriptor_path, root, session)
+    state_path = _state_path(gitdir, "opencode", session)
+    if not state_path.exists():
+        raise ValueError("pressure configuration requires an initialized exact-session checkpoint")
+    with ci.locked(_lock_path(state_path)):
+        _, state = _load_state(ci, root, gitdir, "opencode", session)
+        if not state.get("enabled"):
+            raise ValueError("pressure configuration requires an enabled exact-session checkpoint")
+        pressure = state["opencode_pressure"]
+        pressure.update(descriptor=descriptor, descriptor_sha256=descriptor_sha,
+                        status="configured" if descriptor["compaction"]["auto"] else "unknown",
+                        reason=None if descriptor["compaction"]["auto"] else "auto_compaction_disabled",
+                        last_observed_at=None, last_anchor_tokens=None,
+                        last_threshold_tokens=None, last_usage_age_seconds=None,
+                        warning_correlation_id=None, warning_output_emitted=False)
+        _record(ci, root, state, "pressure.configured",
+                "configured" if descriptor["compaction"]["auto"] else "disabled",
+                descriptor_sha,
+                {"descriptor_sha256": descriptor_sha,
+                 "ceiling_tokens": descriptor["compaction"]["ceiling_tokens"],
+                 "warning_lead_tokens": descriptor["warning_lead_tokens"],
+                 "pressure_basis": "last_measured_anchor"})
+        _write_json(state_path, state, ci)
+    return {"status": pressure["status"], "reason": pressure["reason"],
+            "harness": "opencode", "session_id": session, "worktree": str(root),
+            "descriptor_sha256": descriptor_sha,
+            "ceiling_tokens": descriptor["compaction"]["ceiling_tokens"],
+            "warning_lead_tokens": descriptor["warning_lead_tokens"]}
+
+
+def opencode_pressure_status(ci, root, gitdir, session):
+    """Return a data-only view of pressure readiness for the plugin adapter."""
+    result = {"status": "unknown", "reason": "checkpoint_disabled",
+              "observation_required": False}
+    if not _opencode_checkpoint_owner(ci, root, gitdir, session):
+        return result
+    state_path = _state_path(gitdir, "opencode", session)
+    if not state_path.exists():
+        return result
+    try:
+        with ci.locked(_lock_path(state_path)):
+            _, state = _load_state(ci, root, gitdir, "opencode", session)
+            pressure = state["opencode_pressure"]
+            descriptor = pressure.get("descriptor")
+            if not state.get("enabled"):
+                result["reason"] = "checkpoint_disabled"
+            elif descriptor is None:
+                result["reason"] = "descriptor_missing"
+            else:
+                try:
+                    descriptor = _validate_opencode_pressure_descriptor(
+                        descriptor, root, session, require_fresh=True)
+                except ValueError:
+                    pressure.update(status="unknown", reason="descriptor_expired")
+                    _write_json(state_path, state, ci)
+                    result["reason"] = "descriptor_expired"
+                else:
+                    if not descriptor["compaction"]["auto"]:
+                        pressure.update(status="unknown", reason="auto_compaction_disabled")
+                        _write_json(state_path, state, ci)
+                        result["reason"] = "auto_compaction_disabled"
+                    else:
+                        result.update(status=pressure["status"], reason=pressure["reason"],
+                                      observation_required=True)
+            result["descriptor_sha256"] = pressure.get("descriptor_sha256")
+            result["ceiling_tokens"] = ((descriptor or {}).get("compaction", {}).get("ceiling_tokens")
+                                        if descriptor is not None else None)
+            result["warning_lead_tokens"] = ((descriptor or {}).get("warning_lead_tokens")
+                                             if descriptor is not None else None)
+    except (OSError, ValueError, UnicodeError, TypeError, KeyError):
+        result["reason"] = "context_read_failed"
+    return result
+
+
+def _pressure_usage_identity(value, label):
+    if not isinstance(value, dict) or set(value) != {
+            "session_id", "worktree", "provider_id", "model_id", "variant", "agent"}:
+        raise ValueError(label + " identity is incomplete")
+    for key in ("session_id", "worktree", "provider_id", "model_id", "variant", "agent"):
+        item = value.get(key)
+        if not isinstance(item, str) or not item or item.strip() != item:
+            raise ValueError(label + " identity is incomplete")
+    return value
+
+
+def _pressure_observation_age(completed_at_ms, now):
+    if isinstance(completed_at_ms, bool) or not isinstance(completed_at_ms, (int, float)):
+        raise ValueError("assistant completion time is missing")
+    if not math.isfinite(completed_at_ms):
+        raise ValueError("assistant completion time is invalid")
+    completed = completed_at_ms / 1000
+    age = now - completed
+    if age < -5 or age > OPENCODE_USAGE_MAX_AGE_SECONDS:
+        raise ValueError("assistant usage is stale")
+    return max(0.0, age)
+
+
+def opencode_pressure_observe(ci, root, gitdir, session, payload):
+    """Evaluate only the latest native assistant's exact reported token counts."""
+    if not _opencode_checkpoint_owner(ci, root, gitdir, session):
+        return {"status": "unknown", "reason": "checkpoint_disabled", "warning": None}
+    state_path = _state_path(gitdir, "opencode", session)
+    if not state_path.exists():
+        return {"status": "unknown", "reason": "checkpoint_disabled", "warning": None}
+    if not isinstance(payload, dict) or set(payload) not in (
+            {"request", "assistant"}, {"read_error"}):
+        raise ValueError("pressure observation payload fields are invalid")
+    with ci.locked(_lock_path(state_path)):
+        _, state = _load_state(ci, root, gitdir, "opencode", session)
+        pressure = state["opencode_pressure"]
+        if not state.get("enabled"):
+            _pressure_unknown(state, "checkpoint_disabled")
+            _write_json(state_path, state, ci)
+            return {"status": "unknown", "reason": "checkpoint_disabled", "warning": None}
+        descriptor = pressure.get("descriptor")
+        if descriptor is None:
+            _pressure_unknown(state, "descriptor_missing")
+            _write_json(state_path, state, ci)
+            return {"status": "unknown", "reason": "descriptor_missing", "warning": None}
+        try:
+            descriptor = _validate_opencode_pressure_descriptor(
+                descriptor, root, session, require_fresh=True)
+        except ValueError:
+            _pressure_unknown(state, "descriptor_expired")
+            _write_json(state_path, state, ci)
+            return {"status": "unknown", "reason": "descriptor_expired", "warning": None}
+        if not descriptor["compaction"]["auto"]:
+            _pressure_unknown(state, "auto_compaction_disabled")
+            _write_json(state_path, state, ci)
+            return {"status": "unknown", "reason": "auto_compaction_disabled", "warning": None}
+        if set(payload) == {"read_error"}:
+            reason = payload["read_error"]
+            if reason not in ("context_read_failed", "assistant_missing"):
+                reason = "context_read_failed"
+            _pressure_unknown(state, reason)
+            _record(ci, root, state, "pressure.observed", "unknown", None,
+                    {"reason": reason, "descriptor_sha256": pressure["descriptor_sha256"]})
+            _write_json(state_path, state, ci)
+            return {"status": "unknown", "reason": reason, "warning": None}
+        now = time.time()
+        try:
+            request = _pressure_usage_identity(payload["request"], "current request")
+            assistant = payload["assistant"]
+            if not isinstance(assistant, dict) or set(assistant) != {"identity", "completed_at_ms", "tokens"}:
+                raise ValueError("assistant usage record is incomplete")
+            assistant_identity = _pressure_usage_identity(assistant["identity"], "assistant")
+            expected = {"session_id": session, "worktree": str(root),
+                        "provider_id": descriptor["provider_id"], "model_id": descriptor["model_id"],
+                        "variant": descriptor["variant"], "agent": descriptor["agent"]}
+            if request != expected or assistant_identity != expected:
+                raise ValueError("request or assistant identity does not match the reviewed descriptor")
+            usage_age = _pressure_observation_age(assistant["completed_at_ms"], now)
+            generation_boundary = pressure.get("generation_started_at_ms")
+            if (generation_boundary is not None and
+                    assistant["completed_at_ms"] < generation_boundary):
+                raise ValueError("assistant usage predates the successful compaction generation boundary")
+            tokens = assistant["tokens"]
+            token_fields = {"input", "output", "reasoning", "cache_read", "cache_write"}
+            if not isinstance(tokens, dict) or set(tokens) != token_fields:
+                raise ValueError("assistant usage fields are incomplete")
+            counts = {key: _pressure_token_count(tokens[key], "assistant " + key + " usage")
+                      for key in token_fields}
+            anchor = sum(counts.values())
+            if anchor <= 0:
+                raise ValueError("assistant usage is not positive")
+        except ValueError as error:
+            message = str(error)
+            if "generation boundary" in message:
+                reason = "new_generation"
+            elif "stale" in message or "completion time" in message:
+                reason = "usage_stale"
+            elif "usage" in message or "token" in message:
+                reason = "usage_invalid"
+            else:
+                reason = "identity_mismatch"
+            _pressure_unknown(state, reason)
+            _record(ci, root, state, "pressure.observed", "unknown", None,
+                    {"reason": reason, "descriptor_sha256": pressure["descriptor_sha256"]})
+            _write_json(state_path, state, ci)
+            return {"status": "unknown", "reason": reason, "warning": None}
+        threshold = descriptor["compaction"]["ceiling_tokens"] - descriptor["warning_lead_tokens"]
+        pressure.update(last_observed_at=_now(), last_anchor_tokens=anchor,
+                        last_threshold_tokens=threshold, last_usage_age_seconds=usage_age,
+                        reason=None)
+        details = {"usage_anchor_tokens": anchor, "warning_threshold_tokens": threshold,
+                   "ceiling_tokens": descriptor["compaction"]["ceiling_tokens"],
+                   "warning_lead_tokens": descriptor["warning_lead_tokens"],
+                   "usage_age_seconds": usage_age, "pressure_basis": "last_measured_anchor",
+                   "descriptor_sha256": pressure["descriptor_sha256"]}
+        if anchor < threshold:
+            pressure.update(status="below_threshold", warning_correlation_id=None,
+                            warning_output_emitted=False)
+            _record(ci, root, state, "pressure.observed", "below_threshold", None, details)
+            _write_json(state_path, state, ci)
+            return {"status": "below_threshold", "reason": None, "warning": None,
+                    "usage_anchor_tokens": anchor, "threshold_tokens": threshold,
+                    "ceiling_tokens": descriptor["compaction"]["ceiling_tokens"]}
+        _record(ci, root, state, "pressure.observed", "threshold_reached", None, details)
+        if state.get("reminded_generation") == state.get("observed_generation"):
+            pressure.update(status="warning_deduplicated")
+            _write_json(state_path, state, ci)
+            return {"status": "warning_deduplicated", "reason": None, "warning": None,
+                    "usage_anchor_tokens": anchor, "threshold_tokens": threshold,
+                    "ceiling_tokens": descriptor["compaction"]["ceiling_tokens"]}
+        generation = state.get("observed_generation", 0)
+        correlation = _digest((session + "\0" + str(generation) + "\0" +
+                               pressure["descriptor_sha256"]).encode("utf-8"))
+        state["reminded_generation"] = generation
+        pressure.update(status="warning_eligible", warning_correlation_id=correlation,
+                        warning_output_emitted=False)
+        _record(ci, root, state, "reminder.eligible", "eligible", correlation, details)
+        _write_json(state_path, state, ci)
+        warning = (
+            "Pattern Buffer early checkpoint warning. The last measured lower-bound usage anchor is "
+            f"{anchor} tokens, at or above the configured warning threshold of {threshold} tokens; "
+            f"the observed automatic compaction ceiling is {descriptor['compaction']['ceiling_tokens']} tokens. "
+            "This is a lower-bound last-measured reminder, not exact current occupancy or guaranteed headroom. "
+            "A sudden large unseen context tail can still trigger automatic compaction without a warning. "
+            "Review and prune the editable checkpoint draft now, then let a successful tool completion publish it."
+        )
+        return {"status": "warning_eligible", "reason": None, "warning": warning,
+                "correlation_id": correlation, "usage_anchor_tokens": anchor,
+                "threshold_tokens": threshold, "ceiling_tokens": descriptor["compaction"]["ceiling_tokens"]}
+
+
+def opencode_pressure_emitted(ci, root, gitdir, session, correlation_id):
+    if not _opencode_checkpoint_owner(ci, root, gitdir, session):
+        return {"status": "checkpoint_disabled", "session_id": session, "worktree": str(root)}
+    if not isinstance(correlation_id, str) or re.fullmatch(r"[0-9a-f]{64}", correlation_id) is None:
+        raise ValueError("pressure warning correlation ID is invalid")
+    state_path = _state_path(gitdir, "opencode", session)
+    if not state_path.exists():
+        return {"status": "checkpoint_disabled", "session_id": session, "worktree": str(root)}
+    with ci.locked(_lock_path(state_path)):
+        _, state = _load_state(ci, root, gitdir, "opencode", session)
+        pressure = state["opencode_pressure"]
+        if pressure.get("warning_correlation_id") != correlation_id:
+            return {"status": "unknown_warning", "session_id": session, "worktree": str(root)}
+        if pressure.get("warning_output_emitted"):
+            result = "duplicate"
+        else:
+            pressure["status"] = "warning_emitted"
+            pressure["warning_output_emitted"] = True
+            _record(ci, root, state, "delivery.emitted", "emitted", correlation_id,
+                    {"source": "opencode", "outcome": "emitted"})
+            result = "emitted"
+        _write_json(state_path, state, ci)
+    return {"status": result, "session_id": session, "worktree": str(root)}
+
+
 def _load_state(ci, root, gitdir, harness, session):
     path = _state_path(gitdir, harness, session)
     if not path.exists():
@@ -702,7 +1142,70 @@ def _load_state(ci, root, gitdir, harness, session):
                    for value in state["draft_signature"][:2])
             or not isinstance(state["draft_signature"][2], str)):
         raise ValueError("checkpoint draft metadata is invalid")
-    _validate_settings(state["compact_at"], state["lead_points"])
+    pressure_qualified = state.get("pressure_qualified", harness != "opencode")
+    if not isinstance(pressure_qualified, bool):
+        raise ValueError("checkpoint pressure qualification metadata is invalid")
+    if harness == "opencode":
+        if (pressure_qualified or state["compact_at"] is not None or state["lead_points"] is not None
+                or state["reminders"]):
+            raise ValueError("OpenCode pressure must remain unqualified until native usage evidence is reviewed")
+        pressure = state.setdefault("opencode_pressure", _empty_opencode_pressure())
+        pressure_fields = {"descriptor", "descriptor_sha256", "status", "reason", "last_observed_at",
+                           "last_anchor_tokens", "last_threshold_tokens", "last_usage_age_seconds",
+                           "warning_correlation_id", "warning_output_emitted",
+                           "generation_started_at_ms"}
+        if not isinstance(pressure, dict) or set(pressure) != pressure_fields:
+            raise ValueError("OpenCode pressure metadata is invalid")
+        if pressure.get("status") not in OPENCODE_PRESSURE_STATUSES or pressure.get("reason") not in OPENCODE_PRESSURE_REASONS:
+            raise ValueError("OpenCode pressure state is invalid")
+        if pressure.get("last_observed_at") is not None:
+            _timestamp_seconds(pressure["last_observed_at"], "OpenCode pressure observation time")
+        for key in ("last_anchor_tokens", "last_threshold_tokens"):
+            item = pressure.get(key)
+            if item is not None and (isinstance(item, bool) or not isinstance(item, int) or item < 0):
+                raise ValueError("OpenCode pressure token metadata is invalid")
+        age = pressure.get("last_usage_age_seconds")
+        if age is not None and (isinstance(age, bool) or not isinstance(age, (int, float))
+                                or not math.isfinite(age) or age < 0):
+            raise ValueError("OpenCode pressure usage age is invalid")
+        correlation = pressure.get("warning_correlation_id")
+        if correlation is not None and (not isinstance(correlation, str)
+                                        or re.fullmatch(r"[0-9a-f]{64}", correlation) is None):
+            raise ValueError("OpenCode warning correlation metadata is invalid")
+        if type(pressure.get("warning_output_emitted")) is not bool:
+            raise ValueError("OpenCode warning emission metadata is invalid")
+        generation_boundary = pressure.get("generation_started_at_ms")
+        if (generation_boundary is not None and
+                (isinstance(generation_boundary, bool) or not isinstance(generation_boundary, int)
+                 or generation_boundary < 0)):
+            raise ValueError("OpenCode successful-generation boundary metadata is invalid")
+        descriptor = pressure.get("descriptor")
+        descriptor_sha = pressure.get("descriptor_sha256")
+        if descriptor is None:
+            if descriptor_sha is not None:
+                raise ValueError("OpenCode pressure descriptor digest has no descriptor")
+        else:
+            _validate_opencode_pressure_descriptor(descriptor, root, session)
+            if not isinstance(descriptor_sha, str) or re.fullmatch(r"[0-9a-f]{64}", descriptor_sha) is None:
+                raise ValueError("OpenCode pressure descriptor digest is invalid")
+        recent = state.get("recent_compaction_event_ids", [])
+        if (not isinstance(recent, list) or len(recent) > 64 or
+                any(not isinstance(item, dict) or set(item) != {"event_id", "event_type"}
+                    or not isinstance(item.get("event_id"), str)
+                    or not re.fullmatch(r"evt_[A-Za-z0-9]+", item["event_id"])
+                    or item.get("event_type") not in OPENCODE_EVENT_TYPES for item in recent)):
+            raise ValueError("OpenCode compaction event metadata is invalid")
+        sequence = state.get("last_compaction_event_sequence")
+        if sequence is not None and (isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0):
+            raise ValueError("OpenCode compaction event sequence is invalid")
+        for key in ("invalid_draft_sha256", "advised_draft_sha256"):
+            value = state.get(key)
+            if value is not None and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)):
+                raise ValueError("OpenCode draft advisory metadata is invalid")
+    else:
+        if not pressure_qualified:
+            raise ValueError("pressure qualification metadata is invalid for this harness")
+        _validate_settings(state["compact_at"], state["lead_points"])
     note_path = Path(state["checkpoint_path"])
     previous_path = Path(state["previous_path"])
     if not state["external"] and note_path != _dir(gitdir, harness, session) / "checkpoint.md":
@@ -723,6 +1226,8 @@ def _load_state(ci, root, gitdir, harness, session):
 
 
 def _effective_threshold(state, harness):
+    if not state.get("pressure_qualified", harness != "opencode"):
+        return None, None, "unqualified; live pressure warnings disabled"
     compact = state["compact_at"]
     source = state.get("threshold_source", "operator configuration")
     if harness == "claude":
@@ -745,6 +1250,7 @@ def _report(ci, root, gitdir, harness, session, state, include_note=False):
     note, warning = _read_note(state, ci)
     revision = ci.git(root, "rev-parse", "HEAD")
     compact, reminder_threshold, effective_source = _effective_threshold(state, harness)
+    pressure_qualified = state.get("pressure_qualified", harness != "opencode")
     elapsed = None
     if state.get("reviewed_at"):
         try:
@@ -752,9 +1258,23 @@ def _report(ci, root, gitdir, harness, session, state, include_note=False):
             elapsed = max(0, int((datetime.datetime.now(datetime.timezone.utc) - reviewed).total_seconds()))
         except (ValueError, TypeError):
             pass
+    pressure_status = "qualified" if pressure_qualified else "unqualified; exact occupancy warnings disabled"
+    pressure_basis = None
+    pressure_reason = None
+    if harness == "opencode":
+        pressure = state.get("opencode_pressure", _empty_opencode_pressure())
+        pressure_reason = pressure.get("reason")
+        pressure_basis = "last_measured_anchor" if pressure.get("descriptor") is not None else None
+        pressure_status = "unqualified; advisory " + pressure.get("status", "unknown")
+        if pressure_reason:
+            pressure_status += " (" + pressure_reason + ")"
     result = {"initialized": True, "checkpoint_path": state["checkpoint_path"],
               "identity": state.get("identity"), "enabled": state.get("enabled", False),
               "reminders": state.get("reminders", False),
+              "pressure_qualified": pressure_qualified,
+              "pressure_status": pressure_status,
+              "pressure_basis": pressure_basis,
+              "pressure_reason": pressure_reason,
               "reviewed_at": state.get("reviewed_at"), "saved_revision": state.get("saved_revision"),
               "published_at": state.get("published_at"),
               "seconds_since_review": elapsed,
@@ -807,8 +1327,10 @@ def _report(ci, root, gitdir, harness, session, state, include_note=False):
 
 def handle_cli(ci, root, gitdir, args):
     harness, session, command = args.harness, args.session, args.command
-    if harness not in ("claude", "codex") or not session:
+    if harness not in ("claude", "codex", "opencode") or not session:
         raise ValueError("checkpoint commands require a supported harness and session")
+    if harness == "opencode" and not OPENCODE_SESSION_ID.fullmatch(session):
+        raise ValueError("OpenCode checkpoints require the exact case-sensitive ses_ session ID")
     _primary(ci, root, gitdir, harness, session)
     state_path = _state_path(gitdir, harness, session)
     if command == "checkpoint-init":
@@ -821,12 +1343,17 @@ def handle_cli(ci, root, gitdir, args):
                 raise ValueError("checkpoint is already initialized")
             compact = args.compact_at
             source = "operator configuration"
-            if compact is None:
+            if harness == "opencode":
+                if compact is not None or args.lead_points is not None:
+                    raise ValueError("OpenCode pressure is unqualified; do not supply compact-at or lead values")
+                source = "unqualified; verified provider usage, usable window, and active compaction settings are required"
+            elif compact is None:
                 if harness == "codex":
                     raise ValueError("Codex requires explicit --compact-at because its runtime threshold is unknown")
                 compact, source = 60.0, "operator fallback 60; runtime override is honored"
-            lead = args.lead_points
-            _validate_settings(compact, lead)
+            lead = args.lead_points if args.lead_points is not None else 5.0
+            if harness != "opencode":
+                _validate_settings(compact, lead)
             folder = state_path.parent
             folder.mkdir(parents=True, exist_ok=True, mode=0o700)
             note_path = folder / "checkpoint.md"
@@ -862,16 +1389,27 @@ def handle_cli(ci, root, gitdir, args):
                 raise ValueError(draft_error)
             state = {"version": 1, "identity": owner, "checkpoint_path": str(note_path),
                      "previous_path": str(previous_path),
-                     "compact_at": float(compact), "lead_points": float(lead),
-                     "threshold_source": source, "reminders": True, "enabled": True,
+                     "compact_at": float(compact) if compact is not None else None,
+                     "lead_points": float(lead) if harness != "opencode" else None,
+                     "threshold_source": source, "pressure_qualified": harness != "opencode",
+                     "reminders": harness != "opencode", "enabled": True,
                      "reviewed_at": None, "saved_revision": None, "note_sha256": None,
                      "saved_generation": None, "external": bool(args.path),
                      "observed_generation": 0, "generation_uncertain": True,
-                     "generation_scope": "since enrollment",
-                     "uncertainty": "no transcript provenance observed yet", "transcript": None,
+                     "generation_scope": ("observed completion events; event coverage uncertain"
+                                          if harness == "opencode" else "since enrollment"),
+                     "uncertainty": ("native compaction completion events may be missed while the plugin is inactive"
+                                     if harness == "opencode" else "no transcript provenance observed yet"),
+                     "transcript": None,
                      "reminded_generation": None, "usage": None,
                      "draft_path": str(draft), "draft_signature": draft_signature,
                      "published_at": None}
+            if harness == "opencode":
+                state["recent_compaction_event_ids"] = []
+                state["last_compaction_event_sequence"] = None
+                state["invalid_draft_sha256"] = None
+                state["advised_draft_sha256"] = None
+                state["opencode_pressure"] = _empty_opencode_pressure()
             state["idle_warning_minutes"] = 50 if harness == "claude" else 0
             _arm_idle_timer(state, harness, session, "enrollment", ci)
             _write_json(state_path, state, ci)
@@ -880,6 +1418,9 @@ def handle_cli(ci, root, gitdir, args):
             return result
         _, state = _load_state(ci, root, gitdir, harness, session)
         if command == "checkpoint-config":
+            if harness == "opencode" and (args.reminders is not None or args.compact_at is not None
+                                           or args.lead_points is not None or args.idle_warning_minutes is not None):
+                raise ValueError("OpenCode percentage pressure settings remain disabled; reviewed native evidence may enable lower-bound token reminders separately")
             if args.idle_warning_minutes is not None:
                 minutes = args.idle_warning_minutes
                 if harness != "claude" or not 0 <= minutes <= 1440:
@@ -890,7 +1431,8 @@ def handle_cli(ci, root, gitdir, args):
                 state["threshold_source"] = "operator configuration"
             if args.lead_points is not None:
                 state["lead_points"] = args.lead_points
-            _validate_settings(state["compact_at"], state["lead_points"])
+            if harness != "opencode":
+                _validate_settings(state["compact_at"], state["lead_points"])
             if args.reminders is not None:
                 state["reminders"] = args.reminders == "on"
             if args.enabled is not None:
@@ -920,6 +1462,167 @@ def handle_cli(ci, root, gitdir, args):
         if command == "checkpoint-read":
             return _report(ci, root, gitdir, harness, session, state, True)
     raise ValueError("unknown checkpoint command")
+
+
+def _opencode_checkpoint_owner(ci, root, gitdir, session):
+    if not isinstance(session, str) or not OPENCODE_SESSION_ID.fullmatch(session):
+        raise ValueError("OpenCode checkpoints require the exact case-sensitive ses_ session ID")
+    config_path = gitdir / "context-injector" / "config.json"
+    if not config_path.exists():
+        return False
+    config, _ = ci.load(root, gitdir)
+    if not ci.enabled(config):
+        return False
+    role, _, binding = ci.resolve_role(root, gitdir, config, "opencode", session)
+    return role == "orchestrator" and not binding.get("task_id")
+
+
+def opencode_recovery_context(ci, root, gitdir, session):
+    """Return exact-session recovery guidance from the shared checkpoint state."""
+    if not _opencode_checkpoint_owner(ci, root, gitdir, session):
+        return ""
+    state_path = _state_path(gitdir, "opencode", session)
+    if not state_path.exists():
+        return ""
+    with ci.locked(_lock_path(state_path)):
+        try:
+            _, state = _load_state(ci, root, gitdir, "opencode", session)
+        except (OSError, ValueError, UnicodeError, TypeError, KeyError):
+            return ("Pattern Buffer checkpoint recovery for this exact OpenCode session.\n"
+                    "WARNING: Checkpoint metadata failed integrity checks; no checkpoint contents were injected. "
+                    "Inspect checkpoint-status for this exact session and repair its reviewed publication before relying on recovery.\n"
+                    "This advisory does not change standing context, task authority, or human holds.")
+        if not state.get("enabled"):
+            return ""
+        note, warning = _read_note(state, ci)
+        draft = Path(state["draft_path"])
+        draft_notice = None
+        if not draft.exists():
+            draft_notice = "The editable draft is missing; recreate it from the reviewed note before updating."
+        else:
+            draft_text, signature, draft_error = _draft_snapshot(draft)
+            if not draft_error and signature != state["draft_signature"]:
+                try:
+                    _validate_note(draft_text)
+                except ValueError as error:
+                    draft_error = str(error)
+            if draft_error:
+                if (signature != state["draft_signature"] and
+                        state.get("invalid_draft_sha256") != signature[2]):
+                    state["invalid_draft_sha256"] = signature[2]
+                    _write_json(state_path, state, ci)
+            elif signature != state["draft_signature"]:
+                draft_notice = "The editable draft has unpublished changes; reconcile it with the published note."
+        lines = ["Pattern Buffer checkpoint recovery for this exact OpenCode session.",
+                 "Read the reviewed current-state checkpoint before resuming: " + state["checkpoint_path"],
+                 "Reconcile its claims with live evidence, preserve its human holds, and do not adopt another session's note.",
+                 "Maintain the separate editable draft as a pruned current snapshot: " + state["draft_path"],
+                 "A successful OpenCode tool-completion callback publishes a changed valid draft atomically.",
+                 _generation_text(state),
+                 "OpenCode pressure reminders require a fresh, exact-session descriptor and matching recent assistant usage. "
+                 "Any reminder uses a last-measured lower-bound token anchor, not exact occupancy or guaranteed headroom; "
+                 "unknown or stale evidence produces no warning."]
+        if note is None:
+            lines.append("WARNING: The reviewed checkpoint is unavailable or changed outside checkpoint-save; no note contents are injected. Inspect checkpoint-status for this exact session before relying on recovery.")
+        if draft_notice:
+            lines.append("WARNING: " + draft_notice)
+        elif warning:
+            lines.append("WARNING: " + warning)
+        invalid_digest = state.get("invalid_draft_sha256")
+        if invalid_digest and invalid_digest != state.get("advised_draft_sha256"):
+            lines.append("WARNING: The latest changed draft was rejected or is invalid; the last good checkpoint remains published. Review and correct the draft before further substantial work.")
+            state["advised_draft_sha256"] = invalid_digest
+            _write_json(state_path, state, ci)
+        lines.append("This checkpoint records current state. It does not grant authority or prove model reception.")
+        return "\n".join(lines)
+
+
+def opencode_event(ci, root, gitdir, session, event_type, event_id=None, aggregate_id=None,
+                   event_sequence=None):
+    """Apply native OpenCode lifecycle observations through shared checkpoint publication semantics."""
+    if event_type not in ("tool-completed", *OPENCODE_EVENT_TYPES):
+        raise ValueError("unsupported OpenCode checkpoint lifecycle event")
+    if not _opencode_checkpoint_owner(ci, root, gitdir, session):
+        return {"status": "not_checkpoint_owner", "harness": "opencode", "session_id": session,
+                "worktree": str(root)}
+    state_path = _state_path(gitdir, "opencode", session)
+    if not state_path.exists():
+        return {"status": "not_enrolled", "harness": "opencode", "session_id": session,
+                "worktree": str(root)}
+    with ci.locked(_lock_path(state_path)):
+        _, state = _load_state(ci, root, gitdir, "opencode", session)
+        if not state.get("enabled"):
+            result = "disabled"
+        elif event_type == "tool-completed":
+            draft = _verify_draft(ci, root, gitdir, "opencode", session, state, missing_ok=True)
+            if not draft.exists():
+                result = "draft_missing"
+            else:
+                draft_text, signature, draft_error = _draft_snapshot(draft)
+                if signature == state["draft_signature"]:
+                    result = "unchanged"
+                else:
+                    digest = signature[2]
+                    state["draft_signature"] = signature
+                    _record(ci, root, state, "note.draft_changed", "changed", digest,
+                            {"bytes": len(draft_text.encode()) if draft_text else 0, "source": "opencode"})
+                    if draft_error:
+                        state["invalid_draft_sha256"] = digest
+                        _record(ci, root, state, "note.rejected", "invalid", digest, {"source": "opencode"})
+                        _write_json(state_path, state, ci)
+                        result = "rejected"
+                    else:
+                        try:
+                            note = _publish(ci, root, state, draft_text, _signature_time(signature))
+                        except ValueError:
+                            state["invalid_draft_sha256"] = digest
+                            _record(ci, root, state, "note.rejected", "invalid", digest, {"source": "opencode"})
+                            _write_json(state_path, state, ci)
+                            result = "rejected"
+                        else:
+                            state["invalid_draft_sha256"] = None
+                            _write_json(state_path, state, ci)
+                            result = "published"
+        else:
+            if (not isinstance(event_id, str) or not re.fullmatch(r"evt_[A-Za-z0-9]+", event_id)
+                    or aggregate_id != session or isinstance(event_sequence, bool)
+                    or not isinstance(event_sequence, int) or event_sequence < 0):
+                return {"status": "unknown_identity", "harness": "opencode", "session_id": session,
+                        "worktree": str(root)}
+            recent = state.get("recent_compaction_event_ids", [])
+            last_sequence = state.get("last_compaction_event_sequence")
+            if (any(item["event_id"] == event_id for item in recent) or
+                    last_sequence is not None and event_sequence <= last_sequence):
+                result = "duplicate"
+            else:
+                recent.append({"event_id": event_id, "event_type": event_type})
+                state["recent_compaction_event_ids"] = recent[-64:]
+                state["last_compaction_event_sequence"] = event_sequence
+                if event_type == "compaction-ended":
+                    state["observed_generation"] += 1
+                    state["generation_uncertain"] = True
+                    state["uncertainty"] = "OpenCode event subscription has no replay guarantee; completion coverage may be incomplete"
+                    pressure = state["opencode_pressure"]
+                    pressure.update(status="awaiting_usage", reason="new_generation",
+                                    last_observed_at=None, last_anchor_tokens=None,
+                                    last_threshold_tokens=None, last_usage_age_seconds=None,
+                                    warning_correlation_id=None, warning_output_emitted=False,
+                                    generation_started_at_ms=int(time.time() * 1000))
+                    _record(ci, root, state, "compaction.observed", "completed", event_id,
+                            {"generation": state["observed_generation"], "generation_uncertain": True,
+                             "trigger": "opencode"})
+                    result = "completed"
+                elif event_type == "compaction-failed":
+                    _record(ci, root, state, "compaction.failed", "failed", event_id, {"trigger": "opencode"})
+                    result = "failed"
+                else:
+                    _record(ci, root, state, "compaction.attempted", "started", event_id,
+                            {"trigger": "opencode"})
+                    result = "attempted"
+                _write_json(state_path, state, ci)
+    return {"status": result, "harness": "opencode", "session_id": session,
+            "worktree": str(root), "pressure_qualified": False,
+            "observed_generation": state.get("observed_generation", 0)}
 
 
 def _transcript_identity(ci, root, harness, session, payload):

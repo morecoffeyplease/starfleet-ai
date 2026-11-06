@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
@@ -63,10 +64,19 @@ def owner_from_args(args):
 
 
 def canonical_owner(harness, session, surface):
-    require(harness in ("claude", "codex"), "Specify --harness claude|codex")
+    require(harness in ("claude", "codex", "opencode"), "Specify --harness claude|codex|opencode")
     require(session and surface, "Specify the enrolled owner --session and --surface")
-    return {"harness": harness, "session": canonical_uuid(session, "--session"),
+    return {"harness": harness, "session": canonical_session(harness, session),
             "surface": canonical_uuid(surface, "--surface")}
+
+
+def canonical_session(harness, session):
+    if harness == "opencode":
+        require(isinstance(session, str) and re.fullmatch(r"ses_[A-Za-z0-9]+", session),
+                "OpenCode --session must be the exact native ses_ ID")
+        return session
+    require(harness in ("claude", "codex"), "Unsupported owner harness")
+    return canonical_uuid(session, "--session")
 
 
 def canonical_uuid(value, name):
@@ -1130,7 +1140,7 @@ def completion_route_info(row, targets):
     return {"status": "missing_exact_hailing_route", "request_ids": [row["id"]],
             "owner": owner, "owner_setup_action": enroll,
             "handoff_action": ("The current owner may authorize `warp-drive transfer REQUEST_ID "
-                               "--harness claude|codex --session NEW_SESSION --surface NEW_SURFACE "
+                               "--harness claude|codex|opencode --session NEW_SESSION --surface NEW_SURFACE "
                                "--from-session CURRENT_OWNER_SESSION --reason 'completion handoff'` "
                                "to a live enrolled owner.")}
 
@@ -1914,7 +1924,7 @@ def build_parser():
     attach = sub.add_parser("attach", help=ATTACH_RECOVERY_HELP,
                             description=ATTACH_RECOVERY_HELP)
     attach.add_argument("request_id")
-    attach.add_argument("--harness", choices=("claude", "codex"), required=True)
+    attach.add_argument("--harness", choices=("claude", "codex", "opencode"), required=True)
     attach.add_argument("--session", required=True)
     attach.add_argument("--surface", required=True)
     attach.add_argument("--timeout", type=float,
@@ -1943,7 +1953,7 @@ def build_parser():
     group.add_argument("--resume", action="store_true")
     transfer = sub.add_parser("transfer", help="transfer current owner without replaying work")
     transfer.add_argument("request_id")
-    transfer.add_argument("--harness", choices=("claude", "codex"), required=True)
+    transfer.add_argument("--harness", choices=("claude", "codex", "opencode"), required=True)
     transfer.add_argument("--session", required=True)
     transfer.add_argument("--surface", required=True)
     transfer.add_argument("--reason", required=True)
@@ -1986,7 +1996,7 @@ def build_parser():
     incident.add_argument("--resolve", action="store_true")
     reconcile = sub.add_parser("reconcile", help="record owner evidence for an uncertain command")
     reconcile.add_argument("request_id")
-    reconcile.add_argument("--harness", choices=("claude", "codex"), required=True)
+    reconcile.add_argument("--harness", choices=("claude", "codex", "opencode"), required=True)
     reconcile.add_argument("--session", required=True)
     reconcile.add_argument("--surface", required=True)
     reconcile.add_argument("--outcome", choices=("unknown", "succeeded", "failed"), required=True)
@@ -1997,7 +2007,7 @@ def build_parser():
 
 def _add_request_args(parser):
     parser.add_argument("--key", required=True)
-    parser.add_argument("--harness", choices=("claude", "codex"), required=True)
+    parser.add_argument("--harness", choices=("claude", "codex", "opencode"), required=True)
     parser.add_argument("--session", required=True)
     parser.add_argument("--surface", required=True)
     parser.add_argument("--size", choices=("light", "heavy"), required=True,
@@ -2163,7 +2173,7 @@ def _main(argv, product_umask):
             with immediate_transaction(db):
                 row = current_request(db, args.request_id)
                 old = {"harness": row["owner_harness"], "session": row["owner_session"], "surface": row["owner_surface"]}
-                require(row["owner_session"] == canonical_uuid(args.from_session, "--from-session"),
+                require(row["owner_session"] == canonical_session(row["owner_harness"], args.from_session),
                         "--from-session must be the current reservation owner")
                 if row["state"] == "waiting":
                     freeze_credit(db, row, now())

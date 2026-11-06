@@ -68,10 +68,17 @@ Do not hold a checkout's only available turn while synchronously waiting for dep
 
 ## Submit and run one request
 
-Use the exact session and surface identities observed for your current Claude or Codex owner.
+Use the exact session and surface identities observed for your current Claude, Codex or OpenCode owner.
 Do not use a workspace title or an identity copied from another session.
 Use a parent's stable, exact enrolled completion recipient only when that parent explicitly delegates it for this request.
 That delegated identity is recorded as the request's current owner and recipient; handoff later still requires an explicit `warp-drive transfer`.
+
+For OpenCode, pass its exact native `ses_` session ID, including letter case, and the current CMUX surface UUID.
+Warp-drive does not convert OpenCode session IDs to UUIDs or borrow an identity from another agent.
+The source CLI accepts OpenCode reservation ownership, but an installed older Warp-drive runtime does not gain that support until separately updated.
+This owner identity support does not start a scheduler, grant admission authority or prove an installed runtime's native notification path.
+Exact completion routing also depends on the installed Hailing Frequencies target accepting that same OpenCode session and CMUX surface.
+The separate native OpenCode Hailing route is not proven by this Warp-drive source change.
 
 ```sh
 warp-drive run --key UNIQUE_REQUEST_KEY \

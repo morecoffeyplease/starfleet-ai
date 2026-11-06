@@ -8,8 +8,11 @@ import tempfile
 
 root = Path(__file__).resolve().parent
 with tempfile.TemporaryDirectory(prefix="hailing-frequencies-compile-") as temporary:
-    for name in ("hailing_frequencies.py", "install.py", "service.py", "temporal_beacon.py", "verify.py"):
-        py_compile.compile(str(root / name), cfile=str(Path(temporary) / (name + "c")), doraise=True)
+    sources = [root / name for name in
+               ("hailing_frequencies.py", "install.py", "service.py", "temporal_beacon.py", "verify.py")]
+    sources.append(root.parent / "opencode-adapter" / "opencode_adapter.py")
+    for index, source in enumerate(sources):
+        py_compile.compile(str(source), cfile=str(Path(temporary) / f"{index}-{source.name}c"), doraise=True)
 for name in ("agent-notify", "tests/test_agent_notify.sh"):
     subprocess.run(["bash", "-n", str(root / name)], check=True)
 subprocess.run(["bash", str(root / "tests/test_agent_notify.sh")], check=True)

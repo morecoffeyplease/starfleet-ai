@@ -232,6 +232,11 @@ Live harness delivery remains a separate observation and is not established by t
 Inspect authorized model-visible records for delivery evidence; ordinary run logs, printed IDs and successful dispatch/finish commands alone do not establish what the model received.
 This public source tree does not include private pilot receipts or acceptance snapshots.
 
+## OpenCode pilot
+
+OpenCode uses a separate prepare-then-bind workflow because Pattern Buffer does not launch or discover native OpenCode sessions.
+Read the [OpenCode adapter guide](opencode.md) for the exact `ses_` binding contract, isolated plugin setup and unverified native delivery boundary.
+
 ## Verification
 
 Run the canonical local suite documented in the app README.

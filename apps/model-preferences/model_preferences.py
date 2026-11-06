@@ -25,6 +25,11 @@ _transport_spec = importlib.util.spec_from_file_location("model_preferences_cmux
 cmux_transport = importlib.util.module_from_spec(_transport_spec)
 _transport_spec.loader.exec_module(cmux_transport)
 PreferenceError = cmux_transport.PreferenceError
+_opencode_path = Path(__file__).resolve().with_name("opencode_dispatch.py")
+_opencode_spec = importlib.util.spec_from_file_location("model_preferences_opencode_dispatch", _opencode_path)
+opencode_dispatch = importlib.util.module_from_spec(_opencode_spec)
+sys.modules[_opencode_spec.name] = opencode_dispatch
+_opencode_spec.loader.exec_module(opencode_dispatch)
 
 
 def now():
@@ -78,6 +83,24 @@ def locked(directory):
 
 
 ROLES = ("orchestrator", "implementer", "researcher", "standard_review", "advanced_review")
+QWEN_OBSERVER_GUIDE_URL = (
+    "https://github.com/morecoffeyplease/starfleet-ai/blob/main/docs/qwen-operating-guide.md"
+    "#inference-and-test-observer-preflight"
+)
+
+
+def qwen_observer_guide_path():
+    source_path = Path(__file__).resolve()
+    repository_root = source_path.parents[2]
+    guide_path = repository_root / "docs/qwen-operating-guide.md"
+    try:
+        if (repository_root / ".git").exists() and guide_path.is_file():
+            return str(guide_path.resolve(strict=True))
+    except (OSError, RuntimeError):
+        pass
+    return None
+
+
 DELEGATION = ("Ask your parent orchestrator for additional agents, including research and review, unless this task explicitly delegates that authority. "
               "Explicit delegation still follows current role choices, reviewer count and advanced-review permission.")
 
@@ -109,6 +132,13 @@ def example_config():
         models[name] = {"harness": harness, "slug": slug,
                         "efforts": ["low", "medium", "high", "xhigh", "max"],
                         "source": "opt-in example; current availability is not checked"}
+    models["local-qwen3.6-35b"] = {
+        "harness": "opencode", "provider_id": "trial-local", "slug": "qwen3.6:35b", "efforts": ["max"],
+        "source": "opt-in example; native pilot verified the local OpenAI-compatible provider's max reasoning request and 32768 output limit",
+    }
+    qwen_max = choice("local-qwen3.6-35b", "max")
+    sol_medium = choice("codex-sol", "medium")
+    sol_high = choice("codex-sol", "high")
     return {"schema_version": 1, "active": None, "activation": None, "models": models, "profiles": {
         "Claude-Codex": profile("claude-opus", "codex-luna", ["codex-sol", "claude-opus"],
                                 ["claude-fable", "codex-astra"]),
@@ -116,6 +146,10 @@ def example_config():
         "Claude-only": profile("claude-opus", "claude-haiku", ["claude-opus"], ["claude-fable"]),
         "Claude-Muse": profile("claude-opus", "muse-spark", ["claude-opus"] * 2, ["claude-fable"] * 2),
         "Codex-Muse": profile("codex-sol", "muse-spark", ["codex-sol"], ["codex-astra"]),
+        "Codex-Qwen": {"orchestrator": sol_medium, "implementer": qwen_max, "researcher": qwen_max,
+                       "standard_review": [sol_high], "advanced_review": [sol_high]},
+        "Qwen-only": {"orchestrator": qwen_max, "implementer": qwen_max, "researcher": qwen_max,
+                      "standard_review": [sol_high], "advanced_review": [sol_high]},
     }, "approval_authority": {"label": None}, "review_rules": {"file_threshold": 10,
         "money_paths": ["**/money/**", "**/payments/**", "**/pricing/**"],
         "time_zone_paths": ["**/timezone/**", "**/timezones/**", "**/time-zone/**"],
@@ -143,7 +177,7 @@ def validate(config):
     require(isinstance(models, dict) and isinstance(profiles, dict), "Models and profiles must be objects.")
     for key, model in models.items():
         require(isinstance(model, dict), f"Invalid model {key}.")
-        require(model.get("harness") in ("codex", "claude", "muse"), f"Unknown harness for {key}.")
+        require(model.get("harness") in ("codex", "claude", "muse", "opencode"), f"Unknown harness for {key}.")
         slug = model.get("slug")
         require(isinstance(slug, str) and slug and not slug.startswith("-") and not any(c.isspace() for c in slug),
                 f"Exact model slug required for {key}.")
@@ -152,6 +186,14 @@ def validate(config):
                     for e in model["efforts"]), f"Invalid supported efforts for {key}.")
         if model["harness"] == "muse":
             require(slug.endswith("-contributor"), f"Muse model {key} must use a contributor slug.")
+        if model["harness"] == "opencode":
+            provider_id = model.get("provider_id")
+            require(isinstance(provider_id, str) and provider_id and len(provider_id) <= 128
+                    and not any(c.isspace() for c in provider_id),
+                    f"OpenCode model {key} requires its exact provider ID.")
+            require(model["efforts"] == ["max"], f"OpenCode model {key} requires the explicit max reasoning effort contract.")
+        else:
+            require("provider_id" not in model, f"Only OpenCode models may define provider_id ({key}).")
     for name, profile in profiles.items():
         require(isinstance(name, str) and name and isinstance(profile, dict) and set(profile) == set(ROLES),
                 f"Profile {name} must define exactly {', '.join(ROLES)}.")
@@ -171,6 +213,17 @@ def validate(config):
                 if name in ("Claude-Muse", "Codex-Muse"):
                     expected = "muse" if role in ("implementer", "researcher") else name.split("-")[0].lower()
                     require(m["harness"] == expected, f"{name}/{role} requires {expected}.")
+                if name in ("Codex-Qwen", "Qwen-only"):
+                    if role in ("standard_review", "advanced_review"):
+                        require(m["harness"] == "codex" and entry["model"] == "codex-sol" and entry["effort"] == "high",
+                                f"{name}/{role} requires the external Codex Sol high reviewer.")
+                    elif name == "Codex-Qwen" and role == "orchestrator":
+                        require(m["harness"] == "codex" and entry["model"] == "codex-sol" and entry["effort"] == "medium",
+                                "Codex-Qwen/orchestrator requires Codex Sol medium.")
+                    else:
+                        require(m["harness"] == "opencode" and entry["model"] == "local-qwen3.6-35b"
+                                and entry["effort"] == "max",
+                                f"{name}/{role} requires the exact local Qwen OpenCode model at max effort.")
     authority = config.get("approval_authority")
     require(isinstance(authority, dict) and set(authority) == {"label"} and
             (authority.get("label") is None or
@@ -194,7 +247,8 @@ def selection(config):
             model = config["models"][entry["model"]]
             resolved.append({"family": entry["model"], "harness": model["harness"],
                              "model": model["slug"], "effort": entry["effort"],
-                             "contributor_mode": model["harness"] == "muse"})
+                             "contributor_mode": model["harness"] == "muse",
+                             **({"provider_id": model["provider_id"]} if model["harness"] == "opencode" else {})})
         roles[role] = resolved if group else resolved[0]
     result = {"profile": name, "roles": roles, "review_rules": config["review_rules"],
               "approval_authority": config["approval_authority"]}
@@ -354,6 +408,7 @@ class App(CmuxTransport):
 def argv_for(choice, prompt, cwd, interactive=False):
     harness = choice["harness"]
     model, effort = choice["model"], choice["effort"]
+    require(harness != "opencode", "OpenCode uses an authenticated API and native CMUX binding, not a CLI subprocess; use the guarded OpenCode dispatch path.")
     require(shutil.which(harness) is not None, f"Selected harness unavailable: {harness}. No fallback permitted.")
     if harness == "codex":
         argv = ["codex"] + ([] if interactive else ["exec"])
@@ -491,6 +546,24 @@ def parser():
     sub.add_parser("list")
     sub.add_parser("status")
     startup = sub.add_parser("startup"); startup.add_argument("--expect-profile")
+    preflight = sub.add_parser(
+        "preflight",
+        help="Check a saved OpenCode role with read-only API metadata requests.",
+        description="Check the active profile's exact role, worktree and OpenCode API configuration without creating a session, surface, prompt or model inference request.",
+        epilog=("This is metadata/config evidence, not proof of native TUI behavior or task success. "
+                "Optional --require-plugin checks the API server's exact project plugin row for state.status=active.\n"
+                "Use --config-dir and --state-dir for an existing isolated pilot profile; this command never activates or overrides a profile.\n"
+                "Required reading before OpenCode harness preparation or parent/child task-brief relay:\n"
+                f"{QWEN_OBSERVER_GUIDE_URL}\n"
+                "Relay this guide and applicable checks before a child brief is snapshotted; do not rewrite an existing brief."),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    preflight.add_argument("--role", choices=ROLES, required=True)
+    preflight.add_argument("--slot", type=int, choices=(1, 2))
+    preflight.add_argument("--cwd", required=True, help="Exact Git worktree root whose OpenCode config should be checked.")
+    preflight.add_argument("--opencode-manifest", required=True, help="Private loopback OpenCode connection manifest.")
+    preflight.add_argument("--require-plugin", action="append", default=[], metavar="ID",
+                           help="Require this exact API-reported project plugin ID to have state.status=active; repeatable.")
     sub.add_parser("validate")
     show = sub.add_parser("show"); show.add_argument("profile")
     for name in ("activate", "notify"):
@@ -504,7 +577,8 @@ def parser():
             s.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
     put = sub.add_parser("profile-put"); put.add_argument("name"); put.add_argument("--file", required=True)
     put.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
-    model = sub.add_parser("model-set"); model.add_argument("family"); model.add_argument("--harness", choices=("claude", "codex", "muse"), required=True)
+    model = sub.add_parser("model-set"); model.add_argument("family"); model.add_argument("--harness", choices=("claude", "codex", "muse", "opencode"), required=True)
+    model.add_argument("--provider-id")
     model.add_argument("--slug", required=True)
     model.add_argument("--efforts", nargs="+", required=True); model.add_argument("--source", required=True)
     model.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
@@ -523,11 +597,15 @@ def parser():
         if name == "dispatch":
             s.add_argument("--cwd", required=True); s.add_argument("--task-file", required=True)
             s.add_argument("--review-plan"); s.add_argument("--approval")
+            s.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review launch.")
+            s.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for guarded preflight.")
             s.add_argument("--pattern-buffer", "--context-injector", dest="context_injector", help="Pattern Buffer script; --context-injector is a compatibility alias."); s.add_argument("--owner-worktree")
             s.add_argument("--receipt-file", help="Forward a unique Pattern Buffer dispatch snapshot path; requires its script and owner worktree.")
-    resume = sub.add_parser("resume", help="Continue an exited, identity-verified Codex launch with its recorded choice.")
+    resume = sub.add_parser("resume", help="Continue a guarded OpenCode session or an exited, verified Codex launch.")
     resume.add_argument("launch"); resume.add_argument("--task-file", required=True)
+    resume.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for a guarded continuation.")
     resume.add_argument("--review-plan"); resume.add_argument("--approval")
+    resume.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review continuation.")
     review = sub.add_parser("review-plan"); review.add_argument("--cwd", required=True)
     review.add_argument("--base", required=True); review.add_argument("--facts", required=True)
     review.add_argument("--full", action="store_true", help="Print every path; default output is a bounded preview of the full saved scope.")
@@ -567,9 +645,1017 @@ def resolve(snapshot, role, slot):
     return {"profile": snapshot["profile"], "selection": snapshot["selection"], "role": role, **choice}
 
 
+def preflight_remediation(code, details=None):
+    messages = {
+        "profile_config_missing": "Pass the intended existing pilot configuration with --config-dir and its matching isolated path with --state-dir; this command does not create or activate profiles.",
+        "profile_config_invalid": "Repair the intended isolated Model Preferences configuration and confirm it with `model-preferences --config-dir PATH validate`.",
+        "active_profile_required": "Pass an existing config with the intended active profile using --config-dir and its matching isolated --state-dir; this command never activates or overrides profiles.",
+        "selected_role_not_opencode": "Use --config-dir and --state-dir for the intended isolated pilot choices, then inspect it with `model-preferences --config-dir CONFIG --state-dir STATE resolve --role ROLE`; this command cannot override or activate a profile.",
+        "invalid_role_slot": "Use --slot only for a configured reviewer group and select an existing slot.",
+        "preflight_worktree_unavailable": "Pass an existing Git worktree root for the intended task.",
+        "preflight_worktree_root_required": "Pass the exact Git worktree root, not a subdirectory.",
+        "invalid_loopback_url": "Use the exact authenticated OpenCode API origin in the private manifest, with an HTTP loopback IP address and no embedded credentials.",
+        "loopback_ip_literal_required": "Bind the private manifest to the intended loopback IP address; do not use a hostname or remote provider.",
+        "private_manifest_required": "Check the private loopback connection manifest and its mode-0600 owner-only password file; do not change global credentials.",
+        "invalid_private_password_file": "Check that the private owner-only password file matches the intended API server; do not change global credentials.",
+        "private_password_file_required": "Check the private loopback connection manifest and its mode-0600 owner-only password file; do not change global credentials.",
+        "invalid_manifest_json": "Repair the private connection manifest JSON and keep its API URL, expected PID and password-file path explicit.",
+        "authenticated_api_challenge_required": "Check that the private manifest origin and password file match the intended authenticated OpenCode server; do not change global credentials.",
+        "invalid_expected_server_pid": "Set the expected server PID in the private manifest to the owned OpenCode API process.",
+        "unsupported_opencode_version": "Use the supported OpenCode 2.2.5 API server for this preflight.",
+        "opencode_server_pid_mismatch": "Confirm the manifest points to the intended owned API process, then update only its private manifest if needed.",
+        "manifest_model_mismatch": "Align optional provider/model pins in the private manifest with the exact saved role choice.",
+        "unsupported_local_provider_model": "Inspect the exact OpenCode provider id and model slug in the saved role and existing target-worktree settings; do not substitute a catalog model.",
+        "exact_model_unavailable": "Inspect the exact existing provider/model configuration and API catalog in the target worktree with read-only commands; do not update a catalog or substitute a model.",
+        "model_output_limit_below_maximum_effort": "Check the exact model's reported output allowance; no fallback model is selected.",
+        "unsupported_provider_package": "Check that the existing exact provider uses the supported local OpenAI-compatible package; do not install or update packages.",
+        "unsupported_model_schema": "Check the pinned OpenCode 2.2.5 model catalog response shape in the exact worktree; unknown schemas are not treated as ready.",
+        "unsupported_model_variant_schema": "Inspect the existing model's `max` variant in the target worktree configuration; the preflight does not change variants.",
+        "max_reasoning_variant_unverified": "Inspect the existing `max` variant settings in the target worktree; do not replace the saved role choice.",
+        "max_reasoning_request_body_unverified": "Inspect the existing model and variant request-body overlays for `reasoning_effort: max`; do not alter them automatically.",
+        "model_tool_capability_unverified": "Check the exact provider/model's reported tool capability in the existing target-worktree catalog.",
+        "unsupported_provider_schema": "Check the pinned OpenCode 2.2.5 provider response shape and exact provider id in the target worktree.",
+        "local_provider_base_url_unavailable": "Confirm the exact saved provider reports its local loopback base URL in the target worktree.",
+        "unsupported_plugin_schema": "Inspect the pinned OpenCode 2.2.5 GET /api/plugin response shape for the exact worktree; unknown rows are not treated as active.",
+        "required_plugin_not_active": "Resolve the plugin load failure in the exact project and rerun with its API-reported ID; a configured path alone is not proof.",
+        "required_plugin_status_ambiguous": "Resolve duplicate API plugin rows for this ID and retry only after the exact project reports one active row.",
+        "invalid_required_plugin_id": "Pass the exact nonempty plugin id reported by the OpenCode API.",
+        "plugin_status_location_mismatch": "Check the exact worktree and OpenCode project configuration; the API response must report that same directory.",
+    }
+    if code == "required_plugin_not_active" and isinstance(details, dict) and details.get("unidentified_failed_local_plugins"):
+        return ("Inspect the failed local plugin row's source basename, error summary and ref; the API omitted its id, "
+                "so it cannot satisfy --require-plugin. Resolve the load failure and rerun after the exact API row "
+                "reports active; do not fabricate an id or trust a configured path.")
+    if code in messages:
+        return messages[code]
+    if code.startswith("plugin_status_"):
+        return "Check the owned loopback OpenCode API and its exact project plugin endpoint; preserve the typed error and do not infer plugin readiness."
+    if code.endswith("_http_timeout") or code in ("http_timeout", "http_unavailable"):
+        return "Check that the intended owned loopback OpenCode API is responsive, then rerun this read-only preflight after resolving the cause."
+    return "Inspect the typed preflight code against the Model Preferences guide and exact worktree configuration; no session or prompt was created."
+
+
+def _preflight_output(args, *, status, code=None, details=None, profile=None,
+                      choice=None, selection_digest=None, cwd=None, metadata=None, plugins=None):
+    required_reading = {
+        "purpose": ["OpenCode harness preparation", "parent/child task-brief relay"],
+        "guide_url": QWEN_OBSERVER_GUIDE_URL,
+        "relay_to_children_before_brief_snapshot": True,
+        "comprehension_verified": False,
+    }
+    guide_path = qwen_observer_guide_path()
+    if guide_path:
+        required_reading["guide_path"] = guide_path
+    result = {
+        "kind": "opencode_preflight",
+        "status": status,
+        "evidence_scope": "read_only_api_metadata",
+        "profile": profile,
+        "role": args.role,
+        "slot": args.slot,
+        "selection": selection_digest,
+        "worktree": str(cwd) if cwd else None,
+        "choice": ({"harness": choice.get("harness"), "provider_id": choice.get("provider_id"),
+                    "model": choice.get("model"), "effort": choice.get("effort")} if choice else None),
+        "metadata": metadata,
+        "required_plugins": plugins or [],
+        "required_reading": required_reading,
+        "operations": {
+            "api_request_methods_allowed": ["GET"],
+            "preferences_written": False,
+            "session_created": False,
+            "surface_created": False,
+            "prompt_submitted": False,
+            "model_inference_requested": False,
+        },
+        "native_proof": False,
+        "exit_code": 0 if status == "passed" else 2,
+    }
+    if code:
+        result["error"] = {"code": code, "remediation": preflight_remediation(code, details),
+                           **({"details": details} if details else {})}
+    else:
+        result["limits"] = [
+            "API metadata and any server-reported plugin status do not prove native TUI hook delivery, permissions, model reception or task success.",
+            "No session, CMUX surface, prompt or model inference was started by this command.",
+        ]
+    return result
+
+
+def opencode_preflight(app, args):
+    profile = None
+    active_selection = None
+    choice = None
+    cwd = None
+    try:
+        config = app.config()
+    except FileNotFoundError:
+        return _preflight_output(args, status="held", code="profile_config_missing")
+    except (OSError, PreferenceError, ValueError, KeyError, TypeError):
+        return _preflight_output(args, status="held", code="profile_config_invalid")
+    if config.get("active") is None:
+        return _preflight_output(args, status="held", code="active_profile_required")
+    try:
+        active_selection = selection(config)
+        profile = active_selection["profile"]
+        choice = resolve(active_selection, args.role, args.slot)
+    except PreferenceError:
+        return _preflight_output(args, status="held", code="invalid_role_slot", profile=profile)
+    if choice.get("harness") != "opencode":
+        return _preflight_output(args, status="held", code="selected_role_not_opencode",
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"])
+    try:
+        cwd = Path(args.cwd).expanduser().resolve(strict=True)
+        if not cwd.is_dir():
+            raise OSError("not a directory")
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return _preflight_output(args, status="held", code="preflight_worktree_unavailable",
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"])
+    try:
+        git_root = Path(git(cwd, "rev-parse", "--show-toplevel").decode().strip()).resolve(strict=True)
+    except (PreferenceError, OSError, RuntimeError, ValueError):
+        return _preflight_output(args, status="held", code="preflight_worktree_unavailable",
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"], cwd=cwd)
+    if git_root != cwd:
+        return _preflight_output(args, status="held", code="preflight_worktree_root_required",
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"], cwd=cwd)
+    metadata = None
+    try:
+        connection = opencode_dispatch.load_connection(args.opencode_manifest)
+        evidence = opencode_dispatch.preflight(connection, choice, directory=cwd)
+        metadata = {
+            "api_contract": evidence.api_contract,
+            "api_origin": evidence.api_origin,
+            "server_version": evidence.server_version,
+            "server_pid": evidence.server_pid,
+            "provider_id": evidence.provider_id,
+            "model_id": evidence.model_id,
+            "variant": evidence.model_variant,
+            "output_limit": evidence.output_limit,
+            "tools": evidence.tools,
+            "local_provider_origin": evidence.local_provider_origin,
+        }
+        plugins = opencode_dispatch.preflight_plugins(
+            connection, directory=cwd, required_plugin_ids=args.require_plugin)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        return _preflight_output(args, status="held", code=exc.code, details=exc.details,
+                                 profile=profile, choice=choice,
+                                 selection_digest=active_selection["selection"], cwd=cwd,
+                                 metadata=metadata)
+    return _preflight_output(args, status="passed", profile=profile, choice=choice,
+                             selection_digest=active_selection["selection"], cwd=cwd,
+                             metadata=metadata, plugins=plugins)
+
+
+def cmux_uuid(value, field):
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PreferenceError(f"CMUX {field} UUID is unavailable; no OpenCode session created.") from exc
+
+
+def opencode_destination():
+    caller = run_json(["cmux", "--json", "--id-format", "uuids", "identify"]).get("caller") or {}
+    workspace = cmux_uuid(caller.get("workspace_id"), "workspace")
+    surface = cmux_uuid(caller.get("surface_id"), "surface")
+    tree = run_json(["cmux", "--json", "--id-format", "uuids", "tree", "--all"])
+    panes = [pane for window in tree.get("windows", []) for ws in window.get("workspaces", [])
+             if str(ws.get("id", "")).lower() == workspace.lower()
+             for pane in ws.get("panes", [])
+             if any(str(item.get("id", "")).lower() == surface.lower() for item in pane.get("surfaces", []))]
+    require(len(panes) == 1, "Cannot identify one exact caller pane; no OpenCode session created.")
+    return {"workspace_uuid": workspace, "surface_uuid": surface, "pane_id": panes[0]["id"]}
+
+
+def opencode_parent_caller(app, connection, owner_worktree, destination):
+    launch_kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().casefold()
+    session = os.environ.get("OPENCODE_SESSION_ID")
+    owner_worktree = str(Path(owner_worktree).expanduser().resolve(strict=True))
+    if launch_kind != "opencode":
+        require(not session, "OPENCODE_SESSION_ID is present without the OpenCode launch kind; refusing inherited identity.")
+        parent_harness = ("claude" if launch_kind in ("claude", "claudeteams") else
+                          "codex" if launch_kind == "codex" else None)
+        if parent_harness is None:
+            require(not os.environ.get("CODEX_THREAD_ID") and not os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                    "A native parent session ID is present without its recognized launch kind.")
+            return None
+        session_name = "CLAUDE_CODE_SESSION_ID" if parent_harness == "claude" else "CODEX_THREAD_ID"
+        expected_session = os.environ.get(session_name)
+        caller = app.caller()
+        require(isinstance(expected_session, str) and expected_session
+                and caller.get("harness") == parent_harness and caller.get("session") == expected_session,
+                "OpenCode dispatch parent does not match the exact current Codex or Claude session.")
+        try:
+            session_surface = cmux_uuid(caller.get("surface"), "parent surface")
+            session_workspace = cmux_uuid(caller.get("workspace"), "parent workspace")
+        except PreferenceError as exc:
+            raise PreferenceError(f"Native parent environment is incomplete: {exc}") from None
+        require(session_surface == destination["surface_uuid"] and session_workspace == destination["workspace_uuid"],
+                "Native parent does not match the exact CMUX caller surface and workspace.")
+        return {"harness": parent_harness, "session_id": expected_session,
+                "workspace_uuid": session_workspace, "surface_uuid": session_surface,
+                "owner_worktree": owner_worktree}
+    require(isinstance(session, str) and session.startswith("ses_"),
+            "OpenCode child dispatch needs the exact current OPENCODE_SESSION_ID.")
+    try:
+        session_surface = cmux_uuid(os.environ.get("CMUX_SURFACE_ID"), "surface")
+        session_workspace = cmux_uuid(os.environ.get("CMUX_WORKSPACE_ID"), "workspace")
+    except PreferenceError as exc:
+        raise PreferenceError(f"OpenCode parent environment is incomplete: {exc}") from None
+    require(session_surface == destination["surface_uuid"] and session_workspace == destination["workspace_uuid"],
+            "OpenCode parent environment does not match the exact CMUX caller surface and workspace.")
+    current = app.current()
+    native = opencode_dispatch.require_native_dispatch_binding(
+        expected_workspace=session_workspace, expected_surface=session_surface,
+        expected_session=session, current=current)
+    require(native["state"] == "working",
+            "Only the currently executing exact OpenCode orchestrator may start a child session.")
+    launches = app.state_dir / "launches"
+    matches = []
+    if launches.is_dir():
+        for path in launches.glob("*.json"):
+            record = read(path)
+            if (record.get("choice", {}).get("harness") == "opencode"
+                    and record.get("native_session") == session
+                    and record.get("parent_task_id") == connection.parent_task_id
+                    and record.get("worktree_directory") == owner_worktree
+                    and record.get("cmux_workspace_uuid") == session_workspace
+                    and record.get("cmux_surface_uuid") == session_surface
+                    and record.get("task_id") == connection.parent_task_id
+                    and record.get("choice", {}).get("profile") == "Qwen-only"
+                    and record.get("choice", {}).get("role") == "orchestrator"
+                    and record.get("status") == "running"):
+                matches.append(record)
+    require(len(matches) == 1, "OpenCode parent session has no unique active Model Preferences launch binding.")
+    parent = matches[0]
+    active_continuation = app.state(f"continuations/{session}", None)
+    startup = parent.get("startup_turn")
+    active_task = (isinstance(startup, dict) and startup.get("state") == "running"
+                   and isinstance(startup.get("user_message_id"), str))
+    task_message_id = startup.get("user_message_id") if active_task else None
+    task_prompt_sha256 = parent.get("startup_prompt_sha256") if active_task else None
+    if not active_task and isinstance(active_continuation, dict) and active_continuation.get("status") == "submitted":
+        task_message_id = active_continuation.get("message_id")
+        task_prompt_sha256 = active_continuation.get("task_digest")
+        active_task = isinstance(task_message_id, str)
+    require(active_task,
+            "OpenCode orchestrator has no admitted active Model Preferences task; no child created.")
+    try:
+        latest_user = opencode_dispatch.latest_user_message_matches(
+            connection, session_id=session, message_id=task_message_id, text_sha256=task_prompt_sha256)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"OpenCode parent task admission held: {exc.code}.") from None
+    require(latest_user,
+            "The current OpenCode parent prompt does not match the exact admitted task; no child created.")
+    if parent.get("native_started_at") is not None:
+        opencode_dispatch.require_native_hook_binding(
+            expected_workspace=session_workspace, expected_surface=session_surface,
+            expected_session=session, worktree_directory=owner_worktree,
+            expected_started_at=parent["native_started_at"])
+    try:
+        opencode_dispatch.verify_session(
+            connection, session, expected_directory=owner_worktree, choice=parent["choice"],
+            launch_id=parent["id"], task_digest=parent["task_digest"],
+            parent_task_id=parent["parent_task_id"],
+            parent_session_id=parent.get("opencode_parent_session_id"))
+        opencode_dispatch.require_no_pending_interactions(connection, session)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"OpenCode parent API identity held: {exc.code}.") from None
+    context_adapter = parent.get("context_injector")
+    require(isinstance(context_adapter, dict) and context_adapter.get("role") == "orchestrator"
+            and context_adapter.get("session_id") == session,
+            "OpenCode parent lacks its exact Pattern Buffer orchestrator assignment.")
+    context = app.run_json([sys.executable, context_adapter["script"], "--cwd", owner_worktree, "context",
+                            "--harness", "opencode", "--session", session])
+    assignment_sha256 = parent.get("pattern_buffer_assignment_sha256")
+    require(context.get("status") == "context" and context.get("harness") == "opencode"
+            and context.get("session_id") == session and context.get("worktree") == owner_worktree
+            and isinstance(assignment_sha256, str) and len(assignment_sha256) == 64
+            and context.get("assignment_sha256") == assignment_sha256,
+            "OpenCode parent Pattern Buffer assignment changed or is unavailable.")
+    return {"harness": "opencode", "session_id": session, "workspace_uuid": session_workspace,
+            "surface_uuid": session_surface, "started_at": parent.get("native_started_at"),
+            "task_id": parent["task_id"], "launch_id": parent["id"],
+            "owner_worktree": owner_worktree,
+            "owner_gitdir": git(owner_worktree, "rev-parse", "--absolute-git-dir").decode().strip(),
+            "assignment_sha256": assignment_sha256}
+
+
+def prepare_opencode_pattern_buffer(app, args, cwd, task_digest, parent):
+    require(args.context_injector and args.owner_worktree and args.receipt_file,
+            "OpenCode Pattern Buffer dispatch requires --pattern-buffer, --owner-worktree and a unique --receipt-file.")
+    require(args.role == "implementer", "OpenCode Pattern Buffer dispatch is available for implementer only.")
+    require(parent is None or (isinstance(parent, dict)
+            and parent.get("harness") in ("opencode", "codex", "claude")),
+            "Pattern Buffer OpenCode dispatch requires a verified OpenCode, Codex or Claude parent.")
+    script = Path(args.context_injector).expanduser().resolve(strict=True)
+    require(script.is_file(), "Pattern Buffer script is unavailable.")
+    owner = Path(args.owner_worktree).expanduser().resolve(strict=True)
+    if parent is not None:
+        require(str(owner) == parent["owner_worktree"],
+                "The child owner must match the verified parent worktree.")
+    require(str(cwd) != str(owner), "Pattern Buffer OpenCode child must use a separate Git worktree.")
+    owner_gitdir = git(owner, "rev-parse", "--absolute-git-dir").decode().strip()
+    receipt_path = Path(args.receipt_file).expanduser().absolute()
+    require(not receipt_path.exists() and not receipt_path.is_symlink(), "Pattern Buffer receipt path must be new and unique.")
+    command = [sys.executable, str(script), "--cwd", str(cwd), "prepare-dispatch",
+               "--harness", "opencode", "--owner-worktree", str(owner),
+               "--task-file", str(Path(args.task_file).resolve()),
+               "--receipt-file", str(receipt_path), "--role", "implementer"]
+    open_parent = parent if parent is not None and parent["harness"] == "opencode" else None
+    if open_parent:
+        command.extend(["--parent-task-id", open_parent["task_id"]])
+    prepared = app.run_json(command)
+    receipt = read(receipt_path)
+    expected_parent = ({"harness": "opencode", "session_id": open_parent["session_id"],
+                       "task_id": open_parent["task_id"], "role": "orchestrator",
+                       "owner_worktree": open_parent["owner_worktree"],
+                       "owner_gitdir": open_parent["owner_gitdir"],
+                       "surface_id": open_parent["surface_uuid"].upper(),
+                       "workspace_id": open_parent["workspace_uuid"].upper(),
+                       "assignment_sha256": open_parent["assignment_sha256"]}
+                       if open_parent else None)
+    expected_parent_kinds = ({"opencode"} if open_parent else
+                             ({parent["harness"], "worktree"} if parent else {"worktree"}))
+    require(prepared.get("status") == "pending" and prepared.get("harness") == "opencode"
+            and prepared.get("role") == "implementer" and prepared.get("task_id") == receipt.get("task_id")
+            and prepared.get("ticket_version") == 2
+            and prepared.get("parent_kind") in expected_parent_kinds
+            and ((prepared.get("parent") == expected_parent) if expected_parent is not None
+                 else "parent" not in prepared),
+            "Pattern Buffer did not return the prepared OpenCode ticket; no session created.")
+    require(receipt.get("harness") == "opencode" and receipt.get("role") == "implementer"
+            and receipt.get("status") == "pending" and receipt.get("session_id") is None
+            and receipt.get("worktree") == str(cwd) and receipt.get("owner_worktree") == str(owner)
+            and receipt.get("owner_gitdir") == owner_gitdir
+            and receipt.get("brief_sha256") == task_digest and receipt.get("ticket_version") == 2
+            and receipt.get("parent_kind") == prepared.get("parent_kind")
+            and ((receipt.get("parent") == expected_parent) if expected_parent is not None
+                 else "parent" not in receipt),
+            "Pattern Buffer ticket does not match the exact task, worktree and owner; no session created.")
+    task_id = safe_id(receipt.get("task_id"))
+    return {"script": str(script), "owner_worktree": str(owner), "receipt": str(receipt_path),
+            "owner_gitdir": owner_gitdir, "task_id": task_id, "parent": expected_parent,
+            "parent_kind": receipt["parent_kind"]}
+
+
+def assign_opencode_orchestrator_context(app, args, cwd, session):
+    require(args.context_injector and not args.owner_worktree and not args.receipt_file,
+            "A fresh OpenCode orchestrator requires --pattern-buffer and an independent orchestrator assignment, without child-task flags.")
+    script = Path(args.context_injector).expanduser().resolve(strict=True)
+    require(script.is_file(), "Pattern Buffer script is unavailable.")
+    cli = [sys.executable, str(script), "--cwd", str(cwd)]
+    try:
+        app.run_command([*cli, "assign", "--harness", "opencode", "--session", session,
+                         "--role", "orchestrator"])
+        context = app.run_json([*cli, "context", "--harness", "opencode", "--session", session])
+    except PreferenceError as exc:
+        raise PreferenceError(f"Pattern Buffer orchestrator context failed: {exc}") from None
+    require(context.get("status") == "context" and context.get("harness") == "opencode"
+            and context.get("session_id") == session and context.get("worktree") == str(cwd)
+            and isinstance(context.get("text"), str)
+            and context["text"].startswith("pattern-buffer | role: orchestrator |"),
+            "Pattern Buffer did not confirm the exact OpenCode orchestrator assignment; no prompt sent.")
+    assignment_sha256 = context.get("assignment_sha256")
+    require(isinstance(assignment_sha256, str) and len(assignment_sha256) == 64
+            and all(char in "0123456789abcdef" for char in assignment_sha256),
+            "Pattern Buffer did not return exact orchestrator assignment proof; no prompt sent.")
+    return {"script": str(script), "role": "orchestrator", "session_id": session,
+            "assignment_sha256": assignment_sha256}
+
+
+def bind_opencode_pattern_buffer(app, adapter, session):
+    receipt = read(adapter["receipt"])
+    cli = [sys.executable, adapter["script"], "--cwd", receipt["worktree"]]
+    bound = app.run_json([*cli, "bind-dispatch", "--harness", "opencode", "--session", session,
+                          "--task-id", adapter["task_id"], "--receipt-file", adapter["receipt"],
+                          "--role", "implementer"])
+    require(bound.get("status") == "active" and bound.get("task_id") == adapter["task_id"]
+            and bound.get("session_id") == session and bound.get("harness") == "opencode"
+            and bound.get("role") == "implementer",
+            "Pattern Buffer did not confirm the exact OpenCode session binding; no prompt sent.")
+    context = app.run_json([*cli, "context", "--harness", "opencode", "--session", session])
+    assignment_sha256 = context.get("assignment_sha256")
+    require(context.get("status") == "context" and context.get("harness") == "opencode"
+            and context.get("session_id") == session and context.get("worktree") == receipt["worktree"]
+            and isinstance(context.get("text"), str)
+            and context["text"].startswith("pattern-buffer | role: implementer |")
+            and isinstance(assignment_sha256, str) and len(assignment_sha256) == 64
+            and all(char in "0123456789abcdef" for char in assignment_sha256),
+            "Pattern Buffer did not confirm the exact active implementer context; no prompt sent.")
+    return assignment_sha256
+
+
+def update_opencode_launch(app, launch):
+    with locked(app.config_dir):
+        app.save_state(f"launches/{launch['id']}", launch)
+
+
+def signal_private(path, value):
+    try:
+        opencode_dispatch.write_private_json(path, value)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"Private OpenCode launch signal failed: {exc.code}.") from None
+
+
+def run_cmux_rpc(method, **params):
+    require(isinstance(method, str) and method in ("surface.input_state", "agent.message.settings"),
+            "Unsupported CMUX guard operation.")
+    value = run_json(["cmux", "--json", "rpc", method, json.dumps(params, separators=(",", ":"))])
+    require(isinstance(value, dict), "CMUX native guard response is unavailable.")
+    return value
+
+
+NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS = 180
+
+
+def _native_startup_clock():
+    return time.monotonic()
+
+
+def _native_startup_pause():
+    time.sleep(1)
+
+
+def _native_hook_observation_pending(session):
+    """Return true only while the exact session's native hook record is absent."""
+    path = Path(opencode_dispatch.native_hook_store_path())
+    try:
+        value = opencode_dispatch.read_private_json(path, maximum=2 * 1024 * 1024)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        if exc.code != "private_json_file_invalid":
+            raise
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            raise opencode_dispatch.OpenCodeDispatchError("native_hook_store_unavailable") from None
+        raise opencode_dispatch.OpenCodeDispatchError("native_hook_store_malformed") from None
+    sessions = value.get("sessions")
+    if not isinstance(sessions, dict):
+        raise opencode_dispatch.OpenCodeDispatchError("native_hook_store_malformed")
+    if session not in sessions:
+        return True
+    if not isinstance(sessions[session], dict):
+        raise opencode_dispatch.OpenCodeDispatchError("native_hook_identity_malformed")
+    return False
+
+
+def _bounded_native_value(value, allowed):
+    if value is None:
+        return None
+    return value if isinstance(value, str) and value in allowed else "unrecognized"
+
+
+def _bounded_startup_reason(value, fallback="startup_observation_unclassified"):
+    if (isinstance(value, str) and value and len(value) <= 96 and value.isascii()
+            and all(char.islower() or char.isdigit() or char == "_" for char in value)):
+        return value
+    return fallback
+
+
+def _native_startup_diagnostic(current, expected_session, expected_workspace, expected_surface):
+    states = ("working", "idle", "needs_input", "unknown")
+    lifecycles = ("running", "idle", "backgroundWorkPending")
+    freshness_states = ("current", "stale")
+    input_states = ("unknown", "empty", "draft", "needs_input")
+    diagnostic = {"schema": "cmux-current-opencode-v1", "status": "unknown",
+                  "observation_truncated": None, "agent_sessions_available": False,
+                  "items_observed": 0, "items_total_capped": 0, "items_truncated": False,
+                  "agent_lists_truncated": False, "candidate_count_capped": 0,
+                  "candidates_truncated": False, "candidates": []}
+    if not isinstance(current, dict):
+        diagnostic["status"] = "observation_unavailable"
+        return diagnostic
+    diagnostic["observation_truncated"] = (current.get("truncated")
+                                           if isinstance(current.get("truncated"), bool) else None)
+    availability = current.get("owner_availability")
+    diagnostic["agent_sessions_available"] = (
+        isinstance(availability, dict) and availability.get("agent_sessions") == "available")
+    items = current.get("items")
+    if not isinstance(items, list):
+        diagnostic["status"] = "items_schema_unknown"
+        return diagnostic
+    scan_limit = 256
+    diagnostic["status"] = "observed"
+    diagnostic["items_observed"] = min(len(items), scan_limit)
+    diagnostic["items_total_capped"] = min(len(items), 9999)
+    diagnostic["items_truncated"] = len(items) > scan_limit
+    for item in items[:scan_limit]:
+        if not isinstance(item, dict):
+            continue
+        agents = item.get("agents")
+        if not isinstance(agents, list):
+            continue
+        if len(agents) > 64:
+            diagnostic["agent_lists_truncated"] = True
+        projections = item.get("projections")
+        projections = projections if isinstance(projections, list) else []
+        expected_workspace_match = any(
+            isinstance(projection, dict) and isinstance(projection.get("workspace_id"), str)
+            and projection["workspace_id"].casefold() == expected_workspace.casefold()
+            for projection in projections)
+        expected_surface_match = any(
+            isinstance(projection, dict) and isinstance(projection.get("panel_id"), str)
+            and projection["panel_id"].casefold() == expected_surface.casefold()
+            for projection in projections)
+        for agent in agents[:64]:
+            if (not isinstance(agent, dict) or agent.get("kind") != "opencode"
+                    or agent.get("session_id") != expected_session):
+                continue
+            diagnostic["candidate_count_capped"] = min(diagnostic["candidate_count_capped"] + 1, 9999)
+            if len(diagnostic["candidates"]) < 8:
+                diagnostic["candidates"].append({
+                    "native_state": _bounded_native_value(agent.get("state"), states),
+                    "native_lifecycle": _bounded_native_value(item.get("lifecycle"), lifecycles),
+                    "native_freshness": _bounded_native_value(
+                        item.get("freshness", {}).get("state")
+                        if isinstance(item.get("freshness"), dict) else None, freshness_states),
+                    "native_input_state": _bounded_native_value(agent.get("input_state"), input_states),
+                    "expected_workspace_match": expected_workspace_match,
+                    "expected_surface_match": expected_surface_match})
+    diagnostic["candidates_truncated"] = diagnostic["candidate_count_capped"] > len(diagnostic["candidates"])
+    if diagnostic["candidate_count_capped"] == 1:
+        diagnostic.update(diagnostic["candidates"][0])
+    return diagnostic
+
+
+def dispatch_opencode(app, args, config, choice, cwd, task_bytes):
+    role = choice["role"]
+    require(role in ("orchestrator", "implementer", "researcher"),
+            "OpenCode dispatch supports fresh orchestration, implementation and research roles only.")
+    if role == "orchestrator":
+        require(choice["profile"] == "Qwen-only" and args.context_injector
+                and not args.owner_worktree and not args.receipt_file,
+                "A fresh Qwen-only orchestrator requires --pattern-buffer and cannot replace an existing owner.")
+    require(args.opencode_manifest, "OpenCode dispatch requires --opencode-manifest with a mode-0600 loopback API connection.")
+    try:
+        connection = opencode_dispatch.load_connection(args.opencode_manifest)
+        require(connection.parent_task_id, "OpenCode manifest must name the explicit parent_task_id.")
+        require(Path(git(cwd, "rev-parse", "--show-toplevel").decode().strip()).resolve() == cwd,
+                "OpenCode --cwd must be the exact Git worktree root so session and worktree identity remain distinct and verifiable.")
+        # Confirm the exact provider/model/output/variant contract before creating a server-side session.
+        evidence = opencode_dispatch.preflight(connection, choice, directory=str(cwd))
+        binary = opencode_dispatch.check_opencode_cli()
+        destination = opencode_destination()
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"OpenCode preflight held: {exc.code}") from None
+    wants_child_ticket = bool(args.owner_worktree or args.receipt_file)
+    if role == "orchestrator":
+        require(not wants_child_ticket, "A fresh orchestrator receives its own role assignment, not a child receipt.")
+        adapter = None
+        parent = None
+    elif args.context_injector or wants_child_ticket:
+        require(args.context_injector and args.owner_worktree and args.receipt_file,
+                "OpenCode child dispatch requires --pattern-buffer, --owner-worktree and --receipt-file together.")
+        try:
+            owner_worktree = Path(args.owner_worktree).expanduser().resolve(strict=True)
+            parent = opencode_parent_caller(app, connection, owner_worktree, destination)
+        except (PreferenceError, opencode_dispatch.OpenCodeDispatchError) as exc:
+            raise PreferenceError(f"OpenCode child parent proof held: {getattr(exc, 'code', str(exc))}.") from None
+        adapter = prepare_opencode_pattern_buffer(app, args, cwd, hashlib.sha256(task_bytes).hexdigest(), parent)
+    else:
+        require(not args.owner_worktree and not args.receipt_file,
+                "--owner-worktree and --receipt-file require --pattern-buffer.")
+        adapter = None
+        parent = None
+    opencode_parent = parent if parent is not None and parent.get("harness") == "opencode" else None
+
+    brief = task_bytes.decode("utf-8")
+    if role == "orchestrator":
+        cli = shlex.join([sys.executable, str(Path(__file__).resolve()),
+                          "--config-dir", str(app.config_dir.resolve()),
+                          "--state-dir", str(app.state_dir.resolve())])
+        prompt = ("You are a fresh Qwen-only orchestrator for the exact task below. Your native OpenCode session, "
+                  "Pattern Buffer orchestrator assignment, worktree, task reference and CMUX surface are bound separately. "
+                  "Keep the task within this owner worktree. For bounded implementation work, create a separate Git worktree "
+                  "and dispatch an implementer using the current private OpenCode manifest and Pattern Buffer path from "
+                  "MODEL_PREFERENCES_OPENCODE_MANIFEST and MODEL_PREFERENCES_PATTERN_BUFFER. Use the exact current owner "
+                  "worktree and a unique receipt file, then verify the returned child session and receipt before delegating. "
+                  "Do not launch a successor owner or change shared profile activation. Every review launch requires a fresh "
+                  "operator authorization; do not infer or reuse one. Use the configured external Codex Sol high reviewer "
+                  "only after that authorization.\n\n"
+                  f"Dispatch command prefix: {cli}\n"
+                  f"For a child, run `{cli} dispatch --role implementer --cwd CHILD_WORKTREE --task-file BRIEF "
+                  f"--pattern-buffer \"$MODEL_PREFERENCES_PATTERN_BUFFER\" --owner-worktree {shlex.quote(str(cwd))} "
+                  "--receipt-file UNIQUE_RECEIPT "
+                  "--opencode-manifest \"$MODEL_PREFERENCES_OPENCODE_MANIFEST\"`.\n\n"
+                  f"{brief}")
+    else:
+        prompt = DELEGATION + (" Use the current researcher role for authorized research. Verify its findings.\n\n"
+                               if role == "researcher" else " Follow the exact bounded implementation task.\n\n") + brief
+    prompt_bytes = prompt.encode("utf-8")
+    require(0 < len(prompt_bytes) <= 32768, "OpenCode startup prompt must be at most 32768 UTF-8 bytes.")
+    launch_id = uuid.uuid4().hex
+    task_digest = hashlib.sha256(task_bytes).hexdigest()
+    prompt_file = app.state_dir / "opencode-launches" / f"{launch_id}.prompt"
+    handshake_file = app.state_dir / "opencode-launches" / f"{launch_id}.handshake.json"
+    release_file = app.state_dir / "opencode-launches" / f"{launch_id}.release.json"
+    abort_file = app.state_dir / "opencode-launches" / f"{launch_id}.abort.json"
+    child_descriptor_file = app.state_dir / "opencode-launches" / f"{launch_id}.child.json"
+    helper = Path(__file__).resolve().with_name("opencode_dispatch.py")
+    try:
+        child_xdg_environment = opencode_dispatch.caller_private_xdg_environment()
+        child_command = opencode_dispatch.tui_child_command(
+            helper, child_descriptor_file.resolve(), sys.executable)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"OpenCode launch preparation held: {exc.code}.") from None
+    launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
+              "context_injector": adapter, "slot": args.slot, "task_digest": task_digest,
+              "status": "session_create_pending", "api_contract": evidence.api_contract,
+              "api_origin": evidence.api_origin, "expected_server_pid": evidence.server_pid,
+              "delivery_policy": connection.delivery_policy,
+              "parent_task_id": connection.parent_task_id, "caller_workspace_uuid": destination["workspace_uuid"],
+              "caller_surface_uuid": destination["surface_uuid"], "session_directory": str(cwd),
+              "worktree_directory": str(cwd), "task_id": adapter["task_id"] if adapter else connection.parent_task_id,
+              "opencode_parent_session_id": opencode_parent["session_id"] if opencode_parent else None,
+              "parent_launch_id": opencode_parent["launch_id"] if opencode_parent else None,
+              "prompt_snapshot": str(prompt_file),
+              "startup_prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest()}
+
+    with locked(app.config_dir):
+        active_launches = app.state_dir / "launches"
+        if active_launches.is_dir():
+            for path in active_launches.glob("*.json"):
+                previous = read(path)
+                if (previous.get("choice", {}).get("harness") == "opencode"
+                        and previous.get("cwd") == str(cwd) and previous.get("task_digest") == task_digest
+                        and previous.get("choice", {}).get("selection") == choice["selection"]
+                        and previous.get("status") in ("session_create_pending", "session_created",
+                                                        "session_move_pending", "task_bound",
+                                                        "surface_opening", "native_binding_pending", "uncertain", "running")):
+                    raise PreferenceError(f"Matching OpenCode launch {previous.get('id')} is unresolved or live; inspect it before retrying.")
+
+        try:
+            opencode_dispatch.write_private_snapshot(prompt_file, prompt_bytes)
+        except opencode_dispatch.OpenCodeDispatchError as exc:
+            raise PreferenceError(f"OpenCode launch preparation failed: {exc.code}.") from None
+        app.save_state(f"launches/{launch['id']}", launch)
+    creation_attempted = False
+    surface_opened = False
+    last_startup_readiness = None
+    startup_observation_history = []
+    startup_poll_count = 0
+    startup_wait_count = 0
+    startup_classification_count = 0
+    startup_first_wait_at = None
+    startup_last_wait_at = None
+    startup_started_at = None
+    startup_started_monotonic = None
+
+    def classify_startup(classification, reason, current=None, turn=None, *, persist=True):
+        nonlocal last_startup_readiness, startup_wait_count, startup_classification_count
+        nonlocal startup_first_wait_at, startup_last_wait_at
+        reason = _bounded_startup_reason(reason)
+        observed_at = now()
+        startup_classification_count = min(
+            startup_classification_count + 1, NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 2)
+        if classification == "waiting":
+            startup_wait_count = min(startup_wait_count + 1, NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 1)
+            startup_first_wait_at = startup_first_wait_at or observed_at
+            startup_last_wait_at = observed_at
+        turn_state = _bounded_native_value(
+            turn.get("state") if isinstance(turn, dict) else None,
+            ("not_admitted", "running", "complete", "failed"))
+        sample = {"classification": classification, "reason": reason,
+                  "observed_at": observed_at,
+                  "elapsed_seconds": min(float(NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS),
+                                         round(max(0.0, _native_startup_clock() - startup_started_monotonic), 3))
+                  if startup_started_monotonic is not None else 0.0,
+                  "poll_number": min(startup_poll_count, NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 1),
+                  "wait_number": startup_wait_count,
+                  "startup_turn_state": turn_state,
+                  "native_observation": _native_startup_diagnostic(current, session, workspace, surface)}
+        startup_observation_history.append(sample)
+        history_limit = NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 2
+        if len(startup_observation_history) > history_limit:
+            del startup_observation_history[0]
+        last_startup_readiness = {
+            "schema_version": 2,
+            "state": classification,
+            "reason": reason,
+            "observed_at": observed_at,
+            "started_at": startup_started_at,
+            "elapsed_seconds": sample["elapsed_seconds"],
+            "poll_count": sample["poll_number"],
+            "wait_count": startup_wait_count,
+            "classification_count": startup_classification_count,
+            "first_wait_at": startup_first_wait_at,
+            "last_wait_at": startup_last_wait_at,
+            "startup_turn_state": turn_state,
+            "native_observation": sample["native_observation"],
+            "classifications": list(startup_observation_history)}
+        if persist:
+            launch["startup_readiness_observation"] = last_startup_readiness
+            update_opencode_launch(app, launch)
+        return last_startup_readiness
+
+    try:
+        # Recheck immediately before creation in case provider configuration or server identity changed.
+        evidence = opencode_dispatch.preflight(connection, choice, directory=str(cwd))
+        if parent:
+            parent_recheck = opencode_parent_caller(app, connection, owner_worktree=Path(parent["owner_worktree"]),
+                                                    destination=destination)
+            require(parent_recheck == parent,
+                    "OpenCode parent session, assignment or native generation changed after Pattern Buffer preparation.")
+        creation_attempted = True
+        created = opencode_dispatch.create_session(connection, directory=str(cwd), choice=choice,
+                                                   launch_id=launch_id, task_digest=task_digest,
+                                                   parent_task_id=connection.parent_task_id,
+                                                   parent_session_id=opencode_parent["session_id"] if opencode_parent else None)
+        session = created["session_id"]
+        launch.update(status="session_created", native_session=session,
+                      opencode_parent_session_id=created.get("parent_session_id"),
+                      model=created["model"], session_directory=created["directory"])
+        update_opencode_launch(app, launch)
+        if created["directory"] != str(cwd):
+            launch.update(status="session_move_pending",
+                          session_move_source_directory=created["directory"],
+                          session_move_target_directory=str(cwd))
+            update_opencode_launch(app, launch)
+            moved = opencode_dispatch.move_session(
+                connection, session, source_directory=created["directory"], directory=str(cwd),
+                choice=choice, launch_id=launch_id, task_digest=task_digest,
+                parent_task_id=connection.parent_task_id,
+                parent_session_id=opencode_parent["session_id"] if opencode_parent else None)
+            launch.update(status="session_created", session_directory=moved["directory"],
+                          session_move_confirmed_at=now())
+            update_opencode_launch(app, launch)
+        if role == "orchestrator":
+            assignment = assign_opencode_orchestrator_context(app, args, cwd, session)
+            launch["context_injector"] = assignment
+            launch["pattern_buffer_assignment_sha256"] = assignment["assignment_sha256"]
+            update_opencode_launch(app, launch)
+        if adapter:
+            launch["status"] = "task_binding_pending"
+            update_opencode_launch(app, launch)
+            assignment_sha256 = bind_opencode_pattern_buffer(app, adapter, session)
+            launch["status"] = "task_bound"
+            launch["pattern_buffer_task_id"] = adapter["task_id"]
+            launch["pattern_buffer_owner_worktree"] = adapter["owner_worktree"]
+            launch["pattern_buffer_assignment_sha256"] = assignment_sha256
+            update_opencode_launch(app, launch)
+
+        child_descriptor = {
+            "schema_version": opencode_dispatch.TUI_CHILD_DESCRIPTOR_SCHEMA,
+            "manifest_path": str(Path(args.opencode_manifest).expanduser().resolve()),
+            "session_id": session,
+            "directory": str(cwd),
+            "prompt_file": str(prompt_file.resolve()),
+            "provider_id": choice["provider_id"],
+            "model_id": choice["model"],
+            "launch_id": launch_id,
+            "selection": choice["selection"],
+            "task_digest": task_digest,
+            "xdg_environment": child_xdg_environment,
+            "handshake_file": str(handshake_file.resolve()),
+            "release_file": str(release_file.resolve()),
+            "abort_file": str(abort_file.resolve()),
+            "binary": binary,
+        }
+        if opencode_parent:
+            child_descriptor["parent_session_id"] = opencode_parent["session_id"]
+        try:
+            opencode_dispatch.write_tui_child_descriptor(child_descriptor_file, child_descriptor)
+        except opencode_dispatch.OpenCodeDispatchError as exc:
+            raise PreferenceError(f"OpenCode launch preparation held: {exc.code}.") from None
+        launch["status"] = "surface_opening"
+        update_opencode_launch(app, launch)
+        surface_opened = True
+        opened = run_json(["cmux", "--json", "--id-format", "uuids", "new-surface", "--type", "terminal",
+                           "--workspace", destination["workspace_uuid"], "--pane", destination["pane_id"],
+                           "--working-directory", str(cwd), "--focus", "false", "--command", child_command])
+        surface = cmux_uuid(opened.get("surface_id"), "new surface")
+        workspace = cmux_uuid(opened.get("workspace_id", destination["workspace_uuid"]), "new workspace")
+        require(workspace.lower() == destination["workspace_uuid"].lower(),
+                "OpenCode surface opened in a different CMUX workspace; prompt remains held.")
+        launch.update(status="native_binding_pending", cmux_workspace_uuid=workspace, cmux_surface_uuid=surface,
+                      surface_opened_at=now())
+        update_opencode_launch(app, launch)
+
+        try:
+            deadline = time.monotonic() + 15
+            handshake = None
+            while time.monotonic() < deadline:
+                if handshake_file.exists():
+                    handshake = opencode_dispatch.read_private_json(handshake_file)
+                    break
+                time.sleep(0.1)
+            expected_handshake = {"launch_id": launch_id, "session_id": session,
+                                  "workspace_uuid": workspace, "surface_uuid": surface}
+            require(isinstance(handshake, dict)
+                    and all(handshake.get(k) == v for k, v in expected_handshake.items()),
+                    "OpenCode child CMUX handshake did not match the exact new surface; initial prompt was not released.")
+            socket_path = handshake.get("cmux_socket_path")
+            capability = handshake.get("cmux_socket_capability")
+            opencode_dispatch.set_session_environment(
+                connection, session, workspace_uuid=workspace, surface_uuid=surface, launch_id=launch_id,
+                cmux_socket_path=socket_path, cmux_socket_capability=capability,
+                model_preferences_manifest=str(Path(args.opencode_manifest).expanduser().resolve()),
+                pattern_buffer_script=adapter["script"] if adapter else
+                (launch.get("context_injector", {}).get("script") if role == "orchestrator" else None),
+                task_id=launch["task_id"], parent_task_id=opencode_parent["task_id"] if opencode_parent else None)
+            signal_private(release_file, expected_handshake)
+        finally:
+            try:
+                handshake_file.unlink()
+            except OSError:
+                pass
+
+        launch["status"] = "native_binding_pending"
+        launch["initial_prompt_released_at"] = now()
+        update_opencode_launch(app, launch)
+        startup_started_at = now()
+        startup_started_monotonic = _native_startup_clock()
+        deadline = startup_started_monotonic + NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS
+        last_startup_current = None
+        last_startup_turn = None
+        while _native_startup_clock() < deadline:
+            startup_poll_count = min(startup_poll_count + 1, NATIVE_STARTUP_BINDING_TIMEOUT_SECONDS + 1)
+            try:
+                current = app.current()
+            except Exception as exc:
+                reason = (exc.code if isinstance(exc, opencode_dispatch.OpenCodeDispatchError)
+                          else "native_current_observation_unavailable")
+                classify_startup("held", reason)
+                raise
+            last_startup_current = current
+            try:
+                native = opencode_dispatch.require_native_dispatch_binding(
+                    expected_workspace=workspace, expected_surface=surface,
+                    expected_session=session, current=current, allow_startup_unknown=True)
+            except opencode_dispatch.OpenCodeDispatchError as exc:
+                if exc.code == "native_session_surface_binding_pending":
+                    classify_startup("waiting", exc.code, current)
+                    _native_startup_pause()
+                    continue
+                classify_startup("held", exc.code, current)
+                raise
+            if (native["state"] == "needs_input"
+                    or native.get("input_state") not in (None, "unknown", "empty")):
+                classify_startup("held", "native_session_state_unknown", current)
+                raise opencode_dispatch.OpenCodeDispatchError("native_session_state_unknown")
+            try:
+                turn = opencode_dispatch.startup_turn_observation(
+                    connection, session_id=session, prompt_sha256=launch["startup_prompt_sha256"],
+                    provider_id=choice["provider_id"], model_id=choice["model"])
+            except opencode_dispatch.OpenCodeDispatchError as exc:
+                classify_startup("held", exc.code, current)
+                raise
+            last_startup_turn = turn
+            if not isinstance(turn, dict) or turn.get("state") not in ("not_admitted", "running", "complete", "failed"):
+                classify_startup("held", "startup_turn_observation_schema_unknown", current, turn)
+                raise opencode_dispatch.OpenCodeDispatchError("startup_turn_observation_schema_unknown")
+            if turn["state"] == "not_admitted":
+                classify_startup("waiting", "startup_prompt_not_admitted", current, turn)
+                _native_startup_pause()
+                continue
+            if turn["state"] == "running":
+                if role == "orchestrator" and native["state"] == "working":
+                    native_generation = None
+                    try:
+                        hook = opencode_dispatch.require_native_hook_binding(
+                            expected_workspace=workspace, expected_surface=surface,
+                            expected_session=session, worktree_directory=str(cwd))
+                        native_generation = hook["started_at"]
+                    except opencode_dispatch.OpenCodeDispatchError:
+                        pass
+                    launch.update(status="running", native_binding=native, startup_turn=turn,
+                                  initial_turn_state="working", execution_result="turn_in_progress",
+                                  delivery_readiness="held",
+                                  delivery_hold_codes=["startup_turn_in_progress"])
+                    if native_generation is not None:
+                        launch["native_started_at"] = native_generation
+                    update_opencode_launch(app, launch)
+                classify_startup("waiting", "startup_turn_running", current, turn)
+                _native_startup_pause()
+                continue
+            if turn["state"] == "failed":
+                classify_startup("held", "startup_turn_failed", current, turn)
+                raise opencode_dispatch.OpenCodeDispatchError("startup_turn_failed")
+            if native["state"] == "unknown":
+                classify_startup("waiting", "native_session_state_unknown", current, turn)
+                _native_startup_pause()
+                continue
+            if native["state"] == "working":
+                if (turn["state"] == "complete" and native["lifecycle"] == "running"
+                        and native.get("input_state") in (None, "unknown", "empty")):
+                    classify_startup("waiting", "startup_turn_completed_native_working", current, turn)
+                    _native_startup_pause()
+                    continue
+                classify_startup("held", "native_session_state_unknown", current, turn)
+                raise opencode_dispatch.OpenCodeDispatchError("native_session_state_unknown")
+            if native["state"] != "idle":
+                classify_startup("held", "native_session_state_unknown", current, turn)
+                raise opencode_dispatch.OpenCodeDispatchError("native_session_state_unknown")
+            try:
+                identity = opencode_dispatch.inspect_session(
+                    connection, session_id=session, session_directory=str(cwd), worktree_directory=str(cwd),
+                    workspace_uuid=workspace, surface_uuid=surface, parent_task_id=connection.parent_task_id)
+            except opencode_dispatch.OpenCodeDispatchError as exc:
+                if exc.code == "session_guard_session_busy":
+                    classify_startup("waiting", exc.code, current, turn)
+                    _native_startup_pause()
+                    continue
+                classify_startup("held", exc.code, current, turn)
+                raise
+            hold_codes = []
+            try:
+                hook = opencode_dispatch.require_native_hook_binding(
+                    expected_workspace=workspace, expected_surface=surface, expected_session=session,
+                    worktree_directory=str(cwd))
+                native_generation = hook["started_at"]
+            except opencode_dispatch.OpenCodeDispatchError as exc:
+                if exc.code in ("native_hook_store_unavailable", "native_hook_session_unavailable"):
+                    try:
+                        hook_pending = _native_hook_observation_pending(session)
+                    except opencode_dispatch.OpenCodeDispatchError as hook_error:
+                        classify_startup("held", hook_error.code, current, turn)
+                        raise
+                    classify_startup("waiting",
+                                     "native_hook_record_missing" if hook_pending else "native_hook_record_arrived",
+                                     current, turn)
+                    _native_startup_pause()
+                    continue
+                classify_startup("held", exc.code, current, turn)
+                raise
+            delivery_guard_reason = None
+            try:
+                opencode_dispatch.require_native_delivery_binding(
+                    run_cmux_rpc, expected_workspace=workspace, expected_surface=surface,
+                    allow_composer_state=connection.delivery_policy == "api_sidechannel")
+            except opencode_dispatch.OpenCodeDispatchError as exc:
+                hold_codes.append("native_composer_state_not_proven_empty")
+                delivery_guard_reason = _bounded_startup_reason(
+                    exc.code, "native_delivery_binding_unavailable")
+            except PreferenceError:
+                hold_codes.append("native_composer_state_not_proven_empty")
+                delivery_guard_reason = "native_delivery_binding_unavailable"
+            execution_result = "turn_idle"
+            readiness = classify_startup(
+                "held" if hold_codes else "ready",
+                hold_codes[0] if hold_codes else "startup_native_binding_ready",
+                current, turn, persist=False)
+            readiness["delivery_guard_reason"] = delivery_guard_reason
+            launch.update(status="running", native_binding=native, identity=identity,
+                          initial_turn_state="idle", execution_result=execution_result,
+                          startup_turn=turn, delivery_readiness="ready" if not hold_codes else "held",
+                          delivery_hold_codes=hold_codes, native_bound_at=now(),
+                          startup_readiness_observation=readiness)
+            if native_generation is not None:
+                launch["native_started_at"] = native_generation
+            update_opencode_launch(app, launch)
+            try:
+                prompt_file.unlink()
+            except OSError:
+                pass
+            return {"launch": launch_id, "choice": choice, "status": "running", "session": session,
+                    "cmux_workspace_uuid": workspace, "cmux_surface_uuid": surface,
+                    "initial_turn_state": "idle", "execution_result": execution_result,
+                    "delivery_readiness": launch["delivery_readiness"],
+                    "delivery_hold_codes": hold_codes, "identity": identity}
+        classify_startup("timed_out", "native_binding_timeout", last_startup_current, last_startup_turn)
+        raise opencode_dispatch.OpenCodeDispatchError("native_binding_timeout")
+    except BaseException as exc:
+        if surface_opened:
+            try:
+                signal_private(abort_file, {"launch_id": launch_id, "reason": "native_binding_unconfirmed"})
+            except PreferenceError:
+                pass
+        if (launch.get("initial_prompt_released_at") and
+                (last_startup_readiness is None
+                 or last_startup_readiness.get("state") not in ("held", "timed_out"))):
+            failure_reason = (exc.code if isinstance(exc, opencode_dispatch.OpenCodeDispatchError)
+                              else "startup_observation_failed")
+            try:
+                classify_startup("held", failure_reason,
+                                 locals().get("last_startup_current"), locals().get("last_startup_turn"))
+            except Exception:
+                pass
+        code = exc.code if isinstance(exc, opencode_dispatch.OpenCodeDispatchError) else "dispatch_uncertain"
+        launch.update(status="uncertain" if creation_attempted else "failed", error_code=code,
+                      uncertain_since=now() if creation_attempted else None)
+        if last_startup_readiness is not None:
+            launch["startup_readiness_observation"] = last_startup_readiness
+        update_opencode_launch(app, launch)
+        if not surface_opened:
+            try:
+                prompt_file.unlink()
+            except OSError:
+                pass
+        raise PreferenceError(f"OpenCode launch {launch_id} {launch['status']}: {code}. Inspect its exact session and CMUX surface before retrying.") from None
+
+
 def execute(args):
     app = App(args.config_dir, args.state_dir)
     command = args.command
+    if command == "preflight":
+        return opencode_preflight(app, args)
     if command == "resume":
         return resume_launch(app, args)
     if command == "examples":
@@ -612,8 +1698,11 @@ def execute(args):
                 config["active"] = args.profile
             elif command == "model-set":
                 require(args.family and not any(c.isspace() for c in args.family), "Model family must be a nonempty token.")
+                require((args.harness == "opencode") == bool(args.provider_id),
+                        "Pass --provider-id for OpenCode models only.")
                 config["models"][args.family] = {"harness": args.harness, "slug": args.slug,
-                                                  "efforts": args.efforts, "source": args.source}
+                                                  "efforts": args.efforts, "source": args.source,
+                                                  **({"provider_id": args.provider_id} if args.harness == "opencode" else {})}
             elif command == "profile-put":
                 config["profiles"][args.name] = read(args.file)
             else:
@@ -745,45 +1834,55 @@ def execute(args):
             require(not args.receipt_file or (args.context_injector and args.owner_worktree),
                     "--receipt-file requires --context-injector and --owner-worktree.")
             choice = resolve(selection(config), args.role, args.slot)
-            require(args.role != "orchestrator", "Use handoff-start for successor orchestrators.")
+            require(args.role != "orchestrator" or choice["harness"] == "opencode",
+                    "Fresh successor orchestration remains outside Model Preferences handoff authority.")
             cwd = Path(args.cwd).resolve(); require(cwd.is_dir(), "Task directory is missing.")
-            prompt = Path(args.task_file).read_text()
-            require(0 < len(prompt.encode()) <= 16384, "Task brief must be 1 to 16384 bytes.")
+            task_bytes = Path(args.task_file).read_bytes()
+            try:
+                prompt = task_bytes.decode("utf-8")
+            except UnicodeError as exc:
+                raise PreferenceError("Task brief must be UTF-8.") from exc
+            require(0 < len(task_bytes) <= 16384 and prompt.strip(), "Task brief must be 1 to 16384 bytes of nonempty UTF-8.")
             validate_review(app, config, args, choice, cwd)
-            require(bool(args.context_injector) == bool(args.owner_worktree), "Pattern Buffer needs both its script and --owner-worktree.")
-            if args.context_injector:
-                require(args.role == "implementer" and choice["harness"] in ("claude", "codex"),
-                        f"Pattern Buffer automatic task replay is unavailable for role {args.role} on harness {choice['harness']}. "
-                        "It supports Claude/Codex implementers only. Use plain Model Preferences dispatch without "
-                        "--context-injector, --owner-worktree or --receipt-file, putting required context in --task-file "
-                        "and retaining applicable review/permission flags. "
-                        "Guide: apps/model-preferences/README.md#pattern-buffer-support")
-            prompt = DELEGATION + " Use the current researcher role for authorized research. Verify its findings.\n\n" + prompt
-            argv = argv_for(choice, prompt, cwd)
-            launch_id = uuid.uuid4().hex
-            adapter = None
-            if args.context_injector:
-                receipt = (Path(args.receipt_file).expanduser().absolute() if args.receipt_file else
-                           app.state_dir.resolve() / "ci-receipts" / f"{launch_id}.json")
-                adapter = {"script": str(Path(args.context_injector).resolve()),
-                           "owner_worktree": str(Path(args.owner_worktree).resolve()), "receipt": str(receipt)}
-                # The owning app supplies stdin. Do not change its approved brief.
-                argv = argv_for(choice, "-", cwd)
-                if choice["harness"] == "claude":
-                    argv = argv[:-1]
-                argv = [sys.executable, str(Path(args.context_injector).resolve()), "--cwd", str(cwd), "dispatch",
-                        "--owner-worktree", str(Path(args.owner_worktree).resolve()), "--harness", choice["harness"],
-                        "--task-file", str(Path(args.task_file).resolve()),
-                        "--receipt-file", str(receipt),
-                        "--", *argv]
-            launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
-                      "context_injector": adapter, "slot": args.slot,
-                      "task_digest": hashlib.sha256(Path(args.task_file).read_bytes()).hexdigest(), "status": "starting"}
-            app.save_state(f"launches/{launch['id']}", launch)
+            if choice["harness"] == "opencode":
+                opencode_task = task_bytes
+            else:
+                require(bool(args.context_injector) == bool(args.owner_worktree), "Pattern Buffer needs both its script and --owner-worktree.")
+                if args.context_injector:
+                    require(args.role == "implementer" and choice["harness"] in ("claude", "codex"),
+                            f"Pattern Buffer automatic task replay is unavailable for role {args.role} on harness {choice['harness']}. "
+                            "It supports Claude/Codex implementers only. Use plain Model Preferences dispatch without "
+                            "--context-injector, --owner-worktree or --receipt-file, putting required context in --task-file "
+                            "and retaining applicable review/permission flags. "
+                            "Guide: apps/model-preferences/README.md#pattern-buffer-support")
+                prompt = DELEGATION + " Use the current researcher role for authorized research. Verify its findings.\n\n" + prompt
+                argv = argv_for(choice, prompt, cwd)
+                launch_id = uuid.uuid4().hex
+                adapter = None
+                if args.context_injector:
+                    receipt = (Path(args.receipt_file).expanduser().absolute() if args.receipt_file else
+                               app.state_dir.resolve() / "ci-receipts" / f"{launch_id}.json")
+                    adapter = {"script": str(Path(args.context_injector).resolve()),
+                               "owner_worktree": str(Path(args.owner_worktree).resolve()), "receipt": str(receipt)}
+                    argv = argv_for(choice, "-", cwd)
+                    if choice["harness"] == "claude":
+                        argv = argv[:-1]
+                    argv = [sys.executable, str(Path(args.context_injector).resolve()), "--cwd", str(cwd), "dispatch",
+                            "--owner-worktree", str(Path(args.owner_worktree).resolve()), "--harness", choice["harness"],
+                            "--task-file", str(Path(args.task_file).resolve()),
+                            "--receipt-file", str(receipt), "--", *argv]
+                launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
+                          "context_injector": adapter, "slot": args.slot,
+                          "task_digest": hashlib.sha256(task_bytes).hexdigest(), "status": "starting"}
+                if choice["profile"] in ("Codex-Qwen", "Qwen-only") and choice["role"].endswith("_review"):
+                    launch["review_authorization_sha256"] = hashlib.sha256(args.review_authorization.encode()).hexdigest()
+                app.save_state(f"launches/{launch['id']}", launch)
         elif command.startswith("handoff-"):
             return handoff(app, config, args)
         else:
             raise PreferenceError("Unsupported command.")
+    if command == "dispatch" and choice["harness"] == "opencode":
+        return dispatch_opencode(app, args, config, choice, cwd, opencode_task)
     if command in ("activate", "model-set", "profile-put", "authority-set", "notify"):
         notice = app.notify(after, args.orchestrators, retry=command == "notify")
         return {"changed": command != "notify", "active": after, "notification": notice}
@@ -809,6 +1908,10 @@ def execute(args):
 def validate_review(app, config, args, choice, cwd):
     if not choice["role"].endswith("_review"):
         return
+    if choice["profile"] in ("Codex-Qwen", "Qwen-only"):
+        authorization = getattr(args, "review_authorization", None)
+        require(isinstance(authorization, str) and authorization.strip(),
+                "Every review launch in a Qwen profile requires a fresh --review-authorization on this command, including standard review.")
     require(args.review_plan, "Review dispatch requires a review-plan, including standard review.")
     plan = app.state(f"reviews/{safe_id(args.review_plan)}", None)
     require(plan, "Unknown review plan.")
@@ -904,11 +2007,161 @@ def injector_task(app, launch, session):
     return cli, task_id, task
 
 
+def resume_opencode_launch(app, args, brief):
+    require(args.opencode_manifest,
+            "OpenCode resume requires the private --opencode-manifest used by the original launch.")
+    launch_id = safe_id(args.launch)
+    try:
+        connection = opencode_dispatch.load_connection(args.opencode_manifest)
+    except opencode_dispatch.OpenCodeDispatchError as exc:
+        raise PreferenceError(f"OpenCode resume preflight held: {exc.code}.") from None
+    initial = app.state(f"launches/{launch_id}", None)
+    require(initial and initial.get("choice", {}).get("harness") == "opencode",
+            "OpenCode resume requires a recorded OpenCode launch.")
+    session = initial.get("native_session")
+    require(isinstance(session, str) and session.startswith("ses_"),
+            "Recorded OpenCode launch has no exact native session identity.")
+    lock_path = app.state_dir / "resume-locks" / f"{session}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PreferenceError("This exact OpenCode session already has a continuation in flight.") from exc
+        with locked(app.config_dir):
+            config = app.config()
+            launch = app.state(f"launches/{launch_id}", None)
+            require(launch and launch.get("status") == "running",
+                    "OpenCode launch is not an exact verified running session; nothing sent.")
+            choice = launch["choice"]
+            active = selection(config)
+            require(choice.get("selection") == active["selection"] and
+                    resolve(active, choice["role"], launch.get("slot")) == choice,
+                    "Current profile choice conflicts with this OpenCode session; nothing sent.")
+            require(connection.parent_task_id == launch.get("parent_task_id")
+                    and connection.api_origin == launch.get("api_origin")
+                    and connection.expected_server_pid == launch.get("expected_server_pid")
+                    and connection.delivery_policy == launch.get("delivery_policy", "native_empty_composer"),
+                    "OpenCode manifest no longer matches the exact server and task binding.")
+            text = brief.decode("utf-8")
+            require(text.strip(), "Continuation task must be nonempty UTF-8.")
+            task_digest = hashlib.sha256(brief).hexdigest()
+            require(task_digest != launch.get("task_digest"),
+                    "The original task digest cannot be submitted again to this session.")
+            previous = app.state(f"continuations/{session}", None)
+            require(previous is None or previous.get("status") not in ("send_intent", "uncertain"),
+                    "A prior OpenCode send has uncertain admission; inspect the exact session before retrying.")
+            require(previous is None or previous.get("task_digest") != task_digest,
+                    "This continuation task digest was already submitted to the exact session.")
+            validate_review(app, config, args, choice, Path(launch["worktree_directory"]))
+            worktree = Path(launch["worktree_directory"]).resolve(strict=True)
+            require(str(worktree) == launch["worktree_directory"] and worktree.is_dir(),
+                    "Recorded OpenCode worktree is missing or moved.")
+            require(launch.get("native_started_at") is not None,
+                    "Native OpenCode hook generation is unavailable; managed continuation remains held.")
+            require(launch.get("execution_result") in ("turn_idle", "turn_failed"),
+                    "The initial OpenCode task has not completed; managed continuation remains held.")
+        try:
+            evidence = opencode_dispatch.preflight(
+                connection, choice, directory=launch["session_directory"])
+            require(evidence.api_origin == launch["api_origin"] and evidence.server_pid == launch["expected_server_pid"],
+                    "OpenCode server binding changed; nothing sent.")
+            opencode_dispatch.verify_session(
+                connection, session, expected_directory=launch["session_directory"], choice=choice,
+                launch_id=launch_id, task_digest=launch["task_digest"],
+                parent_task_id=launch["parent_task_id"],
+                parent_session_id=launch.get("opencode_parent_session_id"))
+            identity = opencode_dispatch.inspect_session(
+                connection, session_id=session, session_directory=launch["session_directory"],
+                worktree_directory=launch["worktree_directory"],
+                workspace_uuid=launch["cmux_workspace_uuid"], surface_uuid=launch["cmux_surface_uuid"],
+                parent_task_id=launch["parent_task_id"])
+            current = app.current()
+            native = opencode_dispatch.require_native_dispatch_binding(
+                expected_workspace=launch["cmux_workspace_uuid"],
+                expected_surface=launch["cmux_surface_uuid"], expected_session=session, current=current)
+            require(native["state"] == "idle",
+                    "Exact OpenCode native session is busy, awaiting input or unknown; nothing sent.")
+            hook = opencode_dispatch.require_native_hook_binding(
+                expected_workspace=launch["cmux_workspace_uuid"],
+                expected_surface=launch["cmux_surface_uuid"], expected_session=session,
+                worktree_directory=launch["worktree_directory"],
+                expected_started_at=launch["native_started_at"])
+            require(hook["agent_lifecycle"] == "idle",
+                    "Exact OpenCode hook lifecycle is not idle; nothing sent.")
+            opencode_dispatch.require_native_delivery_binding(
+                run_cmux_rpc, expected_workspace=launch["cmux_workspace_uuid"],
+                expected_surface=launch["cmux_surface_uuid"],
+                allow_composer_state=connection.delivery_policy == "api_sidechannel")
+            adapter = launch.get("context_injector")
+            if choice["role"] == "orchestrator":
+                require(isinstance(adapter, dict) and adapter.get("role") == "orchestrator",
+                        "OpenCode orchestrator assignment is missing; nothing sent.")
+                context = app.run_json([sys.executable, adapter["script"], "--cwd", str(worktree),
+                                        "context", "--harness", "opencode", "--session", session])
+                require(context.get("status") == "context" and isinstance(context.get("text"), str)
+                        and context["text"].startswith("pattern-buffer | role: orchestrator |")
+                        and context.get("assignment_sha256") == launch.get("pattern_buffer_assignment_sha256"),
+                        "OpenCode orchestrator assignment changed; nothing sent.")
+            elif isinstance(adapter, dict) and adapter.get("task_id"):
+                cli = [sys.executable, adapter["script"], "--cwd", str(worktree)]
+                task = app.run_json([*cli, "task-status", "--task-id", adapter["task_id"]])
+                require(task.get("status") == "active" and task.get("harness") == "opencode"
+                        and task.get("session_id") == session and task.get("root") == str(worktree)
+                        and task.get("role") == "implementer"
+                        and task.get("owner", {}).get("root") == adapter.get("owner_worktree"),
+                        "OpenCode Pattern Buffer task is no longer active on this exact session.")
+                context = app.run_json([*cli, "context", "--harness", "opencode", "--session", session])
+                require(context.get("status") == "context" and context.get("worktree") == str(worktree)
+                        and context.get("assignment_sha256") == launch.get("pattern_buffer_assignment_sha256"),
+                        "OpenCode implementer assignment changed; nothing sent.")
+        except (opencode_dispatch.OpenCodeDispatchError, PreferenceError) as exc:
+            detail = exc.code if isinstance(exc, opencode_dispatch.OpenCodeDispatchError) else str(exc)
+            raise PreferenceError(f"OpenCode continuation held: {detail}.") from None
+
+        attempt = {"id": uuid.uuid4().hex, "launch": launch_id, "session": session,
+                   "choice": choice, "task_digest": task_digest, "created_at": now(),
+                   "status": "send_intent"}
+        with locked(app.config_dir):
+            latest = app.state(f"launches/{launch_id}", None)
+            require(latest and latest.get("status") == "running"
+                    and latest.get("native_started_at") == launch.get("native_started_at"),
+                    "OpenCode launch changed before send intent; nothing sent.")
+            current_previous = app.state(f"continuations/{session}", None)
+            require(current_previous == previous,
+                    "OpenCode continuation state changed before send intent; nothing sent.")
+            app.save_state(f"continuations/{session}", attempt)
+            app.save_state(f"attempts/{attempt['id']}", attempt)
+        try:
+            sent = opencode_dispatch.send_prompt(connection, session_id=session, text=text)
+        except opencode_dispatch.OpenCodeDispatchError as exc:
+            attempt.update(status="uncertain", error_code=exc.code, uncertain_at=now())
+            with locked(app.config_dir):
+                app.save_state(f"continuations/{session}", attempt)
+                app.save_state(f"attempts/{attempt['id']}", attempt)
+            raise PreferenceError(f"OpenCode prompt admission is uncertain: {exc.code}; inspect before retrying.") from None
+        attempt.update(status="submitted", message_id=sent["message_id"], submitted_at=now(),
+                       admission=sent["admission"])
+        with locked(app.config_dir):
+            app.save_state(f"continuations/{session}", attempt)
+            app.save_state(f"attempts/{attempt['id']}", attempt)
+        return {"launch": launch_id, "continuation": attempt["id"], "session": session,
+                "status": "submitted", "message_id": sent["message_id"],
+                "execution_result": "not_yet_observed", "delivery_readiness": "held"}
+
+
 def resume_launch(app, args):
     launch_id = safe_id(args.launch)
     # Snapshot before side effects, then freeze the exact bytes for both CI update and native stdin.
     brief = Path(args.task_file).read_bytes()
-    require(0 < len(brief) <= 16384 and brief.decode().strip(), "Task brief must be 1 to 16384 bytes of nonempty UTF-8.")
+    require(0 < len(brief) <= 16384, "Task brief must be 1 to 16384 bytes of nonempty UTF-8.")
+    try:
+        require(brief.decode("utf-8").strip(), "Task brief must be 1 to 16384 bytes of nonempty UTF-8.")
+    except UnicodeError as exc:
+        raise PreferenceError("Task brief must be UTF-8.") from exc
+    existing = app.state(f"launches/{launch_id}", None)
+    if existing and existing.get("choice", {}).get("harness") == "opencode":
+        return resume_opencode_launch(app, args, brief)
     with locked(app.config_dir):
         launch = app.state(f"launches/{launch_id}", None)
         require(launch and launch["choice"]["harness"] == "codex", "Resume supports recorded Codex launches only.")
@@ -949,6 +2202,8 @@ def resume_launch(app, args):
             attempt = {"id": uuid.uuid4().hex, "launch": launch_id, "session": session, "choice": choice,
                        "task_digest": hashlib.sha256(brief).hexdigest(), "created_at": now(), "status": "starting",
                        "previous": previous.get("id") if previous else None}
+            if choice["profile"] in ("Codex-Qwen", "Qwen-only") and choice["role"].endswith("_review"):
+                attempt["review_authorization_sha256"] = hashlib.sha256(args.review_authorization.encode()).hexdigest()
             app.save_state(f"continuations/{session}", attempt)
             app.save_state(f"attempts/{attempt['id']}", attempt)
         try:

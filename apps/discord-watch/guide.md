@@ -1,7 +1,7 @@
 # Discord Watch setup guide
 
 Discord Watch receives configured-user replies through one Discord Gateway connection and reconciles retained agent-notify forum threads through REST.
-With `--send`, one supervised worker sends a guarded wake to the exact Claude or Codex session enrolled for each thread.
+With `--send`, one supervised worker sends a guarded wake to the exact Claude, Codex, or explicitly bound OpenCode session enrolled for each thread.
 The wake contains the exact `discord-watch receive` command and never contains the reply body.
 New replies are grouped by thread and exact owner generation after three seconds of quiet, with a maximum ten-second delay from the first queued reply.
 Quiet time uses local intake time for unique configured-user messages, while the maximum delay starts at the first message in that pending group.
@@ -12,9 +12,11 @@ Messages are ordered by numeric Discord message ID and retain their full bodies 
 ## Prerequisites
 
 Use Python 3.10 or newer on macOS or another POSIX host with `fcntl`.
-Install or reuse `agent-notify`, Hailing Frequencies, and a current CMUX command that supports `current`, `surface.input_state`, and JSON `paste --submit` results.
+Install or reuse `agent-notify`, Hailing Frequencies, and a current CMUX command that supports `current` and `surface.input_state`.
+Claude and Codex also require JSON `paste --submit` results.
+OpenCode also requires its supported Hailing Frequencies API binding; the selected delivery policy determines whether a native empty-composer result is required.
 Run `agent-notify guide --print` first for complete Discord Community, Forum, webhook, bot, permission, and private credential setup.
-The recipient must already be enrolled in Hailing Frequencies from the exact current Claude or Codex session.
+The recipient must already be enrolled in Hailing Frequencies from the exact current Claude or Codex session, or from the explicit OpenCode manifest path in the Hailing Frequencies guide.
 The existing `agent-notify` environment file must contain `DISCORD_BOT_TOKEN` and should contain `DISCORD_USER_ID` for the account whose replies should be queued.
 When `DISCORD_USER_ID` is omitted, Discord Watch uses the cached `user` written by `agent-notify doctor`.
 Never copy tokens into command arguments, repository files, or logs.
@@ -49,8 +51,16 @@ discord-watch doctor
 ```
 
 Use `--harness codex` and the exact `CODEX_THREAD_ID` for a Codex recipient.
-The surface, session, workspace, harness hook generation, receiving settings, and empty composer are checked at registration and before every wake.
+OpenCode registration, `managed`, `close`, and `receive` verify the exact Hailing Frequencies owner identity without checking composer readiness.
+Automatic wake checks the exact surface, session, workspace, hook generation, receiving settings, and native input state separately.
+The default `native_empty_composer` policy requires an explicitly empty composer with no human-input obligation.
+For OpenCode only, an explicitly selected `api_sidechannel` policy may also accept `draft` or `unknown` classifications when there is no blocking input or human-input obligation and all other native, API, lifecycle, receiving, and owner guards pass.
 The command must run in the recipient's own CMUX session with its normal `CMUX_AGENT_LAUNCH_KIND`, session ID, and `CMUX_SURFACE_ID` environment.
+For OpenCode, keep the session's exact `ses_` identity and API binding in Hailing Frequencies, and pass `--session ses_ID` to owner commands when needed.
+OpenCode owner commands also require `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, and the exact `CMUX_SURFACE_ID` and `CMUX_WORKSPACE_ID` values seeded for that session.
+The current native CMUX OpenCode input state is `unknown`, so identity-only registration and owner commands can succeed while default-policy automatic wakes remain held until CMUX proves the composer empty.
+An explicitly configured `api_sidechannel` wake may accept that `unknown` state only with the full guard set above.
+This policy boundary does not qualify automatic wake delivery or prove a recipient received the reply.
 
 ## Register an exact thread
 
@@ -59,6 +69,13 @@ From the recipient session that will own the thread, run:
 ```sh
 discord-watch register THREAD_ID
 discord-watch managed THREAD_ID
+```
+
+For OpenCode, supply the exact session ID explicitly:
+
+```sh
+discord-watch register THREAD_ID --session ses_EXACT_SESSION_ID
+discord-watch managed THREAD_ID --session ses_EXACT_SESSION_ID
 ```
 
 Registration uses the current session's exact Hailing Frequencies enrollment.
@@ -81,6 +98,7 @@ New groups are not sealed while the thread has an incomplete REST catch-up bound
 Worker submission and default foreground pulls wait for both per-thread ordering barriers, while explicit frozen-group and exact-message receipts remain available to the exact owner.
 
 Only the current registered owner can receive or locally close a thread.
+For OpenCode, the group wake command includes its exact `--session ses_ID` owner so reply receipt does not depend on a guessed terminal or a tab title.
 To hand a retained registration to a different current enrolled session, run `discord-watch transfer THREAD_ID --from-session OLD_SESSION_UUID` from the new owner's session.
 Transfer requires the old session ID to match the stored owner and preserves every unreceived reply.
 Transfer can preserve a locally closed registration without reopening it.
@@ -162,6 +180,7 @@ The production Gateway adapter commits each dispatch sequence atomically with el
 Status reports Gateway condition, resumable-session availability, recovery coverage, and each thread's REST recovery and access condition separately.
 If an exact owner is missing or stale, restore that same Hailing Frequencies binding or arrange an explicit authorized transfer before delivery can continue.
 Discord Watch never reroutes replies to another owner automatically or starts a separate escalation service.
+OpenCode identity-only owner commands and API admission remain separate: registration, `managed`, `close`, and `receive` verify exact enrollment, while automatic wake readiness follows the selected Hailing Frequencies delivery policy.
 
 ## Verification and delivery evidence
 

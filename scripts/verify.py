@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKUP = ROOT / "apps" / "starfleet-markup"
 
 PYTHON_CHECKS = (
+    ("OpenCode adapter", ("-m", "unittest", "discover", "-s", "apps/opencode-adapter/tests", "-p", "test_*.py", "-v")),
     ("Away Mode", ("apps/away-mode/verify.py",)),
     ("Context Injector compatibility", ("-m", "unittest", "discover", "-s", "apps/context-injector", "-p", "test_*.py", "-v")),
     ("Discord Watch", ("apps/discord-watch/verify.py",)),

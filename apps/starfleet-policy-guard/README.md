@@ -1,6 +1,6 @@
 # Starfleet Policy Guard
 
-Policy Guard provides a local delivery report and an optional native-owner seat for supported GitHub CLI paths.
+Policy Guard provides a local delivery report and optional native-owner seats for supported GitHub CLI paths, including an opt-in OpenCode plugin source candidate for bounded Prime Directive actions.
 Reports organize audit, target-awareness, conflict and canonical verification evidence without running those checks or granting readiness, merge or deployment authority.
 The seat can gate only its documented command paths; it does not intercept arbitrary scripts, other applications, web/API actions or commands outside its adapters.
 
@@ -14,7 +14,7 @@ python3 apps/starfleet-policy-guard/lane.py guide --print
 ```
 
 The guide documents the read-only plan, explicit install, checkout attachment, owner handoff, recovery and cleanup commands.
-Use the exact current native Claude or Codex session identity; never infer ownership from a title.
+Use the exact current native Claude or Codex session identity in those CLI flows; never infer ownership from a title.
 Installation preserves native trust requirements and existing settings outside the owned hook.
 It does not start a service or create GitHub records.
 `status` and `coverage` include one read-only setup recommendation based on the recorded attachment, owner, source pin, adapter and upgrade journal.
@@ -22,6 +22,19 @@ The recommendation is advisory, and an intact legacy installation does not need 
 Standalone reporting and proof-only work do not require enrollment.
 A recorded report is a covered-delivery requirement, not proof of setup or a prerequisite to attach a checkout.
 `status --session-id` selects recorded activation events; it does not identify the actor or establish lane ownership.
+
+## OpenCode 2.2.5 prototype
+
+The local prototype targets only the OpenCode 2.2.5 server plugin API and the dedicated `prime_directive_manage` and `prime_directive_gh` tools.
+The plugin binds identity from the actual server tool context and OpenCode session API result, including the exact session, parent, project and location.
+An `OPENCODE_SESSION_ID` environment value does not enroll a native owner.
+Configure the immutable plugin directory returned by `plan` or `install` as a local directory in the OpenCode `plugins` setting.
+The dedicated GitHub tool first requests OpenCode's native `shell` permission for the equivalent command resource, then checks the owner, checkout, PR, source and fresh report immediately before forwarding.
+Configured native asks and denies remain effective.
+Direct plain-shell `gh pr ready` and `gh pr merge` commands are refused.
+Wrapped commands, opaque shell syntax, alternate executables, scripts, APIs, web and other tools remain outside this bounded coverage.
+For setup and handoff details, use the printable guide.
+Source and fixture checks do not qualify a native OpenCode runtime or establish a public support claim.
 
 ## Inspect a lane before a PR exists
 
@@ -48,6 +61,8 @@ Local verification is evidence for the recorded source and verification inputs, 
 The reported verification command must exactly match the canonical command documented by the repository.
 Policy Guard neither guesses a package manager nor runs the command while reporting.
 Configured installation and adapter state are not proof that a native runtime loaded the hook or that a message was delivered.
+The OpenCode plugin uses a local JSON CLI bridge that does not authenticate its event payload cryptographically, so this remains a cooperative workflow guard rather than an adversarial local-process boundary.
+Native plugin loading and covered action outcomes remain unqualified; see the [setup guide](guide.md) for the bridge limitation and the exact acceptance boundary.
 
 The separate `guard.py` workflow uses the local policy in `config/default-policy.json` and is distinct from the delivery-only seat.
 Its fixture workflow does not make filesystem access a security boundary and does not install into a lane through the seat installer.

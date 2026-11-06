@@ -1,6 +1,6 @@
 # Pattern Buffer guide
 
-Pattern Buffer restores approved worktree context to Claude Code and Codex at startup, resume and recovery.
+Pattern Buffer restores approved worktree context to Claude Code and Codex at startup, resume and recovery, with an opt-in OpenCode context plugin pilot.
 It can also remind enrolled orchestrators to refresh a private checkpoint as context fills.
 It is a local Python CLI with no daemon, database or model-based role detection.
 It requires Python 3.10 or newer, Git, and macOS or Linux.
@@ -49,6 +49,9 @@ python3 apps/pattern-buffer/pattern_buffer.py install --harness codex
 python3 apps/pattern-buffer/pattern_buffer.py install --harness claude
 ```
 
+For the OpenCode v2.2.5 context hook pilot, use a dedicated OpenCode settings copy and pass it explicitly.
+The adapter requires an exact session ID and does not infer roles from worktree defaults or OpenCode parent IDs.
+Read the [OpenCode adapter guide](docs/opencode.md) for isolated setup, two-phase task binding, limits and native verification requirements.
 If install refuses an unowned or damaged runtime entrypoint, preserve the existing runtime.
 From a source checkout, use the same settings path and install into a new empty runtime:
 
@@ -107,6 +110,7 @@ Use `--harness claude` for Claude and a real session identity when known.
 `validate` checks both role sections and exits nonzero on malformed or oversized context.
 It reports header bytes, usable content bytes and remaining UTF-8 bytes from the exact rendered header.
 Use the exact session ID when available so the report includes the selected session file path.
+Without `--session`, status labels its placeholder header budget and does not establish exact native-session binding.
 `status`, `session-enroll`, `enrollment-status` and `handoff-check` use the same calculation.
 Oversized or malformed required sources fail closed and are never truncated.
 The hook uses the harness-reported working directory, not the directory from which installation was run.

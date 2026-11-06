@@ -32,6 +32,10 @@ Use `python3 scripts/verify.py --python-only` only when the Node.js browser suit
 Run `git diff --check` and report the exact command, candidate revision, result, and any unverified native behavior.
 Configuration and a successful simulated submission do not prove actual recipient delivery.
 
+Before preparing OpenCode for Qwen or relaying a parent/child task brief, read the [Qwen inference and test observer preflight](docs/qwen-operating-guide.md#inference-and-test-observer-preflight).
+Before costly inference, pin the runtime and reuse a maintained or generated client, then check configuration and API shapes without a model request.
+Replay sanitized event examples and review the observer's terminal-state, raw/rendered-content and failure-classification behavior before launch.
+
 CI must run on GitHub-hosted runners with read-only repository permissions.
 Do not add self-hosted runners, live model credentials, real CMUX sessions, Discord credentials, or personal transcripts to CI.
 Keep workflow action references pinned to full commit SHAs.

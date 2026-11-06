@@ -1,8 +1,10 @@
+import base64
 import contextlib
 from datetime import datetime, timezone
 import inspect
 import io
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import queue
@@ -84,6 +86,67 @@ class FakeAPI:
         raise AssertionError(f"Unexpected API path: {path}")
 
 
+class FakeOpenCodeAPI:
+    def __init__(self, session, directory, password):
+        self.session = session
+        self.directory = str(directory)
+        self.password = password
+        self.active = {}
+        self.malformed_info = False
+        self.version = hf.opencode_adapter_module().SUPPORTED_OPENCODE_VERSION
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def respond(self, status, value, headers=None):
+                body = json.dumps(value).encode("utf-8")
+                self.send_response(status)
+                for name, content in (headers or {}).items():
+                    self.send_header(name, content)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                expected = "Basic " + base64.b64encode(
+                    f"opencode:{owner.password}".encode("utf-8")).decode("ascii")
+                if self.headers.get("Authorization") != expected:
+                    self.respond(401, {}, {"WWW-Authenticate": 'Basic realm="OpenCode fixture"'})
+                    return
+                if self.path == "/api/info":
+                    info = {"version": owner.version, "pid": os.getpid(), "urls": [],
+                            "paths": {"tmp": "/tmp/opencode-fixture"}}
+                    if owner.malformed_info:
+                        info.pop("version")
+                    self.respond(200, info)
+                elif self.path == f"/api/session/{owner.session}":
+                    self.respond(200, {"data": {"id": owner.session, "projectID": "prj_fixture",
+                                                 "location": {"directory": owner.directory},
+                                                 "time": {"archived": None}, "subpath": ""}})
+                elif self.path == "/api/session/active":
+                    self.respond(200, {"data": owner.active})
+                elif self.path in (f"/api/session/{owner.session}/inbox",
+                                   f"/api/session/{owner.session}/permission",
+                                   f"/api/session/{owner.session}/form"):
+                    self.respond(200, {"data": []})
+                else:
+                    self.respond(404, {})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
 class FakeCmux:
     def __init__(self):
         self.fail_binding = None
@@ -100,6 +163,14 @@ class FakeCmux:
         if self.fail_binding:
             raise ValueError(self.fail_binding)
         return True
+
+    def owner_identity_binding(self, current):
+        if current.get("harness") != "opencode":
+            raise ValueError("Owner identity check requires OpenCode")
+        return self.binding(current)
+
+    def enrollment_binding(self, current):
+        return self.binding(current)
 
     def submit(self, current, text, on_transport_start=None):
         self.binding(current)
@@ -151,12 +222,13 @@ class DiscordWatchTests(unittest.TestCase):
                              cmux=self.cmux, now=self.clock)
         self.old_env = {key: os.environ.get(key) for key in (
             "CMUX_AGENT_LAUNCH_KIND", "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID",
-            "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")}
+            "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID")}
         os.environ["CMUX_AGENT_LAUNCH_KIND"] = "codex"
         os.environ["CMUX_SURFACE_ID"] = SURFACE_A
         os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_A
         os.environ["CODEX_THREAD_ID"] = SESSION_A
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        os.environ.pop("OPENCODE_SESSION_ID", None)
 
     def tearDown(self):
         for key, value in self.old_env.items():
@@ -1555,6 +1627,391 @@ class DiscordWatchTests(unittest.TestCase):
         os.environ.pop("CODEX_THREAD_ID", None)
         self.assertEqual(self.register()["owner_session"], SESSION_A)
 
+    def test_opencode_session_self_registers_exact_owner_without_state_migration(self):
+        opencode_session = "ses_DiscordWatchFixture"
+        api_url = "http://127.0.0.1:4096"
+        password_file = str(self.root / "opencode-password")
+        self.targets = [target(session=opencode_session, harness="opencode",
+                               api_url=api_url, password_file=password_file,
+                               expected_server_pid=12345,
+                               session_directory=str(self.root), worktree_directory=str(self.root),
+                               parent_task_id="task:discord-watch-fixture")]
+        self._write_hailing()
+        os.environ["CMUX_AGENT_LAUNCH_KIND"] = "opencode"
+        os.environ["OPENCODE_SESSION_ID"] = opencode_session
+        owner = self.app.current_owner()
+        self.assertEqual(owner["session"], opencode_session)
+        self.assertEqual(owner["harness"], "opencode")
+        self.assertEqual(owner["expected_server_pid"], 12345)
+        self.assertEqual(owner["delivery_policy"], "native_empty_composer")
+        self.assertEqual(self.register()["owner_session"], opencode_session)
+        managed = self.app.managed(THREAD)
+        self.assertTrue(managed["managed"])
+        with contextlib.closing(self.app.database(create=False)) as db:
+            row = db.execute("SELECT owner_json FROM threads WHERE thread_id=?", (THREAD,)).fetchone()
+            tables = {item[0] for item in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        registered_owner = json.loads(row[0])
+        self.assertEqual(registered_owner["session"], opencode_session)
+        self.assertEqual(registered_owner["api_url"], api_url)
+        self.assertIn("threads", tables)
+        self.assertIn("messages", tables)
+        self.assertNotIn("opencode_threads", tables)
+        prompt = self.app._wake_prompt(THREAD, "501", owner)
+        self.assertIn("receive --thread 100 --session ses_DiscordWatchFixture --message 501", prompt)
+
+    def test_opencode_group_wake_targets_exact_session_for_group_receipt(self):
+        session = "ses_DiscordWatchGroupReceipt"
+        prompt = self.app._group_wake_prompt(
+            THREAD, 17, {"harness": "opencode", "session": session})
+        self.assertIn(f"receive --thread {THREAD} --session {session} --group 17", prompt)
+        self.assertNotIn("private reply body", prompt)
+        args = dw.parser().parse_args([
+            "receive", "--thread", THREAD, "--session", session, "--group", "17"])
+        self.assertEqual((args.session, args.group), (session, "17"))
+
+    def test_opencode_current_owner_rejects_wrong_session_and_missing_workspace(self):
+        opencode_session = "ses_DiscordWatchFixture"
+        self.targets = [target(session=opencode_session, harness="opencode",
+                               api_url="http://127.0.0.1:4096", password_file=str(self.root / "secret"),
+                               expected_server_pid=12345, session_directory=str(self.root),
+                               worktree_directory=str(self.root), parent_task_id="task:fixture")]
+        self._write_hailing()
+        os.environ["CMUX_AGENT_LAUNCH_KIND"] = "opencode"
+        os.environ["OPENCODE_SESSION_ID"] = "ses_OtherSession"
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.current_owner()
+        os.environ["OPENCODE_SESSION_ID"] = opencode_session
+        os.environ.pop("CMUX_WORKSPACE_ID", None)
+        with self.assertRaisesRegex(ValueError, "CMUX_WORKSPACE_ID"):
+            self.app.current_owner()
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_A
+        os.environ.pop("OPENCODE_SESSION_ID", None)
+        with self.assertRaisesRegex(ValueError, "OPENCODE_SESSION_ID"):
+            self.app.current_owner(session_hint=opencode_session)
+
+    def test_binding_snapshot_normalizes_policy_only_for_opencode(self):
+        opencode_fields = {"api_url": "http://127.0.0.1:4096",
+                           "password_file": str(self.root / "password"),
+                           "expected_server_pid": 12345,
+                           "session_directory": str(self.root),
+                           "worktree_directory": str(self.root),
+                           "parent_task_id": "task:fixture"}
+        defaulted = self.app.binding_snapshot(target(session="ses_PolicyFixture", harness="opencode",
+                                                       **opencode_fields))
+        self.assertEqual(defaulted["delivery_policy"], "native_empty_composer")
+        explicit = self.app.binding_snapshot(target(session="ses_PolicyFixture", harness="opencode",
+                                                      delivery_policy="api_sidechannel", **opencode_fields))
+        self.assertEqual(explicit["delivery_policy"], "api_sidechannel")
+        with self.assertRaisesRegex(ValueError, "delivery policy"):
+            self.app.binding_snapshot(target(session="ses_PolicyFixture", harness="opencode",
+                                               delivery_policy="future_policy", **opencode_fields))
+
+        for harness in ("claude", "codex"):
+            snapshot = self.app.binding_snapshot(target(harness=harness, delivery_policy="api_sidechannel"))
+            self.assertNotIn("delivery_policy", snapshot)
+
+    def _prepare_busy_opencode(self):
+        session = "ses_DiscordWatchReceipt"
+        worktree = self.root / "opencode-worktree"
+        worktree.mkdir()
+        password_file = self.root / "opencode-password"
+        password_file.write_text("synthetic-opencode-password", encoding="utf-8")
+        password_file.chmod(0o600)
+        server = FakeOpenCodeAPI(session, worktree, "synthetic-opencode-password")
+        self.addCleanup(server.close)
+        self.targets = [target(session=session, harness="opencode", api_url=server.url,
+                               password_file=str(password_file), expected_server_pid=os.getpid(),
+                               session_directory=str(worktree), worktree_directory=str(worktree),
+                               parent_task_id="task:discord-watch-fixture")]
+        self._write_hailing()
+
+        hook_directory = self.root / "cmux-hooks"
+        hook_directory.mkdir(mode=0o700)
+        hook_record = {"surfaceId": SURFACE_A, "workspaceId": WORKSPACE_A,
+                       "agentLifecycle": "idle", "startedAt": 1234.5,
+                       "cwd": str(worktree)}
+        hook_path = hook_directory / "opencode-hook-sessions.json"
+
+        def write_hook():
+            hook_path.write_text(json.dumps({"sessions": {session: hook_record}}), encoding="utf-8")
+            hook_path.chmod(0o600)
+
+        write_hook()
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                   "items": [{"placement": {"kind": "local"},
+                              "projections": [{"panel_id": SURFACE_A, "workspace_id": WORKSPACE_A}],
+                              "agents": [{"session_id": session, "kind": "opencode", "state": "idle"}]}]}
+        guard = {"surface_id": SURFACE_A, "workspace_id": WORKSPACE_A, "state": "empty",
+                 "agent": True, "terminal": True, "blocks_typing": False,
+                 "waiting_on_human": False, "lifecycle": "idle"}
+        settings = {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+        cmux = hf.Cmux(hook_directory=hook_directory)
+
+        def native_command(*args):
+            if args[0] == "current":
+                return current
+            if args[0] == "rpc" and args[1] == "surface.input_state":
+                return guard
+            if args[0] == "rpc" and args[1] == "agent.message.settings":
+                return settings
+            raise AssertionError(f"Unexpected CMUX command: {args}")
+
+        cmux.command = native_command
+        self.app.fake_cmux = cmux
+        os.environ["CMUX_AGENT_LAUNCH_KIND"] = "opencode"
+        os.environ["OPENCODE_SESSION_ID"] = session
+        return session, server, hook_record, write_hook, current, settings
+
+    def test_busy_opencode_can_receive_with_identity_binding_while_send_stays_held(self):
+        session, server, hook_record, write_hook, current, _settings = self._prepare_busy_opencode()
+        self.app.register(THREAD, session_hint=session)
+        self.api.rows = [message("101", content="busy-session reply")]
+        self.app.scan()
+        self.assertEqual(self.messages()[0][1], "pending")
+
+        server.active[session] = {"type": "running"}
+        current["items"][0]["agents"][0]["state"] = "working"
+        hook_record["agentLifecycle"] = "running"
+        write_hook()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        report = self.app.scan(send=True)
+        self.assertEqual(report["threads"][0]["wake"]["state"], "held")
+        self.assertIn("session_busy", report["threads"][0]["wake"]["held"])
+        self.assertEqual(self.messages()[0][1:3], ("pending", 0))
+
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.receive(THREAD, "101", io.StringIO(), session_hint="ses_OtherDiscordSession")
+        self.targets[0]["started_at"] += 1
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "generation changed"):
+            self.app.receive(THREAD, "101", io.StringIO(), session_hint=session)
+        self.assertEqual(self.messages()[0][1], "pending")
+
+        self.targets[0]["started_at"] = 1234.5
+        self._write_hailing()
+        output = io.StringIO()
+        result = self.app.receive(THREAD, "101", output, session_hint=session)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("[discord:100:101] Configured user: busy-session reply", output.getvalue())
+        self.assertEqual(self.messages()[0][1], "received")
+
+    def test_busy_opencode_can_receive_frozen_group_with_identity_binding(self):
+        session, server, hook_record, write_hook, current, _settings = self._prepare_busy_opencode()
+        self.app.register(THREAD, session_hint=session)
+        self.api.rows = [message("101", content="busy-session group reply")]
+        self.app.scan()
+        server.active[session] = {"type": "running"}
+        current["items"][0]["agents"][0]["state"] = "working"
+        hook_record["agentLifecycle"] = "running"
+        write_hook()
+
+        output = io.StringIO()
+        result = self.app.receive(THREAD, output=output, session_hint=session)
+
+        self.assertEqual(result["group"], 1)
+        self.assertEqual(result["received"], ["101"])
+        self.assertIn("[discord:100:101] Configured user: busy-session group reply", output.getvalue())
+        self.assertEqual(self.messages()[0][1], "received")
+
+    def test_busy_opencode_can_register_manage_and_close_without_waking(self):
+        session, server, hook_record, write_hook, current, _settings = self._prepare_busy_opencode()
+        server.active[session] = {"type": "running"}
+        current["items"][0]["agents"][0]["state"] = "working"
+        hook_record["agentLifecycle"] = "running"
+        write_hook()
+
+        registered = self.app.register(THREAD, session_hint=session)
+        self.assertTrue(registered["registered"])
+        self.assertEqual(registered["owner_session"], session)
+        managed = self.app.managed(THREAD, session_hint=session)
+        self.assertTrue(managed["managed"])
+        self.assertEqual(managed["owner_session"], session)
+
+        self.api.rows = [message("101", content="preserve across close")]
+        self.app.scan()
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        report = self.app.scan(send=True)
+        self.assertEqual(report["threads"][0]["wake"]["state"], "held")
+        self.assertIn("session_busy", report["threads"][0]["wake"]["held"])
+        self.assertEqual(self.messages()[0][1:3], ("pending", 0))
+
+        closed = self.app.close(THREAD, session_hint=session)
+        self.assertEqual(closed, {"thread": THREAD, "closed": True,
+                                  "subscribed": True, "pending_preserved": True})
+        self.assertEqual(self.messages()[0][1], "pending")
+        self.assertTrue(self.app.register(THREAD, session_hint=session)["already_registered"])
+        self.assertFalse(self.app.managed(THREAD, session_hint=session)["open"])
+
+    def test_busy_opencode_lifecycle_checks_identity_session_generation_and_api(self):
+        session, server, hook_record, write_hook, current, settings = self._prepare_busy_opencode()
+        server.active[session] = {"type": "running"}
+        current["items"][0]["agents"][0]["state"] = "working"
+        hook_record["agentLifecycle"] = "running"
+        write_hook()
+        self.app.register(THREAD, session_hint=session)
+
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.managed(THREAD, session_hint="ses_OtherDiscordSession")
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.managed(THREAD, session_hint=session)
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_A
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_B
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.managed(THREAD, session_hint=session)
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_A
+        self.targets[0]["started_at"] += 1
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "generation changed"):
+            self.app.managed(THREAD, session_hint=session)
+        self.targets[0]["started_at"] = 1234.5
+        self.targets[0]["expected_server_pid"] += 1
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "api_server_pid_mismatch"):
+            self.app.managed(THREAD, session_hint=session)
+        self.targets[0]["expected_server_pid"] = os.getpid()
+        self._write_hailing()
+
+        server.malformed_info = True
+        with self.assertRaisesRegex(ValueError, "unsupported_api_schema"):
+            self.app.managed(THREAD, session_hint=session)
+        server.malformed_info = False
+        settings["receiving"] = False
+        self.assertTrue(self.app.managed(THREAD, session_hint=session)["managed"])
+        settings["receiving"] = True
+        self.assertTrue(self.app.managed(THREAD, session_hint=session)["managed"])
+
+    def test_opencode_policy_is_persisted_and_live_policy_change_holds(self):
+        session, _server, _hook, _write_hook, _current, _settings = self._prepare_busy_opencode()
+        self.targets[0]["delivery_policy"] = "api_sidechannel"
+        self._write_hailing()
+        self.app.register(THREAD, session_hint=session)
+        self.api.rows = [message("101", content="policy remains bound")]
+        self.app.scan()
+        with contextlib.closing(self.app.database(create=False)) as db:
+            original_json = db.execute("SELECT owner_json FROM threads WHERE thread_id=?", (THREAD,)).fetchone()[0]
+        original_owner = json.loads(original_json)
+        self.assertEqual(original_owner["delivery_policy"], "api_sidechannel")
+
+        self.targets[0]["delivery_policy"] = "native_empty_composer"
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "Registered owner is no longer enrolled"):
+            with contextlib.closing(self.app.database(create=False)) as db:
+                thread = self.app._thread(db, THREAD)
+            self.app.validate_registered_owner(thread["owner"])
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.managed(THREAD, session_hint=session)
+        with self.assertRaisesRegex(ValueError, "Only the registered current owner"):
+            self.app.close(THREAD, session_hint=session)
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.register(THREAD, session_hint=session)
+        self.clock[0] += dw.GROUP_QUIET_SECONDS
+        report = self.app.scan(send=True)
+        self.assertEqual(report["threads"][0]["wake"]["state"], "held")
+        self.assertIn("Registered owner is no longer enrolled", report["threads"][0]["wake"]["held"])
+        self.assertEqual(self.messages()[0][1:3], ("pending", 0))
+        with contextlib.closing(self.app.database(create=False)) as db:
+            stored_json = db.execute("SELECT owner_json FROM threads WHERE thread_id=?", (THREAD,)).fetchone()[0]
+        self.assertEqual(stored_json, original_json)
+
+    def test_legacy_opencode_owner_without_policy_fails_closed_without_rewrite(self):
+        session, _server, _hook, _write_hook, _current, _settings = self._prepare_busy_opencode()
+        self.app.register(THREAD, session_hint=session)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            raw_owner = json.loads(db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
+                                              (THREAD,)).fetchone()[0])
+            raw_owner.pop("delivery_policy")
+            with db:
+                db.execute("UPDATE threads SET owner_json=? WHERE thread_id=?",
+                           (json.dumps(raw_owner, separators=(",", ":")), THREAD))
+
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.managed(THREAD, session_hint=session)
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.register(THREAD, session_hint=session)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            stored_owner = json.loads(db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
+                                                 (THREAD,)).fetchone()[0])
+        self.assertNotIn("delivery_policy", stored_owner)
+
+    def test_lifecycle_commands_reject_foreign_owner_and_preserve_existing_registration(self):
+        self.register()
+        self.api.rows = [message("101", content="keep for registered owner")]
+        self.app.scan()
+        self.targets.append(target(SESSION_B, SURFACE_B, WORKSPACE_B))
+        self._write_hailing()
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_B
+        os.environ["CODEX_THREAD_ID"] = SESSION_B
+
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.register(THREAD)
+        with self.assertRaisesRegex(ValueError, "another exact session"):
+            self.app.managed(THREAD)
+        with self.assertRaisesRegex(ValueError, "Only the registered current owner"):
+            self.app.close(THREAD)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            owner = json.loads(db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
+                                           (THREAD,)).fetchone()[0])
+        self.assertEqual(owner["session"], SESSION_A)
+        self.assertEqual(self.messages()[0][1], "pending")
+
+        os.environ["CMUX_SURFACE_ID"] = SURFACE_A
+        os.environ["CMUX_WORKSPACE_ID"] = WORKSPACE_A
+        os.environ["CODEX_THREAD_ID"] = SESSION_A
+        self.assertTrue(self.app.close(THREAD)["closed"])
+        self.assertEqual(self.messages()[0][1], "pending")
+
+    def test_receive_output_failure_does_not_record_receipt(self):
+        self.register()
+        self.api.rows = [message("101", content="not acknowledged")]
+        self.app.scan()
+
+        class FailingOutput:
+            def write(self, value):
+                return len(value)
+
+            def flush(self):
+                raise OSError("synthetic stdout flush failure")
+
+        with self.assertRaisesRegex(OSError, "synthetic stdout flush failure"):
+            self.app.receive(THREAD, "101", FailingOutput())
+        self.assertEqual(self.messages()[0][1], "pending")
+
+    def test_receive_rechecks_owner_after_flush_before_recording_receipt(self):
+        self.register()
+        self.api.rows = [message("101", content="owner can change")]
+        self.app.scan()
+
+        class ReplacingOutput(io.StringIO):
+            def flush(inner_self):
+                super().flush()
+                self.targets = [target(SESSION_B, SURFACE_B, WORKSPACE_B)]
+                self._write_hailing()
+
+        with self.assertRaisesRegex(ValueError, "exact enrolled"):
+            self.app.receive(THREAD, "101", ReplacingOutput())
+        self.assertEqual(self.messages()[0][1], "pending")
+
+    def test_receive_for_other_harness_still_requires_full_binding(self):
+        self.register()
+        self.api.rows = [message("101")]
+        self.app.scan()
+        self.cmux.fail_binding = "session ended"
+        with self.assertRaisesRegex(ValueError, "session ended"):
+            self.app.register(THREAD)
+        with self.assertRaisesRegex(ValueError, "session ended"):
+            self.app.managed(THREAD)
+        with self.assertRaisesRegex(ValueError, "session ended"):
+            self.app.close(THREAD)
+        with self.assertRaisesRegex(ValueError, "session ended"):
+            self.app.receive(THREAD, "101", io.StringIO())
+        self.assertEqual(self.messages()[0][1], "pending")
+        with contextlib.closing(self.app.database(create=False)) as db:
+            is_open = db.execute("SELECT is_open FROM threads WHERE thread_id=?", (THREAD,)).fetchone()[0]
+        self.assertEqual(is_open, 1)
+
     def test_page_messages_and_cursor_roll_back_together_then_replay_after_restart(self):
         self.register()
         self.api.rows = [message("101"), message("102", content=7)]
@@ -2174,7 +2631,8 @@ class DiscordWatchTests(unittest.TestCase):
     def test_receive_empty_returns_three_without_stdout(self):
         self.register()
         output = io.StringIO()
-        with mock.patch.object(dw.Watch, "current_owner", return_value=self.app.binding_snapshot(self.targets[0])):
+        with mock.patch.object(dw.Watch, "_identity_owner",
+                               return_value=self.app.binding_snapshot(self.targets[0])):
             with contextlib.redirect_stdout(output):
                 result = dw.main(["--state-dir", str(self.state), "--hailing-state", str(self.hailing),
                                   "--notify-home", str(self.notify_home), "receive", "--thread", THREAD])

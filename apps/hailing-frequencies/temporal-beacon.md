@@ -1,6 +1,6 @@
 # Temporal Beacon: agent guide
 
-Temporal Beacon schedules a future continuation for an enrolled Claude or Codex agent inside CMUX.
+Temporal Beacon schedules a future continuation for an enrolled Claude, Codex, or explicitly bound OpenCode session inside CMUX.
 It shares Hailing Frequencies' worker, enrollment, exact-session input guards, and health reporting.
 Timer records and occurrence receipts are separate from unread-message reminders.
 Scheduling a timer does not create a new agent or grant additional task authority.
@@ -11,6 +11,12 @@ The local CLI implements durable one-shot and recurring timers, time deadlines, 
 It uses Python 3.9 or newer with standard-library facilities on macOS or another POSIX host with `fcntl`.
 It requires the same CMUX capabilities and exact-session enrollment as [Hailing Frequencies](README.md#install-without-activating).
 The installer publishes an immutable runtime and the Hailing Frequencies, Temporal Beacon, and Agent Notify commands without starting a worker or registering harness skills.
+
+OpenCode timers require an exact Hailing Frequencies self-enrollment manifest and use the enrolled loopback API binding when they become due.
+Timer commands require the managed launch's exact `CMUX_AGENT_LAUNCH_KIND=opencode`, `OPENCODE_SESSION_ID`, `CMUX_SURFACE_ID`, and `CMUX_WORKSPACE_ID` environment values.
+OpenCode enrollment and timer creation verify the exact API and native session identity and may proceed while the API session is busy.
+Timer delivery still requires the full API readiness inspection and the enrolled composer policy; the current native pilot's `unknown` composer state holds delivery under the default `native_empty_composer` policy.
+The OpenCode API identity inspector checks session identity, server PID, and directories without requiring send readiness, while the delivery inspector also checks running state, permissions, and forms; neither exposes composer drafts.
 
 Register the packaged skill with each harness that needs to discover Temporal Beacon.
 Delivery requires the authorized Hailing worker terminal to remain open.

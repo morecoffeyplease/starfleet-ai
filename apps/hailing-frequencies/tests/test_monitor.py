@@ -475,6 +475,7 @@ class MonitorTests(unittest.TestCase):
             staged_guide = staging / "guide.md"
             staged_agent_notify = staging / "agent-notify"
             staged_agent_notify_guide = staging / "agent-notify-guide.md"
+            staged_opencode_adapter = staging / "opencode_adapter.py"
             staged_script.write_bytes(b"immutable runtime script")
             staged_service.write_bytes(b"immutable runtime service")
             source_app = Path(__file__).resolve().parents[1]
@@ -482,12 +483,15 @@ class MonitorTests(unittest.TestCase):
             staged_guide.write_bytes((source_app / "guide.md").read_bytes())
             staged_agent_notify.write_bytes((source_app / "agent-notify").read_bytes())
             staged_agent_notify_guide.write_bytes((source_app / "agent-notify-guide.md").read_bytes())
+            staged_opencode_adapter.write_bytes(
+                (source_app.parent / "opencode-adapter" / "opencode_adapter.py").read_bytes())
             skill_source = source_app / "skills/temporal-beacon/SKILL.md"
             agent_notify_skill_source = source_app / "skills/agent-notify/SKILL.md"
             sources = {"hailing_frequencies.py": staged_script.read_bytes(), "service.py": staged_service.read_bytes(),
                        "temporal_beacon.py": staged_temporal.read_bytes(), "guide.md": staged_guide.read_bytes(),
                        "agent-notify": staged_agent_notify.read_bytes(),
                        "agent-notify-guide.md": staged_agent_notify_guide.read_bytes(),
+                       "opencode_adapter.py": staged_opencode_adapter.read_bytes(),
                        "skills/temporal-beacon/SKILL.md": skill_source.read_bytes(),
                        "skills/agent-notify/SKILL.md": agent_notify_skill_source.read_bytes()}
             digest = hashlib.sha256(b"".join(name.encode() + b"\0" + content
@@ -1000,7 +1004,13 @@ class InstallationTests(unittest.TestCase):
             source.mkdir()
             source_app = Path(hf.__file__).resolve().parent
             for name in install.SOURCE_NAMES:
-                shutil.copyfile(source_app / name, source / name)
+                if name == "opencode_adapter.py":
+                    adapter_dir = root / "opencode-adapter"
+                    adapter_dir.mkdir()
+                    shutil.copyfile(source_app.parent / "opencode-adapter" / name,
+                                    adapter_dir / name)
+                else:
+                    shutil.copyfile(source_app / name, source / name)
             for skill_name in install.SKILL_NAMES:
                 skill = source / skill_name
                 skill.parent.mkdir(parents=True, exist_ok=True)

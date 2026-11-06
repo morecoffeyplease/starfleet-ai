@@ -74,8 +74,17 @@ class PreferencesTest(unittest.TestCase):
     def plan(self, repo, **changes):
         return self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(self.facts(**changes)))
 
-    def test_five_profiles_and_muse_contributor(self):
-        self.assertEqual(len(self.call("list")["profiles"]), 5)
+    def test_seven_profiles_and_muse_and_qwen_roles(self):
+        self.assertEqual(len(self.call("list")["profiles"]), 7)
+        examples = mp.example_config()
+        self.assertIsNone(examples["active"])
+        self.assertEqual(examples["models"]["local-qwen3.6-35b"], {
+            "harness": "opencode", "provider_id": "trial-local", "slug": "qwen3.6:35b", "efforts": ["max"],
+            "source": "opt-in example; native pilot verified the local OpenAI-compatible provider's max reasoning request and 32768 output limit"})
+        self.assertEqual(examples["profiles"]["Codex-Qwen"]["orchestrator"], {"model": "codex-sol", "effort": "medium"})
+        self.assertEqual(examples["profiles"]["Codex-Qwen"]["implementer"], {"model": "local-qwen3.6-35b", "effort": "max"})
+        self.assertEqual(examples["profiles"]["Qwen-only"]["orchestrator"], {"model": "local-qwen3.6-35b", "effort": "max"})
+        self.assertEqual(examples["profiles"]["Qwen-only"]["standard_review"], [{"model": "codex-sol", "effort": "high"}])
         claude = self.call("show", "Claude-only")
         self.assertEqual(claude["implementer"], {"model": "claude-haiku", "effort": "xhigh"})
         self.assertEqual(claude["researcher"], {"model": "claude-haiku", "effort": "high"})
@@ -129,6 +138,33 @@ class PreferencesTest(unittest.TestCase):
             mp.execute(mp.parser().parse_args(["--config-dir", str(config_dir), "--state-dir", str(state_dir),
                                                "approve-review", plan["id"], "--authorization", "fixture claim"]))
 
+    def test_qwen_profile_review_requires_explicit_authorization_for_each_launch(self):
+        self.activate("Qwen-only")
+        repo = self.repo()
+        plan = self.plan(repo)
+        brief = self.root / "review-brief.txt"
+        brief.write_text("Review the exact scoped diff.")
+        command = ["dispatch", "--role", "standard_review", "--cwd", str(repo),
+                   "--task-file", str(brief), "--review-plan", plan["id"]]
+        with self.assertRaisesRegex(mp.PreferenceError, "fresh --review-authorization"):
+            self.call(*command)
+        self.assertFalse((self.state_dir / "launches").exists())
+
+        original = subprocess.run
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0) if argv[0] == "codex" else original(argv, **kwargs)
+        with patch.object(mp.shutil, "which", return_value="codex"), \
+                patch.object(mp.subprocess, "run", side_effect=run), \
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd: mp.subprocess.run(argv, cwd=cwd, env=env)):
+            result = self.call(*command, "--review-authorization", "Authorize this one standard review launch")
+        launch = self.app.state(f"launches/{result['launch']}", None)
+        self.assertEqual(launch["choice"]["model"], "gpt-6.1-sol")
+        self.assertEqual(launch["choice"]["effort"], "high")
+        self.assertEqual(launch["review_authorization_sha256"], mp.hashlib.sha256(
+            b"Authorize this one standard review launch").hexdigest())
+        with self.assertRaisesRegex(mp.PreferenceError, "fresh --review-authorization"):
+            self.call(*command)
+
     def test_model_set_adds_exact_family_without_catalog_lookup(self):
         config_dir = self.root / "empty-config"
         empty_args = mp.parser().parse_args([
@@ -143,6 +179,16 @@ class PreferencesTest(unittest.TestCase):
         self.assertEqual(saved, {"harness": "codex", "slug": "exact-provider-model-2026",
                                  "efforts": ["low", "high"],
                                  "source": "operator confirmed exact CLI slug"})
+
+    def test_model_set_requires_exact_provider_id_for_opencode(self):
+        with self.assertRaisesRegex(mp.PreferenceError, "--provider-id"):
+            self.call("model-set", "local-qwen", "--harness", "opencode", "--slug", "qwen3.6:35b",
+                      "--efforts", "max", "--source", "exact provider model")
+        self.call("model-set", "local-qwen", "--harness", "opencode", "--provider-id", "trial-local",
+                  "--slug", "qwen3.6:35b", "--efforts", "max", "--source", "exact provider model")
+        self.assertEqual(self.app.config()["models"]["local-qwen"], {
+            "harness": "opencode", "provider_id": "trial-local", "slug": "qwen3.6:35b",
+            "efforts": ["max"], "source": "exact provider model"})
 
     def test_single_reviewer_defaults_resolve_without_a_slot_and_reject_slot_two(self):
         for profile, standard, advanced in (("Codex-only", "gpt-6.1-sol", "gpt-6-astra"),

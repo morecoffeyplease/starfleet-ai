@@ -92,6 +92,10 @@ Product commands inherit the invoking CLI's umask for newly created files and di
 Warp-drive state and detached helper logs remain private.
 The mechanism requires an observed native Claude and Codex survival pilot before claiming resilience to owner-session exit.
 
+The source CLI also accepts an exact OpenCode owner session in the native `ses_` namespace and case-preserved form.
+This source support does not update an installed runtime, start a scheduler, grant admission authority or prove that Hailing Frequencies can route completion to an OpenCode owner.
+See the [agent guide](guide.md) for the current boundary and setup details.
+
 Repeated stable keys attach to the same request only when work contents and checkout identity match.
 Batch input is validated before one transaction commits.
 Delayed, held, and disconnected work retain earned credit and stop accruing new credit.

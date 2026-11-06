@@ -68,6 +68,17 @@ The command detects the worktree and uses `CODEX_THREAD_ID` for Codex when avail
 For Claude, pass the actual native `--session SESSION_ID` unless the harness provides `CLAUDE_SESSION_ID`; an explicit ID conflicting with the inherited ID is rejected.
 The first call prints the take-stock briefing, note template and detected threshold without changing files, hooks or registrations.
 
+OpenCode sessions use the same private checkpoint state and atomic publication rules through the opt-in context plugin.
+Assign the exact native `ses_` session as an orchestrator before enrollment because OpenCode sessions do not inherit a worktree default role.
+The OpenCode plugin observes successful tool completion for draft publication and native compaction lifecycle events for bounded telemetry.
+Its event stream has no replay guarantee, so observed completion counts are explicitly uncertain when the plugin was inactive or disconnected.
+OpenCode percentage-based `--compact-at`, reminder thresholds and lead points remain disabled.
+After exact same-session usage and the active provider, usable window and merged compaction settings are independently verified, a private descriptor can enable a conservative token-anchor reminder through the ordinary context callback.
+The `session.compaction` context callback runs after the current v2.2.5 automatic compaction decision and is not used to warn on that same attempt.
+An ordinary context callback can warn before a later automatic-compaction decision when the request proceeds below the configured ceiling, but a large unseen context tail can still compact without warning.
+The reminder uses a last-measured lower-bound usage anchor and does not claim exact current occupancy or guaranteed headroom.
+See the [OpenCode plugin guide](opencode.md) for exact enrollment commands, behavior and limits.
+
 The briefing asks you to pause and re-read the mission, assigned roadmap, latest user direction and relevant guidance.
 Reconcile current implementation state, worker results, dependencies, evidence and human holds.
 Consider whether you have the full context and appropriate resources, including useful parallel work in temporary worktrees while respecting dependencies, ownership and shared limits.

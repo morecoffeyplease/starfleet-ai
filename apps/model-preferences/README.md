@@ -91,3 +91,94 @@ The application stores profile configuration under the XDG config directory and 
 Use the CLI's --config-dir and --state-dir options to select isolated paths for a separate installation.
 Existing schema-v1 configurations without an approval label remain readable with authority unconfigured and are not rewritten on read.
 Approval and handoff-close actions fail closed until the operator uses authority-set.
+
+## OpenCode local Qwen dispatch
+
+The opt-in examples include `local-qwen3.6-35b`, `Codex-Qwen` and `Qwen-only`, and initialization never activates them.
+`Codex-Qwen` selects Codex Sol medium as orchestrator, local Qwen at max effort for implementation and research, and Codex Sol high for reviews.
+`Qwen-only` selects local Qwen at max effort for orchestration, implementation and research, and Codex Sol high for reviews.
+Every review launch in either reserved profile requires a fresh `--review-authorization` value on that command, including standard review, and the state record keeps only its SHA-256 digest.
+Advanced reviews also require the existing exact-scope plan and explicit configured-authority approval.
+
+The OpenCode family binds an exact provider ID and model slug instead of asking OpenCode to resolve a model name.
+For a new configuration, record the observed local provider and model explicitly.
+
+    model-preferences model-set local-qwen3.6-35b --harness opencode --provider-id trial-local --slug qwen3.6:35b --efforts max --source "verified OpenCode 2.2.5 local provider"
+
+OpenCode dispatch requires a pre-existing OpenCode 2.2.5 API server with Basic authentication on a loopback IP address and the exact local provider/model enabled.
+The separate JSON connection manifest and password file must be regular files owned by the current user with mode `0600`, and neither may be a symlink.
+The manifest contains `api_url`, `expected_server_pid`, `password_file` and an explicit `parent_task_id`; optional `metadata` can pin `provider_id` and `model_id`.
+Optional top-level `delivery_policy` accepts `native_empty_composer` or `api_sidechannel`; omission selects `native_empty_composer`.
+Model Preferences records the selected policy with the exact launch and refuses a resume if the private manifest changes it.
+The explicit `api_sidechannel` policy permits only `empty`, `draft`, or `unknown` native composer classifications while retaining exact current, hook, API, lifecycle, receiving, and human-input guards.
+Both policies require an inactive API session and empty inbox, permission, and form lists.
+An opted-in continuation sends `text`, `delivery: queue`, and `resume: true`, and remains uncertain unless the exact API message is admitted to the queue.
+The policy does not change startup prompts or role choices, and changing it on a recorded launch holds before a continuation send.
+The password stays in its private file and is not copied into the manifest, process arguments, launch records or receipts.
+The API PID and loopback origin bind the connection for this preflight, but OpenCode 2.2.5 exposes no stable server-startup identity, so PID reuse remains a limitation.
+
+Use the read-only preflight before costly inference to check the active saved role against the exact worktree and OpenCode API metadata.
+It reads the active profile only from the provided `--config-dir` and requires the requested role to select OpenCode and the exact Git worktree root.
+Use the runbook's isolated `--config-dir` and matching `--state-dir` for pilot choices; preflight never activates a profile or overrides shared launch choices.
+It reads the private connection manifest, checks the OpenCode version, provider, model, local URL, `max` reasoning variant, request body and output allowance, and returns bounded JSON evidence with a typed error code and remediation when held.
+It sends `GET` requests only and does not write profile state, create a session or CMUX surface, submit a prompt, or request model inference.
+Optional repeated `--require-plugin ID` checks use the `GET /api/plugin` response for that exact directory and require the matching row's `state.status` to be `active`.
+A configured plugin path is not evidence that the API server loaded it, and a failed local plugin row may have no `id`, so that failure is reported without assigning it a made-up ID.
+API plugin status is server-reported configuration evidence only; it does not prove native TUI hook delivery, permissions, model reception or task success.
+For model-free config and API-shape smoke checks plus observer preparation, see the [Qwen inference and test observer preflight](../../docs/qwen-operating-guide.md#inference-and-test-observer-preflight).
+
+```sh
+model-preferences --config-dir /private/config --state-dir /private/state preflight \
+  --role implementer --cwd /absolute/path/to/worktree \
+  --opencode-manifest /private/opencode-connection.json \
+  --require-plugin EXACT_API_PLUGIN_ID
+```
+
+Launch an implementer or researcher task from the exact Git worktree root while running inside the intended CMUX pane.
+
+    model-preferences --config-dir /private/config --state-dir /private/state dispatch --role implementer --cwd /absolute/path/to/worktree --task-file /absolute/path/to/task.md --opencode-manifest /private/opencode-connection.json
+
+The helper scopes both catalog requests to the exact target or session directory and requires both API responses to report that directory.
+It resolves provider, model, and selected `max` variant settings and request bodies using OpenCode 2.2.5's overlay rules before checking the effective loopback endpoint and `reasoning_effort` body value.
+The helper checks the authenticated API version, server PID, exact provider and model, local provider URL, tools, the named `max` reasoning variant and a distinct output budget of at least 32768 tokens before creating a session.
+An unlinked session is created directly at the target directory and its native `ses_` ID, directory, and model are verified before TUI startup.
+OpenCode 2.2.5 creates a parent-linked child at its parent's directory, so the helper first persists the returned native `ses_` ID and parent identity, then uses the supported session move API to relocate the idle child to its target directory.
+The helper confirms the exact session, parent, model, launch ticket, and final directory before it proceeds; an uncertain move is not repeated.
+When Pattern Buffer dispatch is requested, its immutable task snapshot is prepared before session creation and bound to that exact native session only after the final child directory is verified.
+The child TUI obtains its CMUX workspace and surface UUIDs from its own `cmux identify` result, and a private launch barrier requires those UUIDs to match the exact newly opened surface before the session-scoped CMUX environment is set and the initial prompt is released.
+The child transfers its own native `CMUX_SOCKET_CAPABILITY` through that mode-0600 handshake, and Model Preferences writes it only into the exact OpenCode session environment.
+The capability is never written to launch records, receipts, command arguments or diagnostics.
+The initial task is recorded only after the exact startup prompt appears in the exact session message history, a matching assistant turn is complete, the native session is idle, and API inspection reports no active turn, pending permissions or pending forms.
+The bounded pinned-2.2.5 history reader follows opaque cursors to an empty end page, because nonempty response cursors are navigation anchors rather than evidence of additional pages.
+This records an observed completed turn, not semantic task success.
+If CMUX current, hook-generation or empty-composer proof is unavailable, the completed turn remains recorded while managed continuation stays held.
+Wrong or ambiguous surfaces, timeouts, unsupported schemas and uncertain sends remain unresolved and block retry until inspected.
+Titles and working directories alone never establish a native session identity.
+
+Start a fresh Qwen-only orchestrator with its own Pattern Buffer orchestrator assignment.
+
+    model-preferences --config-dir /private/config --state-dir /private/state dispatch --role orchestrator --cwd /absolute/path/to/owner-worktree --task-file /absolute/path/to/task.md --pattern-buffer /absolute/path/to/pattern_buffer.py --opencode-manifest /private/opencode-connection.json
+
+This opens a new visible TUI in the current CMUX workspace after creating and verifying the exact API session.
+It does not replace an existing orchestrator or mutate the active profile.
+The orchestrator may prepare a bounded implementer child in a separate Git worktree with `--pattern-buffer`, the exact owner worktree and a unique immutable receipt.
+Child dispatch requires the exact currently executing OpenCode orchestrator session, its current CMUX surface and workspace, its active admitted task, and the matching Pattern Buffer `{root, role}` assignment digest.
+The API child `parentID` stores that verified native parent `ses_` ID separately from the explicit parent task reference and the new child Pattern Buffer ticket.
+Codex-Qwen keeps Codex Sol medium orchestration and uses local Qwen only for configured implementation and research roles.
+Qwen-only uses local Qwen for orchestration, implementation and research, with external Codex Sol high reviews.
+Every review launch still requires fresh explicit operator authorization.
+
+Continue a recorded OpenCode session with a new bounded task only when the exact server, session model, worktree, native session, hook generation and CMUX placement still match.
+
+    model-preferences --config-dir /private/config --state-dir /private/state resume LAUNCH_ID --task-file /absolute/path/to/follow-up.md --opencode-manifest /private/opencode-connection.json
+
+Before one Model Preferences continuation prompt is sent, the default policy requires an empty native composer, while `api_sidechannel` permits a `draft` or `unknown` composer classification with no blocking input or human-input obligation.
+Both policies require native receiving, exact CMUX current and hook records for the recorded session generation, an idle OpenCode API session, and no pending inbox work, permissions, or forms.
+The helper persists a send intent before the API request.
+If the response is uncertain, the exact session is held against automatic retry.
+An accepted prompt records submission only; later model output is not inferred.
+Human drafts, busy or unknown states, changed worktrees, stale or ambiguous surfaces, unsupported versions and uncertain API responses all hold without sending.
+
+The OpenCode API server must already be running on the exact loopback origin with its private connection manifest and password file.
+Dispatch itself opens the interactive TUI in a new CMUX surface and never starts or configures a global OpenCode service.
+OpenCode 2.2.5 exposes no stable server-startup identifier, so a reused PID at the same loopback origin remains a binding limitation.

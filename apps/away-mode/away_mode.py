@@ -156,6 +156,21 @@ def active_agent(recipient, inventory):
     return owners[0]
 
 
+def opencode_identity(environ=None):
+    environ = os.environ if environ is None else environ
+    require(environ.get("CMUX_AGENT_LAUNCH_KIND") == "opencode",
+            "OpenCode caller requires CMUX_AGENT_LAUNCH_KIND=opencode.")
+    session = environ.get("OPENCODE_SESSION_ID", "")
+    require(isinstance(session, str) and re.fullmatch(r"ses_[A-Za-z0-9]+", session),
+            "OpenCode caller requires its exact native OPENCODE_SESSION_ID.")
+    try:
+        workspace = str(uuid.UUID(environ.get("CMUX_WORKSPACE_ID", "")))
+        surface = str(uuid.UUID(environ.get("CMUX_SURFACE_ID", "")))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise Error("OpenCode caller requires exact CMUX_WORKSPACE_ID and CMUX_SURFACE_ID UUIDs.") from exc
+    return {"workspace": workspace, "surface": surface, "session": session, "harness": "opencode"}
+
+
 def instructions(presence, phrases=None):
     phrases = phrases or {"away": [], "back": []}
     listed = "; ".join(f"{mode}: {', '.join(values)}" for mode, values in phrases.items() if values)
@@ -276,12 +291,40 @@ class App(mp.CmuxTransport):
                     "Native hook does not own this lane.")
             self.confirm(recipient)
             return recipient
+        if recipient["harness"] == "opencode":
+            self.opencode_owner(recipient)
+            return recipient
         caller = mp.run_json(["cmux", "--json", "--id-format", "uuids", "identify"]).get("caller") or {}
         require(caller.get("surface_id", "").lower() == recipient["surface"].lower() and
                 caller.get("workspace_id", "").lower() == recipient["workspace"].lower(),
                 "Only the enrolled lane's exact cmux surface can submit or acknowledge.")
         self.confirm(recipient)
         return recipient
+
+    def opencode_owner(self, recipient=None):
+        identity = opencode_identity()
+        if recipient is None:
+            state = self.read()
+            matches = [lane for lane in state["lanes"].values()
+                       if all(lane.get(key) == identity[key] for key in ("workspace", "surface", "session", "harness"))]
+            require(len(matches) == 1, "OpenCode identity is not one exact enrolled Away Mode lane.")
+            recipient = matches[0]
+        require(all(recipient.get(key) == identity[key] for key in ("workspace", "surface", "session", "harness")),
+                "OpenCode environment does not own this exact Away Mode lane.")
+        caller = mp.run_json(["cmux", "--json", "--id-format", "uuids", "identify"]).get("caller") or {}
+        require(caller.get("surface_id", "").lower() == identity["surface"].lower() and
+                caller.get("workspace_id", "").lower() == identity["workspace"].lower(),
+                "OpenCode caller does not match the native CMUX surface and workspace.")
+        self.confirm(recipient)
+        return recipient
+
+    def opencode_context(self):
+        recipient = self.opencode_owner()
+        with mp.locked(self.directory):
+            state = self.read()
+            return {"presence": state["presence"], "instructions": instructions(state["presence"], state.get("phrases")),
+                    "reports": [{"id": r["id"], "start": r["start"], "end": r["end"]} for r in state["reports"].values()],
+                    "owner": {key: recipient[key] for key in ("harness", "session", "workspace", "surface")}}
 
     def discover(self, state):
         paths, errors = set(), []
@@ -688,13 +731,14 @@ def parser():
     s.add_argument("name")
     for field in ("workspace", "surface", "session", "worktree"):
         s.add_argument("--" + field, required=True)
-    s.add_argument("--harness", choices=("claude", "codex", "muse"), required=True)
+    s.add_argument("--harness", choices=("claude", "codex", "muse", "opencode"), required=True)
     s.add_argument("--allow-shared-surface", action="store_true",
                    help="Confirmed Claude owner may share its terminal with workers; never enables a forced wake.")
     s = sub.add_parser("unenroll"); s.add_argument("name")
     s = sub.add_parser("track-worktree"); s.add_argument("path")
     sub.add_parser("status")
     sub.add_parser("context")
+    sub.add_parser("opencode-context", help="Read presence context from the exact current native OpenCode lane.")
     g = sub.add_parser("guide")
     g.add_argument("--print", action="store_true", required=True, dest="print_guide")
     n = sub.add_parser("notification-context", help="Read-only presence and exact CMUX location for an attention message.")
@@ -744,6 +788,8 @@ def execute(args, app=None):
         return Path(__file__).with_name("guide.md").read_text()
     if command == "notification-context":
         return notification_context(app, args.workspace, args.surface)
+    if command == "opencode-context":
+        return app.opencode_context()
     if command in ("phrase", "presence"):
         identifier(args.request_id)
         return app.change_presence(phrase_mode(args.text, app.read().get("phrases", {}))

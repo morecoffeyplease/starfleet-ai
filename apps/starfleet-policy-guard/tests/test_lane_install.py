@@ -749,6 +749,65 @@ class LaneInstallTest(unittest.TestCase):
                          hashlib.sha256(seat_settings.read_bytes()).hexdigest())
         self.assertEqual(existing_migrated_state['runtime']['version'], old_runtime['version'])
 
+        # Recreate the immutable 15-file runtime layout from before the OpenCode plugin files were added.
+        legacy_runtime_files = tuple(
+            relative for relative in lane_runtime.session_store.RUNTIME_FILES
+            if relative not in ('opencode-plugin/index.ts', 'opencode-plugin/policy.js'))
+        legacy_runtime_rows = {}
+        legacy_runtime_digest = hashlib.sha256()
+        legacy_runtime_source = Path(old_runtime['path'])
+        for relative in legacy_runtime_files:
+            content = (legacy_runtime_source / relative).read_bytes()
+            fingerprint = hashlib.sha256(content).hexdigest()
+            legacy_runtime_rows[relative] = fingerprint
+            legacy_runtime_digest.update(relative.encode() + b'\0' + bytes.fromhex(fingerprint))
+        legacy_runtime_version = legacy_runtime_digest.hexdigest()
+        legacy_runtime_path = Path(old_runtime['path']).parent / legacy_runtime_version
+        legacy_runtime_path.mkdir()
+        for relative in legacy_runtime_files:
+            destination = legacy_runtime_path / relative
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            destination.write_bytes((legacy_runtime_source / relative).read_bytes())
+            destination.chmod(0o444)
+        for directory in sorted(
+                (path for path in legacy_runtime_path.rglob('*') if path.is_dir()),
+                key=lambda path: len(path.parts), reverse=True):
+            directory.chmod(0o555)
+        legacy_runtime_path.chmod(0o555)
+        legacy_runtime = {
+            'version': legacy_runtime_version,
+            'path': str(legacy_runtime_path),
+            'files': legacy_runtime_rows,
+            'source_revision': 'runtime:' + legacy_runtime_version,
+        }
+        legacy_source_versions = {
+            name: legacy_runtime_rows[name] for name in lane_runtime.source_versions('claude')}
+        unsupported_runtime_rows = dict(legacy_runtime_rows)
+        unsupported_runtime_rows.pop('README.md')
+        with self.assertRaisesRegex(ValueError, 'runtime file layout is unsupported'):
+            lane_runtime.session_store.recorded_runtime_plan(
+                legacy_runtime_path, unsupported_runtime_rows)
+        changed_runtime_rows = dict(legacy_runtime_rows)
+        changed_runtime_rows['README.md'] = '0' * 64
+        with self.assertRaisesRegex(ValueError, 'runtime files changed'):
+            lane_runtime.session_store.recorded_runtime_plan(
+                legacy_runtime_path, changed_runtime_rows)
+        seat_manifest = json.loads(seat_manifest_path.read_text())
+        seat_manifest['runtime'] = legacy_runtime
+        seat_manifest_path.write_text(json.dumps(seat_manifest, indent=2) + '\n')
+        for checkout_root in (self.repo, second_product, existing_migration_product):
+            checkout_state_path = (seat_dir / 'checkouts' /
+                lane_runtime.session_store.checkout_id(checkout_root) / 'state.json')
+            checkout_state = json.loads(checkout_state_path.read_text())
+            checkout_state.update(source=str(legacy_runtime_path),
+                                  source_revision='runtime:' + legacy_runtime_version,
+                                  source_versions=legacy_source_versions,
+                                  runtime={'version': legacy_runtime_version,
+                                           'path': str(legacy_runtime_path),
+                                           'files': legacy_runtime_rows})
+            checkout_state_path.write_text(json.dumps(checkout_state, indent=2) + '\n')
+        first_state = json.loads(first_state_path.read_text())
+
         legacy_product = self.base / 'recovered-migrated-product'
         legacy_gitdir, legacy_common_gitdir = self.init_fixture_repo(
             legacy_product, 'feature/legacy', 'git@fixture.invalid:starfleet/guard.git')
