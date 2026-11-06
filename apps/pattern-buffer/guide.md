@@ -126,13 +126,29 @@ An armed timer is configuration evidence, not proof that its wake was received.
 
 ## Shared recovery reminder
 
-Every rendered context includes the same short PStack reminder for every role, whether or not a checkpoint is enrolled.
-It asks agents to use the installed PStack runtime and Poteto Mode.
-After compaction, it asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
-The reminder does not install PStack, change roles or authority, or rewrite custom context files.
+Pattern Buffer appends the same short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
+It asks agents to use the installed PStack runtime and Poteto Mode, then after compaction read the sections relevant to current work in full, not the entire PStack library.
+The runtime reminder does not install PStack, change roles or authority, or rewrite custom context files.
 It stays outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
 Oversized combined context fails instead of being truncated.
 Hook output remains configuration evidence, not proof that the harness loaded or delivered the reminder.
+
+## Confirmation and review guidance
+
+The default context template ends with an optional `# confirmation` section.
+Pattern Buffer appends that section after the selected role for implementers, orchestrators, and unassigned sessions.
+The section counts toward the 8192-byte standing-context budget.
+It asks agents to confirm receipt, completion of relevant PStack and Poteto reading, and whether the mission or tracker needs updating in their own chat.
+If a required read is unavailable or incomplete, it asks agents to name the gap and preserve applicable holds.
+Existing custom context files are not rewritten and do not get the common footer until an owner-reviewed update adds the final section.
+Legacy custom contexts keep the runtime's completion-confirmation wording after compaction.
+Owners must fit their approved context within the existing 8192-byte standing and 24 KiB combined limits.
+Pattern Buffer does not provide a length exception.
+
+The default context template includes shared review judgment and orchestrator repair-round guidance.
+Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
+Revisit the relevant rule before each repair decision.
+The delivery seat does not enforce those fix-round decisions automatically.
 
 ## Checkpoints for orchestrators
 

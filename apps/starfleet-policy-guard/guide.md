@@ -4,6 +4,82 @@ Policy Guard keeps delivery reports and their local history for a native orchest
 It can refuse covered GitHub readiness and merge commands when an attached checkout or pull request has no valid report.
 It does not run audits or verification, classify prompts, grant readiness authority, or enforce fix rounds.
 
+## Review and fix cycles
+
+Read this section when starting or resuming a review-and-fix cycle, then revisit the relevant rule before each repair decision.
+Use the approved PR purpose to decide whether a finding warrants blocking delivery; review does not require eliminating every conceivable defect.
+Repeated repairs can add risk and delay, so choose the smallest safe route that delivers the approved outcome.
+
+### Triage findings
+
+Use existing evidence to establish the concrete harm, likely path, and connection to the approved outcome.
+Bot names, security labels, and agreement do not supply independent proof.
+
+- **Fix here** for a material PR regression, an unmet approved outcome, or a high-impact defect on a common path, within existing authority.
+- **Defer** a real but nonblocking, unrelated, or low-impact edge case; link a matching issue or file one actionable issue only when authorized.
+- **Dismiss** a duplicate or an evidence-refuted or nonapplicable claim, and record the reason and evidence.
+
+Missing evidence means a claim is unverified, not disproved.
+Take the cheapest observation that could decide an unresolved claim, and ask the user before repairing if uncertainty remains.
+Do not create an issue for every speculative warning.
+Workers report new findings to the orchestrator and preserve their assigned batch rather than expanding it.
+
+For a credible serious-but-rare security exposure, data-loss risk, or safety-contract failure, report it promptly and ask the user before implementing a fix.
+Existing investigation is allowed, but do not silently defer the risk or mark the PR ready while its safety decision remains unresolved.
+Keep sensitive details in the approved private channel.
+
+### Handle repair-caused regressions and count attempts
+
+If a repair creates a new regression in the same area, stop that affected repair chain before another product edit or dispatch.
+Preserve the evidence and compare an isolatable revert with a simpler design.
+Prefer removing an unsuccessful repair when safe, but do not mechanically revert mixed changes, discard unrelated approved work, or restore a demonstrated serious vulnerability.
+If safe reversion is unclear or the approved outcome would remain broken, ask the user for a bounded next route.
+
+Use the existing accepted product-fix-batch count.
+One accepted batch may contain several findings, and a commit, worker launch, clean review, or unchanged verification rerun does not add a round.
+Keep the existing counting exclusions for confirmed flakes, rebase-only work, and proof-harness-only changes without a qualifying product fix.
+Product behavior changes cannot be relabelled proof repair to avoid the count.
+
+A repair attempt is a coherent product change aimed at one underlying finding.
+It is unsuccessful when deciding evidence shows that the finding remains unresolved or the repair creates a same-area regression.
+Several commits or workers within one attempt do not multiply attempts.
+A renamed symptom, handoff, rebase, split, or child symptom does not erase related history.
+If the relationship between findings is uncertain, record the uncertainty rather than resetting the count.
+
+After two unsuccessful attempts on the same finding, stop before a third, reconsider the premise, and ask the user for bounded continuation, safe reversion, or deferral.
+A first repair-caused regression already requires an immediate stop, so the two-attempt limit does not grant another automatic patch.
+From round three, prepare a fresh zoom-out for the actual upcoming repair batch before accepting or dispatching it.
+Before round four, obtain user approval for a specific next batch or explicit allowance.
+For an existing PR already beyond round three, apply this prospectively before the next unapproved batch; do not reset or retroactively approve its history.
+
+The request for approval should state the approved outcome, remaining evidence-backed blocker, attempts and outcomes, added complexity, simplest safe route, and proposed bounded batch.
+One request may cover overlapping stop conditions, but approval applies only to its stated batch or allowance.
+Preserve stricter scope, mechanism, review, merge, safety, and human-approval rules.
+Continue independent authorized work while a held batch waits, and do not stop already authorized jobs solely to introduce this policy.
+
+### Record the zoom-out in existing records
+
+Use the existing PR, tracker, and evidence links; do not create another form, panel, model call, or fresh run solely to populate it.
+Keep one concise assessment row per finding where practical, with disposition, evidence, impact, attempt count, and next action.
+
+The existing fixture assessment schema requires these fields:
+
+- `batch` and `round` must identify the active batch and round.
+- `purpose_quote` must quote the exact current PR purpose.
+- `observed`, `concluded`, `simplest_design`, `design_reason`, and `decision` must be nonempty.
+- `inventory` must be a list, including an explicit empty list when no mechanisms were added.
+- Each inventory entry must include nonempty `name`, `needed_because`, and `deletion_effect`, a nonnegative integer `lines` count, and an originating `round` number or `unknown` when history is unavailable.
+- `runtime_failure` must be a boolean.
+- When `runtime_failure` is true, include nonempty `solo_evidence` and `main_evidence`; otherwise include nonempty `finding_quote`, `source_path`, and `unproven`.
+- `decision` must be `keep`, `delete`, `revert`, `split out`, or `simplify`.
+- `adds_scope` and `adds_mechanism` must be booleans.
+
+The guard continues to require its existing accepted and dismissed finding-ID coverage and report obligations.
+If the selected decision is `split out`, or `adds_scope` or `adds_mechanism` is true, the fixture guard stops and requires human approval.
+Policy Guard does not import or authenticate that approval.
+This guidance does not change the fixture schema, round counting, or delivery-seat behavior.
+The current delivery seat does not enforce fix rounds, and this guide does not claim automated enforcement.
+
 ## Requirements
 
 Use Python 3.10 or later, Git, and the GitHub CLI `gh` on PATH.
