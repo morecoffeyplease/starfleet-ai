@@ -49,6 +49,25 @@ python3 /path/to/installed/runtime/lane.py --cwd /product/worktree status --sess
 python3 /path/to/installed/runtime/lane.py --cwd /product/worktree coverage --summary
 ```
 
+## Read-only setup recommendation
+
+`status` and `coverage` include the same `setup_guidance` object with one `action`, a concrete `reason`, and a `command` only when its required inputs are known.
+`coverage --summary` prints the same recommendation as one `Next setup:` line and an optional `Run:` command.
+Actions include `attach`, `upgrade`, `migrate`, `handoff`, `recover`, `inspect`, and `none`.
+The recommendation uses the recorded checkout, installed source fingerprints, managed adapter state, upgrade journal, and actual native identity.
+The `status --session-id` argument selects activation observations only and does not identify the acting owner.
+Missing identity, unrecognized owner metadata, unavailable source, or a different root or branch produces a bounded inspection recommendation without guessed IDs, paths, or flags.
+A clean committed source checkout is required before the recommendation prints an `upgrade-plan` or `migrate-plan` command.
+An installed immutable runtime can report status, but it is not presented as an executable source-upgrade plan when no clean Git revision is available.
+An owner mismatch does not authorize transfer; a handoff command is conditional on explicit authorization from the recorded owner.
+Interrupted upgrade recovery is shown only when the actual native identity and checkout root and branch match the recorded context.
+
+If no lane is attached, the recommendation keeps attachment optional because standalone reporting and proof-only work do not need enrollment.
+If an existing legacy binding is healthy, the recommendation does not require migration solely because the installation is legacy.
+If a legacy source checkout is missing, `migrate-plan` may assess migration from a clean source without recreating the deleted source.
+A recorded delivery report remains separate from setup and is needed only before ordinary covered delivery.
+The report can record checklist gaps and does not replace repository checks, human approval, or delivery authority.
+
 Covered delivery remains PR-bound and requires a real PR binding and a recorded delivery report.
 The plan and install commands do not create a PR, fetch, change branches, run checks, or update GitHub records.
 

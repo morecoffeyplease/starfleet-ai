@@ -17,6 +17,11 @@ The guide documents the read-only plan, explicit install, checkout attachment, o
 Use the exact current native Claude or Codex session identity; never infer ownership from a title.
 Installation preserves native trust requirements and existing settings outside the owned hook.
 It does not start a service or create GitHub records.
+`status` and `coverage` include one read-only setup recommendation based on the recorded attachment, owner, source pin, adapter and upgrade journal.
+The recommendation is advisory, and an intact legacy installation does not need migration solely because it is legacy.
+Standalone reporting and proof-only work do not require enrollment.
+A recorded report is a covered-delivery requirement, not proof of setup or a prerequisite to attach a checkout.
+`status --session-id` selects recorded activation events; it does not identify the actor or establish lane ownership.
 
 ## Inspect a lane before a PR exists
 
