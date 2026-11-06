@@ -126,12 +126,10 @@ An armed timer is configuration evidence, not proof that its wake was received.
 
 ## Shared recovery reminder
 
-Every rendered context includes a short recovery reminder for every role, whether or not that session enrolled a checkpoint.
-After compaction or recovery, the reminder directs agents to reread installed `pstack-runtime` and `poteto-mode` entry points and relevant playbook and skill references, then use PStack `recall` as documented there.
-It also directs agents to reconcile the active brief, latest user direction, role and optional checkpoint before continuing.
-Do not rely on remembered or summarized instructions.
-If a reference is unavailable, report that limit and continue within current authority without guessing its contents or installing it.
-This reminder does not alter standing files, install PStack, or load skills automatically.
+Every rendered context includes the same short PStack reminder for every role, whether or not a checkpoint is enrolled.
+It asks agents to use the installed PStack runtime and Poteto Mode.
+After compaction, it asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
+The reminder does not install PStack, change roles or authority, or rewrite custom context files.
 It stays outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
 Oversized combined context fails instead of being truncated.
 Hook output remains configuration evidence, not proof that the harness loaded or delivered the reminder.

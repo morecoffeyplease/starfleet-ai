@@ -11,11 +11,8 @@
 - Stay within the user's authorized scope.
 
 **PStack guidance**
-- Before work or preparing a brief, read the installed `pstack-runtime` and `poteto-mode` entry points and use the relevant playbook and skills.
-- In briefs, point to those entry points and the relevant playbook and skill references instead of copying their contents.
-- After every compaction or recovery, reread those entry points and relevant references, then use PStack `recall` as documented there and reconcile the active brief, latest user direction, role and optional checkpoint.
-- Do not rely on remembered or summarized instructions.
-- If a reference is unavailable, report that limit and continue within current authority without guessing its contents or installing it.
+- Use the installed PStack runtime and Poteto Mode.
+- After compaction, read the sections relevant to current work in full and confirm completion in your own chat.
 
 **Agents**
 - Before launching any agent, read the saved active profile in Model Preferences and resolve its configured reviewers.
