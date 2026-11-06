@@ -72,6 +72,9 @@ class CheckpointTests(unittest.TestCase):
                                                               'model_context_window': 10000}}})
 
     def assert_pressure_warning(self, result):
+        self.assertTrue(result.stdout,
+                        f"Expected pressure warning but hook stdout was empty (exit {result.returncode}); "
+                        f"stderr: {result.stderr}")
         output = json.loads(result.stdout)
         context = output['hookSpecificOutput']['additionalContext']
         self.assertTrue(context.startswith('Take action immediately, compaction imminent. '), context)

@@ -542,7 +542,8 @@ class PatternBufferTests(unittest.TestCase):
                 preview_text = preview.stdout[:-1]
                 self.assertEqual(len(preview_text.encode("utf-8")),
                                  expected + len(ci.compose_task_context("").encode("utf-8")))
-                self.assertIn("After compaction or recovery", preview_text)
+                self.assertIn("After compaction, read the sections relevant to current work in full and confirm completion in your own chat.",
+                              preview_text)
                 self.assertLessEqual(len(preview_text.encode("utf-8")), ci.INJECTION_LIMIT)
                 status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
                 budgets = status["standing_context_budgets"]
