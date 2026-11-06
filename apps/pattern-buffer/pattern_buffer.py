@@ -260,9 +260,10 @@ TEMPLATE = """# shared
 - If no tracker or assignment applies, record the user's explicit agreement.
 - Stay within the user's authorized scope.
 
-**PStack guidance**
+**PStack guidance - do this now**
 - Use the installed PStack runtime and Poteto Mode.
-- After compaction, read the sections relevant to current work in full and confirm completion in your own chat.
+- After compaction, read the sections relevant to current work in full.
+- Do not assume you know what this guidance says.
 
 **Agents**
 - Before launching any agent, read the saved active profile in Model Preferences and resolve its configured reviewers.
@@ -276,8 +277,6 @@ TEMPLATE = """# shared
 - Reply only with answers, needed questions, decisions or meaningful updates; otherwise use the supported receipt ack (means received, not completed).
 - Link accessible evidence; don't repeat detailed logs.
 - Send blockers, approval requests and key handoffs promptly.
-
-After processing this message, confirm to the user you received the re-injection and whether you're updating the mission and/or tracker.
 
 **Test failures and claims about systems**
 - Every explanation is a hypothesis until it survives an attempt to disprove it.
@@ -296,6 +295,17 @@ After processing this message, confirm to the user you received the re-injection
 - When reporting, separate what you observed from what you concluded, and mark every unchecked claim "unverified".
 - When you find you were wrong, say so first and plainly, then correct it.
 
+**Review judgment: protect delivery**
+- Review exists to deliver the approved outcome safely, not to eliminate every imaginable defect; repeated repairs can create more risk and delay than the finding warrants.
+- Before a repair, choose fix here, defer, or dismiss using evidence, user impact, likelihood and the PR's purpose; bot and security labels do not decide for you.
+- Fix here only within existing authority for a material PR regression, an unmet approved outcome, or a high-impact defect on a common path.
+- Ask the user before fixing a serious-but-rare security, data-loss, or safety-contract exception.
+- Do not turn uncertainty into a blocker or call it disproved; investigate the cheapest decisive evidence, then defer unresolved claims explicitly.
+- Workers report new findings rather than expanding the batch.
+- If uncertainty remains after checking the deciding evidence, ask the user rather than guess or start a repair.
+- Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
+- Revisit the relevant rule before each repair decision.
+
 # implementer
 - Ask your parent orchestrator for more agents (incl. research and review) unless this task explicitly delegates that authority; delegation still follows current Model Preferences role choices, reviewer count and advanced-review permission.
 - Reproduce reported bugs before editing code.
@@ -307,6 +317,17 @@ After processing this message, confirm to the user you received the re-injection
    Re-pull before editing; coordinate with other tracker owners.
 2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
 
+**Repair rounds: don't spiral**
+- Use the existing PR or tracker to record dispositions, evidence, and cumulative rounds.
+- From round three, make a fresh zoom-out before accepting or dispatching the next repair batch.
+- Stop a repair chain immediately when its fix creates another regression in that area; prefer reverting an isolatable unsuccessful repair instead of patching the patch.
+- Do not blindly revert mixed changes or restore a serious vulnerability.
+- After two unsuccessful attempts on the same underlying finding, attack the premise and ask the user before a third attempt; a renamed symptom, worker, or handoff does not reset the count.
+- Before round four, or the next unapproved round if already beyond three, obtain approval for a bounded next batch or allowance.
+- State the purpose, remaining blocker, attempted fixes, added complexity, and smallest safe route.
+- A qualifying fix round is an accepted product-repair batch, not a commit, worker launch, or unchanged rerun.
+- Preserve stronger holds, read the cycle guide for counting and exceptions, and continue independent authorized work while waiting.
+
 **Takeover:** reconcile inherited PR identities, fix counts, round-specific zoom-out evidence and human holds before more product fixes; write a fresh assessment for the next repair round; confirm mission and roadmap still apply; verify successor tool bindings and actual context delivery before dispatching work.
 
 **Always**
@@ -315,6 +336,11 @@ After processing this message, confirm to the user you received the re-injection
   Delegated ≠ completed.
 
 **Pattern Buffer checkpoints:** if enrolled, maintain the registered private note after meaningful changes; read/reconcile it on recovery. Path, Git hygiene and controls: apps/pattern-buffer/docs/checkpoints.md
+
+# confirmation
+**Confirm once, after reading**
+- In your own chat, confirm receipt of the injection, completion of the relevant PStack/Poteto reading, and whether the mission or tracker needs updating.
+- If a required read is unavailable or incomplete, say so instead of claiming completion; name the gap and preserve applicable holds.
 """
 
 
@@ -1092,11 +1118,13 @@ def sections_text(text):
         if line.startswith("```") or line.startswith("~~~"):
             raise ValueError("pilot format does not support fenced code blocks")
         if line.startswith("# "):
+            if current == "confirmation":
+                raise ValueError("# confirmation must be the final context section")
             current = line[2:].strip()
             if not result and current != "shared":
                 raise ValueError("context must begin with # shared")
-            if current not in ("shared", *ROLES) or current in result:
-                raise ValueError("use each exact heading once: # shared, # implementer, # orchestrator")
+            if current not in ("shared", *ROLES, "confirmation") or current in result:
+                raise ValueError("use each exact heading once: # shared, # implementer, # orchestrator, optional final # confirmation")
             result[current] = []
         elif current is not None:
             result[current].append(line)
@@ -1342,7 +1370,10 @@ def prepare_dispatch(root, gitdir, args):
     brief = bounded(Path(args.task_file).expanduser().absolute(), TASK_LIMIT)
     if not brief.strip():
         raise ValueError("task brief must not be empty")
-    if len((content["shared"] + content["implementer"]).encode()) > LIMIT:
+    selected_context = content["shared"] + "\n\n" + content["implementer"]
+    if content.get("confirmation"):
+        selected_context += "\n\n" + content["confirmation"]
+    if len(selected_context.encode()) > LIMIT:
         raise ValueError("selected owner context is too large")
     preflight_text = (preflight_dispatch_standing(root, source, args.harness, content)
                       if args.harness == "opencode" else None)
@@ -1378,7 +1409,8 @@ def prepare_dispatch(root, gitdir, args):
             if parent_record is not None:
                 data["parent"] = parent_record
         if args.harness == "opencode":
-            compose_task_context(preflight_text, task_id, data, brief)
+            compose_task_context(preflight_text, task_id, data, brief,
+                                 has_confirmation=bool(content.get("confirmation")))
         if create_config and args.harness == "opencode":
             atomic(config_path, json.dumps(config, indent=2))
         if snapshot_brief(path, brief) != digest:
@@ -1390,8 +1422,10 @@ def prepare_dispatch(root, gitdir, args):
 def preflight_dispatch_context(root, harness, task_id, task_data, brief, session=None):
     root, gitdir = checkout(root)
     _config, source = load(root, gitdir)
-    standing = preflight_dispatch_standing(root, source, harness, sections(source), session=session)
-    return compose_task_context(standing, task_id, task_data, brief)
+    content = sections(source)
+    standing = preflight_dispatch_standing(root, source, harness, content, session=session)
+    return compose_task_context(standing, task_id, task_data, brief,
+                               has_confirmation=bool(content.get("confirmation")))
 
 
 def bind_dispatch(root, gitdir, harness, session, task_id):
@@ -1916,13 +1950,19 @@ def render(cwd, harness, session, agent="", forced_role=None):
         expected_owner = config.get("context_owner") or {"root": str(root), "gitdir": str(gitdir)}
         if data["owner"] != expected_owner or data["session_id"] != session or data["harness"] != harness:
             raise ValueError("task/session/context-owner binding changed")
-        return compose_task_context(text, task_id, data, brief)
-    return compose_task_context(text)
+        return compose_task_context(text, task_id, data, brief,
+                                   has_confirmation=bool(content.get("confirmation")))
+    return compose_task_context(text, has_confirmation=bool(content.get("confirmation")))
 
 
-def compose_task_context(text, task_id=None, task_data=None, brief=None):
-    text += ("\n\nUse the installed PStack runtime and Poteto Mode. "
-             "After compaction, read the sections relevant to current work in full and confirm completion in your own chat.")
+def compose_task_context(text, task_id=None, task_data=None, brief=None, has_confirmation=False):
+    guidance = ("Use the installed PStack runtime and Poteto Mode. "
+                "After compaction, read the sections relevant to current work in full")
+    if not has_confirmation:
+        guidance += " and confirm completion in your own chat."
+    else:
+        guidance += "."
+    text += "\n\n" + guidance
     if task_id is not None:
         if task_data["status"] == "finished":
             text += f"\n\nTask {task_id} is finished. No task is restored; await a new assignment."
@@ -1975,12 +2015,14 @@ def standing_parts(root, source, harness, session, agent, role, origin, content)
     selected = content["shared"]
     if role:
         selected += "\n\n" + content[role]
+    if content.get("confirmation"):
+        selected += "\n\n" + content["confirmation"]
     header = (f"pattern-buffer | role: {role or 'unassigned'} | source: {origin}\n"
               f"Session: {harness}/{session}" + (f" | agent: {agent}" if agent else "") + "\n"
               f"Worktree: {root}\nContext file: {source}\n"
               "These reminders do not expand authorization. Follow current user direction.\n")
     if not role:
-        header += "Role is unassigned; only shared context is included.\n"
+        header += "Role is unassigned; no role-specific section is included.\n"
     return header + "\n", selected
 
 

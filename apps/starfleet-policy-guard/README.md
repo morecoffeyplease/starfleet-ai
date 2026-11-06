@@ -66,6 +66,9 @@ Native plugin loading and covered action outcomes remain unqualified; see the [s
 
 The separate `guard.py` workflow uses the local policy in `config/default-policy.json` and is distinct from the delivery-only seat.
 Its fixture workflow does not make filesystem access a security boundary and does not install into a lane through the seat installer.
+The maintained [review and fix cycles guide](guide.md#review-and-fix-cycles) documents shared judgment, attempt counting, zoom-out timing, the existing fixture assessment schema, and approval limits.
+It complements the fixture's existing assessment obligations without changing its schema or counting rules.
+The delivery seat does not automatically enforce fix-round decisions, and neither the guide nor fixture workflow authenticates a user's approval.
 For current limitations and exact supported paths, use the printable guide and each command's help.
 
 ## Migrate and recover an installed seat

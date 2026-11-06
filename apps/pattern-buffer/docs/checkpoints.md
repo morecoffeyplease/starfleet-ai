@@ -15,13 +15,18 @@ Link useful history instead of repeating it.
 
 ## Shared recovery reminder
 
-Every rendered context includes a short PStack reminder for every role, even when no checkpoint is enrolled.
-It asks agents to use the installed PStack runtime and Poteto Mode.
-After compaction, it asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
-The reminder does not install PStack, change role or authority, or rewrite custom context files.
+Pattern Buffer appends a short runtime PStack reminder to every rendered context, for every role and even when no checkpoint is enrolled.
+It asks agents to use the installed PStack runtime and Poteto Mode, then after compaction read the sections relevant to current work in full, not the entire PStack library.
+The runtime reminder does not install PStack, change role or authority, or rewrite custom context files.
 It is outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
 Oversized context fails rather than being truncated.
 The reminder is configured context, not proof of native loading or model receipt.
+
+The default context template ends with an optional `# confirmation` section.
+Pattern Buffer appends a nonempty section after the selected role for every role, and its bytes count toward the 8192-byte standing-context limit.
+Existing custom context files are not rewritten and receive the common footer only after an owner-reviewed update adds the section.
+Legacy custom contexts without the section keep the runtime completion-confirmation wording after compaction.
+Owners must fit their own approved context within the existing 8192-byte standing and 24 KiB combined limits.
 
 ## Pilot and installation authority
 
