@@ -40,8 +40,14 @@ def health(directory, now=None):
         heartbeat = scan['completed_at'] if 'completed_at' in scan else scan['at']
         require(type(heartbeat) in (int, float) and math.isfinite(heartbeat), 'Malformed scan heartbeat')
         age = now - heartbeat
-        result.update(scan_age_seconds=round(age, 1), mode=scan['mode'], targets=len(scan['targets']))
+        target_errors = scan.get('target_errors', [])
+        require(isinstance(target_errors, list), 'Malformed target error list')
+        coverage_complete = scan.get('coverage_complete', not target_errors)
+        require(type(coverage_complete) is bool, 'Malformed scan coverage')
+        result.update(scan_age_seconds=round(age, 1), mode=scan['mode'], targets=len(scan['targets']),
+                      target_errors=len(target_errors))
         require(0 <= age <= threshold, 'No fresh successful scan')
+        require(coverage_complete and not target_errors, 'Target coverage is incomplete')
         error_path = directory / 'last-error.json'
         if error_path.exists():
             error = json.loads(error_path.read_text())
