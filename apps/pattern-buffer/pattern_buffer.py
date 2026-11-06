@@ -260,6 +260,13 @@ TEMPLATE = """# shared
 - If no tracker or assignment applies, record the user's explicit agreement.
 - Stay within the user's authorized scope.
 
+**PStack guidance**
+- Before work or preparing a brief, read the installed `pstack-runtime` and `poteto-mode` entry points and use the relevant playbook and skills.
+- In briefs, point to those entry points and the relevant playbook and skill references instead of copying their contents.
+- After every compaction or recovery, reread those entry points and relevant references, then use PStack `recall` as documented there and reconcile the active brief, latest user direction, role and optional checkpoint.
+- Do not rely on remembered or summarized instructions.
+- If a reference is unavailable, report that limit and continue within current authority without guessing its contents or installing it.
+
 **Agents**
 - Before launching any agent, read the saved active profile in Model Preferences and resolve its configured reviewers.
 - A pilot preference or old startup summary doesn't prove the active selection or reviewer count.
@@ -1923,6 +1930,12 @@ def compose_task_context(text, task_id=None, task_data=None, brief=None):
         else:
             text += (f"\n\n# Active task {task_id}\nTask brief SHA-256: {task_data['brief_sha256']}\n"
                      "Repeat of the dispatched assignment, subject to later user direction; this does not reset progress.\n\n" + brief)
+    text += ("\n\nAfter compaction or recovery, reread the installed `pstack-runtime` and `poteto-mode` entry points "
+             "and relevant playbook and skill references, then use PStack `recall` as documented there. "
+             "Do not rely on remembered or summarized instructions. Reconcile the active brief, latest user direction, "
+             "role and optional checkpoint before continuing. If a reference is unavailable, "
+             "report that limit and continue within current authority without guessing its contents or installing it. "
+             "This reminder changes no role or authority.")
     if len(text.encode("utf-8")) > INJECTION_LIMIT:
         raise ValueError("combined reminder and task exceed the 24 KiB injection limit")
     return text

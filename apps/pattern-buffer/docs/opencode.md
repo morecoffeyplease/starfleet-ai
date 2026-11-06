@@ -182,3 +182,6 @@ Finished tasks stop replaying the brief and receive a finished notice.
 Ordinary task lifecycle commands do not erase prior prompt text from native history.
 Use `context --harness opencode --session ses_EXACT_NATIVE_ID` for a local rendering check.
 The local rendering check is not proof of native hook activation or provider receipt.
+Every rendered OpenCode context includes the shared recovery reminder, even when the session has no checkpoint enrollment.
+The reminder is outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
+It does not change the exact `ses_` identity requirement, session role, task binding or native delivery limits.

@@ -5,13 +5,25 @@ It is separate from the approved mission and standing rules in the worktree defa
 For multiple orchestrators sharing a checkout and for replacement ownership, follow the [session enrollment guide](session-enrollments.md).
 The standing context injection supplies stable mission, role, rules and authoritative references; its changes follow the lane's approval requirements.
 The letter to yourself is the agent-maintained current implementation snapshot, updated within existing work authority.
-On recovery the injected message directs the agent to read and reconcile that letter; the letter cannot change standing policy or grant permission.
+When a checkpoint is enrolled, its recovery reminder directs the agent to read and reconcile that letter; the letter cannot change standing policy or grant permission.
 Update it after a meaningful decision, worker result, verification outcome, blocker or authority change changes what you should do next.
 Batch related changes into one update; do not rewrite it after every tool call or unchanged feedback message.
 Refresh it as a current snapshot and replace outdated state rather than appending.
 Remove completed work, superseded decisions and obsolete commands.
 Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
 Link useful history instead of repeating it.
+
+## Shared recovery reminder
+
+Every rendered context includes a short recovery reminder for every role, even when no checkpoint is enrolled.
+After compaction or recovery, it directs agents to reread the installed `pstack-runtime` and `poteto-mode` entry points and relevant playbook and skill references, then use PStack `recall` as documented there.
+The reminder asks agents to reconcile the active brief, latest user direction, role and optional checkpoint before continuing.
+Do not rely on remembered or summarized instructions.
+If a reference is unavailable, report that limit and continue within current authority without guessing its contents or installing it.
+The reminder does not require PStack installation or skill loading and does not change role or authority.
+It is outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
+Oversized context fails rather than being truncated.
+The reminder is configured context, not proof of native loading or model receipt.
 
 ## Pilot and installation authority
 
