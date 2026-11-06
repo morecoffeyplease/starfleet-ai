@@ -863,25 +863,27 @@ def make_light_review_plan(app, config, args, plan):
 
 def reconcile_review_launch(app, target, cycle, slot, plan_id, task_digest):
     links = [link for link in slot["launches"] if link["plan_id"] == plan_id]
+    linked_ids = {link["launch_id"] for link in links}
+    matches = []
+    launches_dir = app.state_dir / "launches"
+    if launches_dir.is_dir():
+        for path in sorted(launches_dir.glob("*.json")):
+            launch = read(path)
+            require(isinstance(launch, dict), "A launch record is malformed; review dispatch is held.")
+            if launch.get("review_cycle") == {"target_id": target["id"], "cycle_id": cycle["id"],
+                                               "plan_id": plan_id, "slot": slot["number"]} and \
+                    launch.get("id") not in linked_ids:
+                matches.append(launch)
+    require(len(matches) <= 1,
+            "Multiple unlinked launches claim this target, cycle, plan, and slot; inspect before retrying.")
+    if matches:
+        launch = matches[0]
+        require(launch.get("choice") == slot["choice"] and launch.get("task_digest") == task_digest,
+                "Unlinked review launch conflicts with the requested slot or task.")
+        slot["launches"].append({"plan_id": plan_id, "launch_id": launch["id"]})
+        save_target(app, target)
+        links.append({"plan_id": plan_id, "launch_id": launch["id"]})
     if not links:
-        matches = []
-        launches_dir = app.state_dir / "launches"
-        if launches_dir.is_dir():
-            for path in sorted(launches_dir.glob("*.json")):
-                launch = read(path)
-                require(isinstance(launch, dict), "A launch record is malformed; review dispatch is held.")
-                if launch.get("review_cycle") == {"target_id": target["id"], "cycle_id": cycle["id"],
-                                                   "plan_id": plan_id, "slot": slot["number"]}:
-                    matches.append(launch)
-        require(len(matches) <= 1,
-                "Multiple unlinked launches claim this target, cycle, plan, and slot; inspect before retrying.")
-        if matches:
-            launch = matches[0]
-            require(launch.get("choice") == slot["choice"] and launch.get("task_digest") == task_digest,
-                    "Unlinked review launch conflicts with the requested slot or task.")
-            slot["launches"].append({"plan_id": plan_id, "launch_id": launch["id"]})
-            save_target(app, target)
-            return launch
         return None
     latest = launch_for_link(app, target, cycle, slot, links[-1])
     require(latest.get("task_digest") == task_digest,

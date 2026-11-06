@@ -179,6 +179,42 @@ class PreferencesTest(unittest.TestCase):
         with self.assertRaisesRegex(mp.PreferenceError, "uncertain|unresolved|starting"):
             self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1, exit_code=0, retry=True)
 
+    def test_light_retry_recovers_an_unlinked_interrupted_attempt_before_retrying(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        plan = self.light_plan(repo, target, "retry-recovery")
+        cycle = self.target_state(target)["cycles"][0]
+        startup = self.call("startup", "--expect-profile", "claude-codex-light")
+        selected = self.call("resolve", "--role", "standard_review", "--slot", "1")
+        self.assertTrue(startup["ready_for_dispatch"])
+        self.assertEqual((selected["role"], selected["model"], selected["effort"]),
+                         ("standard_review", "gpt-6.1-sol", "high"))
+        failed = self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1, exit_code=7)
+        with patch.object(mp, "save_target", side_effect=mp.PreferenceError("interrupted aggregate write")):
+            with self.assertRaisesRegex(mp.PreferenceError, "interrupted aggregate write"):
+                self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1,
+                                           exit_code=0, retry=True)
+        state = self.target_state(target)
+        linked = {link["launch_id"] for link in state["cycles"][0]["slots"][0]["launches"]}
+        membership = {"target_id": target, "cycle_id": cycle["id"], "plan_id": plan["id"], "slot": 1}
+        records = [self.app.state(f"launches/{path.stem}", None)
+                   for path in sorted((self.state_dir / "launches").glob("*.json"))]
+        orphaned = [record for record in records if record.get("review_cycle") == membership
+                    and record["id"] not in linked]
+        self.assertEqual(len(orphaned), 1)
+        self.assertEqual(orphaned[0]["status"], "starting")
+        with self.assertRaisesRegex(mp.PreferenceError, "known nonzero"):
+            self.dispatch_light_review(repo, target, cycle["id"], plan["id"], 1,
+                                       exit_code=0, retry=True)
+        links = self.target_state(target)["cycles"][0]["slots"][0]["launches"]
+        self.assertEqual([link["launch_id"] for link in links], [failed["launch"], orphaned[0]["id"]])
+        records_after = [self.app.state(f"launches/{path.stem}", None)
+                         for path in sorted((self.state_dir / "launches").glob("*.json"))]
+        self.assertEqual(len([record for record in records_after if record.get("review_cycle") == membership]), 2)
+        recovered = self.app.state(f"launches/{orphaned[0]['id']}", None)
+        self.assertEqual(recovered["status"], "starting")
+
     def test_light_cycle_plan_refresh_holds_an_active_or_uncertain_launch(self):
         self.activate("claude-codex-light")
         repo = self.repo()
