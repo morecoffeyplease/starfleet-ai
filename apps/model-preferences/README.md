@@ -147,6 +147,7 @@ The guidance asks the reviewer to ask the parent when that context is materially
 
 Print the same maintained text used by those launch routes with `model-preferences review-guidance --print`.
 The command works without reading or creating Model Preferences configuration, state or locks.
+Supply the complete parent brief, including the approved purpose and relevant repair history, as the task file to automatic `dispatch` and supported Codex `resume`; those routes add the maintained guidance automatically.
 Manual native launches and other routes that bypass Model Preferences dispatch or Codex resume do not receive the guidance automatically.
 For those routes, include the printed guidance and the complete parent brief in the prompt.
 The Pattern Buffer adapter remains limited to Claude and Codex implementers and does not add reviewer task replay.

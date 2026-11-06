@@ -14,7 +14,7 @@ import sys
 MARKER = "# starfleet-away-mode:v1"
 FILES = ("apps/away-mode/away_mode.py", "apps/away-mode/guide.md", "apps/away-mode/README.md",
          "apps/model-preferences/model_preferences.py", "apps/model-preferences/cmux_transport.py",
-         "apps/model-preferences/opencode_dispatch.py")
+         "apps/model-preferences/reviewer_guidance.py", "apps/model-preferences/opencode_dispatch.py")
 
 
 def digest_source(source):
