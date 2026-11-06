@@ -174,10 +174,10 @@ def install(args):
             atomic(opencode_runtime, opencode_payload)
         if not adapter_runtime.exists() or adapter_runtime.read_bytes() != adapter_payload:
             atomic(adapter_runtime, adapter_payload)
-        if not runtime.exists() or runtime.read_bytes() != payload:
-            atomic(runtime, payload)
         if not guidance_runtime.exists() or guidance_runtime.read_bytes() != guidance_payload:
             atomic(guidance_runtime, guidance_payload)
+        if not runtime.exists() or runtime.read_bytes() != payload:
+            atomic(runtime, payload)
         if not launcher.exists() or launcher.read_text() != launcher_text:
             atomic(launcher, launcher_text.encode(), 0o755)
         changed = []

@@ -1,4 +1,5 @@
 """Exercise installation through the real command using isolated user directories."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -115,6 +116,60 @@ class InstallTest(unittest.TestCase):
         self.assertIn("Reviewer judgment guidance", result.stdout)
         self.assertFalse(self.config.exists())
         self.assertFalse(self.state.exists())
+
+    def test_upgrade_keeps_installed_command_usable_during_runtime_publication(self):
+        self.install()
+        self.run_command("init", "--examples")
+        self.assertIsNone(self.run_command("status")["active"])
+
+        runtime = self.runtime / "model_preferences.py"
+        legacy_runtime = runtime.read_text()
+        guidance_import = (
+            "_reviewer_guidance_path = Path(__file__).resolve().with_name(\"reviewer_guidance.py\")\n"
+            "_reviewer_guidance_spec = importlib.util.spec_from_file_location(\n"
+            "    \"model_preferences_reviewer_guidance\", _reviewer_guidance_path)\n"
+            "reviewer_guidance = importlib.util.module_from_spec(_reviewer_guidance_spec)\n"
+            "_reviewer_guidance_spec.loader.exec_module(reviewer_guidance)\n"
+        )
+        self.assertEqual(legacy_runtime.count(guidance_import), 1)
+        legacy_runtime = legacy_runtime.replace(guidance_import, "")
+        runtime.write_text(legacy_runtime)
+        manifest_path = self.runtime / "install.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["runtime_sha256"] = hashlib.sha256(legacy_runtime.encode()).hexdigest()
+        manifest.pop("reviewer_guidance_sha256")
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        (self.runtime / "reviewer_guidance.py").unlink()
+        self.assertIsNone(self.run_command("status")["active"])
+
+        probe_file = self.root / "runtime-publication-probes.json"
+        installer = self.source / "install.py"
+        installer_source = installer.read_text()
+        replace_marker = "        os.replace(name, path)\n"
+        self.assertEqual(installer_source.count(replace_marker), 1)
+        probe = '''        if path.name in ("model_preferences.py", "reviewer_guidance.py"):
+            _probe_cli = os.environ.get("MODEL_PREFERENCES_BOUNDARY_CLI")
+            _probe_file = os.environ.get("MODEL_PREFERENCES_BOUNDARY_RESULTS")
+            if _probe_cli and _probe_file:
+                _probe = subprocess.run([_probe_cli, "status"], capture_output=True, text=True, timeout=10)
+                _probe_path = Path(_probe_file)
+                _probe_records = json.loads(_probe_path.read_text()) if _probe_path.exists() else []
+                _probe_records.append({"published": path.name, "returncode": _probe.returncode,
+                                       "stdout": _probe.stdout, "stderr": _probe.stderr})
+                _probe_path.write_text(json.dumps(_probe_records, indent=2) + "\\n")
+'''
+        installer.write_text(installer_source.replace(replace_marker, replace_marker + probe))
+        self.env["MODEL_PREFERENCES_BOUNDARY_CLI"] = str(self.command)
+        self.env["MODEL_PREFERENCES_BOUNDARY_RESULTS"] = str(probe_file)
+
+        self.install()
+        probes = json.loads(probe_file.read_text())
+        self.assertEqual(len(probes), 2, json.dumps(probes, indent=2))
+        self.assertEqual([probe["returncode"] for probe in probes], [0, 0], json.dumps(probes, indent=2))
+        self.assertIsNone(json.loads(probes[0]["stdout"])["active"])
+        self.assertIsNone(json.loads(probes[1]["stdout"])["active"])
+        self.assertIsNone(self.run_command("status")["active"])
+        self.assertTrue((self.runtime / "reviewer_guidance.py").is_file())
 
     def test_preserves_other_hooks_exact_backup_and_idempotency(self):
         self.active()
