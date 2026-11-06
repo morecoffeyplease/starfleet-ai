@@ -69,7 +69,7 @@ Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery 
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
 Every rendered context also includes a short shared recovery reminder, regardless of role or checkpoint enrollment.
 After compaction or recovery, it directs agents to reread the installed `pstack-runtime` and `poteto-mode` entry points and relevant playbook and skill references, then use PStack `recall` as documented there.
-It does not install or require PStack, change roles or authority, or rewrite custom context files.
+It does not install PStack, change roles or authority, or rewrite custom context files.
 The reminder is outside the 8192-byte standing-context budget and counts toward the existing 24 KiB combined injection limit.
 See the [printable guide](guide.md) for the recovery limits.
 The read-only `handoff-check` distinguishes approved context and optional checkpoint state from installed-hook compatibility, native binding evidence and actual model delivery.

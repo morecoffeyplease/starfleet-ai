@@ -20,7 +20,7 @@ After compaction or recovery, it directs agents to reread the installed `pstack-
 The reminder asks agents to reconcile the active brief, latest user direction, role and optional checkpoint before continuing.
 Do not rely on remembered or summarized instructions.
 If a reference is unavailable, report that limit and continue within current authority without guessing its contents or installing it.
-The reminder does not require PStack installation or skill loading and does not change role or authority.
+The reminder does not install PStack, load skills automatically, or change role or authority.
 It is outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
 Oversized context fails rather than being truncated.
 The reminder is configured context, not proof of native loading or model receipt.
