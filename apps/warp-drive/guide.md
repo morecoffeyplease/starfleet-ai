@@ -47,7 +47,7 @@ Doctor counts pending and unavailable completion wakes separately from uncertain
 Use `warp-drive inspect REQUEST_ID` to see one completion's wake status and event history.
 Status and inspect are passive observations and do not attach to or replace a helper.
 Use `status` or `inspect` for the current point-in-time admission snapshot; initial `run` output cannot predict a later scheduler decision.
-The snapshot shows host sample freshness, observed and projected CPU, memory pressure, estimated active managed contributors, and current candidate constraints.
+The snapshot shows host sample freshness, observed and projected CPU, memory pressure, reserved claim counts, the configured warning heavy limit, estimated active managed contributors, and current candidate constraints.
 The memory-pressure field reports `normal`, `warning`, `critical`, or `unknown`.
 On macOS, sysctl flags 1, 2, and 4 map to normal, warning, and critical.
 Unsupported platforms, failed reads, and unrecognized flags produce unknown.
@@ -99,14 +99,24 @@ Submit one meaningful CPU phase per reservation, and do not add worker counts fr
 Within one checkout, make only one CPU-intensive request eligible at a time when commands share generated files, caches or a database, and enable the next dependent phase after its predecessor finishes.
 Independent requests and batches may run concurrently across checkouts when their shared inputs are safe.
 The initial fallback estimates are one core per light worker and four cores per heavy worker, capped to the configured target.
-During warning pressure, the scheduler pauses heavy starts and admits at most one managed light reservation at a time.
-A reserved light grant counts before its helper starts, and the light must still pass the fresh-sample and CPU headroom checks.
+During warning pressure, the scheduler admits up to the configured number of reserved heavy claims and at most one reserved light claim.
+The heavy limit defaults to one, and the light limit is always one.
+The scheduler counts every reserved claim, including unstarted and uncertain rows with inactive leases.
+The two classes have separate limits, so one heavy and one light claim can coexist under the default setting.
+Every grant still needs a fresh sample and CPU headroom.
+An aged-heavy escape does not bypass the warning heavy limit.
+Use `warp-drive config warning-heavy-limit 0 --actor OPERATOR_ID` to block all new heavy claims during warning.
+Set another nonnegative integer to change the limit, and use `warp-drive config show` to read the current value.
+Only the configured operator or an explicit delegate can change the limit.
+The next scheduler pass uses the new value, and changing it does not preempt existing claims.
+If the reserved heavy count is at or above the limit, the scheduler blocks new heavy claims.
+Status, inspect, and doctor show the configured limit, reserved claim counts, and the same class-specific warning blocker.
 Critical and unknown pressure block every new start.
 Existing commands finish without preemption when pressure changes.
-If several light reservations are active when warning begins, Warp-drive lets them finish and grants no new light until none remains active.
+If multiple claims of one class already exist when warning begins, Warp-drive lets active commands finish and grants no new claim of that class until its reserved count falls below the configured limit.
 A fresh normal sample restores the ordinary admission rules.
 Do not restart a pre-v8 runtime as a pressure-policy rollback because it may treat unknown pressure as normal.
-If the v8 pilot needs a rollback, stop the owned scheduler to pause new grants while active commands finish.
+If the v9 pilot needs a rollback, stop the owned scheduler to pause new grants while active commands finish.
 Resume admission only with a compatible runtime that blocks unknown pressure.
 You may provide `--cpu-cores` and `--cpu-basis` together to declare a finite positive CPU estimate and its evidence or bound basis.
 For example, add `--cpu-cores 0.8 --cpu-basis "measured peak 0.6 cores across three comparable runs plus 0.2 cores of headroom"` when a serial GPU inference phase has supporting measurements.
@@ -114,9 +124,9 @@ The requested estimate is capped at the configured target, and heavy work still 
 Status and inspect show the requested estimate, basis, and effective `estimated_cores` used by admission and grant telemetry.
 An estimate is an admission signal, not a throttle or a peak-use guarantee, and a historical average is not a proven peak bound.
 When the fields are absent, the original light and heavy fallback estimates remain in effect for both new and existing requests.
-Explicit estimates are accepted only after the scheduler has reported policy version v8 in state; the CLI does not change that setting or start a scheduler to force compatibility.
+Explicit estimates are accepted only after the scheduler has reported policy version v9 in state; the CLI does not change that setting or start a scheduler to force compatibility.
 If the state reports an older or unknown policy, wait for the coordinator-authorized compatible scheduler rollout before submitting an explicit estimate.
-Before rolling back to a scheduler that predates v7, allow active explicit-estimate commands to finish and let waiting requests run under v8 or a compatible v7 scheduler, or cancel them.
+Before rolling back to a scheduler that predates v7, allow active explicit-estimate commands to finish and let waiting requests run under v9, v8, or a compatible v7 scheduler, or cancel them.
 Restore the older scheduler only after no waiting or active request has an explicit estimate because that scheduler will use the generic fallback for those rows.
 Batch items may add the optional `cpu_cores` and `cpu_basis` fields together.
 The target defaults to 95 percent and can be changed by the configured operator with `warp-drive config target 0.90 --actor OPERATOR_ID`.

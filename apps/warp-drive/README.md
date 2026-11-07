@@ -54,14 +54,22 @@ Warp-drive records memory severity as `normal`, `warning`, `critical`, or `unkno
 On macOS, sysctl flags 1, 2, and 4 map to normal, warning, and critical.
 Unsupported platforms, failed reads, and unrecognized flags produce unknown.
 Legacy generic `pressure` samples remain unknown and block new work until a fresh severity-aware sample arrives.
-During warning, Warp-drive pauses heavy starts and allows at most one managed light reservation at a time.
-A light grant counts before its helper starts, and the light must still pass the fresh-sample and CPU headroom checks.
+During warning, Warp-drive allows up to the configured number of reserved heavy claims and at most one reserved light claim.
+The default heavy limit is one, and the light limit is always one.
+Warp-drive counts every reserved row, including unstarted claims and uncertain claims with inactive leases.
+The two classes have separate limits, so one heavy and one light claim can coexist under the default setting.
+The scheduler still requires fresh host samples and CPU headroom for every grant.
+Use `warp-drive config warning-heavy-limit 0 --actor OPERATOR_ID` to block all new heavy claims during warning.
+Use another nonnegative integer to change the limit, and use `warp-drive config show` to read the current value.
+An authorized operator or delegate can change the setting while the scheduler runs, and the next pass uses the new value.
+Changing the limit does not preempt existing claims, and a lower limit blocks new heavy work until the reserved count falls below it.
+Status, inspect, and doctor report the configured limit, class counts, and the same class-specific warning blocker.
 Critical and unknown pressure block every new start.
 Existing commands continue without preemption when pressure changes.
-If several light reservations are active when warning begins, Warp-drive lets them finish and grants no new light until none remains active.
+If multiple claims of one class already exist when warning begins, Warp-drive lets active commands finish and grants no new claim of that class until its reserved count is below the configured limit.
 A fresh normal sample restores the ordinary admission rules.
 Do not restart a pre-v8 runtime as a pressure-policy rollback because it may treat unknown pressure as normal.
-If the v8 pilot needs a rollback, stop the owned scheduler to pause new grants while active commands finish.
+If the v9 pilot needs a rollback, stop the owned scheduler to pause new grants while active commands finish.
 Resume admission only with a compatible runtime that blocks unknown pressure.
 The default target is 95 percent.
 CPU estimates are not hard quotas, and below-target utilization does not establish a scheduler fault.
@@ -72,9 +80,9 @@ The scheduler caps the requested estimate at the configured target and preserves
 The requested estimate and basis appear in reservation and admission diagnostics, while `estimated_cores` records the effective estimate used by admission and grant telemetry.
 An estimate is an admission signal, not a throttle or a peak-use guarantee, and a measured historical average does not establish a peak bound.
 Without both fields, the light and heavy fallback estimates remain one core per light worker and four cores per heavy worker, capped to the target.
-The compatible scheduler reports policy version v8 after a scheduler pass, and new explicit estimates are rejected while the state reports another or unknown version.
+The compatible scheduler reports policy version v9 after a scheduler pass, and new explicit estimates are rejected while the state reports another or unknown version.
 The client does not change the policy setting or start a scheduler to force compatibility.
-Before rolling back to a scheduler that predates v7, allow active explicit-estimate commands to finish and let waiting requests run under v8 or v7, or cancel them.
+Before rolling back to a scheduler that predates v7, allow active explicit-estimate commands to finish and let waiting requests run under v9, v8, or a compatible v7 scheduler, or cancel them.
 Restore the older scheduler only after no waiting or active request has an explicit estimate because that scheduler will use the generic fallback for those rows.
 Unavailable thermal data remains explicitly unavailable.
 

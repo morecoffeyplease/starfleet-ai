@@ -233,6 +233,7 @@ def connect(state_dir):
     defaults = {
         "schema_version": 1,
         "target_cpu_fraction": 0.95,
+        "warning_heavy_limit": 1,
         "operator": os.environ.get("USER") or getpass.getuser() or "operator",
         "delegates": [],
         "current_round": 1,
@@ -527,12 +528,20 @@ def active_aged_escape_request_ids(db, active):
     return sorted(escaped)
 
 
+def reserved_claim_counts(db):
+    counts = {"heavy": 0, "light": 0}
+    for row in db.execute("SELECT size,count(*) AS count FROM reservations WHERE state='reserved' GROUP BY size"):
+        if row["size"] in counts:
+            counts[row["size"]] = row["count"]
+    return counts
+
+
 def protected_turn_target(db, ready, unserved, *, at, target_cores, projected_cores,
                           current_projected_cores, light_ready, pressure, sample_fresh,
                           last_heavy_grant, active_heavy_cores, active_managed_cores,
                           active_worktree_ids, active_aged_escape_count):
     """Return (target, continuing, settling) from one live admission view."""
-    if policy.memory_admission_reason("heavy", pressure) is not None:
+    if policy.memory_restricts_admission(pressure):
         return None, False, False
     if active_aged_escape_count > 0:
         return None, False, False
@@ -655,8 +664,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
     active_managed_cores = sum(policy.request_estimate(job, target_cores)
                                for job in active)
     active_light_jobs = [job for job in active if job["size"] == "light"]
-    active_light_reservation_count = db.execute(
-        "SELECT count(*) FROM reservations WHERE state='reserved' AND size='light'").fetchone()[0]
+    reserved_counts = reserved_claim_counts(db)
+    warning_heavy_limit = get_setting(db, "warning_heavy_limit")
     active_worktree_ids = {job["worktree_id"] for job in active}
     active_aged_escape_count = len(active_aged_escape_request_ids(db, active))
     current_projected = ((current_busy or 0.0) * cpus + unreflected
@@ -682,7 +691,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
     granted = None
     decision_log = []
     def try_grant(items):
-        nonlocal projected, active_light_reservation_count
+        nonlocal projected
         for item in items:
             row = item["row"]
             if continuing_protection and row["id"] != protected_target["id"]:
@@ -712,7 +721,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 active_heavy_cores=active_heavy_cores,
                 active_managed_cores=active_managed_cores,
                 active_aged_escape_count=active_aged_escape_count,
-                active_light_count=active_light_reservation_count)
+                reserved_claim_counts=reserved_counts,
+                warning_heavy_limit=warning_heavy_limit)
             if allowed and permit_grants:
                 claim = str(uuid.uuid4())
                 db.execute("UPDATE reservations SET state='reserved',reservation_claim=?,claim_helper_id=helper_id,claim_generation=helper_generation,granted_at=?,lease_active=1,wait_reason=NULL WHERE id=? AND state='waiting'",
@@ -732,7 +742,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 projected += estimate
                 if row["size"] == "light":
                     active_light_jobs.append(row)
-                    active_light_reservation_count += 1
+                reserved_counts[row["size"]] += 1
                 return row["id"]
             set_wait_reason(db, row, reason)
             decision_log.append({"request_id": row["id"], "reason": reason,
@@ -770,7 +780,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 active_heavy_cores=active_heavy_cores,
                 active_managed_cores=active_managed_cores,
                 active_aged_escape_count=active_aged_escape_count,
-                active_light_count=active_light_reservation_count)
+                reserved_claim_counts=reserved_counts,
+                warning_heavy_limit=warning_heavy_limit)
             if row["size"] == "heavy":
                 reason = f"heavy backfill held for aged request {target_id}"
             set_wait_reason(db, row, reason)
@@ -816,7 +827,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
             heavy_wait_seconds=0, active_heavy_cores=active_heavy_cores,
             active_managed_cores=active_managed_cores,
             active_aged_escape_count=active_aged_escape_count,
-            active_light_count=active_light_reservation_count)[0] for row in ready)
+            reserved_claim_counts=reserved_counts,
+            warning_heavy_limit=warning_heavy_limit)[0] for row in ready)
     stalled_candidates = []
     if (granted is None and headroom_available and not active and
             protected_target is None):
@@ -831,7 +843,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 active_heavy_cores=active_heavy_cores,
                 active_managed_cores=active_managed_cores,
                 active_aged_escape_count=active_aged_escape_count,
-                active_light_count=active_light_reservation_count)
+                reserved_claim_counts=reserved_counts,
+                warning_heavy_limit=warning_heavy_limit)
             stalled_candidates.append({"request_id": row["id"],
                 "estimate_cores": estimate,
                 "reason": ("policy permitted admission but scheduler did not grant"
@@ -854,7 +867,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                     active_heavy_cores=active_heavy_cores,
                     active_managed_cores=active_managed_cores,
                     active_aged_escape_count=active_aged_escape_count,
-                    active_light_count=active_light_reservation_count)
+                    reserved_claim_counts=reserved_counts,
+                    warning_heavy_limit=warning_heavy_limit)
                 if allowed:
                     continuing_incident = True
                     break
@@ -960,8 +974,8 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
     active_managed_cores = sum(policy.request_estimate(job, target_cores)
                                for job in active)
     active_light_jobs = [job for job in active if job["size"] == "light"]
-    active_light_reservation_count = db.execute(
-        "SELECT count(*) FROM reservations WHERE state='reserved' AND size='light'").fetchone()[0]
+    reserved_counts = reserved_claim_counts(db)
+    warning_heavy_limit = get_setting(db, "warning_heavy_limit")
     active_escape_ids = active_aged_escape_request_ids(db, active)
     active_aged_escape_count = len(active_escape_ids)
     current_projected = ((current_busy or 0.0) * cpus + unreflected
@@ -1026,7 +1040,8 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
             active_heavy_cores=active_heavy_cores,
             active_managed_cores=active_managed_cores,
             active_aged_escape_count=active_aged_escape_count,
-            active_light_count=active_light_reservation_count)
+            reserved_claim_counts=reserved_counts,
+            warning_heavy_limit=warning_heavy_limit)
         reason = policy_reason
         target_id = None
         if row["id"] == protected_target_id:
@@ -1086,6 +1101,7 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
         "cpu_30s_mean": mean_busy, "observed_cpu_cores": round(observed_cores, 2),
         "projected_cores": round(projected, 2), "target_cores": round(target_cores, 2),
         "memory_pressure": pressure, "sample_fresh": fresh,
+        "warning_heavy_limit": warning_heavy_limit,
         "protected_target_id": protected_target_id,
         "protected_target_reason": protected_wait_reason,
         "active_aged_escape_request_ids": active_escape_ids,
@@ -1097,7 +1113,9 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
             "cpu_30s_mean": mean_busy,
             "memory_pressure_restricts_admission": policy.memory_restricts_admission(pressure),
             "heavy_budget_cores": round(heavy_budget, 2),
-            "active_managed_light_reservations": active_light_reservation_count,
+            "reserved_claims_by_size": reserved_counts,
+            "active_managed_heavy_reservations": reserved_counts["heavy"],
+            "active_managed_light_reservations": reserved_counts["light"],
             "active_managed_estimated_cores": round(active_managed_cores, 2),
             "unreflected_managed_estimated_cores": round(unreflected, 2),
             "active_managed_contributors": active_contributors,
@@ -1987,11 +2005,15 @@ def build_parser():
     boost.add_argument("--actor", required=True)
     boost.add_argument("--reason", required=True)
     boost.add_argument("--remove", action="store_true")
-    config = sub.add_parser("config", help="configure target, authority, delegates and notifications")
+    config = sub.add_parser("config", help="configure target, warning admission, authority, delegates and notifications")
     config_sub = config.add_subparsers(dest="config_action", required=True)
     target = config_sub.add_parser("target")
     target.add_argument("cpu_fraction", type=float)
     target.add_argument("--actor", required=True)
+    warning_heavy_limit = config_sub.add_parser("warning-heavy-limit",
+        help="set the maximum reserved heavy claims allowed during warning pressure")
+    warning_heavy_limit.add_argument("limit", type=int)
+    warning_heavy_limit.add_argument("--actor", required=True)
     operator = config_sub.add_parser("operator")
     operator.add_argument("identity")
     operator.add_argument("--actor", required=True)
@@ -2033,7 +2055,7 @@ def _add_request_args(parser):
     parser.add_argument("--workers", type=int, required=True,
                         help="independent simultaneous workload slots, not internal backend threads or serial phases")
     parser.add_argument("--cpu-cores", type=float,
-                        help="optional positive CPU admission estimate for this phase")
+                        help=f"optional positive CPU admission estimate; requires scheduler policy {policy.POLICY_VERSION}")
     parser.add_argument("--cpu-basis",
                         help="nonempty evidence or bound basis required with --cpu-cores")
     parser.add_argument("--expected-runtime", type=float, required=True,
@@ -2234,6 +2256,13 @@ def _main(argv, product_umask):
                     require(0.1 <= args.cpu_fraction <= 1.0, "CPU target must be in 0.10..1.00")
                     set_setting(db, "target_cpu_fraction", args.cpu_fraction)
                     event(db, "target_changed", None, cpu_fraction=args.cpu_fraction)
+                elif action == "warning-heavy-limit":
+                    resolve_actor(db, args.actor)
+                    require(type(args.limit) is int and args.limit >= 0,
+                            "warning heavy reservation limit must be a nonnegative integer")
+                    set_setting(db, "warning_heavy_limit", args.limit)
+                    event(db, "warning_heavy_limit_changed", None,
+                          limit=args.limit, actor=args.actor)
                 elif action == "operator":
                     resolve_actor(db, args.actor)
                     set_setting(db, "operator", args.identity)
@@ -2260,7 +2289,8 @@ def _main(argv, product_umask):
                 elif action == "show":
                     print(json.dumps({key: get_setting(db, key) for key in
                                       ("target_cpu_fraction", "operator", "delegates", "notifications_enabled",
-                                       "policy_version", "current_round", "order_revision")}, indent=2))
+                                       "warning_heavy_limit", "policy_version", "current_round",
+                                       "order_revision")}, indent=2))
                     return 0
             if args.config_action != "show":
                 print(json.dumps({"action": args.config_action, "updated": True}, indent=2))
