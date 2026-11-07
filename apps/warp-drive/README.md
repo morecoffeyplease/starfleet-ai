@@ -48,8 +48,21 @@ The light headroom reserve applies while light work is ready.
 A heavy command admitted while no light work is queued can use that headroom until it finishes, so a later light request may wait for that non-preemptible command.
 
 Admission uses fresh observed CPU plus conservative estimates for grants whose startup has not yet had time to affect a sample.
-The recent CPU mean and latest sample, memory pressure, heavy startup spacing, light headroom, and the configurable target inform decisions.
+The recent CPU mean and latest sample, memory severity, heavy startup spacing, light headroom, and the configurable target inform decisions.
 New grants remain included in projected load until a sample arrives at least ten seconds after the helper's recorded start or grant time.
+Warp-drive records memory severity as `normal`, `warning`, `critical`, or `unknown`.
+On macOS, sysctl flags 1, 2, and 4 map to normal, warning, and critical.
+Unsupported platforms, failed reads, and unrecognized flags produce unknown.
+Legacy generic `pressure` samples remain unknown and block new work until a fresh severity-aware sample arrives.
+During warning, Warp-drive pauses heavy starts and allows at most one managed light reservation at a time.
+A light grant counts before its helper starts, and the light must still pass the fresh-sample and CPU headroom checks.
+Critical and unknown pressure block every new start.
+Existing commands continue without preemption when pressure changes.
+If several light reservations are active when warning begins, Warp-drive lets them finish and grants no new light until none remains active.
+A fresh normal sample restores the ordinary admission rules.
+Do not restart a pre-v8 runtime as a pressure-policy rollback because it may treat unknown pressure as normal.
+If the v8 pilot needs a rollback, stop the owned scheduler to pause new grants while active commands finish.
+Resume admission only with a compatible runtime that blocks unknown pressure.
 The default target is 95 percent.
 CPU estimates are not hard quotas, and below-target utilization does not establish a scheduler fault.
 Worker counts describe independent workload execution slots that can run at the same time, while backend thread counts and internal tool parallelism are separate details.
@@ -59,9 +72,9 @@ The scheduler caps the requested estimate at the configured target and preserves
 The requested estimate and basis appear in reservation and admission diagnostics, while `estimated_cores` records the effective estimate used by admission and grant telemetry.
 An estimate is an admission signal, not a throttle or a peak-use guarantee, and a measured historical average does not establish a peak bound.
 Without both fields, the light and heavy fallback estimates remain one core per light worker and four cores per heavy worker, capped to the target.
-The compatible scheduler reports policy version v7 after a scheduler pass, and new explicit estimates are rejected while the state reports another or unknown version.
+The compatible scheduler reports policy version v8 after a scheduler pass, and new explicit estimates are rejected while the state reports another or unknown version.
 The client does not change the policy setting or start a scheduler to force compatibility.
-Before rolling back to a scheduler that predates v7, allow active explicit-estimate commands to finish and let waiting requests run under v7 or cancel them.
+Before rolling back to a scheduler that predates v7, allow active explicit-estimate commands to finish and let waiting requests run under v8 or v7, or cancel them.
 Restore the older scheduler only after no waiting or active request has an explicit estimate because that scheduler will use the generic fallback for those rows.
 Unavailable thermal data remains explicitly unavailable.
 

@@ -465,13 +465,14 @@ def host_sample(db, source="native", fixture=None):
     at = float(sample.get("at", now()))
     cpus = int(sample.get("logical_cpus") or os.cpu_count() or 1)
     busy = sample.get("cpu_busy")
-    pressure = sample.get("memory_pressure")
+    pressure = policy.memory_severity(sample.get("memory_pressure"))
     swap_used = sample.get("swap_used_mb")
     thermal = sample.get("thermal_state")
-    availability = sample.get("availability") or {
-        "cpu": busy is not None, "memory_pressure": pressure is not None,
+    availability = dict(sample.get("availability") or {
+        "cpu": busy is not None, "memory_pressure": pressure != "unknown",
         "swap": swap_used is not None, "thermal": thermal is not None,
-    }
+    })
+    availability["memory_pressure"] = pressure != "unknown"
     if busy is not None:
         busy = max(0.0, min(1.0, float(busy)))
     with immediate_transaction(db):
@@ -531,6 +532,8 @@ def protected_turn_target(db, ready, unserved, *, at, target_cores, projected_co
                           last_heavy_grant, active_heavy_cores, active_managed_cores,
                           active_worktree_ids, active_aged_escape_count):
     """Return (target, continuing, settling) from one live admission view."""
+    if policy.memory_admission_reason("heavy", pressure) is not None:
+        return None, False, False
     if active_aged_escape_count > 0:
         return None, False, False
 
@@ -553,7 +556,7 @@ def protected_turn_target(db, ready, unserved, *, at, target_cores, projected_co
                 waiting_credit(candidate, at) >= 120 and \
                 candidate["worktree_id"] not in active_worktree_ids:
             allowed, reason, _estimate, should_drain = decide(candidate)
-            if not sample_fresh or pressure not in ("normal", None):
+            if not sample_fresh:
                 return candidate, True, False
             escape_allowed = allowed and reason == "aged heavy escape with meaningful host headroom"
             heavy_budget = target_cores
@@ -604,10 +607,10 @@ def scheduler_pass(db, sample=None, permit_grants=True):
     latest, mean_busy, fresh = fresh_host_window(db, at)
     if latest is not None:
         cpus = latest["logical_cpus"]
-        pressure = latest["memory_pressure"]
+        pressure = policy.memory_severity(latest["memory_pressure"])
         current_busy = latest["cpu_busy"]
     else:
-        cpus, pressure, current_busy = os.cpu_count() or 1, None, None
+        cpus, pressure, current_busy = os.cpu_count() or 1, "unknown", None
     target_cores = cpus * float(get_setting(db, "target_cpu_fraction") or 0.95)
     sample_busy = max(current_busy or 0.0, mean_busy or 0.0) if mean_busy is not None else current_busy
     observed_cores = (sample_busy or 0.0) * cpus
@@ -652,6 +655,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
     active_managed_cores = sum(policy.request_estimate(job, target_cores)
                                for job in active)
     active_light_jobs = [job for job in active if job["size"] == "light"]
+    active_light_reservation_count = db.execute(
+        "SELECT count(*) FROM reservations WHERE state='reserved' AND size='light'").fetchone()[0]
     active_worktree_ids = {job["worktree_id"] for job in active}
     active_aged_escape_count = len(active_aged_escape_request_ids(db, active))
     current_projected = ((current_busy or 0.0) * cpus + unreflected
@@ -677,7 +682,7 @@ def scheduler_pass(db, sample=None, permit_grants=True):
     granted = None
     decision_log = []
     def try_grant(items):
-        nonlocal projected
+        nonlocal projected, active_light_reservation_count
         for item in items:
             row = item["row"]
             if continuing_protection and row["id"] != protected_target["id"]:
@@ -706,7 +711,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 heavy_wait_seconds=waiting_credit(row, at),
                 active_heavy_cores=active_heavy_cores,
                 active_managed_cores=active_managed_cores,
-                active_aged_escape_count=active_aged_escape_count)
+                active_aged_escape_count=active_aged_escape_count,
+                active_light_count=active_light_reservation_count)
             if allowed and permit_grants:
                 claim = str(uuid.uuid4())
                 db.execute("UPDATE reservations SET state='reserved',reservation_claim=?,claim_helper_id=helper_id,claim_generation=helper_generation,granted_at=?,lease_active=1,wait_reason=NULL WHERE id=? AND state='waiting'",
@@ -718,11 +724,15 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 event(db, "granted", row["id"], claim=claim, worktree_id=row["worktree_id"],
                       round=current_round, estimated_cores=estimate,
                       policy_version=policy.POLICY_VERSION, cpu_busy=current_busy,
+                      memory_pressure=pressure,
                       cpu_30s_mean=mean_busy, projected_cores=projected,
                       target_cores=target_cores, decision=reason,
                       requested_cpu_cores=row["requested_cpu_cores"],
                       cpu_basis=row["cpu_basis"])
                 projected += estimate
+                if row["size"] == "light":
+                    active_light_jobs.append(row)
+                    active_light_reservation_count += 1
                 return row["id"]
             set_wait_reason(db, row, reason)
             decision_log.append({"request_id": row["id"], "reason": reason,
@@ -759,7 +769,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 heavy_wait_seconds=waiting_credit(row, at),
                 active_heavy_cores=active_heavy_cores,
                 active_managed_cores=active_managed_cores,
-                active_aged_escape_count=active_aged_escape_count)
+                active_aged_escape_count=active_aged_escape_count,
+                active_light_count=active_light_reservation_count)
             if row["size"] == "heavy":
                 reason = f"heavy backfill held for aged request {target_id}"
             set_wait_reason(db, row, reason)
@@ -796,16 +807,16 @@ def scheduler_pass(db, sample=None, permit_grants=True):
         backfill.sort(key=policy.request_order_key)
         granted = try_grant(backfill)
     headroom_available = False
-    if fresh and mean_busy is not None and pressure in (None, "normal"):
-        for row in ready:
-            estimate = policy.request_estimate(row, target_cores,
-                                               light_ready=light_ready)
-            budget = target_cores
-            if row["size"] == "heavy" and light_ready:
-                budget -= min(1.0, target_cores / 2)
-            if projected + estimate <= budget:
-                headroom_available = True
-                break
+    if fresh and mean_busy is not None:
+        headroom_available = any(policy.admission_decision(
+            row,
+            target_cores=target_cores, projected_cores=projected,
+            light_ready=light_ready, pressure=pressure,
+            sample_fresh=True, now=at, last_heavy_grant=None,
+            heavy_wait_seconds=0, active_heavy_cores=active_heavy_cores,
+            active_managed_cores=active_managed_cores,
+            active_aged_escape_count=active_aged_escape_count,
+            active_light_count=active_light_reservation_count)[0] for row in ready)
     stalled_candidates = []
     if (granted is None and headroom_available and not active and
             protected_target is None):
@@ -819,7 +830,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                 heavy_wait_seconds=waiting_credit(row, at),
                 active_heavy_cores=active_heavy_cores,
                 active_managed_cores=active_managed_cores,
-                active_aged_escape_count=active_aged_escape_count)
+                active_aged_escape_count=active_aged_escape_count,
+                active_light_count=active_light_reservation_count)
             stalled_candidates.append({"request_id": row["id"],
                 "estimate_cores": estimate,
                 "reason": ("policy permitted admission but scheduler did not grant"
@@ -841,7 +853,8 @@ def scheduler_pass(db, sample=None, permit_grants=True):
                     heavy_wait_seconds=waiting_credit(row, at),
                     active_heavy_cores=active_heavy_cores,
                     active_managed_cores=active_managed_cores,
-                    active_aged_escape_count=active_aged_escape_count)
+                    active_aged_escape_count=active_aged_escape_count,
+                    active_light_count=active_light_reservation_count)
                 if allowed:
                     continuing_incident = True
                     break
@@ -909,7 +922,7 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
     latest, mean_busy, fresh = fresh_host_window(db, at)
     cpus = int(latest["logical_cpus"]) if latest else os.cpu_count() or 1
     target_cores = cpus * float(get_setting(db, "target_cpu_fraction") or 0.95)
-    pressure = latest["memory_pressure"] if latest else None
+    pressure = policy.memory_severity(latest["memory_pressure"]) if latest else "unknown"
     current_busy = latest["cpu_busy"] if latest else None
     sample_busy = max(current_busy or 0.0, mean_busy or 0.0) if mean_busy is not None else current_busy
     observed_cores = (sample_busy or 0.0) * cpus
@@ -947,6 +960,8 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
     active_managed_cores = sum(policy.request_estimate(job, target_cores)
                                for job in active)
     active_light_jobs = [job for job in active if job["size"] == "light"]
+    active_light_reservation_count = db.execute(
+        "SELECT count(*) FROM reservations WHERE state='reserved' AND size='light'").fetchone()[0]
     active_escape_ids = active_aged_escape_request_ids(db, active)
     active_aged_escape_count = len(active_escape_ids)
     current_projected = ((current_busy or 0.0) * cpus + unreflected
@@ -983,8 +998,6 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
     if protected_target is not None:
         if not fresh or mean_busy is None:
             protected_wait_reason = "host sample stale or unavailable"
-        elif pressure not in ("normal", None):
-            protected_wait_reason = "memory pressure observed"
         elif settling_protection:
             protected_wait_reason = f"settling observed CPU window for aged request {protected_target_id}"
         else:
@@ -1012,7 +1025,8 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
             heavy_wait_seconds=waiting_credit(row, at),
             active_heavy_cores=active_heavy_cores,
             active_managed_cores=active_managed_cores,
-            active_aged_escape_count=active_aged_escape_count)
+            active_aged_escape_count=active_aged_escape_count,
+            active_light_count=active_light_reservation_count)
         reason = policy_reason
         target_id = None
         if row["id"] == protected_target_id:
@@ -1043,8 +1057,9 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
             blocker = {"kind": "host_capacity", "request_ids": []}
         elif policy_reason == "host sample stale or unavailable":
             blocker = {"kind": "host_sample", "request_ids": []}
-        elif policy_reason == "memory pressure observed":
-            blocker = {"kind": "memory_pressure", "request_ids": []}
+        elif policy.is_memory_block_reason(policy_reason):
+            blocker = {"kind": "memory_pressure", "severity": pressure,
+                       "request_ids": []}
         elif policy_reason in ("host target has no room for light work",
                                "host target leaves insufficient heavy capacity"):
             blocker = {"kind": "host_capacity", "request_ids": []}
@@ -1080,8 +1095,9 @@ def admission_diagnostics(db, at=None, focus_request_id=None):
             "sample_state": "unavailable" if latest is None else ("fresh" if fresh else "stale"),
             "sample_age_seconds": round(max(0.0, at - latest["at"]), 2) if latest else None,
             "cpu_30s_mean": mean_busy,
-            "memory_pressure_restricts_admission": pressure not in ("normal", None),
+            "memory_pressure_restricts_admission": policy.memory_restricts_admission(pressure),
             "heavy_budget_cores": round(heavy_budget, 2),
+            "active_managed_light_reservations": active_light_reservation_count,
             "active_managed_estimated_cores": round(active_managed_cores, 2),
             "unreflected_managed_estimated_cores": round(unreflected, 2),
             "active_managed_contributors": active_contributors,
@@ -1850,7 +1866,7 @@ def status_data(db):
             "logical_cpus": latest["logical_cpus"] if latest else os.cpu_count(),
             "cpu_busy": latest["cpu_busy"] if latest else None,
             "cpu_30s_mean": mean, "sample_age_seconds": round(at-latest["at"], 2) if latest else None,
-            "memory_pressure": latest["memory_pressure"] if latest else None,
+            "memory_pressure": policy.memory_severity(latest["memory_pressure"]) if latest else "unknown",
             "sample_fresh": fresh, "round": get_setting(db, "current_round"),
             "worktrees": [dict(item) for item in db.execute("SELECT id,path,order_position,served_round FROM worktrees ORDER BY order_position")],
             "reservations": [dict(item) for item in rows],
