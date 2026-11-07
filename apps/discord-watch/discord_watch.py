@@ -848,13 +848,13 @@ class Watch:
         return target
 
     def _identity_owner(self, session_hint=None):
-        """Verify exact ownership without requiring OpenCode delivery readiness."""
+        """Verify the exact Discord Watch owner without prompt input readiness."""
         current = self.current_owner(verify=False, session_hint=session_hint)
         cmux = self.cmux_factory()
         if current["harness"] == "opencode":
             cmux.owner_identity_binding(current)
         else:
-            cmux.binding(current)
+            cmux.binding(current, readiness_policy=hf.DISCORD_REPLY_READINESS)
         return current
 
     @staticmethod
@@ -869,14 +869,19 @@ class Watch:
             snapshot["delivery_policy"] = hf.opencode_delivery_policy(target)
         return snapshot
 
-    def validate_registered_owner(self, target, verify=True):
+    def validate_registered_owner(self, target, verify=True, *,
+                                  readiness_policy=hf.NATIVE_PROMPT_READINESS):
         config = self.hailing_config()
         snapshot = self.binding_snapshot(target)
         matches = [item for item in config["targets"]
                    if self.binding_snapshot(item) == snapshot]
         require(len(matches) == 1, "Registered owner is no longer enrolled in Hailing Frequencies")
         if verify:
-            self.cmux_factory().binding(snapshot)
+            cmux = self.cmux_factory()
+            if readiness_policy == hf.NATIVE_PROMPT_READINESS:
+                cmux.binding(snapshot)
+            else:
+                cmux.binding(snapshot, readiness_policy=readiness_policy)
 
     def read_credentials(self):
         values = read_notify_credentials(self.notify_home)
@@ -1534,8 +1539,11 @@ class Watch:
             return {"group": group_id, "state": "held", "held": "owner_generation_event_chain_invalid",
                     "would_wake": False, "groups_formed": formed}
         owner = thread["owner"]
+        readiness_policy = (hf.DISCORD_REPLY_READINESS
+                            if owner["harness"] in ("claude", "codex")
+                            else hf.NATIVE_PROMPT_READINESS)
         try:
-            self.validate_registered_owner(owner)
+            self.validate_registered_owner(owner, readiness_policy=readiness_policy)
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             with db:
                 db.execute("UPDATE delivery_group_attempts SET state='abandoned_before_transport' "
@@ -1578,7 +1586,12 @@ class Watch:
                            (now, group_id))
 
         try:
-            self.cmux_factory().submit(owner, prompt, on_transport_start=mark_transport_start)
+            cmux = self.cmux_factory()
+            if readiness_policy == hf.NATIVE_PROMPT_READINESS:
+                cmux.submit(owner, prompt, on_transport_start=mark_transport_start)
+            else:
+                cmux.submit(owner, prompt, on_transport_start=mark_transport_start,
+                            readiness_policy=readiness_policy)
         except hf.DeliveryHoldError as error:
             with db:
                 db.execute("UPDATE delivery_group_attempts SET state='held',last_error_json=? "

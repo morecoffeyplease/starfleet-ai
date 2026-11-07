@@ -160,7 +160,7 @@ class FakeCmux:
         self.entered = None
         self.release = None
 
-    def binding(self, current):
+    def binding(self, current, *, readiness_policy=hf.NATIVE_PROMPT_READINESS):
         if self.fail_binding:
             raise ValueError(self.fail_binding)
         return True
@@ -173,8 +173,9 @@ class FakeCmux:
     def enrollment_binding(self, current):
         return self.binding(current)
 
-    def submit(self, current, text, on_transport_start=None):
-        self.binding(current)
+    def submit(self, current, text, on_transport_start=None, *,
+               readiness_policy=hf.NATIVE_PROMPT_READINESS):
+        self.binding(current, readiness_policy=readiness_policy)
         if self.hold_submit:
             raise hf.DeliveryHoldError(self.hold_submit)
         if on_transport_start:
@@ -1733,10 +1734,11 @@ class DiscordWatchTests(unittest.TestCase):
             owner = watch.current_owner(verify=False)
             watch.scan()
 
-            input_state.update(state="draft", lifecycle="unknown")
-            generic_cmux = watch.cmux_factory()
-            with self.assertRaisesRegex(hf.DeliveryHoldError, "Human draft, approval"):
-                generic_cmux.submit(owner, "ordinary Hailing prompt")
+            for composer_state in ("empty", "draft", "unknown"):
+                input_state.update(state=composer_state, lifecycle="unknown")
+                generic_cmux = watch.cmux_factory()
+                with self.assertRaisesRegex(hf.DeliveryHoldError, "Human draft, approval"):
+                    generic_cmux.submit(owner, "ordinary Hailing prompt")
             self.assertEqual(paste_calls, [])
             input_reads_before_reply = sum(
                 len(args) > 3 and args[2] == "rpc" and args[3] == "surface.input_state"
@@ -1749,7 +1751,7 @@ class DiscordWatchTests(unittest.TestCase):
             self.assertIn("receive --thread 100 --group 1", paste_calls[0])
             self.assertNotIn("reply survives unknown terminal input", paste_calls[0])
 
-            for composer_state in ("draft", "unknown"):
+            for composer_state in ("empty", "draft", "unknown"):
                 input_state.update(state=composer_state, lifecycle="unknown")
                 watch.validate_registered_owner(owner, readiness_policy=hf.DISCORD_REPLY_READINESS)
 

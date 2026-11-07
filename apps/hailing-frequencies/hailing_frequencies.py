@@ -30,6 +30,9 @@ INBOX_MESSAGE_LIMIT = 20
 INBOX_OUTPUT_LIMIT = 64 * 1024
 ATTENTION_MESSAGE_LIMIT = 4 * 1024
 ACTIVE_LIFECYCLES = ("running", "idle", "backgroundWorkPending")
+NATIVE_PROMPT_READINESS = "native_prompt"
+DISCORD_REPLY_READINESS = "discord_reply"
+CMUX_READINESS_POLICIES = frozenset((NATIVE_PROMPT_READINESS, DISCORD_REPLY_READINESS))
 INSTALL_MARKER = "# starfleet-hailing-frequencies:v1"
 RUNTIME_SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py", "guide.md",
                         "agent-notify", "agent-notify-guide.md", "opencode_adapter.py")
@@ -335,12 +338,18 @@ class Cmux:
         require(len(matches) == 1, "Exact session activity is unavailable or ambiguous")
         return {"state": matches[0].get("state"), "last_activity_at": matches[0].get("last_activity_at")}
 
-    def binding(self, target):
-        """Require a live projection AND its owning harness's exact hook binding."""
+    def binding(self, target, *, readiness_policy=NATIVE_PROMPT_READINESS):
+        """Validate the live owner and selected native input-readiness policy."""
+        require(readiness_policy in CMUX_READINESS_POLICIES, "Unknown CMUX readiness policy")
         if target.get("harness") == "opencode":
+            require(readiness_policy == NATIVE_PROMPT_READINESS,
+                    "Discord reply readiness is only available for Claude and Codex")
             opencode_binding(target)
             self._opencode_native_binding(target)
             return True
+        if readiness_policy == DISCORD_REPLY_READINESS:
+            require(target.get("harness") in ("claude", "codex"),
+                    "Discord reply readiness is only available for Claude and Codex")
         current = self.command("current", "--limit", "200")
         require(not current.get("truncated", True), "CMUX current snapshot is incomplete")
         require(current.get("owner_availability", {}).get("agent_sessions") == "available",
@@ -370,13 +379,14 @@ class Cmux:
         started = record.get("startedAt")
         require(isinstance(started, (int, float)) and math.isfinite(started), "Missing session start evidence")
         require(started == target["started_at"], "Session generation changed")
-        guard = self.rpc("surface.input_state", surface_id=target["surface"])
-        require(guard.get("surface_id", "").upper() == target["surface"] and
-                guard.get("workspace_id", "").upper() == target["workspace"], "Input owner changed")
-        require(guard.get("agent") is True and guard.get("terminal") is True and
-                guard.get("state") == "empty" and guard.get("blocks_typing") is False and
-                guard.get("waiting_on_human") is False and guard.get("lifecycle") in ACTIVE_LIFECYCLES,
-                "Human draft, approval, unknown input state or inactive session")
+        if readiness_policy == NATIVE_PROMPT_READINESS:
+            guard = self.rpc("surface.input_state", surface_id=target["surface"])
+            require(guard.get("surface_id", "").upper() == target["surface"] and
+                    guard.get("workspace_id", "").upper() == target["workspace"], "Input owner changed")
+            require(guard.get("agent") is True and guard.get("terminal") is True and
+                    guard.get("state") == "empty" and guard.get("blocks_typing") is False and
+                    guard.get("waiting_on_human") is False and guard.get("lifecycle") in ACTIVE_LIFECYCLES,
+                    "Human draft, approval, unknown input state or inactive session")
         settings = self.rpc("agent.message.settings", target=target["surface"])
         require(all(settings.get(k) is True for k in ("messages_enabled", "receiving", "workspace_receiving")),
                 "Native messaging is disabled")
@@ -496,8 +506,11 @@ class Cmux:
                 "Native messaging is disabled")
         return True
 
-    def submit(self, target, text, on_transport_start=None):
+    def submit(self, target, text, on_transport_start=None, *,
+               readiness_policy=NATIVE_PROMPT_READINESS):
         if target.get("harness") == "opencode":
+            require(readiness_policy == NATIVE_PROMPT_READINESS,
+                    "Discord reply readiness is only available for Claude and Codex")
             try:
                 password, _inspection = opencode_binding(target)
                 self._opencode_native_binding(target)
@@ -509,7 +522,10 @@ class Cmux:
         # One host paste/submit operation, never a force flag or separate Escape/Ctrl-C.
         # A multiline Claude paste selects the host's agent-aware submit key.
         try:
-            self.binding(target)
+            if readiness_policy == NATIVE_PROMPT_READINESS:
+                self.binding(target)
+            else:
+                self.binding(target, readiness_policy=readiness_policy)
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             raise DeliveryHoldError(str(exc)) from exc
         if on_transport_start is not None:
