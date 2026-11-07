@@ -67,10 +67,11 @@ The Gateway requests the GUILD_MESSAGES and MESSAGE_CONTENT intents needed to re
 The application configuration and approved intent access remain prerequisites, and a fatal Gateway condition stays visible while REST reconciliation continues.
 Coordinator guidance points to the reported fatal mechanism so the component owner can inspect that specific cause.
 For each thread, registration stores the exact Hailing Frequencies harness, surface, workspace, session, and generation.
-The central worker checks that the same target remains enrolled and validates the current CMUX projection and input guard before each wake.
+Claude and Codex reply wakes and owner commands verify the exact live CMUX projection, hook binding, session generation, and all three native receiving settings.
+These Discord Watch checks do not read `surface.input_state`, so a draft, unknown composer state, or unknown prompt lifecycle does not hold the reply route.
+Ordinary Hailing Frequencies prompts retain the strict empty-composer and no-human-input guard.
 It never forces input, reads or clears CMUX messages, launches another agent, or sends a reply body in a wake.
 The prompt names one exact `discord-watch receive --thread THREAD --group GROUP` command for the frozen group.
-Claude and Codex wakes require an empty composer with no human-input obligation under Hailing Frequencies' existing `Cmux.submit` guard.
 For OpenCode, group wake commands include the exact `--session ses_ID` owner so receipt does not depend on a guessed terminal or tab title.
 OpenCode registration, `managed`, `close`, and `receive` verify the exact enrolled owner without checking composer readiness.
 Automatic wake readiness is checked separately against the persisted Hailing Frequencies delivery policy.
