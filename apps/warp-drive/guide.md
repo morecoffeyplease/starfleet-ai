@@ -48,6 +48,10 @@ Use `warp-drive inspect REQUEST_ID` to see one completion's wake status and even
 Status and inspect are passive observations and do not attach to or replace a helper.
 Use `status` or `inspect` for the current point-in-time admission snapshot; initial `run` output cannot predict a later scheduler decision.
 The snapshot shows host sample freshness, observed and projected CPU, memory pressure, estimated active managed contributors, and current candidate constraints.
+The memory-pressure field reports `normal`, `warning`, `critical`, or `unknown`.
+On macOS, sysctl flags 1, 2, and 4 map to normal, warning, and critical.
+Unsupported platforms, failed reads, and unrecognized flags produce unknown.
+Legacy generic `pressure` samples remain unknown and block new starts until a fresh severity-aware sample arrives.
 Active managed commands are estimated contributors, not proof that each command caused host load or must finish before a request can start.
 When policy identifies an active aged escape or a selected protected backfill target, the snapshot includes that request ID as the specific blocker, and a selected target remains waiting until a later admission pass.
 Host capacity, stale sample, memory pressure, and startup observation restrictions do not assign a causal reservation ID.
@@ -95,15 +99,24 @@ Submit one meaningful CPU phase per reservation, and do not add worker counts fr
 Within one checkout, make only one CPU-intensive request eligible at a time when commands share generated files, caches or a database, and enable the next dependent phase after its predecessor finishes.
 Independent requests and batches may run concurrently across checkouts when their shared inputs are safe.
 The initial fallback estimates are one core per light worker and four cores per heavy worker, capped to the configured target.
+During warning pressure, the scheduler pauses heavy starts and admits at most one managed light reservation at a time.
+A reserved light grant counts before its helper starts, and the light must still pass the fresh-sample and CPU headroom checks.
+Critical and unknown pressure block every new start.
+Existing commands finish without preemption when pressure changes.
+If several light reservations are active when warning begins, Warp-drive lets them finish and grants no new light until none remains active.
+A fresh normal sample restores the ordinary admission rules.
+Do not restart a pre-v8 runtime as a pressure-policy rollback because it may treat unknown pressure as normal.
+If the v8 pilot needs a rollback, stop the owned scheduler to pause new grants while active commands finish.
+Resume admission only with a compatible runtime that blocks unknown pressure.
 You may provide `--cpu-cores` and `--cpu-basis` together to declare a finite positive CPU estimate and its evidence or bound basis.
 For example, add `--cpu-cores 0.8 --cpu-basis "measured peak 0.6 cores across three comparable runs plus 0.2 cores of headroom"` when a serial GPU inference phase has supporting measurements.
 The requested estimate is capped at the configured target, and heavy work still observes the reserved light-work headroom.
 Status and inspect show the requested estimate, basis, and effective `estimated_cores` used by admission and grant telemetry.
 An estimate is an admission signal, not a throttle or a peak-use guarantee, and a historical average is not a proven peak bound.
 When the fields are absent, the original light and heavy fallback estimates remain in effect for both new and existing requests.
-Explicit estimates are accepted only after the scheduler has reported policy version v7 in state; the CLI does not change that setting or start a scheduler to force compatibility.
+Explicit estimates are accepted only after the scheduler has reported policy version v8 in state; the CLI does not change that setting or start a scheduler to force compatibility.
 If the state reports an older or unknown policy, wait for the coordinator-authorized compatible scheduler rollout before submitting an explicit estimate.
-Before rolling back to an older scheduler, allow active explicit-estimate commands to finish and let waiting requests run under v7 or cancel them.
+Before rolling back to a scheduler that predates v7, allow active explicit-estimate commands to finish and let waiting requests run under v8 or a compatible v7 scheduler, or cancel them.
 Restore the older scheduler only after no waiting or active request has an explicit estimate because that scheduler will use the generic fallback for those rows.
 Batch items may add the optional `cpu_cores` and `cpu_basis` fields together.
 The target defaults to 95 percent and can be changed by the configured operator with `warp-drive config target 0.90 --actor OPERATOR_ID`.
@@ -227,7 +240,7 @@ Revisit only when new evidence arrives or someone explicitly requests another re
 
 Commands are stored in owner-only local state for this machine.
 The database and detached helper logs are under `~/.local/state/starfleet-ai/warp-drive/` by default.
-Host rows contain raw CPU, memory pressure, swap, thermal availability, and sample timestamps.
+Host rows contain raw CPU, memory severity, swap, thermal availability, and sample timestamps.
 There is no automatic retention policy.
 
 ## Verification

@@ -9,6 +9,11 @@ They do not grant authority beyond the operator's existing instructions.
 For CPU-intensive local work, read `warp-drive guide --print` and use its reservation workflow.
 Eligible unserved worktrees are selected by authorized boost, least recently served round, then manual order, with waiting credit and stable request details breaking ties.
 The existing protected aged-target path keeps its earned-credit selection and protected-turn behavior.
+Memory samples report `normal`, `warning`, `critical`, or `unknown` severity.
+During warning, Warp-drive pauses heavy starts and allows one managed light reservation only when none is active.
+A reserved light grant counts before its helper starts, and the request still needs fresh samples and CPU headroom.
+Critical, unknown, unsupported, failed, and legacy generic pressure samples block new starts.
+Existing commands finish without preemption, and a fresh normal sample restores ordinary admission.
 Submit one meaningful CPU phase per reservation and declare its workload family, size, expected runtime, and count of independent workload slots that run simultaneously, not backend threads.
 Do not sum worker counts across serial phases.
 Within one checkout, keep only one CPU-intensive request eligible when commands share generated files, caches, or a database.
@@ -48,6 +53,9 @@ Let fitting worktrees take their ordinary turns.
 A protected aged-heavy turn may delay fitting heavy backfill only under the admission conditions documented in the component README.
 Keep light access and unrelated fitting work available while unmanaged load is the blocker.
 An escape requires fresh observations and the documented eligibility credit, projected-load, startup, and memory-pressure checks.
+During warning, an aged heavy target does not hold the available light reservation.
+Do not restart a pre-v8 scheduler as a pressure-policy rollback because it may treat unknown pressure as normal.
+Pause new grants until a compatible fail-closed runtime is ready, and let active commands finish.
 Do not present the soft fairness target as a hard capacity or wait-time guarantee.
 
 A batch does not grant extra priority.

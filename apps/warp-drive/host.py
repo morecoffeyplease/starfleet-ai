@@ -52,21 +52,27 @@ def cpu_busy_sample():
     return None
 
 
+def _macos_memory_pressure_severity(flag):
+    if isinstance(flag, bool) or not isinstance(flag, int):
+        return "unknown"
+    return {1: "normal", 2: "warning", 4: "critical"}.get(flag, "unknown")
+
+
 def memory_pressure():
-    """Return normal/pressure when available, otherwise preserve unknown."""
+    """Return a supported macOS memory severity, or unknown when unavailable."""
     if sys.platform != "darwin":
-        return None
+        return "unknown"
     try:
         lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
         value = ctypes.c_int()
         size = ctypes.c_size_t(ctypes.sizeof(value))
         result = lib.sysctlbyname(b"kern.memorystatus_vm_pressure_level",
                                   ctypes.byref(value), ctypes.byref(size), None, 0)
-        if result != 0:
-            return None
-        return "normal" if value.value == 1 else "pressure"
+        if result != 0 or size.value != ctypes.sizeof(value):
+            return "unknown"
+        return _macos_memory_pressure_severity(value.value)
     except Exception:
-        return None
+        return "unknown"
 
 
 def swap_usage():
@@ -96,7 +102,7 @@ def snapshot():
         "thermal_state": None,
         "availability": {
             "cpu": busy is not None,
-            "memory_pressure": pressure is not None,
+            "memory_pressure": pressure != "unknown",
             "swap": swap is not None,
             "thermal": False,
         },

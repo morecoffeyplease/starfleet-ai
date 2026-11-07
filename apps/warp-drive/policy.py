@@ -1,7 +1,43 @@
 """Deterministic worktree-round and CPU admission policy."""
 
-POLICY_VERSION = "warp-drive-admission-v7"
+POLICY_VERSION = "warp-drive-admission-v8"
 MAX_ACTIVE_AGED_ESCAPES = 2
+MEMORY_SEVERITIES = frozenset(("normal", "warning", "critical", "unknown"))
+
+
+def memory_severity(value):
+    """Return one supported memory severity, treating legacy and invalid values as unknown."""
+    return value if isinstance(value, str) and value in MEMORY_SEVERITIES else "unknown"
+
+
+def memory_admission_reason(size, severity, active_light_count=0):
+    """Return the memory-policy blocker for a reservation, if one applies."""
+    severity = memory_severity(severity)
+    if severity == "normal":
+        return None
+    if severity == "warning":
+        if size != "light":
+            return "memory warning pauses heavy work"
+        if active_light_count:
+            return "memory warning light reservation already active"
+        return None
+    if severity == "critical":
+        return "critical memory pressure"
+    return "memory severity unknown"
+
+
+def memory_restricts_admission(severity):
+    """Return whether memory severity narrows ordinary admission."""
+    return memory_severity(severity) != "normal"
+
+
+def is_memory_block_reason(reason):
+    return reason in {
+        "memory warning pauses heavy work",
+        "memory warning light reservation already active",
+        "critical memory pressure",
+        "memory severity unknown",
+    }
 
 
 def estimated_cores(size, workers, target_cores, light_ready=False,
@@ -81,12 +117,15 @@ def choose_worktree(rows):
 def admission_decision(request, *, target_cores, projected_cores, light_ready,
                        pressure, sample_fresh, now, last_heavy_grant,
                        heavy_wait_seconds, active_heavy_cores,
-                       active_managed_cores=None, active_aged_escape_count=0):
+                       active_managed_cores=None, active_aged_escape_count=0,
+                       active_light_count=0):
     """Return (allowed, reason, estimated_cores, drain_requested)."""
     if not sample_fresh:
         return False, "host sample stale or unavailable", 0.0, False
-    if pressure not in ("normal", None):
-        return False, "memory pressure observed", 0.0, False
+    memory_reason = memory_admission_reason(request["size"], pressure,
+                                            active_light_count=active_light_count)
+    if memory_reason is not None:
+        return False, memory_reason, 0.0, False
     estimate = request_estimate(request, target_cores, light_ready=light_ready)
     if request["size"] == "light":
         if projected_cores + estimate > target_cores:
