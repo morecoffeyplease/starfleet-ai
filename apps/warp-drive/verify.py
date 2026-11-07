@@ -152,6 +152,15 @@ def test_guide_and_install(temp):
                                       "--help"], text=True, capture_output=True, check=True)
         check(expected in " ".join(help_result.stdout.split()),
               f"{command} help omitted its passive diagnostic guidance")
+    estimate_help = subprocess.run([sys.executable, str(ROOT / "warp_drive.py"), "submit",
+                                    "--help"], text=True, capture_output=True, check=True)
+    check(policy.POLICY_VERSION in estimate_help.stdout,
+          "explicit CPU estimate help omitted its compatible scheduler policy")
+    limit_help = subprocess.run([sys.executable, str(ROOT / "warp_drive.py"), "config",
+                                 "--help"], text=True,
+                                capture_output=True, check=True)
+    check("maximum reserved heavy claims" in limit_help.stdout,
+          "warning heavy limit help omitted its admission behavior")
 
     share, bin_dir, installed_state = temp / "share", temp / "bin", temp / "installed-state"
     install_command = [sys.executable, str(ROOT / "install.py"), "--share-dir", str(share),
@@ -511,28 +520,53 @@ def test_macos_memory_severity():
 
 
 def test_memory_policy_fixtures():
-    def decide(size, severity, *, projected=0, target=8, active_lights=0):
-        return policy.admission_decision({"size": size, "workers": 1},
+    def decide(size, severity, *, projected=0, target=8, reserved_counts=None,
+               sample_fresh=True, heavy_wait=0, workers=1, warning_limit=1):
+        return policy.admission_decision({"size": size, "workers": workers},
             target_cores=target, projected_cores=projected,
-            light_ready=size == "light", pressure=severity, sample_fresh=True,
-            now=110, last_heavy_grant=None, heavy_wait_seconds=0,
-            active_heavy_cores=0, active_light_count=active_lights)
+            light_ready=size == "light", pressure=severity, sample_fresh=sample_fresh,
+            now=110, last_heavy_grant=None, heavy_wait_seconds=heavy_wait,
+            active_heavy_cores=0, reserved_claim_counts=reserved_counts,
+            warning_heavy_limit=warning_limit)
 
     warning_light = decide("light", "warning")
-    warning_slot = decide("light", "warning", active_lights=1)
+    warning_slot = decide("light", "warning", reserved_counts={"light": 1})
     warning_heavy = decide("heavy", "warning")
+    warning_heavy_slot = decide("heavy", "warning", reserved_counts={"heavy": 1},
+                                 heavy_wait=130, workers=3)
+    warning_light_with_heavy = decide("light", "warning", reserved_counts={"heavy": 1})
+    warning_heavy_with_light = decide("heavy", "warning", reserved_counts={"light": 1})
+    warning_heavy_stale = decide("heavy", "warning", sample_fresh=False)
+    warning_zero = decide("heavy", "warning", warning_limit=0)
+    warning_two_first = decide("heavy", "warning", reserved_counts={"heavy": 1},
+                               warning_limit=2)
+    warning_two_full = decide("heavy", "warning", reserved_counts={"heavy": 2},
+                              warning_limit=2)
     critical_light = decide("light", "critical")
     unknown_heavy = decide("heavy", "unknown")
     legacy_pressure = decide("light", "pressure")
     missing_pressure = decide("light", None)
     cpu_limited_light = decide("light", "warning", projected=7, target=7.6)
-    normal_after_warning = decide("light", "normal", active_lights=1)
+    cpu_limited_heavy = decide("heavy", "warning", projected=5, target=6)
+    normal_after_warning = decide("heavy", "normal", reserved_counts={"heavy": 1})
     check(warning_light[0] and warning_light[1] == "light allowance admitted",
           "warning pressure did not permit one fitting light request")
-    check(not warning_slot[0] and warning_slot[1] == "memory warning light reservation already active",
+    check(not warning_slot[0] and warning_slot[1] == "memory warning light reservation limit reached",
           "warning pressure admitted a second managed light reservation")
-    check(not warning_heavy[0] and warning_heavy[1] == "memory warning pauses heavy work",
-          "warning pressure admitted heavy work")
+    check(warning_heavy[0] and warning_heavy[1] == "heavy work fits observed host headroom",
+          "warning pressure blocked the first fitting heavy reservation")
+    check(not warning_heavy_slot[0] and
+          warning_heavy_slot[1] == "memory warning heavy reservation limit reached",
+          "an aged escape bypassed the warning heavy reservation limit")
+    check(warning_light_with_heavy[0] and warning_heavy_with_light[0],
+          "warning pressure did not allow one reservation of each class")
+    check(not warning_zero[0] and warning_zero[1] == "memory warning heavy reservation limit reached" and
+          warning_two_first[0] and not warning_two_full[0] and
+          warning_two_full[1] == "memory warning heavy reservation limit reached",
+          "warning heavy limits 0 or 2 did not apply to the reserved claim count")
+    check(not warning_heavy_stale[0] and
+          warning_heavy_stale[1] == "host sample stale or unavailable",
+          "warning heavy admission bypassed the fresh-sample guard")
     check(not critical_light[0] and critical_light[1] == "critical memory pressure" and
           not unknown_heavy[0] and unknown_heavy[1] == "memory severity unknown",
           "critical or unknown memory severity admitted work")
@@ -541,19 +575,24 @@ def test_memory_policy_fixtures():
           "legacy or missing pressure data was inferred to be normal")
     check(not cpu_limited_light[0] and cpu_limited_light[1] == "host target has no room for light work",
           "warning pressure bypassed the ordinary CPU headroom guard")
-    check(normal_after_warning[0] and normal_after_warning[1] == "light allowance admitted",
-          "normal pressure did not restore ordinary light admission")
+    check(not cpu_limited_heavy[0] and
+          cpu_limited_heavy[1] == "host target leaves insufficient heavy capacity",
+          "warning pressure bypassed the heavy CPU headroom guard")
+    check(normal_after_warning[0] and
+          normal_after_warning[1] == "heavy work fits observed host headroom",
+          "normal pressure did not restore ordinary heavy admission")
 
 
 def test_warning_memory_scheduler_and_diagnostics(temp):
     owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
     state = temp / "warning-memory-state"
     run_cli(state, "init")
-    aged_path, first_light_path, second_light_path = [temp / name for name in
-        ("warning-aged-heavy", "warning-first-light", "warning-second-light")]
-    for path in (aged_path, first_light_path, second_light_path):
+    aged_path, second_heavy_path, first_light_path, second_light_path = [temp / name for name in
+        ("warning-aged-heavy", "warning-second-heavy", "warning-first-light", "warning-second-light")]
+    for path in (aged_path, second_heavy_path, first_light_path, second_light_path):
         path.mkdir()
     heavy = submit_and_attach(state, owner, "warning-aged-heavy", aged_path, "heavy")
+    second_heavy = submit_and_attach(state, owner, "warning-second-heavy", second_heavy_path, "heavy")
     first_light = submit_and_attach(state, owner, "warning-first-light", first_light_path, "light")
     second_light = submit_and_attach(state, owner, "warning-second-light", second_light_path, "light")
     with contextlib.closing(warp_drive.connect(state)) as db:
@@ -563,44 +602,54 @@ def test_warning_memory_scheduler_and_diagnostics(temp):
             warp_drive.set_setting(db, "protected_turn_request_id", heavy)
 
     warning_pass = run_fixture_pass(state, 0.02, memory_severity="warning")
-    check(warning_pass["granted"] == first_light and
+    check(warning_pass["granted"] == heavy and
           warning_pass["protected_target_id"] is None,
-          "an aged heavy target held the one warning light turn")
+          "warning pressure did not grant its first heavy reservation or kept aged protection")
     with contextlib.closing(warp_drive.connect(state)) as db:
-        granted_light = warp_drive.current_request(db, first_light)
         heavy_row = warp_drive.current_request(db, heavy)
-        second_row = warp_drive.current_request(db, second_light)
-        grant = db.execute("SELECT data_json FROM events WHERE reservation_id=? AND kind='granted'",
-                           (first_light,)).fetchone()
+        first_light_row = warp_drive.current_request(db, first_light)
         sample = db.execute("SELECT memory_pressure,availability_json FROM host_samples ORDER BY id DESC LIMIT 1").fetchone()
-        check(granted_light["state"] == "reserved" and granted_light["started_at"] is None and
-              granted_light["lease_active"] == 1 and heavy_row["state"] == "waiting" and
-              second_row["state"] == "waiting" and
+        grant = db.execute("SELECT data_json FROM events WHERE reservation_id=? AND kind='granted'",
+                           (heavy,)).fetchone()
+        check(heavy_row["state"] == "reserved" and heavy_row["started_at"] is None and
+              heavy_row["lease_active"] == 1 and first_light_row["state"] == "waiting" and
               warp_drive.get_setting(db, "protected_turn_request_id") is None,
-              "warning admission changed the aged heavy or reserved light lifecycle")
+              "warning admission changed the unstarted heavy claim or retained aged protection")
         check(json.loads(grant["data_json"])["memory_pressure"] == "warning" and
               json.loads(sample["availability_json"])["memory_pressure"] is True and
               sample["memory_pressure"] == "warning",
               "the warning severity was lost from grant telemetry or the stored host sample")
 
+    light_pass = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(light_pass["granted"] == first_light,
+          "warning pressure did not allow one light reservation alongside heavy work")
     blocked_second_pass = run_fixture_pass(state, 0.02, memory_severity="warning")
     check(blocked_second_pass["granted"] is None,
-          "a second warning light reservation started while the first grant had not started")
+          "warning pressure admitted a second heavy or light reservation")
     status, inspect = read_only_status_and_inspect(state, second_light)
     doctor = parse_json(run_cli(state, "doctor"))
     second_candidate = next(item for item in status["admission"]["candidates"]
                             if item["request_id"] == second_light)
+    heavy_candidate = next(item for item in status["admission"]["candidates"]
+                           if item["request_id"] == second_heavy)
     inspect_candidate = next(item for item in inspect["admission"]["candidates"]
                              if item["request_id"] == second_light)
     doctor_candidate = next(item for item in doctor["admission"]["candidates"]
                             if item["request_id"] == second_light)
     check(status["admission"]["memory_pressure"] == "warning" and
-          second_candidate["policy_reason"] == "memory warning light reservation already active" and
+          second_candidate["policy_reason"] == "memory warning light reservation limit reached" and
+          heavy_candidate["policy_reason"] == "memory warning heavy reservation limit reached" and
           second_candidate["diagnostic_blocker"] == {
+              "kind": "memory_pressure", "severity": "warning", "request_ids": []} and
+          heavy_candidate["diagnostic_blocker"] == {
               "kind": "memory_pressure", "severity": "warning", "request_ids": []} and
           inspect_candidate["policy_reason"] == second_candidate["policy_reason"] and
           doctor_candidate["policy_reason"] == second_candidate["policy_reason"] and
           doctor["admission"]["memory_pressure"] == "warning" and
+          status["admission"]["warning_heavy_limit"] == 1 and
+          status["admission"]["host_constraints"]["reserved_claims_by_size"] == {
+              "heavy": 1, "light": 1} and
+          status["admission"]["host_constraints"]["active_managed_heavy_reservations"] == 1 and
           status["admission"]["host_constraints"]["active_managed_light_reservations"] == 1 and
           status["admission"]["host_constraints"]["active_managed_contributors"][0]["started_at"] is None,
           "status, inspect, or doctor disagreed with the warning admission rule")
@@ -610,7 +659,7 @@ def test_warning_memory_scheduler_and_diagnostics(temp):
             db.execute("UPDATE host_samples SET memory_pressure='pressure' WHERE id=(SELECT max(id) FROM host_samples)")
             old_pressure = warp_drive.admission_diagnostics(db)
             old_candidate = next(item for item in old_pressure["candidates"]
-                                 if item["request_id"] == second_light)
+                                 if item["request_id"] == second_heavy)
             check(old_pressure["memory_pressure"] == "unknown" and
                   old_candidate["policy_reason"] == "memory severity unknown" and
                   old_candidate["diagnostic_blocker"]["severity"] == "unknown",
@@ -619,13 +668,15 @@ def test_warning_memory_scheduler_and_diagnostics(temp):
             check(result["granted"] is None,
                   "the scheduler treated a legacy generic pressure row as normal")
 
+    run_cli(state, "cancel", second_light)
     with contextlib.closing(warp_drive.connect(state)) as db:
         with warp_drive.immediate_transaction(db):
-            db.execute("UPDATE reservations SET state='finished',outcome='succeeded',lease_active=0,ended_at=? WHERE id=?",
-                       (time.time(), first_light))
+            db.execute("UPDATE reservations SET state='finished',outcome='succeeded',lease_active=0,ended_at=? WHERE id IN (?,?)",
+                       (time.time(), heavy, first_light))
+            warp_drive.set_setting(db, "last_heavy_grant", time.time() - 10)
     normal_pass = run_fixture_pass(state, 0.02, memory_severity="normal")
-    check(normal_pass["granted"] == heavy,
-          "normal pressure did not restore the aged heavy request's existing admission path")
+    check(normal_pass["granted"] == second_heavy,
+          "normal pressure did not restore ordinary heavy admission")
 
     transition_state = temp / "warning-memory-transition-state"
     run_cli(transition_state, "init")
@@ -687,6 +738,192 @@ def test_warning_memory_scheduler_and_diagnostics(temp):
                   "request_ids": []} for item in blocked_status["admission"]["candidates"]
                   if item["request_id"] in (light_id, heavy_id)),
               f"{severity!r} memory pressure did not block every new reservation")
+
+
+def test_warning_heavy_limit_configuration(temp):
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    state = temp / "warning-heavy-limit-state"
+    initialized = parse_json(run_cli(state, "init"))
+    operator = initialized["operator"]
+    config = parse_json(run_cli(state, "config", "show"))
+    check(config["warning_heavy_limit"] == 1,
+          "new state did not default the warning heavy limit to one")
+    unauthorized = run_cli(state, "config", "warning-heavy-limit", "2",
+                           "--actor", "not-authorized", ok=False)
+    check(unauthorized.returncode != 0 and
+          parse_json(run_cli(state, "config", "show"))["warning_heavy_limit"] == 1,
+          "an unauthorized actor changed the warning heavy limit")
+    run_cli(state, "config", "delegate", "add", "warp-test-delegate", "--actor", operator)
+    for limit in (0, 1, 2):
+        run_cli(state, "config", "warning-heavy-limit", str(limit),
+                "--actor", "warp-test-delegate")
+        check(parse_json(run_cli(state, "config", "show"))["warning_heavy_limit"] == limit,
+              f"authorized delegate could not set warning heavy limit {limit}")
+    negative = run_cli(state, "config", "warning-heavy-limit", "-1",
+                       "--actor", operator, ok=False)
+    noninteger = run_cli(state, "config", "warning-heavy-limit", "two",
+                         "--actor", operator, ok=False)
+    check(negative.returncode != 0 and noninteger.returncode != 0 and
+          parse_json(run_cli(state, "config", "show"))["warning_heavy_limit"] == 2,
+          "invalid warning heavy limits changed the configured value")
+    run_cli(state, "config", "warning-heavy-limit", "1", "--actor", operator)
+
+    first_path, second_path = temp / "warning-limit-first", temp / "warning-limit-second"
+    first_path.mkdir()
+    second_path.mkdir()
+    first = submit_and_attach(state, owner, "warning-limit-first", first_path, "heavy")
+    second = submit_and_attach(state, owner, "warning-limit-second", second_path, "heavy")
+    first_pass = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(first_pass["granted"] == first,
+          "configured warning heavy limit one did not allow its first reservation")
+    run_cli(state, "config", "warning-heavy-limit", "0", "--actor", "warp-test-delegate")
+    blocked_with_claim = run_fixture_pass(state, 0.02, memory_severity="warning")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        first_claim = warp_drive.current_request(db, first)
+    check(blocked_with_claim["granted"] is None and
+          first_claim["state"] == "reserved" and first_claim["lease_active"] == 1,
+          "lowering the warning limit preempted a reserved heavy claim")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET state='finished',outcome='succeeded',lease_active=0,ended_at=? WHERE id=?",
+                       (time.time(), first))
+    zero_pass = run_fixture_pass(state, 0.02, memory_severity="warning")
+    status, inspect = read_only_status_and_inspect(state, second)
+    doctor = parse_json(run_cli(state, "doctor"))
+    candidate = next(item for item in status["admission"]["candidates"]
+                     if item["request_id"] == second)
+    inspect_candidate = next(item for item in inspect["admission"]["candidates"]
+                             if item["request_id"] == second)
+    doctor_candidate = next(item for item in doctor["admission"]["candidates"]
+                            if item["request_id"] == second)
+    check(zero_pass["granted"] is None and
+          status["admission"]["warning_heavy_limit"] == 0 and
+          status["admission"]["host_constraints"]["reserved_claims_by_size"] == {
+              "heavy": 0, "light": 0} and
+          candidate["policy_reason"] == "memory warning heavy reservation limit reached" and
+          inspect_candidate["policy_reason"] == candidate["policy_reason"] and
+          doctor_candidate["policy_reason"] == candidate["policy_reason"] and
+          doctor["admission"]["warning_heavy_limit"] == 0,
+          "limit zero did not block heavy work consistently in scheduler, status, inspect, and doctor")
+    run_cli(state, "config", "warning-heavy-limit", "1", "--actor", operator)
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            warp_drive.set_setting(db, "last_heavy_grant", time.time() - 10)
+    restored = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(restored["granted"] == second,
+          "raising the warning heavy limit did not take effect on the next scheduler pass")
+
+
+def test_warning_heavy_limit_two_and_reduction(temp):
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    state = temp / "warning-heavy-limit-two-state"
+    operator = parse_json(run_cli(state, "init"))["operator"]
+    run_cli(state, "config", "warning-heavy-limit", "2", "--actor", operator)
+    paths = [temp / f"warning-limit-two-{index}" for index in range(3)]
+    for path in paths:
+        path.mkdir()
+    requests = [submit_and_attach(state, owner, f"warning-limit-two-{index}", path, "heavy")
+                for index, path in enumerate(paths)]
+    first = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(first["granted"] == requests[0],
+          "warning heavy limit two did not grant its first reservation")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            old_at = time.time() - 20
+            db.execute("UPDATE reservations SET granted_at=?,started_at=? WHERE id=?",
+                       (old_at, old_at, requests[0]))
+            warp_drive.set_setting(db, "last_heavy_grant", time.time() - 10)
+    second = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(second["granted"] == requests[1],
+          "warning heavy limit two did not grant a second reservation")
+    run_cli(state, "config", "warning-heavy-limit", "1", "--actor", operator)
+    lowered = run_fixture_pass(state, 0.02, memory_severity="warning")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        existing = [warp_drive.current_request(db, request_id) for request_id in requests[:2]]
+        third = warp_drive.current_request(db, requests[2])
+        diagnostics = warp_drive.admission_diagnostics(db)
+        candidate = next(item for item in diagnostics["candidates"]
+                         if item["request_id"] == requests[2])
+    check(lowered["granted"] is None and
+          all(row["state"] == "reserved" and row["lease_active"] == 1 for row in existing) and
+          third["state"] == "waiting" and diagnostics["warning_heavy_limit"] == 1 and
+          diagnostics["host_constraints"]["reserved_claims_by_size"]["heavy"] == 2 and
+          candidate["policy_reason"] == "memory warning heavy reservation limit reached",
+          "lowering the limit below two existing claims preempted work or admitted a third claim")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET state='finished',outcome='succeeded',lease_active=0,ended_at=? WHERE id=?",
+                       (time.time(), requests[0]))
+    one_remains = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(one_remains["granted"] is None,
+          "a reduced limit admitted work while one heavy claim remained reserved")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET state='finished',outcome='succeeded',lease_active=0,ended_at=? WHERE id=?",
+                       (time.time(), requests[1]))
+            warp_drive.set_setting(db, "last_heavy_grant", time.time() - 10)
+    no_claims = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(no_claims["granted"] == requests[2],
+          "the reduced limit did not admit heavy work after all existing claims finished")
+
+
+def test_warning_reserved_claims_and_inherited_multiples(temp):
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    uncertain_state = temp / "warning-uncertain-claim-state"
+    run_cli(uncertain_state, "init")
+    uncertain_path, waiting_path = temp / "warning-uncertain", temp / "warning-uncertain-waiting"
+    uncertain_path.mkdir()
+    waiting_path.mkdir()
+    uncertain = submit_and_attach(uncertain_state, owner, "warning-uncertain", uncertain_path, "heavy")
+    waiting = submit_and_attach(uncertain_state, owner, "warning-uncertain-waiting", waiting_path, "heavy")
+    with contextlib.closing(warp_drive.connect(uncertain_state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET state='reserved',reservation_claim='uncertain',"
+                       "granted_at=?,started_at=NULL,lease_active=0 WHERE id=?",
+                       (time.time(), uncertain))
+    uncertain_pass = run_fixture_pass(uncertain_state, 0.02, memory_severity="warning")
+    with contextlib.closing(warp_drive.connect(uncertain_state)) as db:
+        status = warp_drive.status_data(db)
+        candidate = next(item for item in status["admission"]["candidates"]
+                         if item["request_id"] == waiting)
+    check(uncertain_pass["granted"] is None and
+          status["admission"]["host_constraints"]["reserved_claims_by_size"]["heavy"] == 1 and
+          candidate["policy_reason"] == "memory warning heavy reservation limit reached",
+          "an unstarted inactive-lease claim did not block a second warning heavy reservation")
+
+    inherited_state = temp / "warning-inherited-heavy-state"
+    run_cli(inherited_state, "init")
+    paths = [temp / f"warning-inherited-heavy-{index}" for index in range(3)]
+    for path in paths:
+        path.mkdir()
+    inherited = [submit_and_attach(inherited_state, owner, f"warning-inherited-heavy-{index}",
+                                  path, "heavy") for index, path in enumerate(paths)]
+    with contextlib.closing(warp_drive.connect(inherited_state)) as db:
+        with warp_drive.immediate_transaction(db):
+            active_at = time.time() - 20
+            for request_id in inherited[:2]:
+                db.execute("UPDATE reservations SET state='reserved',lease_active=1,granted_at=?,"
+                           "started_at=?,reservation_claim=? WHERE id=?",
+                           (active_at, active_at, f"inherited-{request_id}", request_id))
+    inherited_pass = run_fixture_pass(inherited_state, 0.02, memory_severity="warning")
+    with contextlib.closing(warp_drive.connect(inherited_state)) as db:
+        existing = [warp_drive.current_request(db, request_id) for request_id in inherited[:2]]
+    check(inherited_pass["granted"] is None and
+          all(row["state"] == "reserved" and row["lease_active"] == 1 and
+              row["started_at"] == active_at for row in existing),
+          "warning pressure preempted inherited heavy claims or admitted another claim")
+    for request_id in inherited[:2]:
+        with contextlib.closing(warp_drive.connect(inherited_state)) as db:
+            with warp_drive.immediate_transaction(db):
+                db.execute("UPDATE reservations SET state='finished',outcome='succeeded',"
+                           "lease_active=0,ended_at=? WHERE id=?", (time.time(), request_id))
+        result = run_fixture_pass(inherited_state, 0.02, memory_severity="warning")
+        if request_id == inherited[0]:
+            check(result["granted"] is None,
+                  "warning pressure admitted a replacement while one inherited heavy claim remained")
+        else:
+            check(result["granted"] == inherited[2],
+                  "warning pressure did not resume heavy admission after all inherited claims finished")
 
 
 def test_scheduler_refreshes_policy_version(temp):
@@ -815,7 +1052,7 @@ def test_explicit_cpu_estimates(temp):
     run_cli(fallback_state, "init")
     with contextlib.closing(warp_drive.connect(fallback_state)) as db:
         check(warp_drive.get_setting(db, "policy_version") is None,
-              "client initialization marked an unobserved scheduler as policy v8")
+              "client initialization marked an unobserved scheduler as policy v9")
         with warp_drive.immediate_transaction(db):
             warp_drive.set_setting(db, "policy_version", "warp-drive-admission-v6")
     path = temp / "cpu-fallback-worktree"
@@ -3286,6 +3523,9 @@ def main():
             test_macos_memory_severity()
             test_memory_policy_fixtures()
             test_warning_memory_scheduler_and_diagnostics(temp)
+            test_warning_heavy_limit_configuration(temp)
+            test_warning_heavy_limit_two_and_reduction(temp)
+            test_warning_reserved_claims_and_inherited_multiples(temp)
             test_scheduler_refreshes_policy_version(temp)
             test_explicit_cpu_estimates(temp)
             test_new_recipient_enrollment_guard(temp)
