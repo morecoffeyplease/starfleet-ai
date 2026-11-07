@@ -10,6 +10,7 @@ from pathlib import Path
 import queue
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1659,6 +1660,138 @@ class DiscordWatchTests(unittest.TestCase):
     def test_caller_without_session_env_uses_unique_surface_enrollment_and_binding(self):
         os.environ.pop("CODEX_THREAD_ID", None)
         self.assertEqual(self.register()["owner_session"], SESSION_A)
+
+    def test_default_watch_binding_sends_and_receives_with_unknown_terminal_input(self):
+        native_root = self.root / "native-binding"
+        state = native_root / "state"
+        hailing = native_root / "hailing"
+        notify_home = native_root / "agent-notify"
+        home = native_root / "home"
+        hook_directory = home / ".cmuxterm"
+        for directory in (hailing, notify_home, hook_directory):
+            directory.mkdir(mode=0o700, parents=True)
+        owner_config = {"version": 1, "targets": [target()], "coordinator": None,
+                        "remind_after": 300, "escalate_after": 900,
+                        "cooldown": 600, "interval": 30}
+        config_path = hailing / "config.json"
+        config_path.write_text(json.dumps(owner_config), encoding="utf-8")
+        config_path.chmod(0o600)
+        hook_record = {"surfaceId": SURFACE_A, "workspaceId": WORKSPACE_A,
+                       "agentLifecycle": "idle", "startedAt": 1234.5}
+        hook_path = hook_directory / "codex-hook-sessions.json"
+        hook_path.write_text(json.dumps({"sessions": {SESSION_A: hook_record}}), encoding="utf-8")
+        hook_path.chmod(0o600)
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"},
+                   "items": [{"placement": {"kind": "local"},
+                              "projections": [{"panel_id": SURFACE_A, "workspace_id": WORKSPACE_A}],
+                              "agents": [{"session_id": SESSION_A, "kind": "codex", "state": "idle"}]}]}
+        input_state = {"surface_id": SURFACE_A, "workspace_id": WORKSPACE_A, "state": "empty",
+                       "agent": True, "terminal": True, "blocks_typing": False,
+                       "waiting_on_human": False, "lifecycle": "idle"}
+        settings = {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+        cmux_calls = []
+        paste_calls = []
+
+        def run_cmux(args, **_kwargs):
+            cmux_calls.append(args)
+            if args[2] == "current":
+                response = current
+            elif args[2] == "rpc" and args[3] == "surface.input_state":
+                response = input_state
+            elif args[2] == "rpc" and args[3] == "agent.message.settings":
+                response = settings
+            elif args[2] == "paste":
+                paste_calls.append(args[-1])
+                response = {"submitted": True}
+            else:
+                raise AssertionError(f"Unexpected CMUX command: {args}")
+            return subprocess.CompletedProcess(args, 0, json.dumps(response), "")
+
+        api = FakeAPI([message("101", content="reply survives unknown terminal input")])
+        now = [TEST_NOW]
+
+        class NativeWatch(dw.Watch):
+            def __init__(self):
+                self.values = {"token": "synthetic-token", "user_id": USER_ID, "closed_tag": "900"}
+                self.api = api
+                super().__init__(state_dir=state, hailing_state=hailing, notify_home=notify_home,
+                                 cmux="synthetic-cmux", clock=lambda: now[0])
+
+            def read_credentials(self):
+                self._configured_user_id = self.values["user_id"]
+                return self.values, self.api
+
+        environment = {"CMUX_AGENT_LAUNCH_KIND": "codex", "CMUX_SURFACE_ID": SURFACE_A,
+                       "CMUX_WORKSPACE_ID": WORKSPACE_A, "CODEX_THREAD_ID": SESSION_A}
+        with mock.patch.object(hf.Path, "home", return_value=home), \
+                mock.patch.object(hf.subprocess, "run", side_effect=run_cmux), \
+                mock.patch.dict(os.environ, environment, clear=False):
+            watch = NativeWatch()
+            self.assertIs(type(watch.cmux_factory()), hf.Cmux)
+            registration = watch.register(THREAD)
+            self.assertEqual(registration["owner_session"], SESSION_A)
+            owner = watch.current_owner(verify=False)
+            watch.scan()
+
+            input_state.update(state="draft", lifecycle="unknown")
+            generic_cmux = watch.cmux_factory()
+            with self.assertRaisesRegex(hf.DeliveryHoldError, "Human draft, approval"):
+                generic_cmux.submit(owner, "ordinary Hailing prompt")
+            self.assertEqual(paste_calls, [])
+            input_reads_before_reply = sum(
+                len(args) > 3 and args[2] == "rpc" and args[3] == "surface.input_state"
+                for args in cmux_calls)
+
+            now[0] += dw.GROUP_QUIET_SECONDS + dw.ROUTINE_REST_INTERVAL
+            result = watch.scan(send=True)
+            self.assertEqual(result["threads"][0]["wake"]["state"], "awaiting_receipt")
+            self.assertEqual(len(paste_calls), 1)
+            self.assertIn("receive --thread 100 --group 1", paste_calls[0])
+            self.assertNotIn("reply survives unknown terminal input", paste_calls[0])
+
+            for composer_state in ("draft", "unknown"):
+                input_state.update(state=composer_state, lifecycle="unknown")
+                watch.validate_registered_owner(owner, readiness_policy=hf.DISCORD_REPLY_READINESS)
+
+            projection = current["items"][0]["projections"][0]
+            agent = current["items"][0]["agents"][0]
+            projection["workspace_id"] = WORKSPACE_B
+            with self.assertRaisesRegex(ValueError, "Workspace changed"):
+                watch.validate_registered_owner(owner, readiness_policy=hf.DISCORD_REPLY_READINESS)
+            projection["workspace_id"] = WORKSPACE_A
+            projection["panel_id"] = SURFACE_B
+            with self.assertRaisesRegex(ValueError, "Surface is missing or ambiguous"):
+                watch.validate_registered_owner(owner, readiness_policy=hf.DISCORD_REPLY_READINESS)
+            projection["panel_id"] = SURFACE_A
+            agent["session_id"] = SESSION_B
+            with self.assertRaisesRegex(ValueError, "Session is absent"):
+                watch.validate_registered_owner(owner, readiness_policy=hf.DISCORD_REPLY_READINESS)
+            agent["session_id"] = SESSION_A
+            hook_record["startedAt"] = 1235.5
+            hook_path.write_text(json.dumps({"sessions": {SESSION_A: hook_record}}), encoding="utf-8")
+            hook_path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "Session generation changed"):
+                watch.validate_registered_owner(owner, readiness_policy=hf.DISCORD_REPLY_READINESS)
+            hook_record["startedAt"] = 1234.5
+            hook_path.write_text(json.dumps({"sessions": {SESSION_A: hook_record}}), encoding="utf-8")
+            hook_path.chmod(0o600)
+            for setting in ("messages_enabled", "receiving", "workspace_receiving"):
+                settings[setting] = False
+                with self.assertRaisesRegex(ValueError, "Native messaging is disabled"):
+                    watch.validate_registered_owner(owner, readiness_policy=hf.DISCORD_REPLY_READINESS)
+                settings[setting] = True
+
+            output = io.StringIO()
+            receipt = watch.receive(THREAD, output=output)
+            self.assertEqual(receipt["received"], ["101"])
+            self.assertIn("reply survives unknown terminal input", output.getvalue())
+            with contextlib.closing(watch.database(create=False)) as db:
+                self.assertEqual(db.execute("SELECT state FROM messages WHERE thread_id=? AND message_id=?",
+                                            (THREAD, "101")).fetchone()[0], "received")
+            input_reads_after_receive = sum(
+                len(args) > 3 and args[2] == "rpc" and args[3] == "surface.input_state"
+                for args in cmux_calls)
+            self.assertEqual(input_reads_after_receive, input_reads_before_reply)
 
     def test_opencode_session_self_registers_exact_owner_without_state_migration(self):
         opencode_session = "ses_DiscordWatchFixture"
