@@ -2,6 +2,7 @@
 """Isolated CLI acceptance for warp-drive; never uses default state or native sends."""
 
 import contextlib
+import ctypes
 import getpass
 import hashlib
 import importlib
@@ -28,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
 warp_drive = importlib.import_module("warp_drive")
 policy = importlib.import_module("policy")
+host = importlib.import_module("host")
 HAILING_SOURCE = ROOT.parent / "hailing-frequencies" / "hailing_frequencies.py"
 spec = importlib.util.spec_from_file_location("warp_verify_hailing", HAILING_SOURCE)
 hailing = importlib.util.module_from_spec(spec)
@@ -465,9 +467,226 @@ def test_policy_fixtures():
         target_cores=9.5, projected_cores=0.6, light_ready=False, pressure="pressure",
         sample_fresh=True, now=700, last_heavy_grant=None, heavy_wait_seconds=130,
         active_heavy_cores=4, active_managed_cores=4, active_aged_escape_count=1)
-    check(not pressured_second_escape[0] and pressured_second_escape[1] == "memory pressure observed" and
+    check(not pressured_second_escape[0] and pressured_second_escape[1] == "memory severity unknown" and
           not pressured_second_escape[3],
           "a second aged escape ignored the memory-pressure guard")
+
+
+def test_macos_memory_severity():
+    class FakeSystemLibrary:
+        def __init__(self, flag=None, result=0, size=None):
+            self.flag = flag
+            self.result = result
+            self.size = ctypes.sizeof(ctypes.c_int) if size is None else size
+
+        def sysctlbyname(self, _name, value_pointer, size_pointer, _new_value, _new_size):
+            if self.result == 0:
+                ctypes.cast(value_pointer, ctypes.POINTER(ctypes.c_int)).contents.value = self.flag
+                ctypes.cast(size_pointer, ctypes.POINTER(ctypes.c_size_t)).contents.value = self.size
+            return self.result
+
+    for flag, expected in ((1, "normal"), (2, "warning"), (4, "critical")):
+        with patch.object(host.sys, "platform", "darwin"), \
+                patch.object(host.ctypes, "CDLL", return_value=FakeSystemLibrary(flag)):
+            check(host.memory_pressure() == expected,
+                  f"macOS memory flag {flag} did not map to {expected}")
+    for flag in (0, 3, 8, -1, "2", None, True, [], {}):
+        check(host._macos_memory_pressure_severity(flag) == "unknown",
+              f"unrecognized macOS memory flag {flag!r} was treated as known")
+    with patch.object(host.sys, "platform", "linux"):
+        check(host.memory_pressure() == "unknown",
+              "unsupported platforms inferred normal memory pressure")
+    with patch.object(host.sys, "platform", "darwin"), \
+            patch.object(host.ctypes, "CDLL", side_effect=OSError("fixture read failure")):
+        check(host.memory_pressure() == "unknown",
+              "a failed memory pressure read inferred normal pressure")
+    with patch.object(host.sys, "platform", "darwin"), \
+            patch.object(host.ctypes, "CDLL", return_value=FakeSystemLibrary(result=1)):
+        check(host.memory_pressure() == "unknown",
+              "a rejected sysctl read inferred normal pressure")
+    with patch.object(host.sys, "platform", "darwin"), \
+            patch.object(host.ctypes, "CDLL", return_value=FakeSystemLibrary(2, size=8)):
+        check(host.memory_pressure() == "unknown",
+              "a malformed sysctl result was accepted as a warning sample")
+
+
+def test_memory_policy_fixtures():
+    def decide(size, severity, *, projected=0, target=8, active_lights=0):
+        return policy.admission_decision({"size": size, "workers": 1},
+            target_cores=target, projected_cores=projected,
+            light_ready=size == "light", pressure=severity, sample_fresh=True,
+            now=110, last_heavy_grant=None, heavy_wait_seconds=0,
+            active_heavy_cores=0, active_light_count=active_lights)
+
+    warning_light = decide("light", "warning")
+    warning_slot = decide("light", "warning", active_lights=1)
+    warning_heavy = decide("heavy", "warning")
+    critical_light = decide("light", "critical")
+    unknown_heavy = decide("heavy", "unknown")
+    legacy_pressure = decide("light", "pressure")
+    missing_pressure = decide("light", None)
+    cpu_limited_light = decide("light", "warning", projected=7, target=7.6)
+    normal_after_warning = decide("light", "normal", active_lights=1)
+    check(warning_light[0] and warning_light[1] == "light allowance admitted",
+          "warning pressure did not permit one fitting light request")
+    check(not warning_slot[0] and warning_slot[1] == "memory warning light reservation already active",
+          "warning pressure admitted a second managed light reservation")
+    check(not warning_heavy[0] and warning_heavy[1] == "memory warning pauses heavy work",
+          "warning pressure admitted heavy work")
+    check(not critical_light[0] and critical_light[1] == "critical memory pressure" and
+          not unknown_heavy[0] and unknown_heavy[1] == "memory severity unknown",
+          "critical or unknown memory severity admitted work")
+    check(not legacy_pressure[0] and legacy_pressure[1] == "memory severity unknown" and
+          not missing_pressure[0] and missing_pressure[1] == "memory severity unknown",
+          "legacy or missing pressure data was inferred to be normal")
+    check(not cpu_limited_light[0] and cpu_limited_light[1] == "host target has no room for light work",
+          "warning pressure bypassed the ordinary CPU headroom guard")
+    check(normal_after_warning[0] and normal_after_warning[1] == "light allowance admitted",
+          "normal pressure did not restore ordinary light admission")
+
+
+def test_warning_memory_scheduler_and_diagnostics(temp):
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    state = temp / "warning-memory-state"
+    run_cli(state, "init")
+    aged_path, first_light_path, second_light_path = [temp / name for name in
+        ("warning-aged-heavy", "warning-first-light", "warning-second-light")]
+    for path in (aged_path, first_light_path, second_light_path):
+        path.mkdir()
+    heavy = submit_and_attach(state, owner, "warning-aged-heavy", aged_path, "heavy")
+    first_light = submit_and_attach(state, owner, "warning-first-light", first_light_path, "light")
+    second_light = submit_and_attach(state, owner, "warning-second-light", second_light_path, "light")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET credit_seconds=180,credit_started_at=NULL WHERE id=?",
+                       (heavy,))
+            warp_drive.set_setting(db, "protected_turn_request_id", heavy)
+
+    warning_pass = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(warning_pass["granted"] == first_light and
+          warning_pass["protected_target_id"] is None,
+          "an aged heavy target held the one warning light turn")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        granted_light = warp_drive.current_request(db, first_light)
+        heavy_row = warp_drive.current_request(db, heavy)
+        second_row = warp_drive.current_request(db, second_light)
+        grant = db.execute("SELECT data_json FROM events WHERE reservation_id=? AND kind='granted'",
+                           (first_light,)).fetchone()
+        sample = db.execute("SELECT memory_pressure,availability_json FROM host_samples ORDER BY id DESC LIMIT 1").fetchone()
+        check(granted_light["state"] == "reserved" and granted_light["started_at"] is None and
+              granted_light["lease_active"] == 1 and heavy_row["state"] == "waiting" and
+              second_row["state"] == "waiting" and
+              warp_drive.get_setting(db, "protected_turn_request_id") is None,
+              "warning admission changed the aged heavy or reserved light lifecycle")
+        check(json.loads(grant["data_json"])["memory_pressure"] == "warning" and
+              json.loads(sample["availability_json"])["memory_pressure"] is True and
+              sample["memory_pressure"] == "warning",
+              "the warning severity was lost from grant telemetry or the stored host sample")
+
+    blocked_second_pass = run_fixture_pass(state, 0.02, memory_severity="warning")
+    check(blocked_second_pass["granted"] is None,
+          "a second warning light reservation started while the first grant had not started")
+    status, inspect = read_only_status_and_inspect(state, second_light)
+    doctor = parse_json(run_cli(state, "doctor"))
+    second_candidate = next(item for item in status["admission"]["candidates"]
+                            if item["request_id"] == second_light)
+    inspect_candidate = next(item for item in inspect["admission"]["candidates"]
+                             if item["request_id"] == second_light)
+    doctor_candidate = next(item for item in doctor["admission"]["candidates"]
+                            if item["request_id"] == second_light)
+    check(status["admission"]["memory_pressure"] == "warning" and
+          second_candidate["policy_reason"] == "memory warning light reservation already active" and
+          second_candidate["diagnostic_blocker"] == {
+              "kind": "memory_pressure", "severity": "warning", "request_ids": []} and
+          inspect_candidate["policy_reason"] == second_candidate["policy_reason"] and
+          doctor_candidate["policy_reason"] == second_candidate["policy_reason"] and
+          doctor["admission"]["memory_pressure"] == "warning" and
+          status["admission"]["host_constraints"]["active_managed_light_reservations"] == 1 and
+          status["admission"]["host_constraints"]["active_managed_contributors"][0]["started_at"] is None,
+          "status, inspect, or doctor disagreed with the warning admission rule")
+
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE host_samples SET memory_pressure='pressure' WHERE id=(SELECT max(id) FROM host_samples)")
+            old_pressure = warp_drive.admission_diagnostics(db)
+            old_candidate = next(item for item in old_pressure["candidates"]
+                                 if item["request_id"] == second_light)
+            check(old_pressure["memory_pressure"] == "unknown" and
+                  old_candidate["policy_reason"] == "memory severity unknown" and
+                  old_candidate["diagnostic_blocker"]["severity"] == "unknown",
+                  "a legacy generic pressure row was treated as a severity-aware sample")
+            result = warp_drive.scheduler_pass(db, sample={"memory_pressure": "normal"})
+            check(result["granted"] is None,
+                  "the scheduler treated a legacy generic pressure row as normal")
+
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET state='finished',outcome='succeeded',lease_active=0,ended_at=? WHERE id=?",
+                       (time.time(), first_light))
+    normal_pass = run_fixture_pass(state, 0.02, memory_severity="normal")
+    check(normal_pass["granted"] == heavy,
+          "normal pressure did not restore the aged heavy request's existing admission path")
+
+    transition_state = temp / "warning-memory-transition-state"
+    run_cli(transition_state, "init")
+    transition_paths = [temp / f"warning-transition-{index}" for index in range(3)]
+    for path in transition_paths:
+        path.mkdir()
+    existing_lights = [submit_and_attach(transition_state, owner,
+        f"warning-transition-{index}", path, "light")
+        for index, path in enumerate(transition_paths[:2])]
+    next_light = submit_and_attach(transition_state, owner, "warning-transition-next",
+                                   transition_paths[2], "light")
+    with contextlib.closing(warp_drive.connect(transition_state)) as db:
+        with warp_drive.immediate_transaction(db):
+            active_at = time.time() - 20
+            for request_id in existing_lights:
+                db.execute("UPDATE reservations SET state='reserved',lease_active=1,granted_at=?,started_at=?,reservation_claim=? WHERE id=?",
+                           (active_at, active_at, f"transition-{request_id}", request_id))
+    transition_pass = run_fixture_pass(transition_state, 0.02, memory_severity="warning")
+    with contextlib.closing(warp_drive.connect(transition_state)) as db:
+        still_active = [warp_drive.current_request(db, request_id) for request_id in existing_lights]
+        waiting_light = warp_drive.current_request(db, next_light)
+    check(transition_pass["granted"] is None and
+          all(row["state"] == "reserved" and row["lease_active"] == 1 and
+              row["started_at"] == active_at for row in still_active) and
+          waiting_light["state"] == "waiting",
+          "warning pressure preempted existing light work or admitted another light")
+
+    cpu_state = temp / "warning-memory-cpu-state"
+    run_cli(cpu_state, "init")
+    cpu_path = temp / "warning-memory-cpu-light"
+    cpu_path.mkdir()
+    cpu_light = submit_and_attach(cpu_state, owner, "warning-memory-cpu-light", cpu_path, "light")
+    cpu_pass = run_fixture_pass(cpu_state, 0.90, memory_severity="warning")
+    cpu_status = parse_json(run_cli(cpu_state, "status"))
+    cpu_candidate = next(item for item in cpu_status["admission"]["candidates"]
+                         if item["request_id"] == cpu_light)
+    check(cpu_pass["granted"] is None and
+          cpu_candidate["policy_reason"] == "host target has no room for light work" and
+          cpu_candidate["diagnostic_blocker"] == {"kind": "host_capacity", "request_ids": []} and
+          cpu_status["admission"]["memory_pressure"] == "warning",
+          "warning pressure bypassed the CPU guard or diagnostics reported a memory blocker")
+
+    for severity in ("critical", "unknown", None):
+        blocked_state = temp / f"memory-block-{severity}"
+        run_cli(blocked_state, "init")
+        light_path, heavy_path = temp / f"memory-block-{severity}-light", temp / f"memory-block-{severity}-heavy"
+        light_path.mkdir()
+        heavy_path.mkdir()
+        light_id = submit_and_attach(blocked_state, owner, f"memory-block-{severity}-light",
+                                     light_path, "light")
+        heavy_id = submit_and_attach(blocked_state, owner, f"memory-block-{severity}-heavy",
+                                     heavy_path, "heavy")
+        blocked_pass = run_fixture_pass(blocked_state, 0.02, memory_severity=severity)
+        blocked_status = parse_json(run_cli(blocked_state, "status"))
+        check(blocked_pass["granted"] is None and
+              blocked_status["admission"]["memory_pressure"] == policy.memory_severity(severity) and
+              all(item["diagnostic_blocker"] == {
+                  "kind": "memory_pressure", "severity": policy.memory_severity(severity),
+                  "request_ids": []} for item in blocked_status["admission"]["candidates"]
+                  if item["request_id"] in (light_id, heavy_id)),
+              f"{severity!r} memory pressure did not block every new reservation")
 
 
 def test_scheduler_refreshes_policy_version(temp):
@@ -596,7 +815,7 @@ def test_explicit_cpu_estimates(temp):
     run_cli(fallback_state, "init")
     with contextlib.closing(warp_drive.connect(fallback_state)) as db:
         check(warp_drive.get_setting(db, "policy_version") is None,
-              "client initialization marked an unobserved scheduler as policy v7")
+              "client initialization marked an unobserved scheduler as policy v8")
         with warp_drive.immediate_transaction(db):
             warp_drive.set_setting(db, "policy_version", "warp-drive-admission-v6")
     path = temp / "cpu-fallback-worktree"
@@ -608,7 +827,7 @@ def test_explicit_cpu_estimates(temp):
     rejected = run_cli(fallback_state, *fallback_content[:-2],
         "--cpu-cores", "0.5", "--cpu-basis", "synthetic fixture evidence",
         *fallback_content[-2:], ok=False)
-    check("warp-drive-admission-v7" in rejected.stderr and "coordinator-authorized" in rejected.stderr,
+    check(policy.POLICY_VERSION in rejected.stderr and "coordinator-authorized" in rejected.stderr,
           "explicit estimate was accepted while the shared state reported old policy v6")
     with contextlib.closing(warp_drive.connect(fallback_state)) as db:
         check(warp_drive.get_setting(db, "policy_version") == "warp-drive-admission-v6",
@@ -668,7 +887,7 @@ def test_explicit_cpu_estimates(temp):
     batch_rejected = run_cli(fallback_state, "batch", "--file", str(old_policy_batch_file), ok=False)
     with contextlib.closing(warp_drive.connect(fallback_state)) as db:
         inserted_batch_rows = db.execute("SELECT count(*) FROM reservations WHERE request_key LIKE 'batch-%'").fetchone()[0]
-    check("warp-drive-admission-v7" in batch_rejected.stderr and inserted_batch_rows == 0,
+    check(policy.POLICY_VERSION in batch_rejected.stderr and inserted_batch_rows == 0,
           "old-policy batch inserted a legacy member before rejecting its explicit estimate")
 
     explicit_state = temp / "cpu-explicit-state"
@@ -717,6 +936,8 @@ def test_explicit_cpu_estimates(temp):
     with contextlib.closing(warp_drive.connect(explicit_state)) as db:
         with db:
             warp_drive.attach_helper(db, explicit["request_id"], owner, str(uuid.uuid4()))
+        with warp_drive.immediate_transaction(db):
+            warp_drive.set_setting(db, "policy_version", "warp-drive-admission-v7")
     explicit_pass = run_fixture_pass(explicit_state, 0.10, cpus=18)
     check(explicit_pass["granted"] == explicit["request_id"],
           "evidence-backed estimate did not fit the same synthetic host")
@@ -757,7 +978,8 @@ def test_explicit_cpu_estimates(temp):
           contributor["requested_cpu_cores"] == 0.5 and
           contributor["cpu_basis"] == "synthetic low-demand fixture" and
           grant["estimated_cores"] == 0.5 and grant["requested_cpu_cores"] == 0.5 and
-          grant["cpu_basis"] == "synthetic low-demand fixture",
+          grant["cpu_basis"] == "synthetic low-demand fixture" and
+          grant["policy_version"] == policy.POLICY_VERSION,
           "active, unreflected, or grant telemetry did not preserve the explicit estimate")
     waiting_path = temp / "cpu-explicit-diagnostic-worktree"
     waiting_path.mkdir()
@@ -779,7 +1001,7 @@ def test_explicit_cpu_estimates(temp):
         with warp_drive.immediate_transaction(db):
             warp_drive.set_setting(db, "policy_version", "warp-drive-admission-v6")
     resume = run_cli(explicit_state, "attach", explicit["request_id"], *owner_flags, ok=False)
-    check("warp-drive-admission-v7" in resume.stderr,
+    check(policy.POLICY_VERSION in resume.stderr,
           "an explicit request resumed under an incompatible old policy")
     with contextlib.closing(warp_drive.connect(explicit_state)) as db:
         after = db.execute("SELECT helper_id,helper_generation FROM reservations WHERE id=?",
@@ -809,7 +1031,7 @@ def test_explicit_cpu_estimates(temp):
         last_heavy_grant=None, heavy_wait_seconds=130, active_heavy_cores=20,
         active_managed_cores=20, active_aged_escape_count=policy.MAX_ACTIVE_AGED_ESCAPES)
     check(capped == 8 and light_reserve == 7 and not guarded[0] and
-          guarded[1] == "memory pressure observed" and reserved_admission[0] and
+          guarded[1] == "memory severity unknown" and reserved_admission[0] and
           reserved_admission[2] == 7 and not startup_guard[0] and
           startup_guard[1] == "heavy startup observation interval" and
           startup_guard[2] == 0.5 and not aged_cap_guard[0] and
@@ -1300,15 +1522,16 @@ def test_claim_and_cancel_launch_interleavings(temp):
     check(not zero_marker.exists(), "cancellation that won before launch still ran a child")
 
 
-def run_fixture_pass(state, busy, cpus=8, permit_grants=True):
+def run_fixture_pass(state, busy, cpus=8, permit_grants=True, memory_severity="normal"):
     fixture = {"at": time.time(), "logical_cpus": cpus, "cpu_busy": busy,
-               "memory_pressure": "normal", "swap_used_mb": 0.0,
+               "memory_pressure": memory_severity, "swap_used_mb": 0.0,
                "thermal_state": None, "availability": {"cpu": True,
-               "memory_pressure": True, "swap": True, "thermal": False}}
+               "memory_pressure": memory_severity != "unknown", "swap": True,
+               "thermal": False}}
     with contextlib.closing(warp_drive.connect(state)) as db:
         with warp_drive.immediate_transaction(db):
-            warp_drive.host_sample(db, source="fixture", fixture=fixture)
-            result = warp_drive.scheduler_pass(db, sample=fixture,
+            sample = warp_drive.host_sample(db, source="fixture", fixture=fixture)
+            result = warp_drive.scheduler_pass(db, sample=sample,
                                                permit_grants=permit_grants)
         return result
 
@@ -1771,8 +1994,10 @@ def test_scheduler_fair_aged_worktree_and_idle_signal(temp):
     pressured, pressured_inspect = read_only_status_and_inspect(unmanaged_state, large_id)
     pressured_candidate = next(item for item in pressured["admission"]["candidates"]
                                if item["request_id"] == large_id)
-    check(pressured_candidate["diagnostic_blocker"] == {"kind": "memory_pressure", "request_ids": []} and
+    check(pressured_candidate["diagnostic_blocker"] == {
+              "kind": "memory_pressure", "severity": "warning", "request_ids": []} and
           pressured["admission"]["host_constraints"]["memory_pressure_restricts_admission"] and
+          pressured["admission"]["memory_pressure"] == "warning" and
           pressured_inspect["admission"]["request_context"]["eligible_now"],
           "memory-pressure diagnostics did not separate the host constraint from causal jobs")
     with contextlib.closing(warp_drive.connect(unmanaged_state)) as db:
@@ -3058,6 +3283,9 @@ def main():
             test_install_removes_new_runtime_after_seal_failure(temp)
             test_product_command_inherits_caller_umask(temp)
             test_policy_fixtures()
+            test_macos_memory_severity()
+            test_memory_policy_fixtures()
+            test_warning_memory_scheduler_and_diagnostics(temp)
             test_scheduler_refreshes_policy_version(temp)
             test_explicit_cpu_estimates(temp)
             test_new_recipient_enrollment_guard(temp)
