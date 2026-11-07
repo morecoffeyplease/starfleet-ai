@@ -115,18 +115,20 @@ def install(args):
     for name in ("runtime_dir", "bin_dir", "config_dir", "state_dir", "claude_settings", "codex_settings"):
         setattr(args, name, Path(getattr(args, name)).expanduser().absolute())
     source = Path(__file__).resolve().with_name("model_preferences.py")
+    guidance_source = source.with_name("reviewer_guidance.py")
     transport_source = source.with_name("cmux_transport.py")
     opencode_source = source.with_name("opencode_dispatch.py")
     adapter_source = source.with_name("opencode_adapter.py")
     if not adapter_source.is_file():
         adapter_source = source.parents[2] / "apps" / "opencode-adapter" / "opencode_adapter.py"
     runtime = args.runtime_dir / "model_preferences.py"
+    guidance_runtime = args.runtime_dir / "reviewer_guidance.py"
     transport_runtime = args.runtime_dir / "cmux_transport.py"
     opencode_runtime = args.runtime_dir / "opencode_dispatch.py"
     adapter_runtime = args.runtime_dir / "opencode_adapter.py"
     launcher = args.bin_dir / "model-preferences"
     manifest = args.runtime_dir / "install.json"
-    for path in (args.runtime_dir, args.bin_dir, runtime, transport_runtime, opencode_runtime,
+    for path in (args.runtime_dir, args.bin_dir, runtime, guidance_runtime, transport_runtime, opencode_runtime,
                  adapter_runtime, launcher, manifest):
         require(not path.is_symlink(), f"Refusing symlink: {path}")
     if launcher.exists():
@@ -135,6 +137,9 @@ def install(args):
     if runtime.exists():
         require(previous.get("owner") == OWNER and previous.get("runtime_sha256") == hashlib.sha256(runtime.read_bytes()).hexdigest(),
                 "Existing runtime is unowned or modified; installation refused.")
+    if guidance_runtime.exists():
+        require(previous.get("owner") == OWNER and previous.get("reviewer_guidance_sha256") == hashlib.sha256(guidance_runtime.read_bytes()).hexdigest(),
+                "Existing reviewer guidance runtime is unowned or modified; installation refused.")
     if transport_runtime.exists():
         require(previous.get("owner") == OWNER and previous.get("transport_sha256") == hashlib.sha256(transport_runtime.read_bytes()).hexdigest(),
                 "Existing transport runtime is unowned or modified; installation refused.")
@@ -151,8 +156,10 @@ def install(args):
     require(opencode_source.is_file() and adapter_source.is_file(), "OpenCode helper or shared adapter source is unavailable.")
     opencode_payload = opencode_source.read_bytes()
     adapter_payload = adapter_source.read_bytes()
+    require(guidance_source.is_file(), "Reviewer guidance source is unavailable.")
+    guidance_payload = guidance_source.read_bytes()
     snapshots = {p: p.read_bytes() if p.exists() else None
-                 for p in (runtime, transport_runtime, opencode_runtime, adapter_runtime, manifest, launcher)}
+                 for p in (runtime, guidance_runtime, transport_runtime, opencode_runtime, adapter_runtime, manifest, launcher)}
     launcher_text = "#!/bin/sh\n" + LAUNCHER_MARKER + "\nexec " + shlex.join([
         sys.executable, str(runtime), "--config-dir", str(args.config_dir), "--state-dir", str(args.state_dir)]) + ' "$@"\n'
     with lock(args.runtime_dir / ".install.lock"):
@@ -167,6 +174,8 @@ def install(args):
             atomic(opencode_runtime, opencode_payload)
         if not adapter_runtime.exists() or adapter_runtime.read_bytes() != adapter_payload:
             atomic(adapter_runtime, adapter_payload)
+        if not guidance_runtime.exists() or guidance_runtime.read_bytes() != guidance_payload:
+            atomic(guidance_runtime, guidance_payload)
         if not runtime.exists() or runtime.read_bytes() != payload:
             atomic(runtime, payload)
         if not launcher.exists() or launcher.read_text() != launcher_text:
@@ -186,6 +195,7 @@ def install(args):
                 atomic(path, (json.dumps(plan["data"], indent=2) + "\n").encode(), mode)
                 changed.append({"harness": plan["harness"], "settings": str(path), "backup": str(backup) if backup else None})
         metadata = {"owner": OWNER, "runtime": str(runtime), "runtime_sha256": hashlib.sha256(payload).hexdigest(),
+                    "reviewer_guidance_sha256": hashlib.sha256(guidance_payload).hexdigest(),
                     "transport_sha256": hashlib.sha256(transport_payload).hexdigest(),
                     "opencode_sha256": hashlib.sha256(opencode_payload).hexdigest(),
                     "adapter_sha256": hashlib.sha256(adapter_payload).hexdigest(),

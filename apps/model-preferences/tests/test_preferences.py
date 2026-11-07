@@ -74,6 +74,36 @@ class PreferencesTest(unittest.TestCase):
     def plan(self, repo, **changes):
         return self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(self.facts(**changes)))
 
+    def fake_native_provider(self, harness):
+        provider_bin = self.root / "fake-native-bin"
+        provider_bin.mkdir(exist_ok=True)
+        capture = self.root / f"{harness}-prompt.json"
+        script = provider_bin / harness
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, sys\n"
+            "argv = sys.argv[1:]\n"
+            "resume = bool(argv and argv[-1] == '-' and 'resume' in argv)\n"
+            "prompt = sys.stdin.read() if resume else argv[-1]\n"
+            "pathlib.Path(os.environ['MODEL_PREFERENCES_TEST_CAPTURE']).write_text("
+            "json.dumps({'argv': argv, 'prompt': prompt}))\n"
+            "if resume:\n"
+            "    session = argv[argv.index('resume') + 1]\n"
+            "    print(json.dumps({'type': 'thread.started', 'thread_id': session}), flush=True)\n"
+        )
+        script.chmod(0o755)
+        cmux = provider_bin / "cmux"
+        cmux.write_text("#!/bin/sh\nprintf '%s\\n' '{\"truncated\":false,\"items\":[]}'\n")
+        cmux.chmod(0o755)
+        env = dict(os.environ, PATH=str(provider_bin) + os.pathsep + os.environ.get("PATH", ""),
+                   MODEL_PREFERENCES_TEST_CAPTURE=str(capture))
+        return capture, env
+
+    def run_cli(self, env, *args):
+        return subprocess.run([sys.executable, str(SCRIPT), "--config-dir", str(self.config_dir),
+                               "--state-dir", str(self.state_dir), *args],
+                              capture_output=True, text=True, timeout=30, env=env)
+
     def create_review_target(self, repo, target_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"):
         return self.call("review-target", "create", "--cwd", str(repo), "--id", target_id)
 
@@ -789,6 +819,152 @@ class PreferencesTest(unittest.TestCase):
         (repo / "docs").mkdir()
         for n in range(20): (repo / "docs" / f"{n}.md").write_text("text\n")
         self.assertEqual(len(self.plan(repo)["counted_files"]), 10)
+
+    def test_real_cli_dispatch_composes_guidance_for_each_supported_native_reviewer(self):
+        repo = self.repo()
+        config = self.app.config()
+        muse_profile = json.loads(json.dumps(config["profiles"]["Codex-only"]))
+        for role in ("standard_review", "advanced_review"):
+            muse_profile[role] = [{"model": "muse-spark", "effort": "high"}]
+        config["profiles"]["Muse-review"] = muse_profile
+        mp.write(self.app.config_path, config)
+
+        cases = (("Codex-only", "standard_review", "codex"),
+                 ("Codex-only", "advanced_review", "codex"),
+                 ("Claude-only", "standard_review", "claude"),
+                 ("Claude-only", "advanced_review", "claude"),
+                 ("Muse-review", "standard_review", "muse"),
+                 ("Muse-review", "advanced_review", "muse"))
+        for profile, role, harness in cases:
+            with self.subTest(profile=profile, role=role, harness=harness):
+                self.activate(profile)
+                task_bytes = (f"Approved purpose for {profile}/{role}.\r\n"
+                              "Preserve this exact line ending and unicode: ✓.\r\n").encode("utf-8")
+                brief = self.root / f"{profile}-{role}-brief.txt"
+                brief.write_bytes(task_bytes)
+                plan = self.plan(repo, repairing_previous_fix=role == "advanced_review")
+                configured_choice = self.call("resolve", "--role", role, "--slot", "1")
+                args = ["dispatch", "--role", role, "--slot", "1", "--cwd", str(repo),
+                        "--task-file", str(brief), "--review-plan", plan["id"]]
+                if role == "advanced_review":
+                    approval = self.call("approve-review", plan["id"], "--authorization",
+                                         "Fixture authority approved this review.")
+                    args.extend(("--approval", approval["id"]))
+                capture, env = self.fake_native_provider(harness)
+                result = self.run_cli(env, *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                received = json.loads(capture.read_text())
+                task_text = task_bytes.decode("utf-8")
+                expected = (mp.DELEGATION + " Use the current researcher role for authorized research. "
+                            "Verify its findings.\n\n" +
+                            mp.reviewer_guidance.compose_reviewer_prompt(role, task_text))
+                self.assertEqual(received["prompt"], expected)
+                self.assertTrue(received["prompt"].endswith(task_text))
+                launch_id = json.loads(result.stdout)["launch"]
+                launch = self.app.state(f"launches/{launch_id}", None)
+                self.assertEqual(launch["choice"]["role"], role)
+                self.assertEqual(launch["choice"], configured_choice)
+                self.assertEqual(launch["task_digest"], mp.hashlib.sha256(task_bytes).hexdigest())
+                self.assertEqual(brief.read_bytes(), task_bytes)
+                if harness == "claude":
+                    self.assertEqual(received["argv"][0], "-p")
+                elif harness == "muse":
+                    self.assertEqual(received["argv"][0], "exec")
+                    self.assertEqual(received["argv"][received["argv"].index("--contributor-mode") + 1], "on")
+                else:
+                    self.assertEqual(received["argv"][0], "exec")
+
+    def test_real_cli_light_cycle_dispatch_composes_guidance_after_slot_resolution(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        plan = self.light_plan(repo, target, "review-guidance-first-cycle")
+        cycle = self.target_state(target)["cycles"][0]
+        task_bytes = b"Review the approved cycle scope.\r\n"
+        brief = self.root / "light-cycle-review.txt"
+        brief.write_bytes(task_bytes)
+        capture, env = self.fake_native_provider("codex")
+        result = self.run_cli(env, "dispatch", "--role", "standard_review", "--slot", "1",
+                              "--cwd", str(repo), "--task-file", str(brief), "--review-plan", plan["id"],
+                              "--review-target", target, "--review-cycle", cycle["id"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        received = json.loads(capture.read_text())
+        task_text = task_bytes.decode()
+        expected = (mp.DELEGATION + " Use the current researcher role for authorized research. "
+                    "Verify its findings.\n\n" +
+                    mp.reviewer_guidance.compose_reviewer_prompt("standard_review", task_text))
+        self.assertEqual(received["prompt"], expected)
+        self.assertTrue(received["prompt"].endswith(task_text))
+        launch_id = json.loads(result.stdout)["launch"]
+        launch = self.app.state(f"launches/{launch_id}", None)
+        self.assertEqual(launch["task_digest"], mp.hashlib.sha256(task_bytes).hexdigest())
+        self.assertEqual(launch["review_cycle"]["cycle_id"], cycle["id"])
+        self.assertEqual(launch["review_cycle"]["slot"], 1)
+        self.assertEqual((launch["choice"]["model"], launch["choice"]["effort"]),
+                         ("gpt-6.1-sol", "high"))
+
+    def test_real_cli_nonreview_prompt_is_unchanged_and_review_checks_precede_provider(self):
+        repo = self.repo()
+        self.activate("Codex-only")
+        capture, env = self.fake_native_provider("codex")
+        task_bytes = b"Unchanged implementer assignment.\r\n"
+        brief = self.root / "implementer-brief.txt"
+        brief.write_bytes(task_bytes)
+        result = self.run_cli(env, "dispatch", "--role", "implementer", "--cwd", str(repo),
+                              "--task-file", str(brief))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        received = json.loads(capture.read_text())
+        self.assertEqual(received["prompt"], mp.DELEGATION +
+                         " Use the current researcher role for authorized research. Verify its findings.\n\n" +
+                         task_bytes.decode())
+        launch = self.app.state(f"launches/{json.loads(result.stdout)['launch']}", None)
+        self.assertEqual(launch["task_digest"], mp.hashlib.sha256(task_bytes).hexdigest())
+
+        capture.unlink()
+        review_brief = self.root / "unplanned-review.txt"
+        review_brief.write_text("Review without an approved plan.")
+        refused = self.run_cli(env, "dispatch", "--role", "standard_review", "--slot", "1",
+                               "--cwd", str(repo), "--task-file", str(review_brief))
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("requires a review-plan", refused.stderr)
+        self.assertFalse(capture.exists())
+
+        plan = self.plan(repo, repairing_previous_fix=True)
+        refused = self.run_cli(env, "dispatch", "--role", "advanced_review", "--slot", "1",
+                               "--cwd", str(repo), "--task-file", str(review_brief),
+                               "--review-plan", plan["id"])
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("explicit permission", refused.stderr)
+        self.assertFalse(capture.exists())
+
+        config = self.app.config()
+        config["models"]["opencode-review"] = {
+            "harness": "opencode", "provider_id": "fixture-provider", "slug": "fixture-review-model",
+            "efforts": ["max"], "source": "synthetic unsupported-review route fixture"}
+        opencode_profile = json.loads(json.dumps(config["profiles"]["Codex-only"]))
+        opencode_profile["standard_review"] = [{"model": "opencode-review", "effort": "max"}]
+        opencode_profile["advanced_review"] = [{"model": "opencode-review", "effort": "max"}]
+        config["profiles"]["OpenCode-review"] = opencode_profile
+        mp.write(self.app.config_path, config)
+        self.activate("OpenCode-review")
+        plan = self.plan(repo)
+        refused = self.run_cli(env, "dispatch", "--role", "standard_review", "--slot", "1",
+                               "--cwd", str(repo), "--task-file", str(review_brief),
+                               "--review-plan", plan["id"], "--opencode-manifest", str(self.root / "unused.json"))
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("OpenCode dispatch supports", refused.stderr)
+        self.assertFalse(capture.exists())
+
+    def test_review_guidance_cli_prints_without_config_or_state(self):
+        config_dir = self.root / "print-config-does-not-exist"
+        state_dir = self.root / "print-state-does-not-exist"
+        result = subprocess.run([sys.executable, str(SCRIPT), "--config-dir", str(config_dir),
+                                 "--state-dir", str(state_dir), "review-guidance", "--print"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, mp.reviewer_guidance.REVIEWER_GUIDANCE)
+        self.assertFalse(config_dir.exists())
+        self.assertFalse(state_dir.exists())
 
     def test_money_and_timezone_paths_trigger_even_one_file(self):
         self.activate(); repo = self.repo()

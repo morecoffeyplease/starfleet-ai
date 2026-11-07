@@ -134,6 +134,25 @@ The tool does not retry a launch whose state is missing, active, failed without 
 Standard-review cycles do not change advanced-review approval rules.
 Other profiles keep their configured standard-review behavior and do not require target or cycle IDs.
 
+### Reviewer judgment guidance
+
+Model Preferences prepends its maintained reviewer judgment guidance when `dispatch` launches a configured `standard_review` or `advanced_review` role through the Codex, Claude, or Muse CLI.
+This includes standard reviews selected through the `claude-codex-light` target and cycle workflow.
+`resume` applies the same guidance to recorded Codex reviewer continuations after the existing scope, plan and approval checks pass.
+OpenCode reviewer dispatch remains unsupported.
+
+The complete task file stays unchanged at the end of the composed prompt, and launch task digests continue to identify the original file bytes.
+The parent brief must supply the approved PR purpose and relevant repair history.
+The guidance asks the reviewer to ask the parent when that context is materially missing.
+
+Print the same maintained text used by those launch routes with `model-preferences review-guidance --print`.
+The command works without reading or creating Model Preferences configuration, state or locks.
+Supply the complete parent brief, including the approved purpose and relevant repair history, as the task file to automatic `dispatch` and supported Codex `resume`; those routes add the maintained guidance automatically.
+Manual native launches and other routes that bypass Model Preferences dispatch or Codex resume do not receive the guidance automatically.
+For those routes, include the printed guidance and the complete parent brief in the prompt.
+The Pattern Buffer adapter remains limited to Claude and Codex implementers and does not add reviewer task replay.
+Installed hooks and source configuration are not evidence that a reviewer received the text; confirm reception in an exact native pilot.
+
 Pattern Buffer can provide exact task replay to temporary worktrees.
 Use the --pattern-buffer script option and owner worktree only when the child should share that owner's approved context.
 This adapter does not transfer task ownership or grant a broader sandbox.
