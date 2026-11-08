@@ -52,7 +52,9 @@ discord-watch doctor
 
 Use `--harness codex` and the exact `CODEX_THREAD_ID` for a Codex recipient.
 OpenCode registration, `managed`, `close`, and `receive` verify the exact Hailing Frequencies owner identity without checking composer readiness.
-Automatic wake checks the exact surface, session, workspace, hook generation, receiving settings, and native input state separately.
+Claude and Codex owner commands and Discord reply wakes check the exact live surface, session, workspace, hook generation, and all three native receiving settings.
+They do not read `surface.input_state`, so draft and unknown composer or prompt lifecycle states do not hold a Discord reply wake or the exact owner's `receive` command.
+Ordinary Hailing Frequencies prompts keep the strict empty-composer and no-human-input guard.
 The default `native_empty_composer` policy requires an explicitly empty composer with no human-input obligation.
 For OpenCode only, an explicitly selected `api_sidechannel` policy may also accept `draft` or `unknown` classifications when there is no blocking input or human-input obligation and all other native, API, lifecycle, receiving, and owner guards pass.
 The command must run in the recipient's own CMUX session with its normal `CMUX_AGENT_LAUNCH_KIND`, session ID, and `CMUX_SURFACE_ID` environment.
