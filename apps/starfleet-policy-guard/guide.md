@@ -85,6 +85,7 @@ The current delivery seat does not enforce fix rounds, and this guide does not c
 Prime Directive (Policy Guard) is the same delivery tool described by this guide and the `lane.py` CLI.
 This optional protocol binds one opening or accepted repair-batch attestation to the existing evidence packet and current PR binding.
 The human owner selects and rereads the applicable guidance, playbooks, principles and repository fix-guidance before editing the packet.
+The evidence packet may be authored manually before a PR exists, while the current renderer and publication check require the published owner-bound PR binding.
 For each reread file, record its kind, name, actual source reference, local path and SHA-256 of its current bytes.
 Use navigable source references, such as a public file URL pinned to a commit, and record installed-only files by their actual path and digest.
 The validator checks the declared local bytes, packet fields, gaps and stage ordering; it cannot prove comprehension, sound judgment or that every applicable source was declared.
@@ -124,8 +125,9 @@ Do not fill unknowns with assumptions or claim future repair verification is com
 }
 ```
 
-An opening render requires a current clean report with every enabled canonical delivery check satisfied.
-Its body presents the approach and completed evidence first, then ends with the attestation.
+An opening render requires a current clean report with successful canonical verification evidence, including a valid nothing-affected outcome when applicable.
+Unrelated report gaps remain independent from the mandatory opening-attestation prerequisite.
+Its body presents the approach, completed evidence, reread references, scope, holds, assumptions and uncertainty before ending with the attestation.
 A repair-batch render does not require the final candidate report, begins with its completed prerequisite attestation, and never claims future fix verification passed.
 Both bodies include the exact statement: `I have chosen the simplest viable approach that meets the approved outcome and constraints, and kept the solution proportionate to the problem it solves.`
 Support that statement with the concrete design choice and why a smaller change would not suffice where relevant; do not invent an alternative to fill a template.

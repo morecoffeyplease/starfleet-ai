@@ -97,18 +97,37 @@ class DeliveryTest(unittest.TestCase):
         after = {str(p.relative_to(self.repo)): p.read_bytes() for p in self.repo.rglob('*') if p.is_file()}
         self.assertEqual(before, after)
 
-    def test_opening_attestation_is_last_and_requires_complete_clean_evidence(self):
+    def test_opening_attestation_allows_unrelated_gaps_but_requires_clean_canonical_verification(self):
         self.data['guidance_attestation'] = self.guidance_attestation()
         report = self.report()
         packet = json.loads(self.packet.read_text())
         rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', report)
         self.assertIn(delivery.GUIDANCE_ATTESTATION_STATEMENT, rendered['body'])
         self.assertLess(rendered['body'].index('## Approach'), rendered['body'].index('## Opening attestation'))
-        self.assertTrue(rendered['body'].rstrip().endswith('- The remote comment remains readable at the next check.'))
+        self.assertLess(rendered['body'].index('## Material uncertainty'), rendered['body'].index('## Opening attestation'))
+        self.assertTrue(rendered['body'].rstrip().endswith(delivery.GUIDANCE_ATTESTATION_STATEMENT))
+
+        self.data['main-awareness']['evidence']['sha256'] = '0' * 64
+        unrelated_gap = self.report()
+        self.assertEqual(unrelated_gap['missing'], 1)
+        self.assertEqual(self.item('local-verification', unrelated_gap)['status'], 'satisfied')
+        packet = json.loads(self.packet.read_text())
+        rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', unrelated_gap)
+        self.assertIn(delivery.GUIDANCE_ATTESTATION_STATEMENT, rendered['body'])
+
+        self.data['main-awareness']['evidence']['sha256'] = self.artifact('main-review.txt', 'Compared target changes')['sha256']
+        self.data['local-verification']['outcome'] = 'nothing-affected'
+        self.data['local-verification']['nothing_affected_reason'] = 'The canonical runner reported no affected targets'
+        nothing_affected = self.report()
+        self.assertEqual(self.item('local-verification', nothing_affected)['status'], 'satisfied')
+        packet = json.loads(self.packet.read_text())
+        delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', nothing_affected)
+
         self.data['local-verification']['exit_code'] = 1
         incomplete = self.report()
         packet = json.loads(self.packet.read_text())
-        with self.assertRaisesRegex(ValueError, 'current clean report'):
+        self.assertEqual(self.item('local-verification', incomplete)['status'], 'missing')
+        with self.assertRaisesRegex(ValueError, 'successful canonical verification'):
             delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', incomplete)
 
     def test_repair_attestation_precedes_work_without_requiring_final_report(self):

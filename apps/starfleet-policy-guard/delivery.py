@@ -144,10 +144,8 @@ def guidance_attestation(packet, directory, pr_url, stage=None):
 def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
     """Render the approved stage ordering and return digests for the exact body."""
     record = guidance_attestation(packet, directory, pr_url, stage)
-    if stage == 'opening' and (not isinstance(report, dict) or report.get('missing') != 0 or
-                               not isinstance(report.get('snapshot'), dict) or
-                               report['snapshot'].get('clean') is not True):
-        raise ValueError('Opening attestation requires a current clean report with every enabled canonical check satisfied')
+    if stage == 'opening' and not opening_report_ready(report):
+        raise ValueError('Opening attestation requires a current clean report with successful canonical verification')
 
     def lines(values):
         return '\n'.join('- ' + value for value in values) if values else '- None recorded'
@@ -160,10 +158,6 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
             record['approach'] + '\n\nReason: ' + record['approach_reason'],
             '## Completed evidence',
             lines(record['evidence_refs']),
-            '## Opening attestation',
-            GUIDANCE_ATTESTATION_STATEMENT,
-            'Guidance application: ' + record['guidance_application'],
-            issue_line,
         ]
     else:
         sections = [
@@ -195,11 +189,26 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
     if stage == 'repair_batch':
         sections.insert(sections.index('## Scope and holds') + 1,
                         'Existing repair history: ' + record['repair_history_ref'])
+    else:
+        sections.extend([
+            '## Opening attestation',
+            'Guidance application: ' + record['guidance_application'],
+            issue_line,
+            GUIDANCE_ATTESTATION_STATEMENT,
+        ])
     body = '\n\n'.join(sections).rstrip()
     attestation_bytes = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
     return {'stage': stage, 'body': body,
             'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
             'attestation_sha256': hashlib.sha256(attestation_bytes).hexdigest()}
+
+
+def opening_report_ready(report):
+    if (not isinstance(report, dict) or not isinstance(report.get('snapshot'), dict) or
+            report['snapshot'].get('clean') is not True or not isinstance(report.get('items'), list)):
+        return False
+    return any(item.get('id') == 'local-verification' and item.get('status') == 'satisfied'
+               for item in report.get('items', []) if isinstance(item, dict))
 
 
 def candidate(record, current, cwd):

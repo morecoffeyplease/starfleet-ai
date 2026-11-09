@@ -1410,15 +1410,21 @@ class LaneInstallTest(unittest.TestCase):
         source = self.source_checkout('published-guidance-attestation')
         owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
         plan = self.install_from_source(source, lane=True, lane_pr_url=self.url, env=owner_env)
+        self.call_source(source, 'discover', env=owner_env)
+        packet = json.loads(self.packet.read_text())
+        packet['base_ref'] = lane_runtime.read(self.repo)['base_ref']
+        self.packet.write_text(json.dumps(packet))
         legacy_report = json.loads(self.call_source(source, 'record', '--evidence', self.packet,
                                                     '--format', 'json', env=owner_env).stdout)
         self.assertGreater(legacy_report['missing'], 0)
         legacy_ready = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
         self.assertEqual(legacy_ready.returncode, 0, legacy_ready.stderr)
-        self.assertNotIn('attestation_required', lane_runtime.read(self.repo))
+        discovered_state = lane_runtime.read(self.repo)
+        self.assertNotIn('attestation_required', discovered_state)
         evidence = self.base / 'owner-guidance.md'
         evidence.write_text('The selected current guidance.')
         packet = json.loads(self.packet.read_text())
+        packet['base_ref'] = discovered_state['base_ref']
         packet['guidance_attestation'] = {
             'version': 1, 'stage': 'repair_batch',
             'issue_ref': 'https://fixture.invalid/starfleet/guard/issues/37',

@@ -471,8 +471,8 @@ def attestation_start_check(args):
             report = delivery_runs.check(state.get('receipt'), args.cwd, state['pr_url'])
             if report['snapshot']['base_ref'] != state['base_ref']:
                 raise ValueError('Opening attestation report must match the current PG target binding')
-            if report.get('missing') != 0 or report['snapshot'].get('clean') is not True:
-                raise ValueError('Opening attestation requires a current clean PG report with every enabled canonical check satisfied')
+            if not delivery.opening_report_ready(report):
+                raise ValueError('Opening attestation requires a current clean PG report with successful canonical verification')
         stage = args.stage.replace('-', '_')
         rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
                                                         stage, report=report)

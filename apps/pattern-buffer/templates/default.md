@@ -67,12 +67,11 @@
    Re-pull before editing; coordinate with other tracker owners.
 2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
 
-**Issue opening and accepted repair batches:**
-- Before opening a PR or starting an accepted repair batch, follow the [Prime Directive (Policy Guard) published guidance attestation guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#published-guidance-attestations), which is the same tool documented as Policy Guard in its CLI.
-- Reread every applicable guidance, playbook, principle and repository fix-guidance file, record its current source reference and file digest, connect it to the approach and deciding evidence, and preserve material assumptions, uncertainty, scope and holds.
-- Render the matching opening or repair-batch attestation, publish its exact body with the normal explicit `gh pr comment --body-file` command, complete its prerequisites, then run `attestation-start-check` from the actual owner session; use `--enable` only for first owner-coordinated adoption.
-- Once adopted, covered ready and merge actions refuse missing, stale, incomplete or mismatched attestations; the guard checks source bytes and performs a bounded authenticated read of the exact published comment.
-- The notice arrives through Pattern Buffer's existing SessionStart standing-context injection and does not detect issues or repair batches; this does not intercept raw push, PR creation, comment editing, web/API actions, GitHub Actions or alternate starts.
+**PR openings and accepted repair batches:**
+- Follow the [Prime Directive (Policy Guard) guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#published-guidance-attestations); it documents the same `lane.py` tool.
+- Reread applicable guidance, playbooks, principles and repository fix guidance; record references, digests and their effect on approach, evidence, uncertainty, scope and holds.
+- Resolve prerequisite gaps, render and manually publish the exact stage attestation, then run `attestation-start-check` as owner (`--enable` only for first adoption); adopted ready/merge actions require a current match.
+- This existing SessionStart notice detects no issue or batch and does not intercept push, PR/comment writes, web/API, GitHub Actions or alternate starts.
 
 **Repair rounds: don't spiral**
 - Use the existing PR or tracker to record dispositions, evidence, and cumulative rounds.
