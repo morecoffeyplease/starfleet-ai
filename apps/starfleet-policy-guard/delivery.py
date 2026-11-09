@@ -15,6 +15,10 @@ POLICY = Path(__file__).resolve().parent / 'config/delivery-checklist.json'
 CHECKS = ('design-fidelity', 'main-awareness', 'merge-conflicts', 'local-verification')
 SKILLS = ('design-fidelity-audit', 'fidelity-audit')
 ERRORS = (ValueError, OSError, TypeError, AttributeError, KeyError)
+GUIDANCE_ATTESTATION_STATEMENT = (
+    'I have chosen the simplest viable approach that meets the approved outcome and constraints, '
+    'and kept the solution proportionate to the problem it solves.'
+)
 
 
 class Gaps:
@@ -93,6 +97,109 @@ def artifact(record, directory):
     if digest != text(record, 'sha256'):
         raise ValueError('Evidence hash changed: ' + str(path))
     return path
+
+
+def guidance_attestation(packet, directory, pr_url, stage=None):
+    """Validate the one human-authored stage attestation in an evidence packet."""
+    record = packet.get('guidance_attestation')
+    if not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1:
+        raise ValueError('Evidence packet needs a version 1 guidance_attestation object')
+    if record.get('stage') not in ('opening', 'repair_batch') or (stage and record['stage'] != stage):
+        raise ValueError('Guidance attestation must identify the requested opening or repair_batch stage')
+    issue_ref = text(record, 'issue_ref')
+    issue = github.reference(issue_ref, 'issues')
+    pull = github.reference(pr_url, 'pull')
+    if issue['repo'].casefold() != pull['repo'].casefold():
+        raise ValueError('Guidance issue and bound pull request must identify the same repository')
+    if record['stage'] == 'repair_batch':
+        text(record, 'accepted_batch_ref')
+        text(record, 'repair_history_ref')
+    elif record.get('accepted_batch_ref'):
+        raise ValueError('An opening attestation cannot claim an accepted repair batch')
+    if record.get('prerequisites_complete') is not True:
+        raise ValueError('Guidance prerequisites are not explicitly complete')
+    gaps = record.get('gaps')
+    if not isinstance(gaps, list) or gaps:
+        raise ValueError('Guidance attestation has unresolved prerequisite gaps')
+    for key in ('guidance_application', 'approach', 'approach_reason', 'approved_scope_ref', 'human_holds_ref'):
+        text(record, key)
+    for key in ('evidence_refs', 'assumptions', 'uncertainty'):
+        values = record.get(key)
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError('Guidance attestation.' + key + ' must be an explicit list of nonempty values')
+    if not record['evidence_refs']:
+        raise ValueError('Guidance attestation must link the deciding evidence')
+    sources = record.get('reread')
+    if not isinstance(sources, list) or not sources:
+        raise ValueError('Guidance attestation must list the guidance files actually reread')
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            raise ValueError('Guidance reread entry ' + str(index) + ' must be an object')
+        for key in ('kind', 'name', 'source_ref'):
+            text(source, key)
+        artifact(source, directory)
+    return record
+
+
+def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
+    """Render the approved stage ordering and return digests for the exact body."""
+    record = guidance_attestation(packet, directory, pr_url, stage)
+    if stage == 'opening' and (not isinstance(report, dict) or report.get('missing') != 0 or
+                               not isinstance(report.get('snapshot'), dict) or
+                               report['snapshot'].get('clean') is not True):
+        raise ValueError('Opening attestation requires a current clean report with every enabled canonical check satisfied')
+
+    def lines(values):
+        return '\n'.join('- ' + value for value in values) if values else '- None recorded'
+
+    issue_line = 'Issue: ' + record['issue_ref']
+    if stage == 'opening':
+        sections = [
+            '# Proposed PR opening',
+            '## Approach',
+            record['approach'] + '\n\nReason: ' + record['approach_reason'],
+            '## Completed evidence',
+            lines(record['evidence_refs']),
+            '## Opening attestation',
+            GUIDANCE_ATTESTATION_STATEMENT,
+            'Guidance application: ' + record['guidance_application'],
+            issue_line,
+        ]
+    else:
+        sections = [
+            '# Accepted repair-batch attestation',
+            GUIDANCE_ATTESTATION_STATEMENT,
+            issue_line,
+            'Accepted batch: ' + record['accepted_batch_ref'],
+            '## Prerequisites completed before work',
+            'Prerequisites are complete; no gaps are recorded.',
+            '## Approach',
+            record['approach'] + '\n\nReason: ' + record['approach_reason'],
+            'Guidance application: ' + record['guidance_application'],
+        ]
+    source_lines = [
+        source['kind'] + ': ' + source['name'] + ' (' + source['source_ref'] + '; ' +
+        str(artifact(source, directory)) + '@sha256:' + source['sha256'] + ')'
+        for source in record['reread']
+    ]
+    sections.extend([
+        '## Guidance reread',
+        lines(source_lines),
+        '## Scope and holds',
+        'Approved scope: ' + record['approved_scope_ref'] + '\n\nHuman holds: ' + record['human_holds_ref'],
+        '## Material assumptions',
+        lines(record['assumptions']),
+        '## Material uncertainty',
+        lines(record['uncertainty']),
+    ])
+    if stage == 'repair_batch':
+        sections.insert(sections.index('## Scope and holds') + 1,
+                        'Existing repair history: ' + record['repair_history_ref'])
+    body = '\n\n'.join(sections).rstrip()
+    attestation_bytes = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
+    return {'stage': stage, 'body': body,
+            'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
+            'attestation_sha256': hashlib.sha256(attestation_bytes).hexdigest()}
 
 
 def candidate(record, current, cwd):

@@ -1,5 +1,6 @@
 """Delivery-only installation preserves other controls and probes never publish."""
 
+import copy
 import hashlib
 import json
 import os
@@ -75,6 +76,9 @@ class LaneInstallTest(unittest.TestCase):
                           '  branch=unquote(sys.argv[-1].split("/git/ref/heads/")[1])\n'
                           '  primary=next(iter(data["records"].values())) if "records" in data else data\n'
                           '  print(json.dumps(data.get("target_response", {"ref":"refs/heads/"+branch,"object":{"type":"commit","sha":data.get("target_head",primary["base"]["sha"])}})))\n'
+                          ' elif "/issues/comments/" in sys.argv[-1]:\n'
+                          '  if data.get("comment_error"): sys.exit(1)\n'
+                          '  print(json.dumps(data["comments"][sys.argv[-1].split("/")[-1]]))\n'
                           ' else: print(json.dumps(data["records"][sys.argv[-1].split("/")[-1]] if "records" in data else data))\n'
                           'else:\n'
                           ' with open(os.environ["FAKE_LANE_FORWARDED"],"a") as f:\n'
@@ -266,6 +270,9 @@ class LaneInstallTest(unittest.TestCase):
 
     def record(self):
         return json.loads(self.call('record', '--evidence', self.packet, '--format', 'json').stdout)
+
+    def invoke_owner(self, env, *args):
+        return subprocess.run([str(self.adapter), *args], cwd=self.repo, env=env, capture_output=True, text=True)
 
     def invoke(self, *args, cwd=None):
         return subprocess.run([str(self.adapter), *args], cwd=cwd or self.repo, env=self.env, capture_output=True, text=True)
@@ -1398,6 +1405,135 @@ class LaneInstallTest(unittest.TestCase):
         self.packet.write_text(json.dumps({'pr_url': self.url, 'base_ref': 'main', 'design-fidelity': {'applicable': True}}))
         self.assertEqual(self.call('record', '--evidence', self.packet, ok=False).returncode, 2)
         self.assertIsNone(json.loads(self.call('status').stdout)['receipt'])
+
+    def test_published_guidance_attestation_requires_owner_current_packet_and_exact_remote_comment(self):
+        source = self.source_checkout('published-guidance-attestation')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        plan = self.install_from_source(source, lane=True, lane_pr_url=self.url, env=owner_env)
+        legacy_report = json.loads(self.call_source(source, 'record', '--evidence', self.packet,
+                                                    '--format', 'json', env=owner_env).stdout)
+        self.assertGreater(legacy_report['missing'], 0)
+        legacy_ready = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(legacy_ready.returncode, 0, legacy_ready.stderr)
+        self.assertNotIn('attestation_required', lane_runtime.read(self.repo))
+        evidence = self.base / 'owner-guidance.md'
+        evidence.write_text('The selected current guidance.')
+        packet = json.loads(self.packet.read_text())
+        packet['guidance_attestation'] = {
+            'version': 1, 'stage': 'repair_batch',
+            'issue_ref': 'https://fixture.invalid/starfleet/guard/issues/37',
+            'accepted_batch_ref': 'https://fixture.invalid/starfleet/guard/issues/37#accepted-batch-1',
+            'repair_history_ref': 'https://fixture.invalid/starfleet/guard/pull/901#issuecomment-1',
+            'prerequisites_complete': True, 'gaps': [],
+            'reread': [{'kind': 'playbook', 'name': 'Current repair playbook',
+                        'source_ref': 'https://fixture.invalid/starfleet/guard/blob/abc/playbook.md',
+                        'path': str(evidence), 'sha256': hashlib.sha256(evidence.read_bytes()).hexdigest()}],
+            'guidance_application': 'The playbook keeps this batch within the approved target.',
+            'approach': 'Keep the existing PR packet and owner lane.',
+            'approach_reason': 'A smaller note would not be checked on the covered ready path.',
+            'evidence_refs': ['Existing issue evidence and the current PG packet.'],
+            'assumptions': [], 'uncertainty': ['GitHub comment reads may be unavailable.'],
+            'approved_scope_ref': 'https://fixture.invalid/starfleet/guard/issues/37#approved-scope',
+            'human_holds_ref': 'No additional hold is recorded.',
+        }
+        self.packet.write_text(json.dumps(packet))
+        rendered = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                    '--stage', 'repair-batch', env=owner_env).stdout
+        comment_id = 1001
+        comment_url = self.url + '#issuecomment-' + str(comment_id)
+        self.remote['comments'] = {str(comment_id): {
+            'id': comment_id, 'html_url': comment_url,
+            'issue_url': 'https://api.fixture.invalid/repos/starfleet/guard/issues/901', 'body': 'old body'}}
+        self.remote_path.write_text(json.dumps(self.remote))
+
+        # A legacy attachment remains unmodified until its owner uses --enable.
+        before = lane_runtime.read(self.repo)
+        self.assertNotIn('attestation_required', before)
+        skipped = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                   '--stage', 'repair-batch', '--comment-url', comment_url,
+                                   env=owner_env, ok=False)
+        self.assertEqual(skipped.returncode, 2)
+        self.assertNotIn('attestation_required', lane_runtime.read(self.repo))
+
+        wrong_actor = dict(owner_env, CODEX_THREAD_ID='codex-other-session')
+        denied_actor = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                        '--stage', 'repair-batch', '--comment-url', comment_url, '--enable',
+                                        env=wrong_actor, ok=False)
+        self.assertIn('belongs to another native session', denied_actor.stderr)
+        wrong_pr = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                    '--stage', 'repair-batch', '--comment-url',
+                                    'https://fixture.invalid/starfleet/guard/pull/902#issuecomment-1001',
+                                    '--enable', env=owner_env, ok=False)
+        self.assertIn('currently bound pull request', wrong_pr.stderr)
+        self.remote['base']['ref'] = 'other-target'
+        self.remote_path.write_text(json.dumps(self.remote))
+        wrong_target = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                        '--stage', 'repair-batch', '--comment-url', comment_url, '--enable',
+                                        env=owner_env, ok=False)
+        self.assertIn('branch and target must agree', wrong_target.stderr)
+        self.remote['base']['ref'] = 'main'
+        self.remote_path.write_text(json.dumps(self.remote))
+        self.remote['comments'][str(comment_id)]['issue_url'] = 'https://api.fixture.invalid/repos/starfleet/guard/issues/902'
+        self.remote_path.write_text(json.dumps(self.remote))
+        wrong_membership = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                            '--stage', 'repair-batch', '--comment-url', comment_url, '--enable',
+                                            env=owner_env, ok=False)
+        self.assertIn('does not belong to the currently bound pull request', wrong_membership.stderr)
+        self.remote['comments'][str(comment_id)]['issue_url'] = 'https://api.fixture.invalid/repos/starfleet/guard/issues/901'
+        self.remote['comment_error'] = True
+        self.remote_path.write_text(json.dumps(self.remote))
+
+        unavailable = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                       '--stage', 'repair-batch', '--comment-url', comment_url, '--enable',
+                                       env=owner_env, ok=False)
+        self.assertIn('GitHub GET failed', unavailable.stderr)
+        self.assertNotIn('attestation_required', lane_runtime.read(self.repo))
+
+        self.remote.pop('comment_error')
+        self.remote['comments'][str(comment_id)]['body'] = rendered
+        self.remote_path.write_text(json.dumps(self.remote))
+        started = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                   '--stage', 'repair-batch', '--comment-url', comment_url, '--enable', env=owner_env)
+        self.assertEqual(json.loads(started.stdout)['status'], 'published_attestation_current')
+        adopted = lane_runtime.read(self.repo)
+        self.assertIs(adopted['attestation_required'], True)
+        self.assertEqual(adopted['guidance_attestation_ref']['comment_url'], comment_url)
+        other_owner = copy.deepcopy(adopted)
+        other_owner['lane_owner']['session_id'] = 'codex-successor-session'
+        with self.assertRaisesRegex(ValueError, 'previous native owner'):
+            lane_runtime.require_guidance_attestation(other_owner, self.repo)
+        other_pr = copy.deepcopy(adopted)
+        other_pr['pr_url'] = self.url.replace('901', '902')
+        with self.assertRaisesRegex(ValueError, 'different PR binding'):
+            lane_runtime.require_guidance_attestation(other_pr, self.repo)
+        other_target = copy.deepcopy(adopted)
+        other_target['base_ref'] = 'release'
+        with self.assertRaisesRegex(ValueError, 'different branch or target binding'):
+            lane_runtime.require_guidance_attestation(other_target, self.repo)
+
+        self.call_source(source, 'record', '--evidence', self.packet, env=owner_env)
+        current = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(current.returncode, 0, current.stderr)
+        old_receipt = lane_runtime.read(self.repo)['receipt']
+
+        evidence.write_text('Changed source after publication.')
+        stale_source = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(stale_source.returncode, 2)
+        self.assertIn('Evidence hash changed', stale_source.stderr)
+        self.assertEqual(lane_runtime.read(self.repo)['receipt'], old_receipt)
+        evidence.write_text('The selected current guidance.')
+
+        self.remote['comments'][str(comment_id)]['body'] = 'edited remotely'
+        self.remote_path.write_text(json.dumps(self.remote))
+        edited = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(edited.returncode, 2)
+        self.assertIn('edited or no longer matches', edited.stderr)
+        self.remote['comment_error'] = True
+        self.remote_path.write_text(json.dumps(self.remote))
+        unavailable_check = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(unavailable_check.returncode, 2)
+        self.assertIn('GitHub GET failed', unavailable_check.stderr)
+        self.assertEqual(lane_runtime.read(self.repo)['receipt'], old_receipt)
 
     def test_rollback_restores_exact_original_and_retains_passthrough_adapter(self):
         self.install()

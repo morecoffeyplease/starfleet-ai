@@ -67,6 +67,25 @@ class DeliveryTest(unittest.TestCase):
         self.packet.write_text(json.dumps(self.data if data is None else data))
         return delivery.report(self.repo, 'main', self.url, self.packet, policy or delivery.POLICY)
 
+    def guidance_attestation(self, stage='opening'):
+        accepted = ({'accepted_batch_ref': 'https://github.com/example/repo/issues/37#accepted-batch-2',
+                     'repair_history_ref': 'https://github.com/example/repo/pull/1#issuecomment-9'}
+                    if stage == 'repair_batch' else {})
+        return {
+            'version': 1, 'stage': stage, 'issue_ref': 'https://github.com/example/repo/issues/37',
+            **accepted, 'prerequisites_complete': True, 'gaps': [],
+            'reread': [{'kind': 'playbook', 'name': 'Feature playbook',
+                        'source_ref': 'https://github.com/example/repo/blob/abc/playbook.md',
+                        **self.artifact('guidance.md', 'Current reviewed guidance')}],
+            'guidance_application': 'The playbook limits the change to the validated delivery path.',
+            'approach': 'Reuse the existing evidence packet and owner-bound delivery lane.',
+            'approach_reason': 'A narrower change would leave the approved readiness path without the current check.',
+            'evidence_refs': ['main-awareness.evidence at main-review.txt'],
+            'assumptions': [], 'uncertainty': ['The remote comment remains readable at the next check.'],
+            'approved_scope_ref': 'https://github.com/example/repo/issues/37#issuecomment-1',
+            'human_holds_ref': 'No additional hold; issue 37 remains authoritative',
+        }
+
     def item(self, identifier, report=None):
         return next(x for x in (report or self.report())['items'] if x['id'] == identifier)
 
@@ -77,6 +96,48 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(self.item('design-fidelity', result)['status'], 'explicitly-not-applicable')
         after = {str(p.relative_to(self.repo)): p.read_bytes() for p in self.repo.rglob('*') if p.is_file()}
         self.assertEqual(before, after)
+
+    def test_opening_attestation_is_last_and_requires_complete_clean_evidence(self):
+        self.data['guidance_attestation'] = self.guidance_attestation()
+        report = self.report()
+        packet = json.loads(self.packet.read_text())
+        rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', report)
+        self.assertIn(delivery.GUIDANCE_ATTESTATION_STATEMENT, rendered['body'])
+        self.assertLess(rendered['body'].index('## Approach'), rendered['body'].index('## Opening attestation'))
+        self.assertTrue(rendered['body'].rstrip().endswith('- The remote comment remains readable at the next check.'))
+        self.data['local-verification']['exit_code'] = 1
+        incomplete = self.report()
+        packet = json.loads(self.packet.read_text())
+        with self.assertRaisesRegex(ValueError, 'current clean report'):
+            delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', incomplete)
+
+    def test_repair_attestation_precedes_work_without_requiring_final_report(self):
+        self.data['guidance_attestation'] = self.guidance_attestation('repair_batch')
+        self.report()
+        packet = json.loads(self.packet.read_text())
+        rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'repair_batch')
+        self.assertTrue(rendered['body'].startswith('# Accepted repair-batch attestation\n\n' +
+                                                     delivery.GUIDANCE_ATTESTATION_STATEMENT))
+        self.assertIn('Accepted batch: https://github.com/example/repo/issues/37#accepted-batch-2', rendered['body'])
+        self.assertNotIn('repair verification passed', rendered['body'].casefold())
+
+    def test_attestation_gaps_and_changed_reread_bytes_refuse(self):
+        attestation = self.guidance_attestation()
+        attestation['prerequisites_complete'] = False
+        self.data['guidance_attestation'] = attestation
+        self.report()
+        with self.assertRaisesRegex(ValueError, 'not explicitly complete'):
+            delivery.guidance_attestation(json.loads(self.packet.read_text()), self.packet.parent, self.url)
+        attestation['prerequisites_complete'] = True
+        attestation['gaps'] = ['Need a decision']
+        self.report()
+        with self.assertRaisesRegex(ValueError, 'unresolved prerequisite gaps'):
+            delivery.guidance_attestation(json.loads(self.packet.read_text()), self.packet.parent, self.url)
+        attestation['gaps'] = []
+        self.report()
+        (self.root / 'guidance.md').write_text('Changed reviewed guidance')
+        with self.assertRaisesRegex(ValueError, 'Evidence hash changed'):
+            delivery.guidance_attestation(json.loads(self.packet.read_text()), self.packet.parent, self.url)
 
     def test_missing_packet_cannot_produce_baseline_report(self):
         with self.assertRaisesRegex(ValueError, 'required before reporting'):

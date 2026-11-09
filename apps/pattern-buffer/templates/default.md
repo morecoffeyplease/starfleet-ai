@@ -53,7 +53,7 @@
 - Do not turn uncertainty into a blocker or call it disproved; investigate the cheapest decisive evidence, then defer unresolved claims explicitly.
 - Workers report new findings rather than expanding the batch.
 - If uncertainty remains after checking the deciding evidence, ask the user rather than guess or start a repair.
-- Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
+- Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full; Prime Directive and Policy Guard are names for the same tool.
 - Revisit the relevant rule before each repair decision.
 
 # implementer
@@ -66,6 +66,13 @@
 1. Re-read the mission, roadmap/tracker and current PRs’ issues IN FULL; reconcile actual checkout, PR heads/states, active work, evidence and human holds, don’t rely on assumptions; then update only this lane's tracker sections where facts changed.
    Re-pull before editing; coordinate with other tracker owners.
 2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
+
+**Issue opening and accepted repair batches:**
+- Before opening a PR or starting an accepted repair batch, follow the [Prime Directive (Policy Guard) published guidance attestation guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#published-guidance-attestations), which is the same tool documented as Policy Guard in its CLI.
+- Reread every applicable guidance, playbook, principle and repository fix-guidance file, record its current source reference and file digest, connect it to the approach and deciding evidence, and preserve material assumptions, uncertainty, scope and holds.
+- Render the matching opening or repair-batch attestation, publish its exact body with the normal explicit `gh pr comment --body-file` command, complete its prerequisites, then run `attestation-start-check` from the actual owner session; use `--enable` only for first owner-coordinated adoption.
+- Once adopted, covered ready and merge actions refuse missing, stale, incomplete or mismatched attestations; the guard checks source bytes and performs a bounded authenticated read of the exact published comment.
+- The notice arrives through Pattern Buffer's existing SessionStart standing-context injection and does not detect issues or repair batches; this does not intercept raw push, PR creation, comment editing, web/API actions, GitHub Actions or alternate starts.
 
 **Repair rounds: don't spiral**
 - Use the existing PR or tracker to record dispositions, evidence, and cumulative rounds.

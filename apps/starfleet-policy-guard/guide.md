@@ -80,6 +80,92 @@ Policy Guard does not import or authenticate that approval.
 This guidance does not change the fixture schema, round counting, or delivery-seat behavior.
 The current delivery seat does not enforce fix rounds, and this guide does not claim automated enforcement.
 
+## Published guidance attestations
+
+Prime Directive (Policy Guard) is the same delivery tool described by this guide and the `lane.py` CLI.
+This optional protocol binds one opening or accepted repair-batch attestation to the existing evidence packet and current PR binding.
+The human owner selects and rereads the applicable guidance, playbooks, principles and repository fix-guidance before editing the packet.
+For each reread file, record its kind, name, actual source reference, local path and SHA-256 of its current bytes.
+Use navigable source references, such as a public file URL pinned to a commit, and record installed-only files by their actual path and digest.
+The validator checks the declared local bytes, packet fields, gaps and stage ordering; it cannot prove comprehension, sound judgment or that every applicable source was declared.
+
+Add one `guidance_attestation` object to the existing evidence packet.
+Use `stage: "opening"` for the opening comment and `stage: "repair_batch"` for an accepted repair batch.
+Both stages require an exact `issue_ref`, explicit prerequisite completion and an empty `gaps` list, current `reread` file references, `guidance_application`, concrete `approach` and `approach_reason`, `evidence_refs`, explicit `assumptions` and `uncertainty` lists, and links to the approved scope and human holds.
+Repair batches also require `accepted_batch_ref` to identify the accepted batch and `repair_history_ref` to link existing repair history.
+Do not fill unknowns with assumptions or claim future repair verification is complete.
+
+```json
+{
+  "guidance_attestation": {
+    "version": 1,
+    "stage": "opening",
+    "issue_ref": "https://github.com/OWNER/REPO/issues/123",
+    "prerequisites_complete": true,
+    "gaps": [],
+    "reread": [
+      {
+        "kind": "playbook",
+        "name": "Applicable playbook",
+        "source_ref": "https://github.com/OWNER/REPO/blob/FULL_COMMIT/path/to/playbook.md",
+        "path": "/absolute/path/to/playbook.md",
+        "sha256": "CURRENT_FILE_SHA256"
+      }
+    ],
+    "guidance_application": "How the reread guidance shaped this approach and evidence.",
+    "approach": "The chosen concrete approach.",
+    "approach_reason": "Why this approach meets the outcome and why a smaller change would not suffice, where relevant.",
+    "evidence_refs": ["https://github.com/OWNER/REPO/pull/123/files"],
+    "assumptions": [],
+    "uncertainty": ["A material unresolved question, or an empty list when none remains."],
+    "approved_scope_ref": "https://github.com/OWNER/REPO/issues/123#approved-scope",
+    "human_holds_ref": "https://github.com/OWNER/REPO/issues/123#human-holds"
+  }
+}
+```
+
+An opening render requires a current clean report with every enabled canonical delivery check satisfied.
+Its body presents the approach and completed evidence first, then ends with the attestation.
+A repair-batch render does not require the final candidate report, begins with its completed prerequisite attestation, and never claims future fix verification passed.
+Both bodies include the exact statement: `I have chosen the simplest viable approach that meets the approved outcome and constraints, and kept the solution proportionate to the problem it solves.`
+Support that statement with the concrete design choice and why a smaller change would not suffice where relevant; do not invent an alternative to fill a template.
+
+Render the exact body without state writes, then post it yourself with the ordinary explicit GitHub CLI command.
+The start check only accepts the exact comment already published to the currently bound PR; it never creates, comments on or edits GitHub records.
+
+```sh
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree record \
+  --evidence /path/to/delivery-evidence.json
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree attestation-render \
+  --evidence /path/to/delivery-evidence.json --stage opening > /tmp/opening-attestation.md
+gh pr comment https://github.com/OWNER/REPO/pull/123 --body-file /tmp/opening-attestation.md
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree attestation-start-check \
+  --evidence /path/to/delivery-evidence.json --stage opening \
+  --comment-url 'https://github.com/OWNER/REPO/pull/123#issuecomment-ID' --enable
+```
+
+Use `--stage repair-batch` for an accepted batch and include its `accepted_batch_ref` in the packet before rendering.
+Run the start check before starting the repair work.
+The first owner-coordinated adoption uses `--enable`; it is accepted only after owner, current remote PR mapping, exact comment membership, body, packet and reread-source validation succeed.
+That sets checkout-level `attestation_required: true` and records the exact publication reference under the current PR binding.
+Legacy attachments with no flag remain unchanged until this explicit adoption.
+Existing immutable seats must first receive the reviewed source through the normal `upgrade-plan` and `upgrade` flow; pinned runtime source is never hand-edited.
+For each later PR, discover its current binding and validate its own published comment with the same command without `--enable`; publication references do not transfer between PRs or owners.
+There is no disable or fallback flag.
+
+An adopted target refuses covered ready or merge unless its current packet attestation, exact local reread bytes and per-PR publication reference match.
+Each covered action reads the exact authenticated GitHub comment using the captured `gh` executable with a bounded timeout; unavailable, edited, deleted or mismatched comments fail closed.
+The ordinary report still checks candidate freshness and preserves its existing checklist-gap behavior.
+No atomicity is claimed between the remote read and later GitHub forwarding.
+The attestation text and hash prove only that the declared files and comment bytes matched these observations.
+
+This addition is qualified only for Codex's explicit seat `gh` entrypoint and Claude's supported direct `gh pr ready` and `gh pr merge` hook paths.
+New enabled Claude checks perform the bounded authenticated comment read; local evaluation of a legacy target remains local.
+OpenCode adoption is refused in this release.
+Pattern Buffer supplies a notice through its existing SessionStart standing-context injection and does not detect an issue or batch.
+Raw push, PR creation, comment editing, scripts, web/API requests, GitHub Actions and alternate start paths remain outside interception.
+Existing report checks, review and CI, human readiness holds, approval authority and merge authority remain unchanged.
+
 ## Requirements
 
 Use Python 3.10 or later, Git, and the GitHub CLI `gh` on PATH.
@@ -190,7 +276,8 @@ Do not claim OpenCode support qualification until the actual native pilot and Po
 Codex currently uses the seat's explicit `gh` entrypoint for covered readiness and merge actions.
 Claude's installed hook covers the supported direct `gh pr ready` and `gh pr merge` command forms in attached repositories.
 On the seat entrypoint, a full PR URL determines its host and repository even when `--repo` is also present; unmatched explicit repository selectors pass through, while selectors ambiguous across attached hosts require a full URL or `HOST/OWNER/REPO` and unknown PRs within an attached repository remain gated.
-Published-branch discovery runs only on the explicit seat `gh` delivery path; local Claude hook evaluation does not make GitHub calls.
+Published-branch discovery runs only on the explicit seat `gh` delivery path.
+Claude's local hook evaluation makes no GitHub calls for legacy targets; an adopted attestation target adds the bounded authenticated comment read described above.
 Neither path intercepts arbitrary shell scripts, other applications, or commands outside its documented entrypoint.
 
 ## Upgrade an installed seat
