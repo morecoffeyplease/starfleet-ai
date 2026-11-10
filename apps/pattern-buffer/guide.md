@@ -107,7 +107,8 @@ pattern-buffer --cwd /absolute/worktree preview --harness codex --session ACTUAL
 ```
 
 Use `--harness claude` for Claude and a real session identity when known.
-`validate` checks both role sections and exits nonzero on malformed or oversized context, including a role view above the 8192-byte authoring budget.
+`validate` checks both role sections, supported local references, and the 8192-byte authoring budget.
+It exits nonzero on malformed context, missing local targets or headings, and oversized context.
 It reports header bytes, usable content bytes and remaining UTF-8 bytes from the exact rendered header.
 Use the exact session ID when available so the report includes the selected session file path.
 Without `--session`, status labels its placeholder header budget and does not establish exact native-session binding.
@@ -120,6 +121,41 @@ The notice preserves unresolved scope and holds, states that it is not full cont
 Preview shows the ordinary-worktree warning and fallback behavior but omits event-specific checkpoint addenda, so the actual SessionStart total can differ.
 The hook uses the harness-reported working directory, not the directory from which installation was run.
 Unregistered worktrees emit no context.
+
+### Compose rules and mission
+
+Use `compose` to combine reviewed project rules with a per-worktree mission.
+It writes an ordinary context file and does not change runtime composition.
+
+```sh
+pattern-buffer --cwd /absolute/worktree compose \
+  --rules /absolute/reviewed-rules.md \
+  --mission /absolute/worktree/mission.md \
+  --output /absolute/private/composed-context.md \
+  --harness codex --session SESSION_UUID
+```
+
+The rules file must contain `# shared`, `# implementer`, and `# orchestrator` sections.
+It may end with `# confirmation`.
+The mission file must contain `# shared` and may include either role section.
+Mission text comes before rules text in each section.
+The confirmation section comes only from the rules file.
+The command reports the input and output SHA-256 digests, paragraph byte counts, and exact rendered budgets for both roles.
+It reuses the 8192-byte renderer and requires at least 1024 bytes of remaining headroom per role by default.
+Pass `--harness` and `--session` to calculate a future session-enrollment budget against the existing destination path.
+That calculation is a preview until you use the normal reviewed enrollment command.
+Without `--session`, `validation` is a placeholder and the command reports no future-recipient budget.
+Use `--check` to compare the composed bytes without writing.
+Use `--replace` to replace an existing output whose bytes differ.
+Compose to a private path, then use `session-enroll --reviewed-update --evidence` for registered exact-session context.
+
+The offline reference checker resolves relative Markdown targets from the worktree root.
+It checks simple inline Markdown targets, Markdown heading anchors, and standalone backticked absolute or home paths.
+It reports HTTP and HTTPS references without making network requests.
+Missing local targets and headings fail `compose` and `validate`.
+`status`, `session-enroll`, `enrollment-status`, and `handoff-check` report the same findings as warnings.
+Reference-style links, raw HTML links, and command-style inline code are not parsed as paths.
+Review those warnings manually when a document uses unsupported or ambiguous syntax.
 
 Use `handoff-check --harness HARNESS --session SESSION_UUID` for a read-only local successor check.
 It reports standing context, optional checkpoint ownership and runtime compatibility separately from native binding and actual delivery.

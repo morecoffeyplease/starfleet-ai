@@ -60,6 +60,20 @@ Profiles are never inferred from a folder name or downloaded from a repository.
 When an existing context file is present, selection records the profile but does not merge or migrate its fragment.
 An owner-linked child worktree always uses its owner's context and cannot select an independent profile.
 
+## Compose reviewed context
+
+Use `compose` to place a reviewed rules file and a per-worktree mission into an ordinary context file.
+The rules file must include `# shared`, `# implementer`, and `# orchestrator`, with an optional final `# confirmation` section.
+The mission file must include `# shared` and may include either role section.
+Mission text comes before rules text in each section, and only the rules file supplies confirmation text.
+The command reports SHA-256 digests, paragraph bytes, exact rendered role budgets, and local reference findings.
+It uses the existing 8192-byte renderer and requires 1024 bytes of remaining headroom per role by default.
+Pass `--harness` and `--session` to calculate a prospective recipient budget against the existing session-enrollment destination.
+Without `--session`, the command labels its `validation` session as a placeholder and does not claim a future-recipient budget.
+`--check` compares bytes without writing, and a differing existing output requires `--replace`.
+The reference checker reads no network targets and reports unsupported Markdown or command-style forms as warnings.
+Compose to a private path, then use the reviewed `session-enroll --reviewed-update --evidence` route for registered exact-session context.
+
 ## Session context and recovery
 
 Use assign for a persistent worktree role or session-enroll for an exact native session that needs a private standing file.

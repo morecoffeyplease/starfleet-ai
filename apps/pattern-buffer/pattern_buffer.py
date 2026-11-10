@@ -21,7 +21,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 ROLES = ("implementer", "orchestrator")
 HARNESS_CHOICES = ("claude", "codex", "opencode")
@@ -34,6 +34,9 @@ INJECTION_LIMIT = 24576
 RECOVERY_OUTPUT_LIMIT = 9 * 1024
 DISPATCH_ENV = "STARFLEET_CONTEXT_DISPATCH"
 REPO_PROFILE_LIMIT = 32768
+REFERENCE_FILE_LIMIT = 256 * 1024
+REFERENCE_TOTAL_LIMIT = 1024 * 1024
+REFERENCE_COUNT_LIMIT = 128
 _OPENCODE_SESSION_ID = re.compile(r"^ses_[A-Za-z0-9]+$")
 STRICT_RENDER_POLICY = "strict"
 ORDINARY_WORKTREE_RENDER_POLICY = "ordinary_worktree"
@@ -1163,6 +1166,512 @@ def sections_text(text):
     return {key: "\n".join(value).strip() for key, value in result.items()}
 
 
+def compose_sections(rules_text, mission_text):
+    rules = sections_text(rules_text)
+    mission = sections_text(mission_text)
+    required = ("shared", *ROLES)
+    if any(section not in rules for section in required):
+        raise ValueError("rules must include # shared, # implementer, and # orchestrator")
+    if "confirmation" in mission:
+        raise ValueError("mission may include # shared, # implementer, and # orchestrator only")
+    result = {}
+    for section in required:
+        pieces = [text for text in (mission.get(section, ""), rules.get(section, "")) if text]
+        result[section] = "\n\n".join(pieces)
+    if "confirmation" in rules:
+        result["confirmation"] = rules["confirmation"]
+    return result
+
+
+def serialize_sections(content):
+    parts = []
+    for section in ("shared", *ROLES, "confirmation"):
+        if section not in content:
+            continue
+        parts.append(f"# {section}\n\n{content[section]}")
+    return ("\n\n".join(parts).rstrip() + "\n").encode("utf-8")
+
+
+def _paragraph_parts(text):
+    paragraphs = []
+    separator_bytes = 0
+    for piece in re.split(r"(\n[ \t]*\n+)", text):
+        if not piece:
+            continue
+        if piece.startswith("\n") and piece.strip(" \t\n") == "":
+            separator_bytes += len(piece.encode("utf-8"))
+        else:
+            paragraphs.append(piece)
+    return paragraphs, separator_bytes
+
+
+def paragraph_accounting(mission, rules, content):
+    accounting = {}
+    for role in ROLES:
+        selected = ["shared", role]
+        if content.get("confirmation"):
+            selected.append("confirmation")
+        paragraphs = []
+        separators = 0
+        content_bytes = 0
+        for section_index, section in enumerate(selected):
+            if section_index:
+                separators += 2
+                content_bytes += 2
+            source_sections = (("mission", mission), ("rules", rules))
+            section_sources = [(label, source.get(section, ""))
+                               for label, source in source_sections if source.get(section, "")]
+            for source_index, (source_name, text) in enumerate(section_sources):
+                if source_index:
+                    separators += 2
+                    content_bytes += 2
+                blocks, internal_separators = _paragraph_parts(text)
+                separators += internal_separators
+                content_bytes += internal_separators
+                for index, block in enumerate(blocks, 1):
+                    size = len(block.encode("utf-8"))
+                    content_bytes += size
+                    paragraphs.append({"section": section, "source": source_name,
+                                       "paragraph": index, "bytes": size})
+        selected_text = content["shared"] + "\n\n" + content[role]
+        if content.get("confirmation"):
+            selected_text += "\n\n" + content["confirmation"]
+        if content_bytes != len(selected_text.encode("utf-8")):
+            raise ValueError("paragraph accounting did not match the rendered content")
+        accounting[role] = {"paragraphs": paragraphs,
+                            "paragraph_bytes": sum(item["bytes"] for item in paragraphs),
+                            "separator_bytes": separators,
+                            "content_bytes": content_bytes}
+    return accounting
+
+
+def _heading_slug(value):
+    value = re.sub(r"<[^>]*>", "", value)
+    value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
+    value = value.replace("`", "").lower()
+    value = re.sub(r"[^\w\- ]", "", value, flags=re.UNICODE)
+    return re.sub(r"-+", "-", re.sub(r"\s+", "-", value).strip("-"))
+
+
+def markdown_anchors(text):
+    anchors = set()
+    counts = {}
+    previous = ""
+    for line in text.splitlines():
+        atx = re.match(r"^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", line)
+        if atx:
+            heading = atx.group(1).strip()
+        elif previous.strip() and re.match(r"^ {0,3}(?:=+|-+)[ \t]*$", line):
+            heading = previous.strip()
+        else:
+            heading = None
+        if heading is not None:
+            explicit = re.search(r"\s*\{#([^}\s]+)\}\s*$", heading)
+            if explicit:
+                anchors.add(explicit.group(1))
+                heading = heading[:explicit.start()].rstrip()
+            slug = _heading_slug(heading)
+            count = counts.get(slug, 0)
+            counts[slug] = count + 1
+            anchors.add(slug if count == 0 else f"{slug}-{count}")
+        previous = line
+    return anchors
+
+
+def _reference_finding(kind, source, target, message, severity="warning"):
+    return {"kind": kind, "source": str(source), "target": target,
+            "message": message, "severity": severity}
+
+
+def _markdown_target(target, source, root, own_text, totals, findings):
+    target = target.strip()
+    if not target:
+        findings.append(_reference_finding("unsupported", source, target,
+                                           "empty Markdown targets are not checked"))
+        return
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1]
+    try:
+        parts = urlsplit(target)
+    except ValueError:
+        findings.append(_reference_finding("unsupported", source, target,
+                                           "ambiguous URL syntax was not checked"))
+        return
+    if parts.scheme.lower() in ("http", "https") or target.startswith("//"):
+        findings.append(_reference_finding("remote", source, target,
+                                           "remote reference was not requested from the network"))
+        return
+    if parts.scheme:
+        findings.append(_reference_finding("unsupported", source, target,
+                                           "non-HTTP URL schemes are not checked"))
+        return
+    path_text = unquote(parts.path)
+    if path_text.startswith("~/"):
+        target_path = Path(path_text).expanduser()
+    elif path_text.startswith("/"):
+        target_path = Path(path_text)
+    elif path_text:
+        target_path = root / path_text
+    else:
+        target_path = Path(source)
+    same_document = target_path.resolve(strict=False) == Path(source).resolve(strict=False)
+    if not same_document and not target_path.exists():
+        findings.append(_reference_finding("missing_target", source, target,
+                                           f"local Markdown target does not exist: {target_path}", "error"))
+        return
+    if not parts.fragment:
+        return
+    if target_path.suffix.lower() not in (".md", ".markdown"):
+        findings.append(_reference_finding("unsupported_anchor", source, target,
+                                           "anchors are checked only for Markdown targets"))
+        return
+    try:
+        cache_key = target_path.resolve(strict=False)
+        if cache_key in totals["anchors"]:
+            anchors = totals["anchors"][cache_key]
+        else:
+            if same_document:
+                target_text = own_text
+            else:
+                size = target_path.stat().st_size
+                if size > REFERENCE_FILE_LIMIT or totals["bytes"] + size > REFERENCE_TOTAL_LIMIT:
+                    findings.append(_reference_finding("reference_limit", source, target,
+                                                       "Markdown heading scan exceeded its byte limit"))
+                    return
+                target_text = bounded(target_path, REFERENCE_FILE_LIMIT)
+                totals["bytes"] += len(target_text.encode("utf-8"))
+            anchors = markdown_anchors(target_text)
+            totals["anchors"][cache_key] = anchors
+    except (OSError, ValueError, UnicodeError) as error:
+        findings.append(_reference_finding("unsupported_anchor", source, target,
+                                           f"Markdown heading scan could not read the target: {error}"))
+        return
+    anchor = unquote(parts.fragment)
+    if anchor not in anchors:
+        findings.append(_reference_finding("missing_heading", source, target,
+                                           f"Markdown heading anchor does not exist: #{anchor}", "error"))
+
+
+def reference_check(text, source, root):
+    source = Path(source)
+    root = Path(root)
+    findings = []
+    totals = {"bytes": 0, "targets": 0, "anchors": {}}
+    lines = text.splitlines(keepends=True)
+    masked_lines = []
+    in_fence = False
+    fence_warning = False
+    for line in lines:
+        if re.match(r"^ {0,3}(?:```|~~~)", line):
+            in_fence = not in_fence
+            fence_warning = True
+            masked_lines.append("\n" if line.endswith("\n") else "")
+        elif in_fence:
+            masked_lines.append("\n" if line.endswith("\n") else "")
+        else:
+            masked_lines.append(line)
+    if in_fence:
+        findings.append(_reference_finding("unsupported_fence", source, "fenced code block",
+                                           "unclosed fenced code block was not scanned"))
+    elif fence_warning:
+        findings.append(_reference_finding("unsupported_fence", source, "fenced code block",
+                                           "fenced code contents were not scanned"))
+    visible = "".join(masked_lines)
+    for match in re.finditer(r"(?<!`)``[^`\n]+``(?!`)", visible):
+        findings.append(_reference_finding("unsupported_code_span", source, match.group(0),
+                                           "multi-backtick code spans are not scanned"))
+    masked = list(visible)
+    code_spans = list(re.finditer(r"(?<!`)`([^`\n]+)`(?!`)", visible))
+    for match in code_spans:
+        masked[match.start():match.end()] = " " * (match.end() - match.start())
+        value = match.group(1).strip()
+        if (value.startswith("/") or value.startswith("~/")) and not re.search(r"\s", value):
+            candidate = Path(value).expanduser()
+            totals["targets"] += 1
+            if not candidate.exists():
+                findings.append(_reference_finding("missing_path", source, value,
+                                                   f"backticked local path does not exist: {candidate}", "error"))
+        elif value.startswith(("/", "~/")) or re.search(r"(?:^|\s)(?:/|~/)[^\s]+", value):
+            findings.append(_reference_finding("unsupported_command_path", source, value,
+                                               "ambiguous or command-style inline code is not parsed as a path"))
+        if totals["targets"] > REFERENCE_COUNT_LIMIT:
+            findings.append(_reference_finding("reference_limit", source, str(totals["targets"]),
+                                               f"reference count exceeds {REFERENCE_COUNT_LIMIT}; remaining references were not checked"))
+            break
+    visible = "".join(masked)
+    inline_pattern = re.compile(r"!?\[[^\]\n]*\]\(([^)\n]*)\)")
+    inline_matches = list(inline_pattern.finditer(visible))
+    for match in inline_matches:
+        inside = match.group(1).strip()
+        target = inside
+        if inside.startswith("<"):
+            end = inside.find(">")
+            if end < 0:
+                findings.append(_reference_finding("unsupported", source, inside,
+                                                   "angle-bracket Markdown targets need a closing >"))
+                continue
+            target, suffix = inside[1:end], inside[end + 1:].strip()
+            if suffix and not re.fullmatch(r"(?:\"[^\"]*\"|'[^']*')", suffix):
+                findings.append(_reference_finding("unsupported", source, inside,
+                                                   "Markdown target title syntax is not recognized"))
+                continue
+        else:
+            tokens = inside.split(None, 1)
+            target = tokens[0] if tokens else ""
+            if ("(" in target or ")" in target or
+                    (len(tokens) > 1 and not re.fullmatch(r"(?:\"[^\"]*\"|'[^']*')", tokens[1]))):
+                findings.append(_reference_finding("unsupported", source, inside,
+                                                   "ambiguous Markdown target syntax was not checked"))
+                continue
+        totals["targets"] += 1
+        if totals["targets"] > REFERENCE_COUNT_LIMIT:
+            findings.append(_reference_finding("reference_limit", source, str(totals["targets"]),
+                                               f"reference count exceeds {REFERENCE_COUNT_LIMIT}; remaining references were not checked"))
+            break
+        _markdown_target(target, source, root, text, totals, findings)
+    matched_starts = {match.start() for match in inline_matches}
+    for match in re.finditer(r"!?\[[^\]\n]*\]\(", visible):
+        if match.start() not in matched_starts:
+            findings.append(_reference_finding("unsupported_inline_link", source, match.group(0),
+                                               "nested or ambiguous inline Markdown targets are not checked"))
+    for match in re.finditer(r"!?\[[^\]\n]*\]\s*\[[^\]\n]*\]", visible):
+        findings.append(_reference_finding("unsupported_reference_link", source, match.group(0),
+                                           "reference-style Markdown links are not checked"))
+    for match in re.finditer(r"!?\[[^\]\n]+\]\s*\n\s*\[[^\]\n]*\]", visible):
+        findings.append(_reference_finding("unsupported_reference_link", source, match.group(0),
+                                           "multiline reference-style Markdown links are not checked"))
+    for line in visible.splitlines():
+        if re.match(r"^ {0,3}\[[^\]]+\]:", line):
+            findings.append(_reference_finding("unsupported_reference_definition", source, line.strip(),
+                                               "Markdown reference definitions are not checked"))
+    if re.search(r"<\s*(?:a|img)\b", visible, re.IGNORECASE):
+        findings.append(_reference_finding("unsupported_html_reference", source, "HTML link or image",
+                                           "raw HTML references are not checked"))
+    remote_targets = {item["target"] for item in findings if item["kind"] == "remote"}
+    for match in re.finditer(r"https?://[^\s<>]+", visible, re.IGNORECASE):
+        target = match.group(0).rstrip(".,;:!?)")
+        if target and target not in remote_targets:
+            totals["targets"] += 1
+            if totals["targets"] > REFERENCE_COUNT_LIMIT:
+                findings.append(_reference_finding("reference_limit", source, str(totals["targets"]),
+                                                   f"reference count exceeds {REFERENCE_COUNT_LIMIT}; remaining references were not checked"))
+                break
+            findings.append(_reference_finding("remote", source, target,
+                                               "remote reference was not requested from the network"))
+            remote_targets.add(target)
+    if totals["targets"] > REFERENCE_COUNT_LIMIT and not any(
+            item["kind"] == "reference_limit" for item in findings):
+        findings.append(_reference_finding("reference_limit", source, str(totals["targets"]),
+                                           f"reference count exceeds {REFERENCE_COUNT_LIMIT}; remaining references were not checked"))
+    unique = {}
+    for item in findings:
+        unique[(item["kind"], item["source"], item["target"], item["severity"])] = item
+    findings = list(unique.values())
+    return {"errors": [item for item in findings if item["severity"] == "error"],
+            "warnings": [item for item in findings if item["severity"] != "error"]}
+
+
+def reference_warnings_for_path(path, root):
+    if path is None:
+        return []
+    try:
+        text = bounded(Path(path), FILE_LIMIT)
+        report = reference_check(text, path, root)
+        findings = report["errors"] + report["warnings"]
+        return [{**item, "validation_error": item["severity"] == "error", "severity": "warning"}
+                for item in findings]
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        return [_reference_finding("unreadable_source", path, str(path),
+                                   f"reference scan could not read the context file: {error}")]
+
+
+def _read_compose_output(path):
+    if path.is_symlink():
+        raise ValueError(f"output must not be a symlink: {path}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"output must be a regular file: {path}")
+        data = bytearray()
+        while len(data) <= FILE_LIMIT:
+            chunk = os.read(descriptor, min(16 * 1024, FILE_LIMIT + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return None if len(data) > FILE_LIMIT else bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def compose_output_write(path, data, replace):
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"output must not be a symlink: {path}")
+    if path.exists():
+        if not path.is_file():
+            raise ValueError(f"output must be a regular file: {path}")
+        old = _read_compose_output(path)
+        if old == data:
+            return "unchanged"
+        if not replace:
+            raise ValueError(f"output differs from the composed context; use --replace: {path}")
+        atomic(path, data.decode("utf-8"))
+        return "replaced"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".compose-pending-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"output must be a regular file: {path}")
+            if _read_compose_output(path) == data:
+                return "unchanged"
+            if not replace:
+                raise ValueError(f"output differs from the composed context; use --replace: {path}")
+            atomic(path, data.decode("utf-8"))
+            return "replaced"
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return "created"
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _path_is_session_source(path, binding=None):
+    candidate = Path(path).resolve(strict=False)
+    if binding is not None and candidate == Path(binding.path).resolve(strict=False):
+        return True
+    parts = candidate.parts
+    return any(parts[index:index + 2] == (".context-injector", "sessions")
+               for index in range(max(0, len(parts) - 1)))
+
+
+def compose_report(root, gitdir, args):
+    input_paths = {"rules": Path(args.rules).expanduser(), "mission": Path(args.mission).expanduser()}
+    output = Path(args.output).expanduser()
+    for label, path in (*input_paths.items(), ("output", output)):
+        if not path.is_absolute():
+            raise ValueError(f"--{label} must be an absolute path")
+    if args.min_headroom < 0:
+        raise ValueError("--min-headroom must be zero or greater")
+    if args.session is not None and not args.session:
+        raise ValueError("--session must not be empty")
+    session = args.session or "validation"
+    state_path(gitdir, args.harness, session, args.agent)
+    for path in input_paths.values():
+        if path.resolve(strict=False) == output.resolve(strict=False):
+            raise ValueError("--output must be separate from both input files")
+    if args.check:
+        sys.dont_write_bytecode = True
+    rules_text = bounded(input_paths["rules"], FILE_LIMIT)
+    mission_text = bounded(input_paths["mission"], FILE_LIMIT)
+    rules_sections = sections_text(rules_text)
+    mission_sections = sections_text(mission_text)
+    content = compose_sections(rules_text, mission_text)
+    output_data = serialize_sections(content)
+    if len(output_data) > FILE_LIMIT:
+        raise ValueError(f"composed context exceeds {FILE_LIMIT} bytes")
+    binding = None
+    normalized_session = session
+    if args.session and not args.agent:
+        session_store = auxiliary("sessions")
+        normalized_session = session_store._normalize_session(session, strict=True)
+        binding = session_binding_readonly(root, gitdir, args.harness, session)
+    if _path_is_session_source(output, binding):
+        raise ValueError("compose to a private output path; update registered exact-session context with session-enroll --reviewed-update --evidence")
+    reference_report = reference_check(output_data.decode("utf-8"), output, root)
+    reference_errors = reference_report["errors"]
+    reference_warnings = reference_report["warnings"]
+    current_preview = standing_context_budgets(root, output, args.harness, session, args.agent,
+                                               "composition preview", content)
+    current_preview.update(exact_session=bool(args.session),
+                           session_basis="requested exact session" if args.session else
+                           "validation placeholder session",
+                           meaning="Private output preview. It does not change or describe active runtime context.")
+    future_recipient = None
+    if args.session and not args.agent:
+        target_path = Path(binding.path) if binding is not None else Path(
+            auxiliary("sessions")._session_path(root, args.harness, normalized_session))
+        future_recipient = standing_context_budgets(root, target_path, args.harness, session, "",
+                                                    "session enrollment", content)
+        future_recipient.update(exact_session=True,
+                                budget_calculated=True,
+                                binding_state=binding.state if binding is not None else "not_enrolled",
+                                meaning="Prospective session-enrollment budget. Publication still requires the reviewed session-enroll route.")
+    accounting = paragraph_accounting(mission_sections, rules_sections, content)
+    for role in ROLES:
+        if accounting[role]["content_bytes"] != current_preview["roles"][role].get("content_bytes"):
+            raise ValueError(f"{role} paragraph accounting did not match the existing rendered budget")
+        accounting[role].update(header_bytes=current_preview["roles"][role]["header_bytes"],
+                                total_bytes=current_preview["roles"][role]["bytes_used"],
+                                remaining_bytes=current_preview["roles"][role]["remaining_bytes"])
+    reports = [("current preview", current_preview)]
+    if future_recipient is not None:
+        reports.append(("future recipient", future_recipient))
+    headroom_failures = []
+    for label, budget_set in reports:
+        for role, budget in budget_set["roles"].items():
+            if budget.get("remaining_bytes", -1) < args.min_headroom:
+                headroom_failures.append(f"{label} {role}: {budget.get('remaining_bytes', -1)} bytes remain; "
+                                         f"minimum is {args.min_headroom}")
+    if future_recipient is None:
+        future_recipient = {
+            "validated": False,
+            "meaning": ("No future session-enrollment budget was calculated because agent sessions cannot use "
+                        "the primary-session enrollment route." if args.session and args.agent else
+                        "No exact recipient was supplied. Pass --session to calculate a future session-enrollment budget."),
+        }
+    report = {
+        "worktree": str(root),
+        "harness": args.harness,
+        "session": session,
+        "agent": args.agent or None,
+        "minimum_headroom_bytes": args.min_headroom,
+        "inputs": {label: {"path": str(path),
+                           "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+                   for label, path, text in (("rules", input_paths["rules"], rules_text),
+                                             ("mission", input_paths["mission"], mission_text))},
+        "output": {"path": str(output), "sha256": hashlib.sha256(output_data).hexdigest(),
+                   "bytes": len(output_data)},
+        "paragraph_accounting": accounting,
+        "current_preview": current_preview,
+        "future_recipient": future_recipient,
+        "references": {"errors": reference_errors, "warnings": reference_warnings},
+        "headroom_errors": headroom_failures,
+        "write_state": "not_written",
+    }
+    if reference_errors or headroom_failures:
+        report["write_state"] = "refused"
+        return report, 1
+    if args.check:
+        if output.is_symlink():
+            raise ValueError(f"output must not be a symlink: {output}")
+        if not output.exists():
+            report["write_state"] = "different"
+            report["check"] = "output is missing"
+            return report, 1
+        if not output.is_file():
+            raise ValueError(f"output must be a regular file: {output}")
+        same = _read_compose_output(output) == output_data
+        report["write_state"] = "not_written"
+        report["check"] = "matches" if same else "differs"
+        return report, 0 if same else 1
+    report["write_state"] = compose_output_write(output, output_data, args.replace)
+    return report, 0
+
+
 def state_path(gitdir, harness, session, agent=""):
     if not isinstance(session, str) or not session or len(session) > 512:
         raise ValueError("a nonempty session ID is required (maximum 512 characters)")
@@ -1934,6 +2443,7 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
                             "Use validate and preview for this exact worktree and session; keep an invalid required source fail-closed."),
             "budgets": context_budgets,
         },
+        "reference_warnings": reference_warnings_for_path(source, root),
         "checkpoint": checkpoint,
         "installed_hooks": hook_report,
         "native_binding": native_binding,
@@ -2274,12 +2784,14 @@ def clear_owned_idle_timers(root, helper):
 
 def session_command(root, gitdir, args):
     store = auxiliary("sessions")
-    load(root, gitdir)
+    _config, context_source = load(root, gitdir)
     if args.command == "enrollment-status":
         binding = store.status(root, gitdir, args.harness, args.session)
         report = binding_report(binding) or {"enrollment": None}
         report["standing_context_budgets"] = safe_context_budget_report(
             root, gitdir, args.harness, args.session, binding=binding)
+        report["reference_warnings"] = reference_warnings_for_path(
+            binding.path if binding is not None else context_source, root)
         return report
     if args.command in ("session-enroll", "assign"):
         if getattr(args, "agent", ""):
@@ -2345,6 +2857,8 @@ def session_command(root, gitdir, args):
     report = binding_report(binding)
     if args.command in ("session-enroll", "assign"):
         report["standing_context_budgets"] = validator.last_report
+    if args.command == "session-enroll":
+        report["reference_warnings"] = reference_warnings_for_path(args.context_file, root)
     return report
 
 
@@ -2665,6 +3179,17 @@ def main():
         cmd.add_argument("--harness", choices=("claude", "codex"), default="codex")
         cmd.add_argument("--session", default="validation", help="session identity to include in the budget")
         cmd.add_argument("--agent", default="")
+    cmd = sub.add_parser("compose", help="compose reviewed rules and a worktree mission into a private context file")
+    cmd.add_argument("--rules", required=True, help="absolute shared and role rules file")
+    cmd.add_argument("--mission", required=True, help="absolute per-worktree mission file")
+    cmd.add_argument("--output", required=True, help="absolute ordinary context output file")
+    cmd.add_argument("--min-headroom", type=int, default=1024,
+                     help="minimum remaining rendered bytes per role (default: 1024)")
+    cmd.add_argument("--replace", action="store_true", help="replace a differing existing output file")
+    cmd.add_argument("--check", action="store_true", help="compare output bytes without writing")
+    cmd.add_argument("--harness", choices=("claude", "codex"), default="codex")
+    cmd.add_argument("--session", help="exact recipient session for prospective enrollment budgets")
+    cmd.add_argument("--agent", default="", help="existing agent ID used in the rendered preview header")
     cmd = sub.add_parser("hook")
     cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
     cmd = sub.add_parser("hook-config", help="print configuration to merge manually")
@@ -2851,6 +3376,10 @@ def main():
                               "session_id": args.session, "status": "active"}))
         elif args.command == "context":
             print(json.dumps(opencode_context(root, gitdir, args.session), ensure_ascii=False))
+        elif args.command == "compose":
+            result, status = compose_report(root, gitdir, args)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return status
         elif args.command == "tasks":
             result = list_owner_tasks(args.owner_worktree or root, args.status)
             print(json.dumps(result, indent=2))
@@ -2899,6 +3428,7 @@ def main():
                           "Model reception is not recorded by Pattern Buffer; "
                           "legacy delivery_verified=false does not mean reception failed."),
                       "delivery_verified": False}
+            reference_source = source
             if args.harness:
                 settings = settings_path(args.harness, args.settings)
                 data = read_settings(settings)
@@ -2937,6 +3467,8 @@ def main():
                 result.update(session=args.session, enrollment=binding_report(binding),
                               context_file=str(binding.path) if binding else str(source),
                               context_required=binding is not None)
+                reference_source = Path(binding.path) if binding else source
+            result["reference_warnings"] = reference_warnings_for_path(reference_source, root)
             print(json.dumps(result, indent=2))
         elif args.command == "handoff-check":
             result = handoff_report(root, gitdir, config_path, args.harness, args.session, args.settings)
@@ -3028,6 +3560,20 @@ def main():
         else:
             config, _source = load(root, gitdir)
             report = current_context_budgets(root, gitdir, args.harness, args.session, args.agent)
+            reference_report = reference_check(bounded(Path(report["source"]), FILE_LIMIT),
+                                               report["source"], root)
+            for finding in reference_report["warnings"]:
+                print(f"WARNING: {finding['message']} ({finding['source']}: {finding['target']})",
+                      file=sys.stderr)
+            if args.command == "validate" and reference_report["errors"]:
+                for finding in reference_report["errors"]:
+                    print(f"ERROR: {finding['message']} ({finding['source']}: {finding['target']})",
+                          file=sys.stderr)
+                raise ValueError("local context references are invalid")
+            if args.command == "doctor":
+                for finding in reference_report["errors"]:
+                    print(f"WARNING: {finding['message']} ({finding['source']}: {finding['target']})",
+                          file=sys.stderr)
             failures = []
             for role, budget in report["roles"].items():
                 if "bytes_used" in budget:
