@@ -729,7 +729,7 @@ class PatternBufferTests(unittest.TestCase):
                         standing, standing_budget = ci.render_standing_details(
                             long_root.resolve(), source.resolve(), harness, session, "",
                             selected_role, origin, ci.sections_text(source.read_text()))
-                        rendered = ci.render(long_root, harness, session)
+                        rendered = ci.render(long_root, harness, session).text
                         budget = report["roles"][role]
                         self.assertEqual(selected_role, role)
                         self.assertEqual(len(standing.encode("utf-8")), budget["bytes_used"])
@@ -788,9 +788,11 @@ class PatternBufferTests(unittest.TestCase):
                 self.assertFalse(budgets["roles"]["unassigned"]["ok"])
                 self.assertEqual(budgets["roles"]["unassigned"]["bytes_used"], expected_unassigned_bytes)
 
-                preview = self.cli("preview", "--harness", harness, "--session", session, success=False)
-                self.assertEqual(preview.stdout, "")
-                self.assertIn(f"unassigned context uses {expected_unassigned_bytes} / 8192 bytes", preview.stderr)
+                preview = self.cli("preview", "--harness", harness, "--session", session)
+                self.assertTrue(preview.stdout.startswith(unassigned_header + "x" * shared_bytes))
+                overage = expected_unassigned_bytes - ci.LIMIT
+                self.assertIn(f"exceeded its 8192-byte budget by {overage} ", preview.stdout)
+                self.assertLessEqual(len(preview.stdout.rstrip("\n").encode("utf-8")), ci.RECOVERY_OUTPUT_LIMIT)
 
     def test_enrolled_session_budgets_still_match_preview_for_both_harnesses(self):
         self.cli("init")
