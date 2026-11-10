@@ -180,7 +180,7 @@ class PatternBufferTests(unittest.TestCase):
         source = self.root / ".context-injector/context.md"
         session = "budget-boundary"
         env = {"STARFLEET_CONTEXT_DISPATCH": "",
-               "XDG_STATE_HOME": str(self.root.parent / "owned-state")}
+               "XDG_STATE_HOME": str((self.root.parent / "owned-state").resolve())}
         for role in ci.ROLES:
             with self.subTest(role=role):
                 source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n")
@@ -220,7 +220,7 @@ class PatternBufferTests(unittest.TestCase):
         source = self.root / ".context-injector/context.md"
         session = "final-output-boundary"
         env = {"STARFLEET_CONTEXT_DISPATCH": "",
-               "XDG_STATE_HOME": str(self.root.parent / "owned-state")}
+               "XDG_STATE_HOME": str((self.root.parent / "owned-state").resolve())}
         tail = "\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n"
 
         def write_role_view(target_bytes):
@@ -599,7 +599,7 @@ class PatternBufferTests(unittest.TestCase):
         source = self.root / ".context-injector/context.md"
         session = "ordinary-failure"
         env = {"STARFLEET_CONTEXT_DISPATCH": "",
-               "XDG_STATE_HOME": str(self.root.parent / "owned-state")}
+               "XDG_STATE_HOME": str((self.root.parent / "owned-state").resolve())}
         self.cli("assign", "--harness", "codex", "--session", session, "--role", "orchestrator")
         cases = (
             ("# shared\na\n# shared\nb", "malformed"),
