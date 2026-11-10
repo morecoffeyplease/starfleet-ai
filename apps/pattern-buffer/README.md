@@ -79,7 +79,11 @@ It asks agents to confirm injection receipt, completion of relevant PStack and P
 Existing custom context files are not rewritten; they keep the runtime completion-confirmation wording until an owner-reviewed update adds the optional section.
 Owners must adjust their own context if it exceeds either existing limit; Pattern Buffer provides no length exception.
 The default context template includes shared review judgment and orchestrator repair-round guidance.
-Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](../starfleet-policy-guard/guide.md#review-and-fix-cycles) in full and revisit the relevant rule before each repair decision.
+Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](../starfleet-policy-guard/guide.md#review-and-fix-cycles) in full and revisit the relevant rule before each repair decision.
+Prime Directive (Policy Guard) is the same delivery tool described as Policy Guard in its CLI and documentation.
+The orchestrator template also points to that tool for its optional published opening and accepted repair-batch attestations.
+Pattern Buffer supplies that notice through its existing SessionStart standing-context injection; it does not detect issues or batches or create, publish or enforce attestation records.
+Read the [published guidance attestation guide](../starfleet-policy-guard/guide.md#published-guidance-attestations) for explicit owner adoption, per-PR publication checks and their bounded ready/merge coverage.
 The read-only `handoff-check` distinguishes approved context and optional checkpoint state from installed-hook compatibility, native binding evidence and actual model delivery.
 Unknown native or delivery evidence stays unknown and does not add a readiness gate.
 

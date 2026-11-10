@@ -53,7 +53,7 @@
 - Do not turn uncertainty into a blocker or call it disproved; investigate the cheapest decisive evidence, then defer unresolved claims explicitly.
 - Workers report new findings rather than expanding the batch.
 - If uncertainty remains after checking the deciding evidence, ask the user rather than guess or start a repair.
-- Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
+- Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full; Prime Directive and Policy Guard are names for the same tool.
 - Revisit the relevant rule before each repair decision.
 
 # implementer
@@ -66,6 +66,12 @@
 1. Re-read the mission, roadmap/tracker and current PRs’ issues IN FULL; reconcile actual checkout, PR heads/states, active work, evidence and human holds, don’t rely on assumptions; then update only this lane's tracker sections where facts changed.
    Re-pull before editing; coordinate with other tracker owners.
 2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
+
+**PR openings and accepted repair batches:**
+- Follow the [Prime Directive (Policy Guard) guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#published-guidance-attestations); it documents the same `lane.py` tool.
+- Reread applicable guidance, playbooks, principles and repository fix guidance; record references, digests and their effect on approach, evidence, uncertainty, scope and holds.
+- Resolve prerequisite gaps, render and manually publish the exact stage attestation, then run `attestation-start-check` as owner (`--enable` only for first adoption); adopted ready/merge actions require a current match.
+- This existing SessionStart notice detects no issue or batch and does not intercept push, PR/comment writes, web/API, GitHub Actions or alternate starts.
 
 **Repair rounds: don't spiral**
 - Use the existing PR or tracker to record dispositions, evidence, and cumulative rounds.

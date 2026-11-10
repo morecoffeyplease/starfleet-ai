@@ -101,6 +101,21 @@ else:
         self.assertEqual({b['pr_url'] for b in bindings},{f.url,second['html_url']})
         self.assertFalse((f.repo/'.git/starfleet-policy-guard').exists(),'delivery enrollment must not create/reset fix-round state')
 
+    def test_published_attestation_reference_stays_with_its_exact_pr_binding(self):
+        lane_scope=fixtures.lane_runtime.lane_scope
+        first_url='https://fixture.invalid/starfleet/guard/pull/901'
+        second_url='https://fixture.invalid/starfleet/guard/pull/902'
+        reference={'version':1,'pr_url':first_url,'comment_url':first_url+'#issuecomment-10',
+                   'body_sha256':'a'*64,'attestation_sha256':'b'*64}
+        state={'lane_owner':{'harness':'codex','session_id':'native-owner-1'},
+               'branch':'feature/test','head_branch':'feature/test','pr_url':first_url,'base_ref':'main',
+               'guidance_attestation_ref':reference,'pr_bindings':{}}
+        lane_scope.select_binding(state, {'branch':'feature/next','head_branch':'feature/next',
+                                          'pr_url':second_url,'base_ref':'main'})
+        self.assertNotIn('guidance_attestation_ref',state)
+        self.assertEqual(state['pr_bindings'][first_url]['guidance_attestation_ref'],reference)
+        self.assertNotIn('guidance_attestation_ref',state['pr_bindings'][second_url])
+
     def test_native_hook_stays_local_while_explicit_seat_entrypoint_discovers(self):
         f=self.f
         plan=self.enroll()

@@ -105,6 +105,8 @@ class PatternBufferTests(unittest.TestCase):
                                 "--role", "orchestrator")
         self.assertIn("Every explanation is a hypothesis", orchestrator.stdout)
         self.assertIn("Check that observation on the failing run AND a passing control", orchestrator.stdout)
+        self.assertIn("published-guidance-attestations", orchestrator.stdout)
+        self.assertIn("attestation-start-check", orchestrator.stdout)
         self.assertIn("Repair rounds: don't spiral", orchestrator.stdout)
         self.assertEqual(orchestrator.stdout.count(confirmation), 1)
         self.assertNotIn("confirm completion in your own chat", orchestrator.stdout)
@@ -126,6 +128,15 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("**Test failures and claims about systems**", default)
         self.assertNotIn("SO MUCH time is lost", default)
         self.assertFalse(hasattr(ci, "REPO_PROFILES"))
+
+    def test_init_embeds_attestation_notice_and_keeps_orchestrator_within_budget(self):
+        self.cli("init", "--default-role", "orchestrator")
+        source = self.root / ".context-injector/context.md"
+        self.assertEqual(source.read_text(), ci.TEMPLATE)
+        self.assertIn("published-guidance-attestations", source.read_text())
+        validation = self.cli("validate", "--harness", "codex")
+        self.assertIn("orchestrator:", validation.stdout)
+        self.assertIn("Context valid:", validation.stdout)
 
     def test_legacy_unassigned_context_at_8192_bytes_keeps_original_header(self):
         self.cli("init")

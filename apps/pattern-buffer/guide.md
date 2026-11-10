@@ -146,9 +146,13 @@ Owners must fit their approved context within the existing 8192-byte standing an
 Pattern Buffer does not provide a length exception.
 
 The default context template includes shared review judgment and orchestrator repair-round guidance.
-Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
+Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
 Revisit the relevant rule before each repair decision.
-The delivery seat does not enforce those fix-round decisions automatically.
+Prime Directive (Policy Guard) is the same delivery tool named Policy Guard in the CLI.
+The orchestrator template also links its optional published guidance attestation flow.
+That notice uses Pattern Buffer's existing SessionStart standing-context injection and does not detect issues, accepted batches or their status.
+Read the [published guidance attestation guide](../starfleet-policy-guard/guide.md#published-guidance-attestations) for the owner-enabled packet, rendering and exact-comment checks.
+The delivery seat does not infer repair-round decisions from those records or enforce unrelated work outside covered ready and merge paths.
 
 ## Checkpoints for orchestrators
 
