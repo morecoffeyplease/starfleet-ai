@@ -1562,8 +1562,50 @@ class LaneInstallTest(unittest.TestCase):
         self.assertIn('Evidence hash changed', changed_reread_status['report_status']['reason'])
         evidence.write_text('The selected current guidance.')
 
-        current = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
+        current = self.invoke_owner(owner_env, 'pr', 'ready', self.url)
         self.assertEqual(current.returncode, 0, current.stderr)
+        forwarded_before = self.forwarded.read_bytes()
+        forwarded = list(map(json.loads, forwarded_before.splitlines()))
+        self.assertEqual([item['argv'] for item in forwarded], [['pr', 'ready', self.url]])
+
+        published_state = lane_runtime.read(self.repo)
+        missing_reference = copy.deepcopy(published_state)
+        missing_reference.pop('guidance_attestation_ref', None)
+        missing_reference['pr_bindings'][self.url].pop('guidance_attestation_ref', None)
+
+        def save_checkout_state(value):
+            owner = value['lane_owner']
+            gitdir = self.git('rev-parse', '--absolute-git-dir').stdout.strip()
+            common_gitdir = self.git('rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
+            lane_runtime.session_store.write_checkout(
+                value['seat_id'], self.repo, value,
+                repository=owner['repository'], host=owner['host'],
+                gitdir=gitdir, common_gitdir=common_gitdir)
+
+        save_checkout_state(missing_reference)
+        try:
+            refused = {}
+            for action in ('ready', 'merge'):
+                result = self.invoke_owner(owner_env, 'pr', action, self.url)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.forwarded.read_bytes(), forwarded_before)
+                refused[action] = result
+        finally:
+            save_checkout_state(published_state)
+
+        guide_command = shlex.join([
+            sys.executable,
+            str(Path(published_state['runtime']['path']) / 'lane.py'),
+            'guide', '--print'])
+        self.assertIn('Published guidance attestations', refused['ready'].stderr)
+        self.assertIn('Before the final start check', refused['ready'].stderr)
+        self.assertLess(refused['ready'].stderr.index('Before the final start check'),
+                        refused['ready'].stderr.index('attestation-start-check'))
+        self.assertIn(guide_command, refused['ready'].stderr)
+        printed_guide = subprocess.run(shlex.split(guide_command), cwd=self.repo, env=owner_env,
+                                       capture_output=True, text=True)
+        self.assertEqual(printed_guide.returncode, 0, printed_guide.stderr)
+        self.assertIn('## Published guidance attestations', printed_guide.stdout)
         old_receipt = lane_runtime.read(self.repo)['receipt']
 
         evidence.write_text('Changed source after publication.')
