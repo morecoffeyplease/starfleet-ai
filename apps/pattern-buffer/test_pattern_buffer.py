@@ -12,6 +12,9 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+import pattern_buffer_reliability as reliability
+from _test_support import isolate_state_home
+
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 GUIDE = SCRIPT.with_name("guide.md")
 _SPEC = importlib.util.spec_from_file_location("pattern_buffer_under_test", SCRIPT)
@@ -23,6 +26,7 @@ class PatternBufferTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self.state_home = isolate_state_home(self)
         self.root = Path(self.temp.name) / "repo"
         self.root.mkdir()
         self.git("init", "-q")
@@ -81,6 +85,15 @@ class PatternBufferTests(unittest.TestCase):
         payload = {"hook_event_name": "SessionStart", "source": source,
                    "session_id": session, "cwd": str(root or self.root), **extra}
         return self.cli("hook", "--harness", "codex", payload=payload)
+
+    def test_reliability_destination_stays_inside_test_owned_state_home(self):
+        result = reliability.emit(self.root, "delivery.held", harness="codex",
+                                  session="fixture-session")
+        self.assertTrue(result["ok"], result)
+        state_dir, _ = reliability._state_path(self.root)
+        self.assertTrue(state_dir.resolve().is_relative_to(self.state_home.resolve()),
+                        f"reliability destination {state_dir} escapes test state {self.state_home}")
+        self.assertTrue(any(state_dir.glob("*.jsonl")))
 
     def assign(self, session, role, **kw):
         return self.cli("assign", "--harness", "codex", "--session", session,

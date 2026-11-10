@@ -3,13 +3,13 @@
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
 import pattern_buffer_reliability as reliability
+from _test_support import isolate_state_home
 
 
 UTC = datetime.timezone.utc
@@ -20,12 +20,9 @@ class ReliabilityTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="pattern-buffer-reliability-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
-        self.state_home = self.base / "state"
+        self.state_home = isolate_state_home(self)
         self.root = self.base / "worktree"
         self.root.mkdir()
-        self.env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)})
-        self.env.start()
-        self.addCleanup(self.env.stop)
 
     @staticmethod
     def at(day, hour=12, second=0):

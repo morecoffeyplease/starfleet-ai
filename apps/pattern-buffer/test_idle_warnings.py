@@ -8,12 +8,15 @@ import tempfile
 import unittest
 import uuid
 
+from _test_support import isolate_state_home
+
 
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 
 
 class IdleWarningTests(unittest.TestCase):
     def setUp(self):
+        isolate_state_home(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name)

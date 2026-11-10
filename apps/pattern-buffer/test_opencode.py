@@ -11,6 +11,8 @@ import datetime
 import unittest
 import uuid
 
+from _test_support import isolate_state_home
+
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 PLUGIN = Path(__file__).parent / "opencode-plugin/server.js"
 NODE = shutil.which("node")
@@ -27,9 +29,10 @@ CHECKPOINT_NOTE = "# Working checkpoint\n\n" + "\n\n".join(
 @unittest.skipUnless(NODE, "Node.js is required for the synthetic plugin callback fixture")
 class OpenCodePatternBufferTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir=Path.home())
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        self.state_home = isolate_state_home(self)
         self.owner = self.base / "owner"
         self.owner.mkdir()
         self.git(self.owner, "init", "-q")
@@ -49,7 +52,7 @@ class OpenCodePatternBufferTests(unittest.TestCase):
                     "OPENCODE_SESSION_ID": self.parent_session,
                     "CMUX_SURFACE_ID": self.surface_id,
                     "CMUX_WORKSPACE_ID": self.workspace_id,
-                    "XDG_STATE_HOME": str(self.base / "state"),
+                    "XDG_STATE_HOME": str(self.state_home),
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         self.call(self.owner, "assign", "--harness", "opencode", "--session", self.parent_session,
                   "--role", "orchestrator")

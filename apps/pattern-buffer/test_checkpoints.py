@@ -11,6 +11,7 @@ import unittest
 import uuid
 
 import pattern_buffer_checkpoint as checkpoints
+from _test_support import isolate_state_home
 
 SCRIPT = Path(__file__).with_name('pattern_buffer.py')
 NOTE = '# Working checkpoint\n\n' + '\n\n'.join(
@@ -25,6 +26,7 @@ NOTE = '# Working checkpoint\n\n' + '\n\n'.join(
 
 class CheckpointTests(unittest.TestCase):
     def setUp(self):
+        isolate_state_home(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'repo'
