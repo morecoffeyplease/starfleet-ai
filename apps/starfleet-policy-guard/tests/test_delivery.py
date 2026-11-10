@@ -81,7 +81,7 @@ class DeliveryTest(unittest.TestCase):
             'approach': 'Reuse the existing evidence packet and owner-bound delivery lane.',
             'approach_reason': 'A narrower change would leave the approved readiness path without the current check.',
             'evidence_refs': ['main-awareness.evidence at main-review.txt'],
-            'assumptions': [], 'uncertainty': ['The remote comment remains readable at the next check.'],
+            'assumptions': [], 'uncertainty': ['A later authenticated GitHub comment read may be unavailable.'],
             'approved_scope_ref': 'https://github.com/example/repo/issues/37#issuecomment-1',
             'human_holds_ref': 'No additional hold; issue 37 remains authoritative',
         }
@@ -139,6 +139,31 @@ class DeliveryTest(unittest.TestCase):
                                                      delivery.GUIDANCE_ATTESTATION_STATEMENT))
         self.assertIn('Accepted batch: https://github.com/example/repo/issues/37#accepted-batch-2', rendered['body'])
         self.assertNotIn('repair verification passed', rendered['body'].casefold())
+
+    def test_assumptions_must_be_explicitly_empty_and_render_as_none(self):
+        self.data['guidance_attestation'] = self.guidance_attestation()
+        report = self.report()
+        packet = json.loads(self.packet.read_text())
+        rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', report)
+        self.assertIn('## Material assumptions\n\n- None', rendered['body'])
+
+        invalid_cases = (
+            ('missing', None, False),
+            ('null', None, True),
+            ('object', {}, True),
+            ('string', 'not-a-list', True),
+            ('nonempty', ['The remote comment will remain readable.'], True),
+        )
+        for name, value, present in invalid_cases:
+            attestation = self.guidance_attestation()
+            if present:
+                attestation['assumptions'] = value
+            else:
+                del attestation['assumptions']
+            with self.subTest(assumptions=name):
+                with self.assertRaisesRegex(ValueError, 'assumptions must be an explicit empty list'):
+                    delivery.guidance_attestation({'guidance_attestation': attestation},
+                                                  self.packet.parent, self.url)
 
     def test_attestation_gaps_and_changed_reread_bytes_refuse(self):
         attestation = self.guidance_attestation()

@@ -28,6 +28,8 @@ A recorded report is a covered-delivery requirement, not proof of setup or a pre
 Prime Directive (Policy Guard) is the same delivery tool described by this README and its `lane.py` CLI.
 An owner can explicitly adopt its stage-specific opening and accepted repair-batch attestations for a target; older attachments remain unchanged until adoption.
 The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, the `--enable` adoption command and source/runtime upgrade requirements.
+An attestation requires `assumptions: []`; unknown required facts must be investigated or raised to the configured human on Discord, then resolved before attesting.
+The packet can record honest uncertainty about tool limits and future outcomes, but it cannot prove that the author's reasoning contains no hidden assumptions.
 Existing immutable seats must use the reviewed source-upgrade flow before they can run the new pinned attestation commands.
 Adopted targets require a current per-PR comment reference before covered ready or merge actions, with source and comment freshness checked on each supported action.
 Codex coverage is through the explicit seat `gh` entrypoint and Claude coverage is through its supported direct ready/merge hook path; raw push, PR creation, comments and alternate tools are not intercepted.

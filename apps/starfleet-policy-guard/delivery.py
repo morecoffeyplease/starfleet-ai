@@ -15,10 +15,12 @@ POLICY = Path(__file__).resolve().parent / 'config/delivery-checklist.json'
 CHECKS = ('design-fidelity', 'main-awareness', 'merge-conflicts', 'local-verification')
 SKILLS = ('design-fidelity-audit', 'fidelity-audit')
 ERRORS = (ValueError, OSError, TypeError, AttributeError, KeyError)
-GUIDANCE_ATTESTATION_STATEMENT = (
-    'I have chosen the simplest viable approach that meets the approved outcome and constraints, '
-    'and kept the solution proportionate to the problem it solves.'
-)
+GUIDANCE_ATTESTATION_STATEMENT = '\n'.join((
+    'I have chosen the simplest viable approach that meets the approved outcome and constraints, and kept the solution proportionate to the problem it solves.',
+    'I have made no claims based on assumptions, and I checked the required reads, investigation, evidence, verification, approved scope, and authority for this work.',
+    'Any required fact that was initially unknown was investigated or raised to the configured human on Discord, then resolved before I attested.',
+    'Disclosing uncertainty does not waive a missing prerequisite.',
+))
 
 
 class Gaps:
@@ -123,7 +125,10 @@ def guidance_attestation(packet, directory, pr_url, stage=None):
         raise ValueError('Guidance attestation has unresolved prerequisite gaps')
     for key in ('guidance_application', 'approach', 'approach_reason', 'approved_scope_ref', 'human_holds_ref'):
         text(record, key)
-    for key in ('evidence_refs', 'assumptions', 'uncertainty'):
+    assumptions = record.get('assumptions')
+    if not isinstance(assumptions, list) or assumptions:
+        raise ValueError('Guidance attestation.assumptions must be an explicit empty list; assumed claims are not allowed')
+    for key in ('evidence_refs', 'uncertainty'):
         values = record.get(key)
         if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
             raise ValueError('Guidance attestation.' + key + ' must be an explicit list of nonempty values')
@@ -147,8 +152,8 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
     if stage == 'opening' and not opening_report_ready(report):
         raise ValueError('Opening attestation requires a current clean report with successful canonical verification')
 
-    def lines(values):
-        return '\n'.join('- ' + value for value in values) if values else '- None recorded'
+    def lines(values, empty='None recorded'):
+        return '\n'.join('- ' + value for value in values) if values else '- ' + empty
 
     issue_line = 'Issue: ' + record['issue_ref']
     if stage == 'opening':
@@ -182,7 +187,7 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
         '## Scope and holds',
         'Approved scope: ' + record['approved_scope_ref'] + '\n\nHuman holds: ' + record['human_holds_ref'],
         '## Material assumptions',
-        lines(record['assumptions']),
+        lines(record['assumptions'], 'None'),
         '## Material uncertainty',
         lines(record['uncertainty']),
     ])

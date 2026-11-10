@@ -92,9 +92,13 @@ The validator checks the declared local bytes, packet fields, gaps and stage ord
 
 Add one `guidance_attestation` object to the existing evidence packet.
 Use `stage: "opening"` for the opening comment and `stage: "repair_batch"` for an accepted repair batch.
-Both stages require an exact `issue_ref`, explicit prerequisite completion and an empty `gaps` list, current `reread` file references, `guidance_application`, concrete `approach` and `approach_reason`, `evidence_refs`, explicit `assumptions` and `uncertainty` lists, and links to the approved scope and human holds.
+Both stages require an exact `issue_ref`, explicit prerequisite completion and an empty `gaps` list, current `reread` file references, `guidance_application`, concrete `approach` and `approach_reason`, `evidence_refs`, `assumptions: []`, an explicit `uncertainty` list, and links to the approved scope and human holds.
+Missing, null, non-list or nonempty `assumptions` values are rejected instead of discarded, and the rendered assumptions section states `None`.
 Repair batches also require `accepted_batch_ref` to identify the accepted batch and `repair_history_ref` to link existing repair history.
-Do not fill unknowns with assumptions or claim future repair verification is complete.
+Resolve an unknown required fact by investigating it or asking the configured human on Discord, and do not attest while a required fact or prerequisite remains unresolved.
+Disclosing an unknown as an assumption or uncertainty does not complete a prerequisite or waive missing evidence, verification, scope or authority.
+The `uncertainty` list may still record honest tool-capability limits or future outcomes, such as a later authenticated comment read being unavailable.
+Do not claim future repair verification is complete.
 
 ```json
 {
@@ -118,7 +122,7 @@ Do not fill unknowns with assumptions or claim future repair verification is com
     "approach_reason": "Why this approach meets the outcome and why a smaller change would not suffice, where relevant.",
     "evidence_refs": ["https://github.com/OWNER/REPO/pull/123/files"],
     "assumptions": [],
-    "uncertainty": ["A material unresolved question, or an empty list when none remains."],
+    "uncertainty": ["A later authenticated GitHub comment read may be unavailable."],
     "approved_scope_ref": "https://github.com/OWNER/REPO/issues/123#approved-scope",
     "human_holds_ref": "https://github.com/OWNER/REPO/issues/123#human-holds"
   }
@@ -127,10 +131,17 @@ Do not fill unknowns with assumptions or claim future repair verification is com
 
 An opening render requires a current clean report with successful canonical verification evidence, including a valid nothing-affected outcome when applicable.
 Unrelated report gaps remain independent from the mandatory opening-attestation prerequisite.
-Its body presents the approach, completed evidence, reread references, scope, holds, assumptions and uncertainty before ending with the attestation.
+Its body presents the approach, completed evidence, reread references, scope, holds and declared uncertainty, renders assumptions as explicit `None`, then ends with the attestation.
 A repair-batch render does not require the final candidate report, begins with its completed prerequisite attestation, and never claims future fix verification passed.
-Both bodies include the exact statement: `I have chosen the simplest viable approach that meets the approved outcome and constraints, and kept the solution proportionate to the problem it solves.`
+Both bodies include this statement:
+
+> I have chosen the simplest viable approach that meets the approved outcome and constraints, and kept the solution proportionate to the problem it solves.
+> I have made no claims based on assumptions, and I checked the required reads, investigation, evidence, verification, approved scope, and authority for this work.
+> Any required fact that was initially unknown was investigated or raised to the configured human on Discord, then resolved before I attested.
+> Disclosing uncertainty does not waive a missing prerequisite.
+
 Support that statement with the concrete design choice and why a smaller change would not suffice where relevant; do not invent an alternative to fill a template.
+The validator checks declared fields and bytes, but cannot prove comprehension or the absence of hidden assumptions in reasoning.
 
 Render the exact body without state writes, then post it yourself with the ordinary explicit GitHub CLI command.
 The start check only accepts the exact comment already published to the currently bound PR; it never creates, comments on or edits GitHub records.
