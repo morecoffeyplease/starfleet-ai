@@ -77,7 +77,11 @@ The default context template also includes a final `# confirmation` section that
 That section counts toward the 8192-byte standing-context limit.
 It asks agents to confirm injection receipt, completion of relevant PStack and Poteto reading, and mission or tracker updates in their own chat.
 Existing custom context files are not rewritten; they keep the runtime completion-confirmation wording until an owner-reviewed update adds the optional section.
-Owners must adjust their own context if it exceeds either existing limit; Pattern Buffer provides no length exception.
+For an ordinary worktree SessionStart, Pattern Buffer can emit a complete role view above 8192 bytes with a warning when the total context, including runtime, task and checkpoint addenda, stays within 9216 bytes and the existing 24 KiB combined limit.
+Larger overflow and source, parser, read or combined-limit failures produce a bounded notice that asks the agent to read the full source file and notify its owner while preserving unresolved scope and holds.
+The notice is not full context and does not expand authorization.
+Exact-session enrollment and dispatched work retain their blocking integrity behavior.
+Preview shows ordinary-worktree warning and fallback behavior without event-specific checkpoint addenda; validate continues to enforce the authoring-time role budget.
 The default context template includes shared review judgment and orchestrator repair-round guidance.
 Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](../starfleet-policy-guard/guide.md#review-and-fix-cycles) in full and revisit the relevant rule before each repair decision.
 Prime Directive (Policy Guard) is the same delivery tool described as Policy Guard in its CLI and documentation.
@@ -121,7 +125,9 @@ Validation and status report header overhead, usable content bytes and remaining
 Pass the exact session ID when available so the calculation uses the enrolled file path and identity.
 Without `--session`, status labels its placeholder header budget and does not establish exact native-session binding.
 Session enrollment and handoff checks use the same calculation before reviewed text is adopted.
-Oversized or malformed required sources still fail closed and are never truncated.
+Oversized or malformed required sources still block exact-session enrollment and dispatched work.
+Ordinary worktree SessionStart uses the bounded warning or failure-notice policy described in the [printable guide](guide.md).
+Status remains a read-only report of local budgets and delivery evidence, and a configured hook does not establish model reception.
 Doctor reads local registration and content only; it does not certify hook activation, model reception or compliance.
 After installation changes, restart or resume the harness according to its own configuration reload behavior.
 Native delivery checks require a separate bounded pilot in disposable state and are not established by these local tests.

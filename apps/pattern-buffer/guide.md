@@ -107,12 +107,17 @@ pattern-buffer --cwd /absolute/worktree preview --harness codex --session ACTUAL
 ```
 
 Use `--harness claude` for Claude and a real session identity when known.
-`validate` checks both role sections and exits nonzero on malformed or oversized context.
+`validate` checks both role sections and exits nonzero on malformed or oversized context, including a role view above the 8192-byte authoring budget.
 It reports header bytes, usable content bytes and remaining UTF-8 bytes from the exact rendered header.
 Use the exact session ID when available so the report includes the selected session file path.
 Without `--session`, status labels its placeholder header budget and does not establish exact native-session binding.
 `status`, `session-enroll`, `enrollment-status` and `handoff-check` use the same calculation.
-Oversized or malformed required sources fail closed and are never truncated.
+Status is read-only and continues to report local budget and delivery observations without claiming that the harness received context.
+Exact-session enrollments and dispatched work keep their blocking integrity checks for missing, inactive, unreviewed, malformed or oversized required context.
+An ordinary directly managed worktree may emit its complete role view above 8192 bytes with a warning when the total Pattern Buffer output, including runtime, task and checkpoint addenda, is at most 9216 bytes and remains under the 24 KiB combined limit.
+If that total exceeds 9216 bytes, or the ordinary source cannot be read or parsed or the combined limit is exceeded, SessionStart emits a bounded notice with the actual source path and asks the agent to read the full file and notify its owner.
+The notice preserves unresolved scope and holds, states that it is not full context, and does not expand authorization.
+Preview shows the ordinary-worktree warning and fallback behavior but omits event-specific checkpoint addenda, so the actual SessionStart total can differ.
 The hook uses the harness-reported working directory, not the directory from which installation was run.
 Unregistered worktrees emit no context.
 
@@ -130,7 +135,9 @@ Pattern Buffer appends the same short runtime PStack reminder to every rendered 
 It asks agents to use the installed PStack runtime and Poteto Mode, then after compaction read the sections relevant to current work in full, not the entire PStack library.
 The runtime reminder does not install PStack, change roles or authority, or rewrite custom context files.
 It stays outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
-Oversized combined context fails instead of being truncated.
+For an ordinary worktree, the full role view can exceed 8192 bytes only when the complete output with its warning and any runtime, task or checkpoint addenda stays at or below 9216 bytes.
+The 24 KiB limit remains a hard combined limit.
+Oversized output produces a bounded full-file-read and owner-notification notice for an ordinary worktree, while exact-session and dispatched integrity failures still stop.
 Hook output remains configuration evidence, not proof that the harness loaded or delivered the reminder.
 
 ## Confirmation and review guidance
@@ -142,8 +149,9 @@ It asks agents to confirm receipt, completion of relevant PStack and Poteto read
 If a required read is unavailable or incomplete, it asks agents to name the gap and preserve applicable holds.
 Existing custom context files are not rewritten and do not get the common footer until an owner-reviewed update adds the final section.
 Legacy custom contexts keep the runtime's completion-confirmation wording after compaction.
-Owners must fit their approved context within the existing 8192-byte standing and 24 KiB combined limits.
-Pattern Buffer does not provide a length exception.
+`validate` and context adoption continue to enforce the 8192-byte authoring budget for every role.
+The ordinary-worktree SessionStart warning policy is a runtime recovery exception and does not change that authoring check.
+Use preview to inspect the runtime warning or fallback notice; preview does not include event-specific checkpoint addenda.
 
 The default context template includes shared review judgment and orchestrator repair-round guidance.
 Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.

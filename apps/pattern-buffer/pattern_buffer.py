@@ -2,7 +2,7 @@
 """Pattern Buffer restores approved worktree context for Claude, Codex, and OpenCode."""
 import argparse
 import datetime
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
@@ -31,9 +31,22 @@ FILE_LIMIT = 32768
 HOOK_INPUT_LIMIT = 1024 * 1024
 TASK_LIMIT = 16384
 INJECTION_LIMIT = 24576
+RECOVERY_OUTPUT_LIMIT = 9 * 1024
 DISPATCH_ENV = "STARFLEET_CONTEXT_DISPATCH"
 REPO_PROFILE_LIMIT = 32768
 _OPENCODE_SESSION_ID = re.compile(r"^ses_[A-Za-z0-9]+$")
+STRICT_RENDER_POLICY = "strict"
+ORDINARY_WORKTREE_RENDER_POLICY = "ordinary_worktree"
+_RENDER_FAILURES = {
+    "combined_limit": "The composed output exceeds the existing 24 KiB injection limit.",
+    "file_limit": "The context source exceeds the 32 KiB file limit.",
+    "malformed": "The context source could not be parsed.",
+    "missing_role_section": "The context source has no section for the assigned role.",
+    "other": "The context could not be rendered safely.",
+    "runtime_output_limit": "The complete output, including its warning and runtime or checkpoint addenda, exceeds the 9 KiB recovery limit.",
+    "standing_limit": "The rendered role view exceeds the 8192-byte standing-context budget.",
+    "unreadable": "The context source could not be read.",
+}
 
 
 class DispatchFailure(ValueError):
@@ -47,6 +60,15 @@ class RequiredContextFailure(ValueError):
         super().__init__(message)
         self.path = Path(path)
         self.enrollment_id = enrollment_id
+
+
+@dataclass(frozen=True)
+class RenderedContext:
+    text: str
+    source: Path
+    runtime_policy: str
+    over_budget_bytes: int = 0
+    failure_kind: str | None = None
 
 
 _AUXILIARY = {}
@@ -1927,7 +1949,68 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
     }
 
 
-def render(cwd, harness, session, agent="", forced_role=None):
+def render_failure_kind(error):
+    if isinstance(error, OSError):
+        return "unreadable"
+    message = str(error).lower()
+    if "expected a regular, non-symlink file" in message:
+        return "unreadable"
+    if "file exceeds" in message or "source exceeds" in message:
+        return "file_limit"
+    if "missing section for assigned role" in message:
+        return "missing_role_section"
+    if "24 kib" in message or "injection limit" in message:
+        return "combined_limit"
+    if "context uses " in message and "8192 bytes" in message:
+        return "standing_limit"
+    if isinstance(error, (ValueError, UnicodeError)):
+        return "malformed"
+    return "other"
+
+
+def failure_notice(source, failure_kind):
+    reason = _RENDER_FAILURES.get(failure_kind, _RENDER_FAILURES["other"])
+    return (f"Pattern Buffer could not deliver the complete standing context. {reason}\n"
+            f"Source file: {source}\n"
+            "Read the complete source file now with your normal file tool and notify its owner before continuing.\n"
+            "Preserve unresolved scope and holds. This notice is not the full context and does not expand authorization.")
+
+
+def over_budget_warning(over_budget_bytes):
+    byte_word = "byte" if over_budget_bytes == 1 else "bytes"
+    return ("Pattern Buffer delivered the complete standing context above. "
+            f"The rendered role view exceeded its 8192-byte budget by {over_budget_bytes} {byte_word}. "
+            "Notify the context owner. This warning does not expand authorization.")
+
+
+def finalize_rendered_context(rendered, addendum=""):
+    if rendered.failure_kind:
+        return rendered
+    text = rendered.text
+    if addendum:
+        text += "\n\n" + addendum
+    if rendered.over_budget_bytes:
+        text += "\n\n" + over_budget_warning(rendered.over_budget_bytes)
+    output_bytes = len(text.encode("utf-8"))
+    if output_bytes > INJECTION_LIMIT:
+        if rendered.runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY:
+            kind = "combined_limit"
+            return RenderedContext(failure_notice(rendered.source, kind), rendered.source,
+                                   rendered.runtime_policy, failure_kind=kind)
+        raise ValueError("combined reminder, checkpoint pointer and task exceed the 24 KiB injection limit")
+    if (rendered.over_budget_bytes and output_bytes > RECOVERY_OUTPUT_LIMIT and
+            rendered.runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY):
+        kind = "runtime_output_limit"
+        return RenderedContext(failure_notice(rendered.source, kind), rendered.source,
+                               rendered.runtime_policy, failure_kind=kind)
+    return RenderedContext(text, rendered.source, rendered.runtime_policy,
+                           rendered.over_budget_bytes)
+
+
+def render(cwd, harness, session, agent="", forced_role=None, *,
+           runtime_policy=STRICT_RENDER_POLICY):
+    if runtime_policy not in (STRICT_RENDER_POLICY, ORDINARY_WORKTREE_RENDER_POLICY):
+        raise ValueError("invalid Pattern Buffer render policy")
     root, gitdir = checkout(cwd)
     config, source = load(root, gitdir)
     enrolled = session_binding(root, gitdir, harness, session, agent)
@@ -1937,28 +2020,49 @@ def render(cwd, harness, session, agent="", forced_role=None):
                                          enrolled.path, enrolled.enrollment_id)
         source = Path(enrolled.path)
     role, origin, saved = resolve_role(root, gitdir, config, harness, session, agent, forced_role)
+    if (runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY and
+            (enrolled is not None or config.get("context_owner") or saved.get("task_id") or
+             os.environ.get(DISPATCH_ENV))):
+        runtime_policy = STRICT_RENDER_POLICY
     try:
         raw = bounded(source, FILE_LIMIT)
         if enrolled is not None and (enrolled.file_status != "valid" or
                 hashlib.sha256(raw.encode()).hexdigest() != enrolled.source_sha256):
             raise ValueError("registered context file is missing, unsafe, or changed outside reviewed publication")
         content = sections_text(raw)
-        text = render_standing(root, source, harness, session, agent, role, origin, content)
+        text, budget = render_standing_details(root, source, harness, session, agent, role, origin, content)
+        over_budget_bytes = max(0, budget["bytes_used"] - LIMIT)
+        if over_budget_bytes and runtime_policy == STRICT_RENDER_POLICY:
+            raise ValueError(standing_budget_message(role, budget))
     except (OSError, ValueError, UnicodeError) as error:
         if enrolled is not None:
             raise RequiredContextFailure(str(error), source, enrolled.enrollment_id) from error
+        if runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY:
+            failure_kind = render_failure_kind(error)
+            return RenderedContext(failure_notice(source, failure_kind), source, runtime_policy,
+                                   failure_kind=failure_kind)
         raise
-    if saved.get("task_id"):
-        if role != "implementer" or agent:
-            raise ValueError("task bindings require a primary implementer session")
-        task_id = saved["task_id"]
-        data, brief = read_task(root, gitdir, task_id)
-        expected_owner = config.get("context_owner") or {"root": str(root), "gitdir": str(gitdir)}
-        if data["owner"] != expected_owner or data["session_id"] != session or data["harness"] != harness:
-            raise ValueError("task/session/context-owner binding changed")
-        return compose_task_context(text, task_id, data, brief,
-                                   has_confirmation=bool(content.get("confirmation")))
-    return compose_task_context(text, has_confirmation=bool(content.get("confirmation")))
+    try:
+        if saved.get("task_id"):
+            if role != "implementer" or agent:
+                raise ValueError("task bindings require a primary implementer session")
+            task_id = saved["task_id"]
+            data, brief = read_task(root, gitdir, task_id)
+            expected_owner = config.get("context_owner") or {"root": str(root), "gitdir": str(gitdir)}
+            if data["owner"] != expected_owner or data["session_id"] != session or data["harness"] != harness:
+                raise ValueError("task/session/context-owner binding changed")
+            text = compose_task_context(text, task_id, data, brief,
+                                        has_confirmation=bool(content.get("confirmation")))
+        else:
+            text = compose_task_context(text, has_confirmation=bool(content.get("confirmation")))
+    except ValueError as error:
+        failure_kind = render_failure_kind(error)
+        if (runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY and
+                failure_kind == "combined_limit"):
+            return RenderedContext(failure_notice(source, failure_kind), source, runtime_policy,
+                                   failure_kind=failure_kind)
+        raise
+    return RenderedContext(text, source, runtime_policy, over_budget_bytes)
 
 
 def compose_task_context(text, task_id=None, task_data=None, brief=None, has_confirmation=False):
@@ -1999,7 +2103,7 @@ def opencode_context(root, gitdir, session):
         if (not isinstance(saved, dict) or saved.get("root") != str(root)
                 or saved.get("role") != "implementer" or not saved.get("task_id")):
             raise ValueError("linked OpenCode worktree session is not bound to its prepared implementer task")
-    text = render(root, "opencode", session)
+    text = render(root, "opencode", session).text
     checkpoint = checkpoints().opencode_recovery_context(sys.modules[__name__], root, gitdir, session)
     if checkpoint:
         text += "\n\n" + checkpoint
@@ -2077,11 +2181,15 @@ def standing_context_budgets(root, source, harness, session, agent, origin, cont
 def render_standing(root, source, harness, session, agent, role, origin, content):
     text, budget = render_standing_details(root, source, harness, session, agent, role, origin, content)
     if not budget["ok"]:
-        raise ValueError(f"{role or 'unassigned'} context uses {budget['bytes_used']} / {LIMIT} bytes "
-                         f"(header {budget['header_bytes']}; content {budget['content_bytes']} / "
-                         f"{budget['usable_content_bytes']} usable bytes; "
-                         f"{abs(budget['remaining_bytes'])} over); shorten the file")
+        raise ValueError(standing_budget_message(role, budget))
     return text
+
+
+def standing_budget_message(role, budget):
+    return (f"{role or 'unassigned'} context uses {budget['bytes_used']} / {LIMIT} bytes "
+            f"(header {budget['header_bytes']}; content {budget['content_bytes']} / "
+            f"{budget['usable_content_bytes']} usable bytes; "
+            f"{abs(budget['remaining_bytes'])} over); shorten the file")
 
 
 def context_validator(root, harness, session):
@@ -2360,26 +2468,40 @@ def hook(harness):
             if payload.get("agent_id"):
                 raise ValueError("dispatch cannot enroll a nested agent")
             bind_dispatch(root, gitdir, harness, payload.get("session_id"), token)
-        text = render(root, harness, payload.get("session_id"), payload.get("agent_id") or "")
-        extra = checkpoint_event(root, gitdir, harness, payload)
-        if extra:
-            text += "\n\n" + extra
-        if len(text.encode()) > INJECTION_LIMIT:
-            raise ValueError("combined reminder, checkpoint pointer and task exceed the 24 KiB injection limit")
+        runtime_policy = (STRICT_RENDER_POLICY if dispatched else
+                          ORDINARY_WORKTREE_RENDER_POLICY)
+        rendered = render(root, harness, payload.get("session_id"), payload.get("agent_id") or "",
+                          runtime_policy=runtime_policy)
+        if rendered.failure_kind:
+            output = rendered
+        else:
+            extra = checkpoint_event(root, gitdir, harness, payload)
+            output = finalize_rendered_context(rendered, extra)
+        text = output.text
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
         record_event(root, "standing.injection_failed", harness, payload.get("session_id"),
-                     result="failed", details={"error_code": type(error).__name__})
+                     result="failed", details={"error_code": type(error).__name__,
+                                               "failure_kind": render_failure_kind(error)})
         if dispatched:
             raise DispatchFailure(str(error)) from error
         raise
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                               "additionalContext": text}}, ensure_ascii=False), flush=True)
     binding = session_binding(root, gitdir, harness, payload.get("session_id"), payload.get("agent_id") or "")
+    if output.failure_kind:
+        record_event(root, "standing.injection_failed", harness, payload.get("session_id"),
+                     binding.enrollment_id if binding else None, "failed",
+                     details={"failure_kind": output.failure_kind})
+        return
+    details = {
+        "trigger": payload.get("source"), "bytes": len(text.encode()),
+        "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "source": "session" if binding else "default",
+    }
+    if output.over_budget_bytes:
+        details["over_budget_bytes"] = output.over_budget_bytes
     record_event(root, "standing.injection_emitted", harness, payload.get("session_id"),
-                 binding.enrollment_id if binding else None, "emitted", details={
-                     "trigger": payload.get("source"), "bytes": len(text.encode()),
-                     "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                     "source": "session" if binding else "default"})
+                 binding.enrollment_id if binding else None, "emitted", details=details)
 
 
 def checkpoint_event(root, gitdir, harness, payload):
@@ -2900,7 +3022,9 @@ def main():
             atomic(path, json.dumps({"root": str(root), "role": args.role}))
             print(f"Assigned {args.harness} session {args.session} to {args.role}.")
         elif args.command == "preview":
-            print(render(root, args.harness, args.session, args.agent, args.role))
+            rendered = render(root, args.harness, args.session, args.agent, args.role,
+                              runtime_policy=ORDINARY_WORKTREE_RENDER_POLICY)
+            print(finalize_rendered_context(rendered).text)
         else:
             config, _source = load(root, gitdir)
             report = current_context_budgets(root, gitdir, args.harness, args.session, args.agent)

@@ -81,10 +81,10 @@ class PatternBufferTests(unittest.TestCase):
             result[key] = (value, stat.st_mode & 0o777, stat.st_mtime_ns)
         return result
 
-    def event(self, session="one", root=None, source="compact", **extra):
+    def event(self, session="one", root=None, source="compact", env=None, **extra):
         payload = {"hook_event_name": "SessionStart", "source": source,
                    "session_id": session, "cwd": str(root or self.root), **extra}
-        return self.cli("hook", "--harness", "codex", payload=payload)
+        return self.cli("hook", "--harness", "codex", payload=payload, env=env)
 
     def test_reliability_destination_stays_inside_test_owned_state_home(self):
         result = reliability.emit(self.root, "delivery.held", harness="codex",
@@ -175,13 +175,17 @@ class PatternBufferTests(unittest.TestCase):
         self.assertEqual(unassigned["bytes_used"], 8192)
         self.assertTrue(unassigned["ok"])
 
-    def test_render_accepts_exactly_8192_bytes_and_rejects_one_byte_over(self):
+    def test_render_accepts_exactly_8192_bytes_and_warns_one_byte_over(self):
         self.cli("init")
         source = self.root / ".context-injector/context.md"
         session = "budget-boundary"
+        env = {"STARFLEET_CONTEXT_DISPATCH": "",
+               "XDG_STATE_HOME": str(self.root.parent / "owned-state")}
         for role in ci.ROLES:
             with self.subTest(role=role):
                 source.write_text("# shared\nx\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n")
+                self.cli("assign", "--harness", "codex", "--session", session,
+                         "--role", role, env=env)
                 content = ci.sections_text(source.read_text())
                 baseline, _budget = ci.render_standing_details(
                     self.root.resolve(), source.resolve(), "codex", session, "", role,
@@ -196,14 +200,154 @@ class PatternBufferTests(unittest.TestCase):
                 self.assertEqual(len(exact.encode("utf-8")), 8192)
                 self.assertEqual(exact_budget["bytes_used"], 8192)
                 preview = self.cli("preview", "--harness", "codex", "--session", session,
-                                   "--role", role)
+                                   "--role", role, env=env)
                 self.assertTrue(preview.stdout.startswith(exact))
+                self.assertNotIn("exceeded its 8192-byte budget", preview.stdout)
                 source.write_text("# shared\n" + "x" * (fill + 1) + "\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n")
                 over = self.cli("preview", "--harness", "codex", "--session", session,
-                                "--role", role, success=False)
-                self.assertIn("8193 / 8192 bytes", over.stderr)
+                                "--role", role, env=env)
+                self.assertIn("exceeded its 8192-byte budget by 1 byte", over.stdout)
+                self.assertIn("Notify the context owner", over.stdout)
+                rejected = self.cli("validate", "--harness", "codex", "--session", session,
+                                    env=env, success=False)
+                self.assertIn(role, rejected.stderr)
+                self.assertIn("remaining", rejected.stderr)
         self.assertEqual((ci.LIMIT, ci.FILE_LIMIT, ci.TASK_LIMIT, ci.INJECTION_LIMIT),
                          (8192, 32768, 16384, 24576))
+
+    def test_sessionstart_recovery_enforces_total_output_limit_with_runtime_addenda(self):
+        self.cli("init", "--default-role", "orchestrator")
+        source = self.root / ".context-injector/context.md"
+        session = "final-output-boundary"
+        env = {"STARFLEET_CONTEXT_DISPATCH": "",
+               "XDG_STATE_HOME": str(self.root.parent / "owned-state")}
+        tail = "\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n"
+
+        def write_role_view(target_bytes):
+            source.write_text("# shared\n" + tail)
+            content = ci.sections_text(source.read_text())
+            baseline, _ = ci.render_standing_details(
+                self.root.resolve(), source.resolve(), "codex", session, "", "orchestrator",
+                "worktree default", content)
+            fill = target_bytes - len(baseline.encode("utf-8"))
+            self.assertGreaterEqual(fill, 0)
+            source.write_text("# shared\n" + "x" * fill + tail)
+            text, budget = ci.render_standing_details(
+                self.root.resolve(), source.resolve(), "codex", session, "", "orchestrator",
+                "worktree default", ci.sections_text(source.read_text()))
+            self.assertEqual(len(text.encode("utf-8")), target_bytes)
+            self.assertEqual(budget["bytes_used"], target_bytes)
+            return text
+
+        base = write_role_view(ci.LIMIT)
+        within_budget = self.content(self.event(session=session, env=env))
+        self.assertIn(base, within_budget)
+        self.assertNotIn("exceeded its 8192-byte budget", within_budget)
+        self.assertLess(len(within_budget.encode("utf-8")), ci.RECOVERY_OUTPUT_LIMIT)
+        composed = ci.compose_task_context(base, has_confirmation=True)
+        runtime_overhead = len(composed.encode("utf-8")) - len(base.encode("utf-8"))
+        seed_warning_length = len(ci.over_budget_warning(100).encode("utf-8"))
+        exact_role_bytes = (ci.RECOVERY_OUTPUT_LIMIT - runtime_overhead - 2 -
+                            seed_warning_length)
+        exact_overage = exact_role_bytes - ci.LIMIT
+        self.assertGreater(exact_overage, 99)
+        self.assertLess(exact_overage, 1000)
+        self.assertEqual(len(ci.over_budget_warning(exact_overage).encode("utf-8")),
+                         seed_warning_length)
+
+        status_before = self.snapshot(self.root.parent)
+        exact_status = json.loads(self.cli("status", "--harness", "codex", "--session", session,
+                                           env=env).stdout)
+        self.assertEqual(self.snapshot(self.root.parent), status_before)
+        self.assertEqual(exact_status["delivery_state"], "not_tracked")
+        self.assertFalse(exact_status["delivery_verified"])
+        self.assertEqual(exact_status["standing_context_budgets"]["roles"]["orchestrator"]["bytes_used"],
+                         ci.LIMIT)
+        self.assertTrue(exact_status["standing_context_budgets"]["ok"])
+        exact_role = write_role_view(exact_role_bytes)
+        exact_result = self.event(session=session, env=env)
+        exact_text = self.content(exact_result)
+        self.assertEqual(len(exact_text.encode("utf-8")), ci.RECOVERY_OUTPUT_LIMIT)
+        self.assertIn("x" * 64, exact_text)
+        self.assertIn("exceeded its 8192-byte budget", exact_text)
+        self.assertIn("does not expand authorization", exact_text)
+        self.assertIn(exact_role, exact_text)
+        emitted = json.loads(self.cli("reliability", "--since", "7d", "--json", env=env).stdout)
+        emission = next(event for event in reversed(emitted["events"])
+                        if event["event"] == "standing.injection_emitted")
+        self.assertEqual(emission["details"]["bytes"], ci.RECOVERY_OUTPUT_LIMIT)
+        self.assertEqual(emission["details"]["over_budget_bytes"], exact_overage)
+
+        write_role_view(exact_role_bytes + 1)
+        status_before = self.snapshot(self.root.parent)
+        over_status = json.loads(self.cli("status", "--harness", "codex", "--session", session,
+                                          env=env).stdout)
+        self.assertEqual(self.snapshot(self.root.parent), status_before)
+        self.assertEqual(over_status["delivery_state"], "not_tracked")
+        self.assertFalse(over_status["delivery_verified"])
+        self.assertEqual(over_status["standing_context_budgets"]["roles"]["orchestrator"]["bytes_used"],
+                         exact_role_bytes + 1)
+        self.assertFalse(over_status["standing_context_budgets"]["ok"])
+        fallback = self.content(self.event(session=session, env=env))
+        self.assertLess(len(fallback.encode("utf-8")), 1024)
+        self.assertIn("exceeds the 9 KiB recovery limit", fallback)
+        self.assertIn(str(source), fallback)
+        self.assertIn("normal file tool", fallback)
+        self.assertIn("notify its owner", fallback)
+        self.assertIn("Preserve unresolved scope and holds", fallback)
+        self.assertIn("This notice is not the full context", fallback)
+        self.assertIn("does not expand authorization", fallback)
+        failed = json.loads(self.cli("reliability", "--since", "7d", "--json", env=env).stdout)
+        failure = next(event for event in reversed(failed["events"])
+                       if event["event"] == "standing.injection_failed")
+        self.assertEqual(failure["details"]["failure_kind"], "runtime_output_limit")
+        self.assertNotIn(str(self.root), json.dumps(failed))
+
+    def test_recovery_limit_counts_checkpoint_addendum_and_warning(self):
+        self.cli("init", "--default-role", "orchestrator")
+        source = self.root / ".context-injector/context.md"
+        session = "checkpoint-output-boundary"
+        addendum = "Checkpoint recovery note: " + "c" * 32
+        tail = "\n# implementer\ny\n# orchestrator\ny\n# confirmation\nz\n"
+
+        def write_role_view(target_bytes):
+            source.write_text("# shared\n" + tail)
+            baseline, _ = ci.render_standing_details(
+                self.root.resolve(), source.resolve(), "codex", session, "", "orchestrator",
+                "worktree default", ci.sections_text(source.read_text()))
+            source.write_text("# shared\n" + "x" * (target_bytes - len(baseline.encode("utf-8"))) + tail)
+            text, budget = ci.render_standing_details(
+                self.root.resolve(), source.resolve(), "codex", session, "", "orchestrator",
+                "worktree default", ci.sections_text(source.read_text()))
+            self.assertEqual(len(text.encode("utf-8")), target_bytes)
+            self.assertEqual(budget["bytes_used"], target_bytes)
+            return text
+
+        base = write_role_view(ci.LIMIT)
+        runtime_text = ci.compose_task_context(base, has_confirmation=True)
+        runtime_overhead = len(runtime_text.encode("utf-8")) - len(base.encode("utf-8"))
+        warning_length = len(ci.over_budget_warning(100).encode("utf-8"))
+        target_role_bytes = (ci.RECOVERY_OUTPUT_LIMIT - runtime_overhead - len(addendum.encode("utf-8")) -
+                             4 - warning_length)
+        overage = target_role_bytes - ci.LIMIT
+        self.assertGreater(overage, 99)
+        self.assertLess(overage, 1000)
+        self.assertEqual(len(ci.over_budget_warning(overage).encode("utf-8")), warning_length)
+        write_role_view(target_role_bytes)
+        with mock.patch.dict(os.environ, {ci.DISPATCH_ENV: ""}):
+            rendered = ci.render(self.root, "codex", session,
+                                 runtime_policy=ci.ORDINARY_WORKTREE_RENDER_POLICY)
+            exact = ci.finalize_rendered_context(rendered, addendum)
+            self.assertEqual(len(exact.text.encode("utf-8")), ci.RECOVERY_OUTPUT_LIMIT)
+            self.assertIn(addendum, exact.text)
+            self.assertIn("exceeded its 8192-byte budget", exact.text)
+            write_role_view(target_role_bytes + 1)
+            rendered = ci.render(self.root, "codex", session,
+                                 runtime_policy=ci.ORDINARY_WORKTREE_RENDER_POLICY)
+            fallback = ci.finalize_rendered_context(rendered, addendum)
+        self.assertEqual(fallback.failure_kind, "runtime_output_limit")
+        self.assertIn(str(source), fallback.text)
+        self.assertIn("This notice is not the full context", fallback.text)
 
     def test_guide_print_is_plain_text_read_only_without_git_or_home_state(self):
         outside = self.root.parent / "outside-git"
@@ -450,15 +594,57 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("Track ownership", self.content(self.event(source="resume")))
         self.assertNotIn("Track ownership", self.content(self.event(session="fork-id", source="fork")))
 
-    def test_malformed_or_oversized_content_emits_no_context(self):
+    def test_ordinary_source_failures_emit_bounded_actionable_notices(self):
+        self.cli("init", "--default-role", "orchestrator")
+        source = self.root / ".context-injector/context.md"
+        session = "ordinary-failure"
+        env = {"STARFLEET_CONTEXT_DISPATCH": "",
+               "XDG_STATE_HOME": str(self.root.parent / "owned-state")}
+        self.cli("assign", "--harness", "codex", "--session", session, "--role", "orchestrator")
+        cases = (
+            ("# shared\na\n# shared\nb", "malformed"),
+            ("# shared\n" + "x" * (ci.FILE_LIMIT + 1), "file_limit"),
+            ("# shared\nOnly shared context is present.", "missing_role_section"),
+            ("# shared\n" + "x" * 25000 + "\n# implementer\nImpl\n# orchestrator\nOwner\n",
+             "combined_limit"),
+        )
+        for text, failure_kind in cases:
+            source.write_text(text)
+            result = self.event(session=session, env=env)
+            notice = self.content(result)
+            self.assertIn(str(source), notice)
+            self.assertIn("normal file tool", notice)
+            self.assertIn("notify its owner", notice)
+            self.assertIn("Preserve unresolved scope and holds", notice)
+            self.assertIn("This notice is not the full context", notice)
+            self.assertIn("does not expand authorization", notice)
+            self.assertLess(len(notice.encode("utf-8")), 1024)
+            self.cli("validate", success=False, env=env)
+        source.unlink()
+        missing = self.content(self.event(session=session, env=env))
+        self.assertIn(str(source), missing)
+        self.assertIn("could not be read", missing)
+        self.assertIn("This notice is not the full context", missing)
+        report = json.loads(self.cli("reliability", "--since", "7d", "--json", env=env).stdout)
+        failures = [event for event in report["events"] if event["event"] == "standing.injection_failed"]
+        self.assertEqual([event["details"]["failure_kind"] for event in failures],
+                         [failure_kind for _text, failure_kind in cases] + ["unreadable"])
+        self.assertNotIn(str(self.root), json.dumps(report))
+
+    def test_ordinary_combined_limit_returns_failure_notice_and_strict_policy_still_raises(self):
         self.cli("init")
         source = self.root / ".context-injector/context.md"
-        for text in ("# shared\na\n# shared\nb", "# shared\n" + "x" * 9000):
-            source.write_text(text)
-            result = self.event()
-            self.assertEqual(result.stdout, "")
-            self.assertIn("pattern-buffer:", result.stderr)
-            self.cli("validate", success=False)
+        source.write_text("# shared\n" + "x" * 9000 + "\n# implementer\ny\n# orchestrator\ny\n")
+        with mock.patch.dict(os.environ, {ci.DISPATCH_ENV: ""}):
+            rendered = ci.render(self.root, "codex", "combined-test", runtime_policy=
+                                 ci.ORDINARY_WORKTREE_RENDER_POLICY)
+            combined = ci.finalize_rendered_context(rendered, "x" * ci.INJECTION_LIMIT)
+            self.assertEqual(combined.failure_kind, "combined_limit")
+            self.assertIn(str(source), combined.text)
+            self.assertIn("24 KiB injection limit", combined.text)
+            self.assertIn("This notice is not the full context", combined.text)
+        with self.assertRaisesRegex(ValueError, r"uses \d+ / 8192 bytes"):
+            ci.render(self.root, "codex", "combined-test")
 
     def test_validation_reports_both_budgets_and_errors_for_unused_role(self):
         self.cli("init", "--default-role", "implementer")
@@ -1694,6 +1880,18 @@ print(json.dumps({{'stdin':sys.stdin.read(),'argv':sys.argv,'context':json.loads
         result = self.dispatch_event(worker, ticket, source="compact", token=False)
         self.assertFalse(json.loads(result.stdout)["continue"])
         self.assertNotIn("additionalContext", result.stdout)
+
+    def test_dispatched_oversized_standing_context_still_stops(self):
+        worker, task_file = self.implementer()
+        ticket = self.prepare(worker, task_file)
+        source = self.root / ".context-injector/context.md"
+        source.write_text("# shared\n" + "x" * 9000 +
+                          "\n# implementer\nAssigned work.\n# orchestrator\nOwner rules.\n")
+        result = self.dispatch_event(worker, ticket)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+        self.assertNotIn("additionalContext", response)
+        self.assertRegex(result.stderr, r"uses \d+ / 8192 bytes")
 
 
 ROLES = ("implementer", "orchestrator")
