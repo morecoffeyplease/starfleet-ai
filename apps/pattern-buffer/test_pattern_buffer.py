@@ -119,7 +119,10 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("Check that observation on the failing run AND a passing control", orchestrator.stdout)
         self.assertIn("Published guidance attestations", orchestrator.stdout)
         self.assertIn("attestation-start-check", orchestrator.stdout)
-        self.assertIn("Outcome, Playbook, Size and Facts in the PR opening explanation", orchestrator.stdout)
+        self.assertIn(
+            "Outcome, Playbook, Size and Facts in each implementer brief and the PR opening explanation.",
+            orchestrator.stdout,
+        )
         self.assertIn("Repair rounds: don't spiral", orchestrator.stdout)
         self.assertEqual(orchestrator.stdout.count(ci.RESTATEMENT), 1)
         self.assertIn("Restate the four lines above.", orchestrator.stdout)
