@@ -405,7 +405,7 @@ def captured_gh(state):
     return path
 
 
-def require_guidance_attestation(state, cwd):
+def require_guidance_attestation(state, cwd, *, local_inspection=False):
     published = state.get('guidance_attestation_ref')
     if (not isinstance(published, dict) or type(published.get('version')) is not int or
             published['version'] != 1):
@@ -430,6 +430,8 @@ def require_guidance_attestation(state, cwd):
     if (published.get('body_sha256') != rendered['body_sha256'] or
             published.get('attestation_sha256') != rendered['attestation_sha256']):
         raise ValueError('Local guidance attestation changed after publication; render and publish the current stage again')
+    if local_inspection:
+        return
     executable = captured_gh(state)
     remote = github.read_comment(published.get('comment_url', ''), state['pr_url'], executable, timeout=5)
     if remote['reference']['comment_id'] != published.get('comment_id'):
@@ -507,7 +509,7 @@ def attestation_start_check(args):
     return 0
 
 
-def require(state, cwd, event=None):
+def require(state, cwd, event=None, *, local_inspection=False):
     if state and state.get('lane_owner'):
         lane_scope.check_owner(state,event=event)
         check_lane_scope(state, cwd)
@@ -520,7 +522,7 @@ def require(state, cwd, event=None):
             raise ValueError('Malformed attestation adoption state; there is no disable or fallback mode')
         if state.get('lane_owner', {}).get('harness') not in ('claude', 'codex'):
             raise ValueError('Published guidance attestation checks are qualified only for the supported Claude and Codex delivery paths')
-        require_guidance_attestation(state, cwd)
+        require_guidance_attestation(state, cwd, local_inspection=local_inspection)
     try:
         report=delivery_runs.check(state.get('receipt'),cwd,state['pr_url'])
         if report['snapshot']['base_ref']!=state['base_ref']:
@@ -2579,7 +2581,7 @@ def status(cwd, session_id=None, state=None, native_context=None):
             receipt_reason = 'An installation upgrade is incomplete; recover it before evaluating this report.'
         else:
             try:
-                require(state, cwd)
+                require(state, cwd, local_inspection=True)
                 receipt_status, receipt_reason = 'valid-local-snapshot', 'Current local candidate, target and inputs match'
             except Exception as error:
                 message = str(error)

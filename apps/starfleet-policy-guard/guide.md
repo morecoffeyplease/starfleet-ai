@@ -168,6 +168,8 @@ There is no disable or fallback flag.
 
 An adopted target refuses covered ready or merge unless its current packet attestation, exact local reread bytes and per-PR publication reference match.
 Each covered action reads the exact authenticated GitHub comment using the captured `gh` executable with a bounded timeout; unavailable, edited, deleted or mismatched comments fail closed.
+When evaluating a recorded report, ordinary `status` checks the attestation packet and reread bytes locally without querying GitHub for comment freshness.
+The explicit `attestation-start-check` and each covered ready or merge action still make a fresh authenticated read.
 The ordinary report still checks candidate freshness and preserves its existing checklist-gap behavior.
 No atomicity is claimed between the remote read and later GitHub forwarding.
 The attestation text and hash prove only that the declared files and comment bytes matched these observations.

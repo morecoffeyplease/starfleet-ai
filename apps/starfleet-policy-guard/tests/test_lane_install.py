@@ -1504,25 +1504,72 @@ class LaneInstallTest(unittest.TestCase):
         adopted = lane_runtime.read(self.repo)
         self.assertIs(adopted['attestation_required'], True)
         self.assertEqual(adopted['guidance_attestation_ref']['comment_url'], comment_url)
+
+        def local_status_without_api_calls(env=owner_env, cli_source=source):
+            before = self.api_calls.read_text().splitlines() if self.api_calls.exists() else []
+            result = self.call_source(cli_source, 'status', env=env)
+            after = self.api_calls.read_text().splitlines() if self.api_calls.exists() else []
+            self.assertEqual(after, before)
+            return json.loads(result.stdout)
+
         other_owner = copy.deepcopy(adopted)
         other_owner['lane_owner']['session_id'] = 'codex-successor-session'
         with self.assertRaisesRegex(ValueError, 'previous native owner'):
-            lane_runtime.require_guidance_attestation(other_owner, self.repo)
+            lane_runtime.require_guidance_attestation(other_owner, self.repo, local_inspection=True)
         other_pr = copy.deepcopy(adopted)
         other_pr['pr_url'] = self.url.replace('901', '902')
         with self.assertRaisesRegex(ValueError, 'different PR binding'):
-            lane_runtime.require_guidance_attestation(other_pr, self.repo)
+            lane_runtime.require_guidance_attestation(other_pr, self.repo, local_inspection=True)
         other_target = copy.deepcopy(adopted)
         other_target['base_ref'] = 'release'
         with self.assertRaisesRegex(ValueError, 'different branch or target binding'):
-            lane_runtime.require_guidance_attestation(other_target, self.repo)
+            lane_runtime.require_guidance_attestation(other_target, self.repo, local_inspection=True)
 
         self.call_source(source, 'record', '--evidence', self.packet, env=owner_env)
+        local_status = local_status_without_api_calls()
+        self.assertEqual(local_status['report_status']['state'], 'valid-local-snapshot')
+        wrong_owner_status = local_status_without_api_calls(wrong_actor)
+        self.assertEqual(wrong_owner_status['report_status']['state'], 'not-evaluated')
+        self.assertIn('belongs to another native session', wrong_owner_status['report_status']['reason'])
+        self.assertTrue(wrong_owner_status['current_owner']['mismatch'])
+
+        pinned_source_file = Path(adopted['source']) / 'lane_scope.py'
+        original_pinned_source = pinned_source_file.read_bytes()
+        original_pinned_mode = pinned_source_file.stat().st_mode & 0o777
+        try:
+            pinned_source_file.chmod(original_pinned_mode | 0o200)
+            pinned_source_file.write_bytes(original_pinned_source + b'\n# local pin control\n')
+            changed_pin_status = local_status_without_api_calls(cli_source=Path(adopted['source']))
+            self.assertEqual(changed_pin_status['installed_source']['integrity'], 'changed')
+            self.assertEqual(changed_pin_status['report_status']['state'], 'not-evaluated')
+        finally:
+            pinned_source_file.write_bytes(original_pinned_source)
+            pinned_source_file.chmod(original_pinned_mode)
+
+        original_packet = self.packet.read_bytes()
+        changed_packet = json.loads(original_packet)
+        changed_packet['guidance_attestation']['approach'] += ' Changed after publication.'
+        self.packet.write_text(json.dumps(changed_packet))
+        changed_packet_status = local_status_without_api_calls()
+        self.assertEqual(changed_packet_status['report_status']['state'], 'stale-or-unusable')
+        self.assertIn('Local guidance attestation changed after publication',
+                      changed_packet_status['report_status']['reason'])
+        self.packet.write_bytes(original_packet)
+
+        evidence.write_text('Changed source after publication.')
+        changed_reread_status = local_status_without_api_calls()
+        self.assertEqual(changed_reread_status['report_status']['state'], 'stale-or-unusable')
+        self.assertIn('Evidence hash changed', changed_reread_status['report_status']['reason'])
+        evidence.write_text('The selected current guidance.')
+
         current = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
         self.assertEqual(current.returncode, 0, current.stderr)
         old_receipt = lane_runtime.read(self.repo)['receipt']
 
         evidence.write_text('Changed source after publication.')
+        changed_reread_status = local_status_without_api_calls()
+        self.assertEqual(changed_reread_status['report_status']['state'], 'stale-or-unusable')
+        self.assertIn('Evidence hash changed', changed_reread_status['report_status']['reason'])
         stale_source = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
         self.assertEqual(stale_source.returncode, 2)
         self.assertIn('Evidence hash changed', stale_source.stderr)
@@ -1531,11 +1578,36 @@ class LaneInstallTest(unittest.TestCase):
 
         self.remote['comments'][str(comment_id)]['body'] = 'edited remotely'
         self.remote_path.write_text(json.dumps(self.remote))
+        edited_status = local_status_without_api_calls()
+        self.assertEqual(edited_status['report_status']['state'], 'valid-local-snapshot')
         edited = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
         self.assertEqual(edited.returncode, 2)
         self.assertIn('edited or no longer matches', edited.stderr)
+
+        edited_start = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                        '--stage', 'repair-batch', '--comment-url', comment_url,
+                                        env=owner_env, ok=False)
+        self.assertEqual(edited_start.returncode, 2)
+        self.assertIn('Published comment body does not match', edited_start.stderr)
+
+        del self.remote['comments'][str(comment_id)]
+        self.remote_path.write_text(json.dumps(self.remote))
+        missing_start = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                         '--stage', 'repair-batch', '--comment-url', comment_url,
+                                         env=owner_env, ok=False)
+        self.assertEqual(missing_start.returncode, 2)
+        self.assertIn('GitHub GET failed', missing_start.stderr)
+        missing_check = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(missing_check.returncode, 2)
+        self.assertIn('GitHub GET failed', missing_check.stderr)
+
         self.remote['comment_error'] = True
         self.remote_path.write_text(json.dumps(self.remote))
+        unavailable_start = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                             '--stage', 'repair-batch', '--comment-url', comment_url,
+                                             env=owner_env, ok=False)
+        self.assertEqual(unavailable_start.returncode, 2)
+        self.assertIn('GitHub GET failed', unavailable_start.stderr)
         unavailable_check = self.invoke_owner(owner_env, 'pr', 'ready', self.url, '--starfleet-probe')
         self.assertEqual(unavailable_check.returncode, 2)
         self.assertIn('GitHub GET failed', unavailable_check.stderr)
