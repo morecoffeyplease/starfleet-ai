@@ -83,14 +83,17 @@ Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery 
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
 Pattern Buffer appends a short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
 The runtime reminder asks agents to use the installed PStack runtime and Poteto Mode.
-After compaction, the composed guidance asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
+After compaction, the composed guidance asks agents to read the sections relevant to current work in full, not the entire PStack library.
+The default shared guidance also asks for a four-line own-chat restatement of the accepted outcome, next deliverable, holds, and what the agent will not do.
+It names unavailable required reads and preserves holds.
+For a legacy custom context without `# confirmation`, the runtime appends that same restatement after its PStack reminder.
 It does not install PStack, change roles or authority, or rewrite custom context files.
 The runtime reminder is outside the 8192-byte standing-context budget and counts toward the existing 24 KiB combined injection limit.
 See the [printable guide](guide.md) for the recovery limits.
-The default context template also includes a final `# confirmation` section that Pattern Buffer appends after the selected role for every role.
+The default context template includes a final `# confirmation` section that Pattern Buffer appends after the selected role for every role.
 That section counts toward the 8192-byte standing-context limit.
-It asks agents to confirm injection receipt, completion of relevant PStack and Poteto reading, and mission or tracker updates in their own chat.
-Existing custom context files are not rewritten; they keep the runtime completion-confirmation wording until an owner-reviewed update adds the optional section.
+The default footer asks agents to repeat the four-line restatement in their own chat.
+Custom context files keep their owner-managed confirmation text.
 For an ordinary worktree SessionStart, Pattern Buffer can emit a complete role view above 8192 bytes with a warning when the total context, including runtime, task and checkpoint addenda, stays within 9216 bytes and the existing 24 KiB combined limit.
 Larger overflow and source, parser, read or combined-limit failures produce a bounded notice that asks the agent to read the full source file and notify its owner while preserving unresolved scope and holds.
 The notice is not full context and does not expand authorization.

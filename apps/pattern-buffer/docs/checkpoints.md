@@ -29,7 +29,8 @@ The reminder is configured context, not proof of native loading or model receipt
 The default context template ends with an optional `# confirmation` section.
 Pattern Buffer appends a nonempty section after the selected role for every role, and its bytes count toward the 8192-byte standing-context limit.
 Existing custom context files are not rewritten and receive the common footer only after an owner-reviewed update adds the section.
-Legacy custom contexts without the section keep the runtime completion-confirmation wording after compaction.
+The default shared guidance asks agents to restate the accepted outcome, next deliverable, holds and unavailable reads, and what they will not do.
+Legacy custom contexts without a confirmation section receive the same restatement after the runtime PStack reminder.
 Owners must fit their approved context within the 8192-byte authoring budget and 24 KiB combined limit.
 
 ## Pilot and installation authority

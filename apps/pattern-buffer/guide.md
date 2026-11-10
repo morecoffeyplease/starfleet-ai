@@ -169,6 +169,8 @@ An armed timer is configuration evidence, not proof that its wake was received.
 
 Pattern Buffer appends the same short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
 It asks agents to use the installed PStack runtime and Poteto Mode, then after compaction read the sections relevant to current work in full, not the entire PStack library.
+The default shared guidance also asks agents to restate the accepted outcome, next deliverable, holds, and what they will not do in four lines in their own chat.
+The holds line names unavailable required reads and preserves holds.
 The runtime reminder does not install PStack, change roles or authority, or rewrite custom context files.
 It stays outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
 For an ordinary worktree, the full role view can exceed 8192 bytes only when the complete output with its warning and any runtime, task or checkpoint addenda stays at or below 9216 bytes.
@@ -178,13 +180,12 @@ Hook output remains configuration evidence, not proof that the harness loaded or
 
 ## Confirmation and review guidance
 
-The default context template ends with an optional `# confirmation` section.
+The default context template ends with a `# confirmation` section.
 Pattern Buffer appends that section after the selected role for implementers, orchestrators, and unassigned sessions.
 The section counts toward the 8192-byte standing-context budget.
-It asks agents to confirm receipt, completion of relevant PStack and Poteto reading, and whether the mission or tracker needs updating in their own chat.
-If a required read is unavailable or incomplete, it asks agents to name the gap and preserve applicable holds.
-Existing custom context files are not rewritten and do not get the common footer until an owner-reviewed update adds the final section.
-Legacy custom contexts keep the runtime's completion-confirmation wording after compaction.
+The footer asks agents to repeat the shared four-line restatement in their own chat.
+Legacy custom contexts without `# confirmation` receive the same restatement after the runtime PStack reminder.
+Custom context files keep their owner-managed confirmation text.
 `validate` and context adoption continue to enforce the 8192-byte authoring budget for every role.
 The ordinary-worktree SessionStart warning policy is a runtime recovery exception and does not change that authoring check.
 Use preview to inspect the runtime warning or fallback notice; preview does not include event-specific checkpoint addenda.

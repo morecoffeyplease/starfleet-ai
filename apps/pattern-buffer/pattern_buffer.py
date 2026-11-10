@@ -273,11 +273,23 @@ def idle_receipt_report(root, since):
         return {"state": "unknown", "reason": "Hailing receipt history could not be read", "receipts": []}
 
 
+RESTATEMENT = (
+    "After the required reads, give four lines in your own chat. State the accepted outcome, "
+    "the next deliverable, the holds and any unavailable reads, and what you will not do."
+)
+
+
 TEMPLATE = """# shared
 - Worktree: <WORKTREE>
 - Mission: <MISSION>
+- Next deliverable: <NEXT_DELIVERABLE>
+- Holds: <HOLDS>
 - Roadmap: <TRACKER>
 - Assigned items: <AUTHORIZED_ITEM_REFERENCES>
+- Read first: <3-5 exact paths or commands>
+
+{RESTATEMENT}
+System and developer instructions take precedence. Follow the latest human instruction, then the standing mission, tracker, checkpoint, and memory or summary. Reconcile conflicts and preserve ownership and holds.
 
 **Scope**
 - If the mission, authoritative tracker or authorized assignment is missing or unclear, ask the user to establish it.
@@ -343,10 +355,8 @@ TEMPLATE = """# shared
 2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
 
 **PR openings and accepted repair batches:**
-- Follow the [Prime Directive (Policy Guard) guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#published-guidance-attestations); it documents the same `lane.py` tool.
-- Reread applicable guidance, playbooks, principles and repository fix guidance; record references, digests and their effect on approach, evidence, uncertainty, scope and holds.
-- Resolve prerequisite gaps, render and manually publish the exact stage attestation, then run `attestation-start-check` as owner (`--enable` only for first adoption); adopted ready/merge actions require a current match.
-- This existing SessionStart notice detects no issue or batch and does not intercept push, PR/comment writes, web/API, GitHub Actions or alternate starts.
+- At PR opening or accepted repair-batch start, read Published guidance attestations in `python3 /path/to/installed/lane.py guide --print`. Adopted ready and merge actions require current evidence.
+- The owner rereads the applicable files, records references, digests and their effect, resolves prerequisites, and keeps `assumptions: []`. Prepare opening evidence before the PR and publish the exact comment on its draft. Run `attestation-start-check` after publication and before repair work. Use `--enable` for first adoption. Put Outcome, Playbook, Size and Facts in the PR opening explanation.
 
 **Repair rounds: don't spiral**
 - Use the existing PR or tracker to record dispositions, evidence, and cumulative rounds.
@@ -369,10 +379,9 @@ TEMPLATE = """# shared
 **Pattern Buffer checkpoints:** if enrolled, maintain the registered private note after meaningful changes; read/reconcile it on recovery. Path, Git hygiene and controls: apps/pattern-buffer/docs/checkpoints.md
 
 # confirmation
-**Confirm once, after reading**
-- In your own chat, confirm receipt of the injection, completion of the relevant PStack/Poteto reading, and whether the mission or tracker needs updating.
-- If a required read is unavailable or incomplete, say so instead of claiming completion; name the gap and preserve applicable holds.
+Restate the four lines above.
 """
+TEMPLATE = TEMPLATE.replace("{RESTATEMENT}", RESTATEMENT)
 
 
 def git(cwd, *args):
@@ -2577,12 +2586,10 @@ def render(cwd, harness, session, agent="", forced_role=None, *,
 
 def compose_task_context(text, task_id=None, task_data=None, brief=None, has_confirmation=False):
     guidance = ("Use the installed PStack runtime and Poteto Mode. "
-                "After compaction, read the sections relevant to current work in full")
-    if not has_confirmation:
-        guidance += " and confirm completion in your own chat."
-    else:
-        guidance += "."
+                "After compaction, read the sections relevant to current work in full.")
     text += "\n\n" + guidance
+    if not has_confirmation:
+        text += "\n\n" + RESTATEMENT
     if task_id is not None:
         if task_data["status"] == "finished":
             text += f"\n\nTask {task_id} is finished. No task is restored; await a new assignment."

@@ -108,23 +108,25 @@ class PatternBufferTests(unittest.TestCase):
         self.assertIn("Ask your parent orchestrator for more agents", preview.stdout)
         self.assertIn("delegation still follows current Model Preferences role choices", preview.stdout)
         self.assertIn("Every explanation is a hypothesis", preview.stdout)
-        confirmation = "In your own chat, confirm receipt of the injection"
-        self.assertEqual(preview.stdout.count(confirmation), 1)
-        self.assertNotIn("confirm completion in your own chat", preview.stdout)
+        self.assertEqual(preview.stdout.count(ci.RESTATEMENT), 1)
+        self.assertIn("Restate the four lines above.", preview.stdout)
         self.assertNotIn("Repair rounds: don't spiral", preview.stdout)
-        self.assertLess(preview.stdout.index("Verify completed changes through the user's path."),
-                        preview.stdout.index(confirmation))
+        self.assertLess(preview.stdout.index(ci.RESTATEMENT),
+                        preview.stdout.index("Verify completed changes through the user's path."))
         orchestrator = self.cli("preview", "--harness", "codex", "--session", "new-orchestrator",
                                 "--role", "orchestrator")
         self.assertIn("Every explanation is a hypothesis", orchestrator.stdout)
         self.assertIn("Check that observation on the failing run AND a passing control", orchestrator.stdout)
-        self.assertIn("published-guidance-attestations", orchestrator.stdout)
+        self.assertIn("Published guidance attestations", orchestrator.stdout)
         self.assertIn("attestation-start-check", orchestrator.stdout)
+        self.assertIn("Outcome, Playbook, Size and Facts in the PR opening explanation", orchestrator.stdout)
         self.assertIn("Repair rounds: don't spiral", orchestrator.stdout)
-        self.assertEqual(orchestrator.stdout.count(confirmation), 1)
-        self.assertNotIn("confirm completion in your own chat", orchestrator.stdout)
+        self.assertEqual(orchestrator.stdout.count(ci.RESTATEMENT), 1)
+        self.assertIn("Restate the four lines above.", orchestrator.stdout)
+        self.assertLess(orchestrator.stdout.index(ci.RESTATEMENT),
+                        orchestrator.stdout.index("Repair rounds: don't spiral"))
         self.assertLess(orchestrator.stdout.index("Repair rounds: don't spiral"),
-                        orchestrator.stdout.index(confirmation))
+                        orchestrator.stdout.index("Restate the four lines above."))
         source = self.root / ".context-injector/context.md"
         approved = source.read_bytes()
         self.cli("init", "--default-role", "implementer")
@@ -142,14 +144,36 @@ class PatternBufferTests(unittest.TestCase):
         self.assertNotIn("SO MUCH time is lost", default)
         self.assertFalse(hasattr(ci, "REPO_PROFILES"))
 
-    def test_init_embeds_attestation_notice_and_keeps_orchestrator_within_budget(self):
+    def test_init_embeds_attestation_notice_within_authoring_budget(self):
         self.cli("init", "--default-role", "orchestrator")
         source = self.root / ".context-injector/context.md"
         self.assertEqual(source.read_text(), ci.TEMPLATE)
-        self.assertIn("published-guidance-attestations", source.read_text())
+        self.assertIn("Published guidance attestations", source.read_text())
+        self.assertIn("python3 /path/to/installed/lane.py guide --print", source.read_text())
         validation = self.cli("validate", "--harness", "codex")
         self.assertIn("orchestrator:", validation.stdout)
         self.assertIn("Context valid:", validation.stdout)
+        budget = next(line for line in validation.stdout.splitlines()
+                      if line.startswith("orchestrator:"))
+        standing_bytes = int(budget.split("content ", 1)[1].split(" /", 1)[0])
+        preview = self.cli("preview", "--harness", "codex", "--session", "wp4-budget-control",
+                           "--role", "orchestrator")
+        runtime_reminder = "\n\nUse the installed PStack runtime and Poteto Mode."
+        rendered = preview.stdout.split("\n\n", 1)[1].split(runtime_reminder, 1)[0]
+        self.assertEqual(len(rendered.encode("utf-8")), standing_bytes)
+        self.assertLessEqual(len(preview.stdout.split(runtime_reminder, 1)[0].encode("utf-8")), ci.LIMIT)
+        self.assertEqual(preview.stdout.count(ci.RESTATEMENT), 1)
+
+    def test_legacy_context_without_confirmation_gets_the_same_restatement(self):
+        legacy = ci.compose_task_context("Legacy custom standing context.")
+        self.assertTrue(legacy.endswith(ci.RESTATEMENT))
+        self.assertEqual(legacy.count(ci.RESTATEMENT), 1)
+        self.assertIn("After compaction, read the sections relevant to current work in full.", legacy)
+        owner_confirmed = ci.compose_task_context(
+            "Custom standing context.\n# confirmation\nOwner-managed request.",
+            has_confirmation=True)
+        self.assertIn("Owner-managed request.", owner_confirmed)
+        self.assertNotIn(ci.RESTATEMENT, owner_confirmed)
 
     def test_legacy_unassigned_context_at_8192_bytes_keeps_original_header(self):
         self.cli("init")
@@ -508,15 +532,12 @@ class PatternBufferTests(unittest.TestCase):
         self.assign("one", "orchestrator")
         orchestrator = self.content(self.event())
         self.assertIn("Track ownership", orchestrator)
-        confirmation = "In your own chat, confirm receipt of the injection"
-        self.assertEqual(orchestrator.count(confirmation), 1)
-        self.assertNotIn("confirm completion in your own chat", orchestrator)
+        self.assertEqual(orchestrator.count(ci.RESTATEMENT), 1)
         other = self.content(self.event(session="two"))
         self.assertIn("role: unassigned", other)
         self.assertNotIn("Track ownership", other)
         self.assertNotIn("Repair rounds: don't spiral", other)
-        self.assertEqual(other.count(confirmation), 1)
-        self.assertNotIn("confirm completion in your own chat", other)
+        self.assertEqual(other.count(ci.RESTATEMENT), 1)
 
     def test_opencode_public_assignment_and_checkpoint_enrollment_accept_exact_native_session(self):
         session = "ses_cliBoundary20261105"
@@ -801,9 +822,10 @@ class PatternBufferTests(unittest.TestCase):
                     preview_text = preview.stdout[:-1]
                     self.assertEqual(len(preview_text.encode("utf-8")),
                                      expected + len(ci.compose_task_context("").encode("utf-8")))
-                    self.assertIn("After compaction, read the sections relevant to current work in full and confirm completion in your own chat.",
+                    self.assertIn("After compaction, read the sections relevant to current work in full.",
                                   preview_text)
-                    self.assertNotIn("In your own chat, confirm receipt of the injection", preview_text)
+                    self.assertTrue(preview_text.endswith(ci.RESTATEMENT))
+                    self.assertEqual(preview_text.count(ci.RESTATEMENT), 1)
                     self.assertLessEqual(len(preview_text.encode("utf-8")), ci.INJECTION_LIMIT)
                     status = json.loads(self.cli("status", "--harness", harness, "--session", session).stdout)
                     budgets = status["standing_context_budgets"]
