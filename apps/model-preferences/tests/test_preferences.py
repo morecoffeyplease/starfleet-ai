@@ -405,11 +405,11 @@ class PreferencesTest(unittest.TestCase):
         brief.write_text(task)
         capture, env = self.fake_native_provider("codex")
 
-        with patch.dict(os.environ, env):
-            result = self.call("dispatch", "--role", "standard_review", "--slot", "1",
-                               "--cwd", str(repo), "--task-file", str(brief),
-                               "--review-plan", plan["id"], "--approval", approval["id"])
-
+        cli_result = self.run_cli(env, "dispatch", "--role", "standard_review", "--slot", "1",
+                                  "--cwd", str(repo), "--task-file", str(brief),
+                                  "--review-plan", plan["id"], "--approval", approval["id"])
+        self.assertEqual(cli_result.returncode, 0, cli_result.stderr)
+        result = json.loads(cli_result.stdout)
         self.assertEqual(result["exit_code"], 0)
         received = json.loads(capture.read_text())
         launch = self.app.state(f"launches/{result['launch']}", None)
