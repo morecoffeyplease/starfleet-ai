@@ -19,6 +19,7 @@ PYTHON_CHECKS = (
     ("Discord Watch", ("apps/discord-watch/verify.py",)),
     ("Hailing Frequencies", ("apps/hailing-frequencies/verify.py",)),
     ("Pattern Buffer", ("-m", "unittest", "discover", "-s", "apps/pattern-buffer", "-p", "test_*.py", "-v")),
+    ("Replicator", ("apps/replicator/verify.py",)),
     ("Starfleet Policy Guard", ("apps/starfleet-policy-guard/verify.py",)),
     ("Warp-drive", ("apps/warp-drive/verify.py",)),
 )
