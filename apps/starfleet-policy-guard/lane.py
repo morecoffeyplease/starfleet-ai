@@ -409,7 +409,11 @@ def require_guidance_attestation(state, cwd, *, local_inspection=False):
     published = state.get('guidance_attestation_ref')
     if (not isinstance(published, dict) or type(published.get('version')) is not int or
             published['version'] != 1):
-        raise ValueError('This target requires a published guidance attestation; run attestation-start-check from its owner session')
+        guide_command = shlex.join([sys.executable, str(SELF), 'guide', '--print'])
+        raise ValueError(
+            'This target requires a published guidance attestation. Before the final start check, print the local '
+            'guide with ' + guide_command + ' and reread its "Published guidance attestations" section. Then run '
+            'attestation-start-check from its owner session.')
     if published.get('pr_url', '').casefold() != state['pr_url'].casefold():
         raise ValueError('Published guidance attestation belongs to a different PR binding')
     binding = {'branch': state['branch'], 'head_branch': state.get('head_branch', state['branch']),

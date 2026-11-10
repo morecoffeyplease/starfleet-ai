@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from test_checkpoints import NOTE
+from _test_support import isolate_state_home
 
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 sys.path.insert(0, str(SCRIPT.parent))
@@ -20,6 +21,7 @@ import pattern_buffer_enrollment as enrollment
 
 class EnrollmentTests(unittest.TestCase):
     def setUp(self):
+        isolate_state_home(self)
         self.temp = tempfile.TemporaryDirectory(dir=Path.home(), prefix=".self-enroll-fixture-")
         self.addCleanup(self.temp.cleanup)
         self.folder = Path(self.temp.name)

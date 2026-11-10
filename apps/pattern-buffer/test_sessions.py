@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 
+from _test_support import isolate_state_home
+
 SCRIPT = Path(__file__).with_name("pattern_buffer_sessions.py")
 sys.path.insert(0, str(SCRIPT.parent))
 import pattern_buffer_sessions as sessions
@@ -13,6 +15,7 @@ import pattern_buffer_sessions as sessions
 
 class SessionEnrollmentTests(unittest.TestCase):
     def setUp(self):
+        isolate_state_home(self)
         self.temp = tempfile.TemporaryDirectory(dir=Path.home(), prefix=".session-enrollment-")
         self.addCleanup(self.temp.cleanup)
         self.folder = Path(self.temp.name)

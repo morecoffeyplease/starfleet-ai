@@ -8,10 +8,15 @@ import sys
 import tempfile
 import unittest
 
+from _test_support import isolate_state_home
+
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 
 
 class RestrictedEnrollmentTests(unittest.TestCase):
+    def setUp(self):
+        isolate_state_home(self)
+
     def test_denied_ps_returns_briefing_without_guessing_or_writing(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder) / "repo"

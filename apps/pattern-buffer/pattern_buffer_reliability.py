@@ -31,6 +31,7 @@ _HEX_DIGEST = re.compile(r"^[0-9a-fA-F]{64}$")
 _DATE_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl$")
 _DETAIL_TYPES = {
     "role": "token", "source_sha256": "hash", "bytes": "integer",
+    "over_budget_bytes": "integer", "failure_kind": "token",
     "usage_percent": "percent", "reminder_threshold": "percent", "generation": "integer",
     "generation_uncertain": "boolean", "reviewed_at": "timestamp", "published_at": "timestamp",
     "saved_generation": "integer", "trigger": "token", "outcome": "token",

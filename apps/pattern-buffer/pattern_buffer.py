@@ -2,7 +2,7 @@
 """Pattern Buffer restores approved worktree context for Claude, Codex, and OpenCode."""
 import argparse
 import datetime
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
@@ -21,7 +21,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 ROLES = ("implementer", "orchestrator")
 HARNESS_CHOICES = ("claude", "codex", "opencode")
@@ -31,9 +31,25 @@ FILE_LIMIT = 32768
 HOOK_INPUT_LIMIT = 1024 * 1024
 TASK_LIMIT = 16384
 INJECTION_LIMIT = 24576
+RECOVERY_OUTPUT_LIMIT = 9 * 1024
 DISPATCH_ENV = "STARFLEET_CONTEXT_DISPATCH"
 REPO_PROFILE_LIMIT = 32768
+REFERENCE_FILE_LIMIT = 256 * 1024
+REFERENCE_TOTAL_LIMIT = 1024 * 1024
+REFERENCE_COUNT_LIMIT = 128
 _OPENCODE_SESSION_ID = re.compile(r"^ses_[A-Za-z0-9]+$")
+STRICT_RENDER_POLICY = "strict"
+ORDINARY_WORKTREE_RENDER_POLICY = "ordinary_worktree"
+_RENDER_FAILURES = {
+    "combined_limit": "The composed output exceeds the existing 24 KiB injection limit.",
+    "file_limit": "The context source exceeds the 32 KiB file limit.",
+    "malformed": "The context source could not be parsed.",
+    "missing_role_section": "The context source has no section for the assigned role.",
+    "other": "The context could not be rendered safely.",
+    "runtime_output_limit": "The complete output, including its warning and runtime or checkpoint addenda, exceeds the 9 KiB recovery limit.",
+    "standing_limit": "The rendered role view exceeds the 8192-byte standing-context budget.",
+    "unreadable": "The context source could not be read.",
+}
 
 
 class DispatchFailure(ValueError):
@@ -47,6 +63,15 @@ class RequiredContextFailure(ValueError):
         super().__init__(message)
         self.path = Path(path)
         self.enrollment_id = enrollment_id
+
+
+@dataclass(frozen=True)
+class RenderedContext:
+    text: str
+    source: Path
+    runtime_policy: str
+    over_budget_bytes: int = 0
+    failure_kind: str | None = None
 
 
 _AUXILIARY = {}
@@ -248,11 +273,23 @@ def idle_receipt_report(root, since):
         return {"state": "unknown", "reason": "Hailing receipt history could not be read", "receipts": []}
 
 
+RESTATEMENT = (
+    "After the required reads, give four lines in your own chat. State the accepted outcome, "
+    "the next deliverable, the holds and any unavailable reads, and what you will not do."
+)
+
+
 TEMPLATE = """# shared
 - Worktree: <WORKTREE>
 - Mission: <MISSION>
+- Next deliverable: <NEXT_DELIVERABLE>
+- Holds: <HOLDS>
 - Roadmap: <TRACKER>
 - Assigned items: <AUTHORIZED_ITEM_REFERENCES>
+- Read first: <3-5 exact paths or commands>
+
+{RESTATEMENT}
+System and developer instructions take precedence. Follow the latest human instruction, then the standing mission, tracker, checkpoint, and memory or summary. Reconcile conflicts and preserve ownership and holds.
 
 **Scope**
 - If the mission, authoritative tracker or authorized assignment is missing or unclear, ask the user to establish it.
@@ -318,10 +355,8 @@ TEMPLATE = """# shared
 2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
 
 **PR openings and accepted repair batches:**
-- Follow the [Prime Directive (Policy Guard) guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#published-guidance-attestations); it documents the same `lane.py` tool.
-- Reread applicable guidance, playbooks, principles and repository fix guidance; record references, digests and their effect on approach, evidence, uncertainty, scope and holds.
-- Resolve prerequisite gaps, render and manually publish the exact stage attestation, then run `attestation-start-check` as owner (`--enable` only for first adoption); adopted ready/merge actions require a current match.
-- This existing SessionStart notice detects no issue or batch and does not intercept push, PR/comment writes, web/API, GitHub Actions or alternate starts.
+- At PR opening or accepted repair-batch start, read Published guidance attestations in `python3 /path/to/installed/lane.py guide --print`. Adopted ready and merge actions require current evidence.
+- The owner rereads the applicable files, records references, digests and their effect, resolves prerequisites, and keeps `assumptions: []`. Prepare opening evidence before the PR and publish the exact comment on its draft. Run `attestation-start-check` after publication and before repair work. Use `--enable` for first adoption. Use Outcome, Playbook, Size and Facts in each implementer brief and the PR opening explanation.
 
 **Repair rounds: don't spiral**
 - Use the existing PR or tracker to record dispositions, evidence, and cumulative rounds.
@@ -344,10 +379,9 @@ TEMPLATE = """# shared
 **Pattern Buffer checkpoints:** if enrolled, maintain the registered private note after meaningful changes; read/reconcile it on recovery. Path, Git hygiene and controls: apps/pattern-buffer/docs/checkpoints.md
 
 # confirmation
-**Confirm once, after reading**
-- In your own chat, confirm receipt of the injection, completion of the relevant PStack/Poteto reading, and whether the mission or tracker needs updating.
-- If a required read is unavailable or incomplete, say so instead of claiming completion; name the gap and preserve applicable holds.
+Restate the four lines above.
 """
+TEMPLATE = TEMPLATE.replace("{RESTATEMENT}", RESTATEMENT)
 
 
 def git(cwd, *args):
@@ -1141,6 +1175,512 @@ def sections_text(text):
     return {key: "\n".join(value).strip() for key, value in result.items()}
 
 
+def compose_sections(rules_text, mission_text):
+    rules = sections_text(rules_text)
+    mission = sections_text(mission_text)
+    required = ("shared", *ROLES)
+    if any(section not in rules for section in required):
+        raise ValueError("rules must include # shared, # implementer, and # orchestrator")
+    if "confirmation" in mission:
+        raise ValueError("mission may include # shared, # implementer, and # orchestrator only")
+    result = {}
+    for section in required:
+        pieces = [text for text in (mission.get(section, ""), rules.get(section, "")) if text]
+        result[section] = "\n\n".join(pieces)
+    if "confirmation" in rules:
+        result["confirmation"] = rules["confirmation"]
+    return result
+
+
+def serialize_sections(content):
+    parts = []
+    for section in ("shared", *ROLES, "confirmation"):
+        if section not in content:
+            continue
+        parts.append(f"# {section}\n\n{content[section]}")
+    return ("\n\n".join(parts).rstrip() + "\n").encode("utf-8")
+
+
+def _paragraph_parts(text):
+    paragraphs = []
+    separator_bytes = 0
+    for piece in re.split(r"(\n[ \t]*\n+)", text):
+        if not piece:
+            continue
+        if piece.startswith("\n") and piece.strip(" \t\n") == "":
+            separator_bytes += len(piece.encode("utf-8"))
+        else:
+            paragraphs.append(piece)
+    return paragraphs, separator_bytes
+
+
+def paragraph_accounting(mission, rules, content):
+    accounting = {}
+    for role in ROLES:
+        selected = ["shared", role]
+        if content.get("confirmation"):
+            selected.append("confirmation")
+        paragraphs = []
+        separators = 0
+        content_bytes = 0
+        for section_index, section in enumerate(selected):
+            if section_index:
+                separators += 2
+                content_bytes += 2
+            source_sections = (("mission", mission), ("rules", rules))
+            section_sources = [(label, source.get(section, ""))
+                               for label, source in source_sections if source.get(section, "")]
+            for source_index, (source_name, text) in enumerate(section_sources):
+                if source_index:
+                    separators += 2
+                    content_bytes += 2
+                blocks, internal_separators = _paragraph_parts(text)
+                separators += internal_separators
+                content_bytes += internal_separators
+                for index, block in enumerate(blocks, 1):
+                    size = len(block.encode("utf-8"))
+                    content_bytes += size
+                    paragraphs.append({"section": section, "source": source_name,
+                                       "paragraph": index, "bytes": size})
+        selected_text = content["shared"] + "\n\n" + content[role]
+        if content.get("confirmation"):
+            selected_text += "\n\n" + content["confirmation"]
+        if content_bytes != len(selected_text.encode("utf-8")):
+            raise ValueError("paragraph accounting did not match the rendered content")
+        accounting[role] = {"paragraphs": paragraphs,
+                            "paragraph_bytes": sum(item["bytes"] for item in paragraphs),
+                            "separator_bytes": separators,
+                            "content_bytes": content_bytes}
+    return accounting
+
+
+def _heading_slug(value):
+    value = re.sub(r"<[^>]*>", "", value)
+    value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
+    value = value.replace("`", "").lower()
+    value = re.sub(r"[^\w\- ]", "", value, flags=re.UNICODE)
+    return re.sub(r"-+", "-", re.sub(r"\s+", "-", value).strip("-"))
+
+
+def markdown_anchors(text):
+    anchors = set()
+    counts = {}
+    previous = ""
+    for line in text.splitlines():
+        atx = re.match(r"^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", line)
+        if atx:
+            heading = atx.group(1).strip()
+        elif previous.strip() and re.match(r"^ {0,3}(?:=+|-+)[ \t]*$", line):
+            heading = previous.strip()
+        else:
+            heading = None
+        if heading is not None:
+            explicit = re.search(r"\s*\{#([^}\s]+)\}\s*$", heading)
+            if explicit:
+                anchors.add(explicit.group(1))
+                heading = heading[:explicit.start()].rstrip()
+            slug = _heading_slug(heading)
+            count = counts.get(slug, 0)
+            counts[slug] = count + 1
+            anchors.add(slug if count == 0 else f"{slug}-{count}")
+        previous = line
+    return anchors
+
+
+def _reference_finding(kind, source, target, message, severity="warning"):
+    return {"kind": kind, "source": str(source), "target": target,
+            "message": message, "severity": severity}
+
+
+def _markdown_target(target, source, root, own_text, totals, findings):
+    target = target.strip()
+    if not target:
+        findings.append(_reference_finding("unsupported", source, target,
+                                           "empty Markdown targets are not checked"))
+        return
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1]
+    try:
+        parts = urlsplit(target)
+    except ValueError:
+        findings.append(_reference_finding("unsupported", source, target,
+                                           "ambiguous URL syntax was not checked"))
+        return
+    if parts.scheme.lower() in ("http", "https") or target.startswith("//"):
+        findings.append(_reference_finding("remote", source, target,
+                                           "remote reference was not requested from the network"))
+        return
+    if parts.scheme:
+        findings.append(_reference_finding("unsupported", source, target,
+                                           "non-HTTP URL schemes are not checked"))
+        return
+    path_text = unquote(parts.path)
+    if path_text.startswith("~/"):
+        target_path = Path(path_text).expanduser()
+    elif path_text.startswith("/"):
+        target_path = Path(path_text)
+    elif path_text:
+        target_path = root / path_text
+    else:
+        target_path = Path(source)
+    same_document = target_path.resolve(strict=False) == Path(source).resolve(strict=False)
+    if not same_document and not target_path.exists():
+        findings.append(_reference_finding("missing_target", source, target,
+                                           f"local Markdown target does not exist: {target_path}", "error"))
+        return
+    if not parts.fragment:
+        return
+    if target_path.suffix.lower() not in (".md", ".markdown"):
+        findings.append(_reference_finding("unsupported_anchor", source, target,
+                                           "anchors are checked only for Markdown targets"))
+        return
+    try:
+        cache_key = target_path.resolve(strict=False)
+        if cache_key in totals["anchors"]:
+            anchors = totals["anchors"][cache_key]
+        else:
+            if same_document:
+                target_text = own_text
+            else:
+                size = target_path.stat().st_size
+                if size > REFERENCE_FILE_LIMIT or totals["bytes"] + size > REFERENCE_TOTAL_LIMIT:
+                    findings.append(_reference_finding("reference_limit", source, target,
+                                                       "Markdown heading scan exceeded its byte limit"))
+                    return
+                target_text = bounded(target_path, REFERENCE_FILE_LIMIT)
+                totals["bytes"] += len(target_text.encode("utf-8"))
+            anchors = markdown_anchors(target_text)
+            totals["anchors"][cache_key] = anchors
+    except (OSError, ValueError, UnicodeError) as error:
+        findings.append(_reference_finding("unsupported_anchor", source, target,
+                                           f"Markdown heading scan could not read the target: {error}"))
+        return
+    anchor = unquote(parts.fragment)
+    if anchor not in anchors:
+        findings.append(_reference_finding("missing_heading", source, target,
+                                           f"Markdown heading anchor does not exist: #{anchor}", "error"))
+
+
+def reference_check(text, source, root):
+    source = Path(source)
+    root = Path(root)
+    findings = []
+    totals = {"bytes": 0, "targets": 0, "anchors": {}}
+    lines = text.splitlines(keepends=True)
+    masked_lines = []
+    in_fence = False
+    fence_warning = False
+    for line in lines:
+        if re.match(r"^ {0,3}(?:```|~~~)", line):
+            in_fence = not in_fence
+            fence_warning = True
+            masked_lines.append("\n" if line.endswith("\n") else "")
+        elif in_fence:
+            masked_lines.append("\n" if line.endswith("\n") else "")
+        else:
+            masked_lines.append(line)
+    if in_fence:
+        findings.append(_reference_finding("unsupported_fence", source, "fenced code block",
+                                           "unclosed fenced code block was not scanned"))
+    elif fence_warning:
+        findings.append(_reference_finding("unsupported_fence", source, "fenced code block",
+                                           "fenced code contents were not scanned"))
+    visible = "".join(masked_lines)
+    for match in re.finditer(r"(?<!`)``[^`\n]+``(?!`)", visible):
+        findings.append(_reference_finding("unsupported_code_span", source, match.group(0),
+                                           "multi-backtick code spans are not scanned"))
+    masked = list(visible)
+    code_spans = list(re.finditer(r"(?<!`)`([^`\n]+)`(?!`)", visible))
+    for match in code_spans:
+        masked[match.start():match.end()] = " " * (match.end() - match.start())
+        value = match.group(1).strip()
+        if (value.startswith("/") or value.startswith("~/")) and not re.search(r"\s", value):
+            candidate = Path(value).expanduser()
+            totals["targets"] += 1
+            if not candidate.exists():
+                findings.append(_reference_finding("missing_path", source, value,
+                                                   f"backticked local path does not exist: {candidate}", "error"))
+        elif value.startswith(("/", "~/")) or re.search(r"(?:^|\s)(?:/|~/)[^\s]+", value):
+            findings.append(_reference_finding("unsupported_command_path", source, value,
+                                               "ambiguous or command-style inline code is not parsed as a path"))
+        if totals["targets"] > REFERENCE_COUNT_LIMIT:
+            findings.append(_reference_finding("reference_limit", source, str(totals["targets"]),
+                                               f"reference count exceeds {REFERENCE_COUNT_LIMIT}; remaining references were not checked"))
+            break
+    visible = "".join(masked)
+    inline_pattern = re.compile(r"!?\[[^\]\n]*\]\(([^)\n]*)\)")
+    inline_matches = list(inline_pattern.finditer(visible))
+    for match in inline_matches:
+        inside = match.group(1).strip()
+        target = inside
+        if inside.startswith("<"):
+            end = inside.find(">")
+            if end < 0:
+                findings.append(_reference_finding("unsupported", source, inside,
+                                                   "angle-bracket Markdown targets need a closing >"))
+                continue
+            target, suffix = inside[1:end], inside[end + 1:].strip()
+            if suffix and not re.fullmatch(r"(?:\"[^\"]*\"|'[^']*')", suffix):
+                findings.append(_reference_finding("unsupported", source, inside,
+                                                   "Markdown target title syntax is not recognized"))
+                continue
+        else:
+            tokens = inside.split(None, 1)
+            target = tokens[0] if tokens else ""
+            if ("(" in target or ")" in target or
+                    (len(tokens) > 1 and not re.fullmatch(r"(?:\"[^\"]*\"|'[^']*')", tokens[1]))):
+                findings.append(_reference_finding("unsupported", source, inside,
+                                                   "ambiguous Markdown target syntax was not checked"))
+                continue
+        totals["targets"] += 1
+        if totals["targets"] > REFERENCE_COUNT_LIMIT:
+            findings.append(_reference_finding("reference_limit", source, str(totals["targets"]),
+                                               f"reference count exceeds {REFERENCE_COUNT_LIMIT}; remaining references were not checked"))
+            break
+        _markdown_target(target, source, root, text, totals, findings)
+    matched_starts = {match.start() for match in inline_matches}
+    for match in re.finditer(r"!?\[[^\]\n]*\]\(", visible):
+        if match.start() not in matched_starts:
+            findings.append(_reference_finding("unsupported_inline_link", source, match.group(0),
+                                               "nested or ambiguous inline Markdown targets are not checked"))
+    for match in re.finditer(r"!?\[[^\]\n]*\]\s*\[[^\]\n]*\]", visible):
+        findings.append(_reference_finding("unsupported_reference_link", source, match.group(0),
+                                           "reference-style Markdown links are not checked"))
+    for match in re.finditer(r"!?\[[^\]\n]+\]\s*\n\s*\[[^\]\n]*\]", visible):
+        findings.append(_reference_finding("unsupported_reference_link", source, match.group(0),
+                                           "multiline reference-style Markdown links are not checked"))
+    for line in visible.splitlines():
+        if re.match(r"^ {0,3}\[[^\]]+\]:", line):
+            findings.append(_reference_finding("unsupported_reference_definition", source, line.strip(),
+                                               "Markdown reference definitions are not checked"))
+    if re.search(r"<\s*(?:a|img)\b", visible, re.IGNORECASE):
+        findings.append(_reference_finding("unsupported_html_reference", source, "HTML link or image",
+                                           "raw HTML references are not checked"))
+    remote_targets = {item["target"] for item in findings if item["kind"] == "remote"}
+    for match in re.finditer(r"https?://[^\s<>]+", visible, re.IGNORECASE):
+        target = match.group(0).rstrip(".,;:!?)")
+        if target and target not in remote_targets:
+            totals["targets"] += 1
+            if totals["targets"] > REFERENCE_COUNT_LIMIT:
+                findings.append(_reference_finding("reference_limit", source, str(totals["targets"]),
+                                                   f"reference count exceeds {REFERENCE_COUNT_LIMIT}; remaining references were not checked"))
+                break
+            findings.append(_reference_finding("remote", source, target,
+                                               "remote reference was not requested from the network"))
+            remote_targets.add(target)
+    if totals["targets"] > REFERENCE_COUNT_LIMIT and not any(
+            item["kind"] == "reference_limit" for item in findings):
+        findings.append(_reference_finding("reference_limit", source, str(totals["targets"]),
+                                           f"reference count exceeds {REFERENCE_COUNT_LIMIT}; remaining references were not checked"))
+    unique = {}
+    for item in findings:
+        unique[(item["kind"], item["source"], item["target"], item["severity"])] = item
+    findings = list(unique.values())
+    return {"errors": [item for item in findings if item["severity"] == "error"],
+            "warnings": [item for item in findings if item["severity"] != "error"]}
+
+
+def reference_warnings_for_path(path, root):
+    if path is None:
+        return []
+    try:
+        text = bounded(Path(path), FILE_LIMIT)
+        report = reference_check(text, path, root)
+        findings = report["errors"] + report["warnings"]
+        return [{**item, "validation_error": item["severity"] == "error", "severity": "warning"}
+                for item in findings]
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        return [_reference_finding("unreadable_source", path, str(path),
+                                   f"reference scan could not read the context file: {error}")]
+
+
+def _read_compose_output(path):
+    if path.is_symlink():
+        raise ValueError(f"output must not be a symlink: {path}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"output must be a regular file: {path}")
+        data = bytearray()
+        while len(data) <= FILE_LIMIT:
+            chunk = os.read(descriptor, min(16 * 1024, FILE_LIMIT + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return None if len(data) > FILE_LIMIT else bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def compose_output_write(path, data, replace):
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"output must not be a symlink: {path}")
+    if path.exists():
+        if not path.is_file():
+            raise ValueError(f"output must be a regular file: {path}")
+        old = _read_compose_output(path)
+        if old == data:
+            return "unchanged"
+        if not replace:
+            raise ValueError(f"output differs from the composed context; use --replace: {path}")
+        atomic(path, data.decode("utf-8"))
+        return "replaced"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".compose-pending-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"output must be a regular file: {path}")
+            if _read_compose_output(path) == data:
+                return "unchanged"
+            if not replace:
+                raise ValueError(f"output differs from the composed context; use --replace: {path}")
+            atomic(path, data.decode("utf-8"))
+            return "replaced"
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return "created"
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _path_is_session_source(path, binding=None):
+    candidate = Path(path).resolve(strict=False)
+    if binding is not None and candidate == Path(binding.path).resolve(strict=False):
+        return True
+    parts = candidate.parts
+    return any(parts[index:index + 2] == (".context-injector", "sessions")
+               for index in range(max(0, len(parts) - 1)))
+
+
+def compose_report(root, gitdir, args):
+    input_paths = {"rules": Path(args.rules).expanduser(), "mission": Path(args.mission).expanduser()}
+    output = Path(args.output).expanduser()
+    for label, path in (*input_paths.items(), ("output", output)):
+        if not path.is_absolute():
+            raise ValueError(f"--{label} must be an absolute path")
+    if args.min_headroom < 0:
+        raise ValueError("--min-headroom must be zero or greater")
+    if args.session is not None and not args.session:
+        raise ValueError("--session must not be empty")
+    session = args.session or "validation"
+    state_path(gitdir, args.harness, session, args.agent)
+    for path in input_paths.values():
+        if path.resolve(strict=False) == output.resolve(strict=False):
+            raise ValueError("--output must be separate from both input files")
+    if args.check:
+        sys.dont_write_bytecode = True
+    rules_text = bounded(input_paths["rules"], FILE_LIMIT)
+    mission_text = bounded(input_paths["mission"], FILE_LIMIT)
+    rules_sections = sections_text(rules_text)
+    mission_sections = sections_text(mission_text)
+    content = compose_sections(rules_text, mission_text)
+    output_data = serialize_sections(content)
+    if len(output_data) > FILE_LIMIT:
+        raise ValueError(f"composed context exceeds {FILE_LIMIT} bytes")
+    binding = None
+    normalized_session = session
+    if args.session and not args.agent:
+        session_store = auxiliary("sessions")
+        normalized_session = session_store._normalize_session(session, strict=True)
+        binding = session_binding_readonly(root, gitdir, args.harness, session)
+    if _path_is_session_source(output, binding):
+        raise ValueError("compose to a private output path; update registered exact-session context with session-enroll --reviewed-update --evidence")
+    reference_report = reference_check(output_data.decode("utf-8"), output, root)
+    reference_errors = reference_report["errors"]
+    reference_warnings = reference_report["warnings"]
+    current_preview = standing_context_budgets(root, output, args.harness, session, args.agent,
+                                               "composition preview", content)
+    current_preview.update(exact_session=bool(args.session),
+                           session_basis="requested exact session" if args.session else
+                           "validation placeholder session",
+                           meaning="Private output preview. It does not change or describe active runtime context.")
+    future_recipient = None
+    if args.session and not args.agent:
+        target_path = Path(binding.path) if binding is not None else Path(
+            auxiliary("sessions")._session_path(root, args.harness, normalized_session))
+        future_recipient = standing_context_budgets(root, target_path, args.harness, session, "",
+                                                    "session enrollment", content)
+        future_recipient.update(exact_session=True,
+                                budget_calculated=True,
+                                binding_state=binding.state if binding is not None else "not_enrolled",
+                                meaning="Prospective session-enrollment budget. Publication still requires the reviewed session-enroll route.")
+    accounting = paragraph_accounting(mission_sections, rules_sections, content)
+    for role in ROLES:
+        if accounting[role]["content_bytes"] != current_preview["roles"][role].get("content_bytes"):
+            raise ValueError(f"{role} paragraph accounting did not match the existing rendered budget")
+        accounting[role].update(header_bytes=current_preview["roles"][role]["header_bytes"],
+                                total_bytes=current_preview["roles"][role]["bytes_used"],
+                                remaining_bytes=current_preview["roles"][role]["remaining_bytes"])
+    reports = [("current preview", current_preview)]
+    if future_recipient is not None:
+        reports.append(("future recipient", future_recipient))
+    headroom_failures = []
+    for label, budget_set in reports:
+        for role, budget in budget_set["roles"].items():
+            if budget.get("remaining_bytes", -1) < args.min_headroom:
+                headroom_failures.append(f"{label} {role}: {budget.get('remaining_bytes', -1)} bytes remain; "
+                                         f"minimum is {args.min_headroom}")
+    if future_recipient is None:
+        future_recipient = {
+            "validated": False,
+            "meaning": ("No future session-enrollment budget was calculated because agent sessions cannot use "
+                        "the primary-session enrollment route." if args.session and args.agent else
+                        "No exact recipient was supplied. Pass --session to calculate a future session-enrollment budget."),
+        }
+    report = {
+        "worktree": str(root),
+        "harness": args.harness,
+        "session": session,
+        "agent": args.agent or None,
+        "minimum_headroom_bytes": args.min_headroom,
+        "inputs": {label: {"path": str(path),
+                           "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+                   for label, path, text in (("rules", input_paths["rules"], rules_text),
+                                             ("mission", input_paths["mission"], mission_text))},
+        "output": {"path": str(output), "sha256": hashlib.sha256(output_data).hexdigest(),
+                   "bytes": len(output_data)},
+        "paragraph_accounting": accounting,
+        "current_preview": current_preview,
+        "future_recipient": future_recipient,
+        "references": {"errors": reference_errors, "warnings": reference_warnings},
+        "headroom_errors": headroom_failures,
+        "write_state": "not_written",
+    }
+    if reference_errors or headroom_failures:
+        report["write_state"] = "refused"
+        return report, 1
+    if args.check:
+        if output.is_symlink():
+            raise ValueError(f"output must not be a symlink: {output}")
+        if not output.exists():
+            report["write_state"] = "different"
+            report["check"] = "output is missing"
+            return report, 1
+        if not output.is_file():
+            raise ValueError(f"output must be a regular file: {output}")
+        same = _read_compose_output(output) == output_data
+        report["write_state"] = "not_written"
+        report["check"] = "matches" if same else "differs"
+        return report, 0 if same else 1
+    report["write_state"] = compose_output_write(output, output_data, args.replace)
+    return report, 0
+
+
 def state_path(gitdir, harness, session, agent=""):
     if not isinstance(session, str) or not session or len(session) > 512:
         raise ValueError("a nonempty session ID is required (maximum 512 characters)")
@@ -1912,6 +2452,7 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
                             "Use validate and preview for this exact worktree and session; keep an invalid required source fail-closed."),
             "budgets": context_budgets,
         },
+        "reference_warnings": reference_warnings_for_path(source, root),
         "checkpoint": checkpoint,
         "installed_hooks": hook_report,
         "native_binding": native_binding,
@@ -1927,7 +2468,68 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
     }
 
 
-def render(cwd, harness, session, agent="", forced_role=None):
+def render_failure_kind(error):
+    if isinstance(error, OSError):
+        return "unreadable"
+    message = str(error).lower()
+    if "expected a regular, non-symlink file" in message:
+        return "unreadable"
+    if "file exceeds" in message or "source exceeds" in message:
+        return "file_limit"
+    if "missing section for assigned role" in message:
+        return "missing_role_section"
+    if "24 kib" in message or "injection limit" in message:
+        return "combined_limit"
+    if "context uses " in message and "8192 bytes" in message:
+        return "standing_limit"
+    if isinstance(error, (ValueError, UnicodeError)):
+        return "malformed"
+    return "other"
+
+
+def failure_notice(source, failure_kind):
+    reason = _RENDER_FAILURES.get(failure_kind, _RENDER_FAILURES["other"])
+    return (f"Pattern Buffer could not deliver the complete standing context. {reason}\n"
+            f"Source file: {source}\n"
+            "Read the complete source file now with your normal file tool and notify its owner before continuing.\n"
+            "Preserve unresolved scope and holds. This notice is not the full context and does not expand authorization.")
+
+
+def over_budget_warning(over_budget_bytes):
+    byte_word = "byte" if over_budget_bytes == 1 else "bytes"
+    return ("Pattern Buffer delivered the complete standing context above. "
+            f"The rendered role view exceeded its 8192-byte budget by {over_budget_bytes} {byte_word}. "
+            "Notify the context owner. This warning does not expand authorization.")
+
+
+def finalize_rendered_context(rendered, addendum=""):
+    if rendered.failure_kind:
+        return rendered
+    text = rendered.text
+    if addendum:
+        text += "\n\n" + addendum
+    if rendered.over_budget_bytes:
+        text += "\n\n" + over_budget_warning(rendered.over_budget_bytes)
+    output_bytes = len(text.encode("utf-8"))
+    if output_bytes > INJECTION_LIMIT:
+        if rendered.runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY:
+            kind = "combined_limit"
+            return RenderedContext(failure_notice(rendered.source, kind), rendered.source,
+                                   rendered.runtime_policy, failure_kind=kind)
+        raise ValueError("combined reminder, checkpoint pointer and task exceed the 24 KiB injection limit")
+    if (rendered.over_budget_bytes and output_bytes > RECOVERY_OUTPUT_LIMIT and
+            rendered.runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY):
+        kind = "runtime_output_limit"
+        return RenderedContext(failure_notice(rendered.source, kind), rendered.source,
+                               rendered.runtime_policy, failure_kind=kind)
+    return RenderedContext(text, rendered.source, rendered.runtime_policy,
+                           rendered.over_budget_bytes)
+
+
+def render(cwd, harness, session, agent="", forced_role=None, *,
+           runtime_policy=STRICT_RENDER_POLICY):
+    if runtime_policy not in (STRICT_RENDER_POLICY, ORDINARY_WORKTREE_RENDER_POLICY):
+        raise ValueError("invalid Pattern Buffer render policy")
     root, gitdir = checkout(cwd)
     config, source = load(root, gitdir)
     enrolled = session_binding(root, gitdir, harness, session, agent)
@@ -1937,38 +2539,57 @@ def render(cwd, harness, session, agent="", forced_role=None):
                                          enrolled.path, enrolled.enrollment_id)
         source = Path(enrolled.path)
     role, origin, saved = resolve_role(root, gitdir, config, harness, session, agent, forced_role)
+    if (runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY and
+            (enrolled is not None or config.get("context_owner") or saved.get("task_id") or
+             os.environ.get(DISPATCH_ENV))):
+        runtime_policy = STRICT_RENDER_POLICY
     try:
         raw = bounded(source, FILE_LIMIT)
         if enrolled is not None and (enrolled.file_status != "valid" or
                 hashlib.sha256(raw.encode()).hexdigest() != enrolled.source_sha256):
             raise ValueError("registered context file is missing, unsafe, or changed outside reviewed publication")
         content = sections_text(raw)
-        text = render_standing(root, source, harness, session, agent, role, origin, content)
+        text, budget = render_standing_details(root, source, harness, session, agent, role, origin, content)
+        over_budget_bytes = max(0, budget["bytes_used"] - LIMIT)
+        if over_budget_bytes and runtime_policy == STRICT_RENDER_POLICY:
+            raise ValueError(standing_budget_message(role, budget))
     except (OSError, ValueError, UnicodeError) as error:
         if enrolled is not None:
             raise RequiredContextFailure(str(error), source, enrolled.enrollment_id) from error
+        if runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY:
+            failure_kind = render_failure_kind(error)
+            return RenderedContext(failure_notice(source, failure_kind), source, runtime_policy,
+                                   failure_kind=failure_kind)
         raise
-    if saved.get("task_id"):
-        if role != "implementer" or agent:
-            raise ValueError("task bindings require a primary implementer session")
-        task_id = saved["task_id"]
-        data, brief = read_task(root, gitdir, task_id)
-        expected_owner = config.get("context_owner") or {"root": str(root), "gitdir": str(gitdir)}
-        if data["owner"] != expected_owner or data["session_id"] != session or data["harness"] != harness:
-            raise ValueError("task/session/context-owner binding changed")
-        return compose_task_context(text, task_id, data, brief,
-                                   has_confirmation=bool(content.get("confirmation")))
-    return compose_task_context(text, has_confirmation=bool(content.get("confirmation")))
+    try:
+        if saved.get("task_id"):
+            if role != "implementer" or agent:
+                raise ValueError("task bindings require a primary implementer session")
+            task_id = saved["task_id"]
+            data, brief = read_task(root, gitdir, task_id)
+            expected_owner = config.get("context_owner") or {"root": str(root), "gitdir": str(gitdir)}
+            if data["owner"] != expected_owner or data["session_id"] != session or data["harness"] != harness:
+                raise ValueError("task/session/context-owner binding changed")
+            text = compose_task_context(text, task_id, data, brief,
+                                        has_confirmation=bool(content.get("confirmation")))
+        else:
+            text = compose_task_context(text, has_confirmation=bool(content.get("confirmation")))
+    except ValueError as error:
+        failure_kind = render_failure_kind(error)
+        if (runtime_policy == ORDINARY_WORKTREE_RENDER_POLICY and
+                failure_kind == "combined_limit"):
+            return RenderedContext(failure_notice(source, failure_kind), source, runtime_policy,
+                                   failure_kind=failure_kind)
+        raise
+    return RenderedContext(text, source, runtime_policy, over_budget_bytes)
 
 
 def compose_task_context(text, task_id=None, task_data=None, brief=None, has_confirmation=False):
     guidance = ("Use the installed PStack runtime and Poteto Mode. "
-                "After compaction, read the sections relevant to current work in full")
-    if not has_confirmation:
-        guidance += " and confirm completion in your own chat."
-    else:
-        guidance += "."
+                "After compaction, read the sections relevant to current work in full.")
     text += "\n\n" + guidance
+    if not has_confirmation:
+        text += "\n\n" + RESTATEMENT
     if task_id is not None:
         if task_data["status"] == "finished":
             text += f"\n\nTask {task_id} is finished. No task is restored; await a new assignment."
@@ -1999,7 +2620,7 @@ def opencode_context(root, gitdir, session):
         if (not isinstance(saved, dict) or saved.get("root") != str(root)
                 or saved.get("role") != "implementer" or not saved.get("task_id")):
             raise ValueError("linked OpenCode worktree session is not bound to its prepared implementer task")
-    text = render(root, "opencode", session)
+    text = render(root, "opencode", session).text
     checkpoint = checkpoints().opencode_recovery_context(sys.modules[__name__], root, gitdir, session)
     if checkpoint:
         text += "\n\n" + checkpoint
@@ -2077,11 +2698,15 @@ def standing_context_budgets(root, source, harness, session, agent, origin, cont
 def render_standing(root, source, harness, session, agent, role, origin, content):
     text, budget = render_standing_details(root, source, harness, session, agent, role, origin, content)
     if not budget["ok"]:
-        raise ValueError(f"{role or 'unassigned'} context uses {budget['bytes_used']} / {LIMIT} bytes "
-                         f"(header {budget['header_bytes']}; content {budget['content_bytes']} / "
-                         f"{budget['usable_content_bytes']} usable bytes; "
-                         f"{abs(budget['remaining_bytes'])} over); shorten the file")
+        raise ValueError(standing_budget_message(role, budget))
     return text
+
+
+def standing_budget_message(role, budget):
+    return (f"{role or 'unassigned'} context uses {budget['bytes_used']} / {LIMIT} bytes "
+            f"(header {budget['header_bytes']}; content {budget['content_bytes']} / "
+            f"{budget['usable_content_bytes']} usable bytes; "
+            f"{abs(budget['remaining_bytes'])} over); shorten the file")
 
 
 def context_validator(root, harness, session):
@@ -2166,12 +2791,14 @@ def clear_owned_idle_timers(root, helper):
 
 def session_command(root, gitdir, args):
     store = auxiliary("sessions")
-    load(root, gitdir)
+    _config, context_source = load(root, gitdir)
     if args.command == "enrollment-status":
         binding = store.status(root, gitdir, args.harness, args.session)
         report = binding_report(binding) or {"enrollment": None}
         report["standing_context_budgets"] = safe_context_budget_report(
             root, gitdir, args.harness, args.session, binding=binding)
+        report["reference_warnings"] = reference_warnings_for_path(
+            binding.path if binding is not None else context_source, root)
         return report
     if args.command in ("session-enroll", "assign"):
         if getattr(args, "agent", ""):
@@ -2237,6 +2864,8 @@ def session_command(root, gitdir, args):
     report = binding_report(binding)
     if args.command in ("session-enroll", "assign"):
         report["standing_context_budgets"] = validator.last_report
+    if args.command == "session-enroll":
+        report["reference_warnings"] = reference_warnings_for_path(args.context_file, root)
     return report
 
 
@@ -2360,26 +2989,40 @@ def hook(harness):
             if payload.get("agent_id"):
                 raise ValueError("dispatch cannot enroll a nested agent")
             bind_dispatch(root, gitdir, harness, payload.get("session_id"), token)
-        text = render(root, harness, payload.get("session_id"), payload.get("agent_id") or "")
-        extra = checkpoint_event(root, gitdir, harness, payload)
-        if extra:
-            text += "\n\n" + extra
-        if len(text.encode()) > INJECTION_LIMIT:
-            raise ValueError("combined reminder, checkpoint pointer and task exceed the 24 KiB injection limit")
+        runtime_policy = (STRICT_RENDER_POLICY if dispatched else
+                          ORDINARY_WORKTREE_RENDER_POLICY)
+        rendered = render(root, harness, payload.get("session_id"), payload.get("agent_id") or "",
+                          runtime_policy=runtime_policy)
+        if rendered.failure_kind:
+            output = rendered
+        else:
+            extra = checkpoint_event(root, gitdir, harness, payload)
+            output = finalize_rendered_context(rendered, extra)
+        text = output.text
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
         record_event(root, "standing.injection_failed", harness, payload.get("session_id"),
-                     result="failed", details={"error_code": type(error).__name__})
+                     result="failed", details={"error_code": type(error).__name__,
+                                               "failure_kind": render_failure_kind(error)})
         if dispatched:
             raise DispatchFailure(str(error)) from error
         raise
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                               "additionalContext": text}}, ensure_ascii=False), flush=True)
     binding = session_binding(root, gitdir, harness, payload.get("session_id"), payload.get("agent_id") or "")
+    if output.failure_kind:
+        record_event(root, "standing.injection_failed", harness, payload.get("session_id"),
+                     binding.enrollment_id if binding else None, "failed",
+                     details={"failure_kind": output.failure_kind})
+        return
+    details = {
+        "trigger": payload.get("source"), "bytes": len(text.encode()),
+        "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "source": "session" if binding else "default",
+    }
+    if output.over_budget_bytes:
+        details["over_budget_bytes"] = output.over_budget_bytes
     record_event(root, "standing.injection_emitted", harness, payload.get("session_id"),
-                 binding.enrollment_id if binding else None, "emitted", details={
-                     "trigger": payload.get("source"), "bytes": len(text.encode()),
-                     "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                     "source": "session" if binding else "default"})
+                 binding.enrollment_id if binding else None, "emitted", details=details)
 
 
 def checkpoint_event(root, gitdir, harness, payload):
@@ -2543,6 +3186,17 @@ def main():
         cmd.add_argument("--harness", choices=("claude", "codex"), default="codex")
         cmd.add_argument("--session", default="validation", help="session identity to include in the budget")
         cmd.add_argument("--agent", default="")
+    cmd = sub.add_parser("compose", help="compose reviewed rules and a worktree mission into a private context file")
+    cmd.add_argument("--rules", required=True, help="absolute shared and role rules file")
+    cmd.add_argument("--mission", required=True, help="absolute per-worktree mission file")
+    cmd.add_argument("--output", required=True, help="absolute ordinary context output file")
+    cmd.add_argument("--min-headroom", type=int, default=1024,
+                     help="minimum remaining rendered bytes per role (default: 1024)")
+    cmd.add_argument("--replace", action="store_true", help="replace a differing existing output file")
+    cmd.add_argument("--check", action="store_true", help="compare output bytes without writing")
+    cmd.add_argument("--harness", choices=("claude", "codex"), default="codex")
+    cmd.add_argument("--session", help="exact recipient session for prospective enrollment budgets")
+    cmd.add_argument("--agent", default="", help="existing agent ID used in the rendered preview header")
     cmd = sub.add_parser("hook")
     cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
     cmd = sub.add_parser("hook-config", help="print configuration to merge manually")
@@ -2729,6 +3383,10 @@ def main():
                               "session_id": args.session, "status": "active"}))
         elif args.command == "context":
             print(json.dumps(opencode_context(root, gitdir, args.session), ensure_ascii=False))
+        elif args.command == "compose":
+            result, status = compose_report(root, gitdir, args)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return status
         elif args.command == "tasks":
             result = list_owner_tasks(args.owner_worktree or root, args.status)
             print(json.dumps(result, indent=2))
@@ -2777,6 +3435,7 @@ def main():
                           "Model reception is not recorded by Pattern Buffer; "
                           "legacy delivery_verified=false does not mean reception failed."),
                       "delivery_verified": False}
+            reference_source = source
             if args.harness:
                 settings = settings_path(args.harness, args.settings)
                 data = read_settings(settings)
@@ -2815,6 +3474,8 @@ def main():
                 result.update(session=args.session, enrollment=binding_report(binding),
                               context_file=str(binding.path) if binding else str(source),
                               context_required=binding is not None)
+                reference_source = Path(binding.path) if binding else source
+            result["reference_warnings"] = reference_warnings_for_path(reference_source, root)
             print(json.dumps(result, indent=2))
         elif args.command == "handoff-check":
             result = handoff_report(root, gitdir, config_path, args.harness, args.session, args.settings)
@@ -2900,10 +3561,26 @@ def main():
             atomic(path, json.dumps({"root": str(root), "role": args.role}))
             print(f"Assigned {args.harness} session {args.session} to {args.role}.")
         elif args.command == "preview":
-            print(render(root, args.harness, args.session, args.agent, args.role))
+            rendered = render(root, args.harness, args.session, args.agent, args.role,
+                              runtime_policy=ORDINARY_WORKTREE_RENDER_POLICY)
+            print(finalize_rendered_context(rendered).text)
         else:
             config, _source = load(root, gitdir)
             report = current_context_budgets(root, gitdir, args.harness, args.session, args.agent)
+            reference_report = reference_check(bounded(Path(report["source"]), FILE_LIMIT),
+                                               report["source"], root)
+            for finding in reference_report["warnings"]:
+                print(f"WARNING: {finding['message']} ({finding['source']}: {finding['target']})",
+                      file=sys.stderr)
+            if args.command == "validate" and reference_report["errors"]:
+                for finding in reference_report["errors"]:
+                    print(f"ERROR: {finding['message']} ({finding['source']}: {finding['target']})",
+                          file=sys.stderr)
+                raise ValueError("local context references are invalid")
+            if args.command == "doctor":
+                for finding in reference_report["errors"]:
+                    print(f"WARNING: {finding['message']} ({finding['source']}: {finding['target']})",
+                          file=sys.stderr)
             failures = []
             for role, budget in report["roles"].items():
                 if "bytes_used" in budget:

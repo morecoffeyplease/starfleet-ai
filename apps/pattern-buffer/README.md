@@ -60,6 +60,20 @@ Profiles are never inferred from a folder name or downloaded from a repository.
 When an existing context file is present, selection records the profile but does not merge or migrate its fragment.
 An owner-linked child worktree always uses its owner's context and cannot select an independent profile.
 
+## Compose reviewed context
+
+Use `compose` to place a reviewed rules file and a per-worktree mission into an ordinary context file.
+The rules file must include `# shared`, `# implementer`, and `# orchestrator`, with an optional final `# confirmation` section.
+The mission file must include `# shared` and may include either role section.
+Mission text comes before rules text in each section, and only the rules file supplies confirmation text.
+The command reports SHA-256 digests, paragraph bytes, exact rendered role budgets, and local reference findings.
+It uses the existing 8192-byte renderer and requires 1024 bytes of remaining headroom per role by default.
+Pass `--harness` and `--session` to calculate a prospective recipient budget against the existing session-enrollment destination.
+Without `--session`, the command labels its `validation` session as a placeholder and does not claim a future-recipient budget.
+`--check` compares bytes without writing, and a differing existing output requires `--replace`.
+The reference checker reads no network targets and reports unsupported Markdown or command-style forms as warnings.
+Compose to a private path, then use the reviewed `session-enroll --reviewed-update --evidence` route for registered exact-session context.
+
 ## Session context and recovery
 
 Use assign for a persistent worktree role or session-enroll for an exact native session that needs a private standing file.
@@ -69,15 +83,22 @@ Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery 
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
 Pattern Buffer appends a short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
 The runtime reminder asks agents to use the installed PStack runtime and Poteto Mode.
-After compaction, the composed guidance asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
+After compaction, the composed guidance asks agents to read the sections relevant to current work in full, not the entire PStack library.
+The default shared guidance also asks for a four-line own-chat restatement of the accepted outcome, next deliverable, holds, and what the agent will not do.
+It names unavailable required reads and preserves holds.
+For a legacy custom context without `# confirmation`, the runtime appends that same restatement after its PStack reminder.
 It does not install PStack, change roles or authority, or rewrite custom context files.
 The runtime reminder is outside the 8192-byte standing-context budget and counts toward the existing 24 KiB combined injection limit.
 See the [printable guide](guide.md) for the recovery limits.
-The default context template also includes a final `# confirmation` section that Pattern Buffer appends after the selected role for every role.
+The default context template includes a final `# confirmation` section that Pattern Buffer appends after the selected role for every role.
 That section counts toward the 8192-byte standing-context limit.
-It asks agents to confirm injection receipt, completion of relevant PStack and Poteto reading, and mission or tracker updates in their own chat.
-Existing custom context files are not rewritten; they keep the runtime completion-confirmation wording until an owner-reviewed update adds the optional section.
-Owners must adjust their own context if it exceeds either existing limit; Pattern Buffer provides no length exception.
+The default footer asks agents to repeat the four-line restatement in their own chat.
+Custom context files keep their owner-managed confirmation text.
+For an ordinary worktree SessionStart, Pattern Buffer can emit a complete role view above 8192 bytes with a warning when the total context, including runtime, task and checkpoint addenda, stays within 9216 bytes and the existing 24 KiB combined limit.
+Larger overflow and source, parser, read or combined-limit failures produce a bounded notice that asks the agent to read the full source file and notify its owner while preserving unresolved scope and holds.
+The notice is not full context and does not expand authorization.
+Exact-session enrollment and dispatched work retain their blocking integrity behavior.
+Preview shows ordinary-worktree warning and fallback behavior without event-specific checkpoint addenda; validate continues to enforce the authoring-time role budget.
 The default context template includes shared review judgment and orchestrator repair-round guidance.
 Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](../starfleet-policy-guard/guide.md#review-and-fix-cycles) in full and revisit the relevant rule before each repair decision.
 Prime Directive (Policy Guard) is the same delivery tool described as Policy Guard in its CLI and documentation.
@@ -121,7 +142,9 @@ Validation and status report header overhead, usable content bytes and remaining
 Pass the exact session ID when available so the calculation uses the enrolled file path and identity.
 Without `--session`, status labels its placeholder header budget and does not establish exact native-session binding.
 Session enrollment and handoff checks use the same calculation before reviewed text is adopted.
-Oversized or malformed required sources still fail closed and are never truncated.
+Oversized or malformed required sources still block exact-session enrollment and dispatched work.
+Ordinary worktree SessionStart uses the bounded warning or failure-notice policy described in the [printable guide](guide.md).
+Status remains a read-only report of local budgets and delivery evidence, and a configured hook does not establish model reception.
 Doctor reads local registration and content only; it does not certify hook activation, model reception or compliance.
 After installation changes, restart or resume the harness according to its own configuration reload behavior.
 Native delivery checks require a separate bounded pilot in disposable state and are not established by these local tests.
