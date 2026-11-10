@@ -2432,7 +2432,13 @@ def execute(args):
             has_cycle_context = bool(args.review_target or args.review_cycle)
             review_cycle = None
             target = cycle = review_slot = None
-            if args.role == "standard_review" and "standard_review_policy" in active:
+            saved_plan = (app.state(f"reviews/{safe_id(args.review_plan)}", None)
+                          if args.role == "standard_review" and "standard_review_policy" in active
+                          and args.review_plan else None)
+            standard_instead_plan = (isinstance(saved_plan, dict)
+                                     and saved_plan.get("role") == "advanced_review")
+            if (args.role == "standard_review" and "standard_review_policy" in active
+                    and not standard_instead_plan):
                 require(args.review_target and args.review_cycle and args.review_plan,
                         "claude-codex-light standard review dispatch requires --review-target, --review-cycle, and --review-plan.")
                 target, cycle, plan, review_slot, choice = cycle_review_context(app, config, args, cwd)
