@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
@@ -88,6 +89,177 @@ class DeliveryTest(unittest.TestCase):
 
     def item(self, identifier, report=None):
         return next(x for x in (report or self.report())['items'] if x['id'] == identifier)
+
+    def required_reads_report(self, state='current', generation=3):
+        entries = []
+        for index in range(1, 4):
+            name = 'required-guide-' + str(index)
+            path = self.root / (name + '.md')
+            path.write_text('Synthetic required guidance ' + str(index) + '\n')
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            entry_state = state
+            part_state = 'current' if state == 'current' else 'pending'
+            entries.append({'name': name, 'path': str(path.resolve()),
+                            'roles': ['implementer'], 'state': entry_state,
+                            'sha256': digest, 'byte_count': path.stat().st_size,
+                            'parts': [{'part': 1, 'state': part_state}]})
+        return {'registered': True, 'ok': True, 'integrity_errors': [],
+                'list_path': str(self.root / 'required-reads.json'),
+                'list_sha256': 'a' * 64, 'list_digest_matches': True,
+                'generation': generation, 'harness': 'codex', 'session_id': 'codex-fixture-session',
+                'role': 'implementer', 'entries': entries}
+
+    def packet_with_required_reads(self, report, *, include_required=True, include_extra=False):
+        packet = {'guidance_attestation': self.guidance_attestation('repair_batch')}
+        attestation = packet['guidance_attestation']
+        entries = []
+        if include_required:
+            entries = [{'kind': 'required_read', 'name': entry['name'],
+                        'source_ref': 'https://example.invalid/guides/' + entry['name'],
+                        'path': entry['path'], 'sha256': entry['sha256']}
+                       for entry in report['entries']]
+        if include_extra:
+            extra = self.artifact('extra-guidance.md', 'Additional reviewed guidance')
+            entries.append({'kind': 'playbook', 'name': 'Additional playbook',
+                            'source_ref': 'https://example.invalid/playbooks/extra', **extra})
+        attestation['reread'] = entries
+        return packet
+
+    def install_pattern_buffer_stub(self, report_text, *, exit_code=0, stderr='stub failure', delay='0'):
+        bin_dir = self.root / 'pattern-buffer-bin'
+        bin_dir.mkdir(exist_ok=True)
+        executable = bin_dir / 'pattern-buffer'
+        executable.write_text(
+            '#!' + sys.executable + '\n'
+            'import os,sys,time\n'
+            'from pathlib import Path\n'
+            'Path(os.environ["PB_STUB_ARGS"]).write_text("\\n".join(sys.argv[1:]))\n'
+            'time.sleep(float(os.environ.get("PB_STUB_DELAY", "0")))\n'
+            'sys.stdout.write(Path(os.environ["PB_STUB_REPORT"]).read_text())\n'
+            'code = int(os.environ.get("PB_STUB_EXIT", "0"))\n'
+            'if code:\n'
+            ' print(os.environ.get("PB_STUB_ERROR", "stub failure"), file=sys.stderr)\n'
+            'sys.exit(code)\n')
+        executable.chmod(0o755)
+        report_path = self.root / 'pattern-buffer-report.json'
+        report_path.write_text(report_text)
+        args_path = self.root / 'pattern-buffer-args.txt'
+        env = {'PATH': str(bin_dir), 'PB_STUB_REPORT': str(report_path),
+               'PB_STUB_ARGS': str(args_path), 'PB_STUB_EXIT': str(exit_code),
+               'PB_STUB_ERROR': stderr, 'PB_STUB_DELAY': delay}
+        return env, args_path, report_path
+
+    def test_required_reads_consumer_calls_installed_cli_directly_and_normalizes_three_entries(self):
+        raw = self.required_reads_report()
+        env, args_path, _report_path = self.install_pattern_buffer_stub(json.dumps(raw))
+        with mock.patch.dict(os.environ, env):
+            report = delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+        self.assertEqual(args_path.read_text().splitlines(), [
+            '--cwd', str(self.repo.resolve()), 'required-reads', 'status',
+            '--harness', 'codex', '--session', 'codex-fixture-session', '--json'])
+        self.assertEqual(report['generation'], 3)
+        self.assertEqual(report['list_sha256'], 'a' * 64)
+        self.assertEqual(len(report['entries']), 3)
+
+    def test_required_reads_consumer_preserves_legacy_mode_for_absent_cli_and_explicit_no_list(self):
+        packet = {'guidance_attestation': self.guidance_attestation('repair_batch')}
+        baseline = delivery.render_guidance_attestation(packet, self.root, self.url, 'repair_batch')
+        self.assertNotIn('required_reads', baseline)
+        env, _args_path, _report_path = self.install_pattern_buffer_stub('{"registered":false}\n')
+        with mock.patch.dict(os.environ, env):
+            explicit_no_list = delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+        self.assertIsNone(explicit_no_list)
+        self.assertEqual(delivery.render_guidance_attestation(
+            packet, self.root, self.url, 'repair_batch', receipt_context=explicit_no_list), baseline)
+
+        empty_path = self.root / 'empty-path'
+        empty_path.mkdir()
+        with mock.patch.dict(os.environ, {'PATH': str(empty_path)}):
+            absent = delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+        self.assertIsNone(absent)
+        self.assertEqual(delivery.render_guidance_attestation(
+            packet, self.root, self.url, 'repair_batch', receipt_context=absent), baseline)
+
+    def test_required_reads_consumer_fails_closed_on_nonzero_malformed_timeout_and_integrity(self):
+        report = self.required_reads_report()
+        cases = (
+            ('nonzero', json.dumps(report), 1, 'exited with code 1'),
+            ('malformed', 'not-json', 0, 'malformed JSON'),
+        )
+        for label, body, exit_code, message in cases:
+            env, _args_path, _report_path = self.install_pattern_buffer_stub(body, exit_code=exit_code)
+            with self.subTest(case=label), mock.patch.dict(os.environ, env):
+                with self.assertRaisesRegex(ValueError, message):
+                    delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+
+        env, _args_path, _report_path = self.install_pattern_buffer_stub(json.dumps(report), delay='0.1')
+        with mock.patch.dict(os.environ, env), mock.patch.object(delivery, 'PATTERN_BUFFER_TIMEOUT_SECONDS', 0.01):
+            with self.assertRaisesRegex(ValueError, 'timed out'):
+                delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+
+        env, _args_path, _report_path = self.install_pattern_buffer_stub(json.dumps(report))
+        with mock.patch.dict(os.environ, env), mock.patch.object(delivery, 'PATTERN_BUFFER_REPORT_LIMIT_BYTES', 8):
+            with self.assertRaisesRegex(ValueError, 'exceeded the size limit'):
+                delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+
+        damaged = dict(report, ok=False, list_digest_matches=False,
+                       integrity_errors=['registered list digest changed'])
+        env, _args_path, _report_path = self.install_pattern_buffer_stub(json.dumps(damaged))
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaisesRegex(ValueError, 'Pattern Buffer integrity error.*digest changed'):
+                delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+
+    def test_required_reads_validation_requires_all_current_matching_receipts_and_allows_extras(self):
+        raw = self.required_reads_report()
+        env, _args_path, _report_path = self.install_pattern_buffer_stub(json.dumps(raw))
+        with mock.patch.dict(os.environ, env):
+            normalized = delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+        packet = self.packet_with_required_reads(normalized, include_extra=True)
+        receipt = delivery.require_required_read_receipts(normalized, packet, self.root)
+        self.assertEqual(receipt['generation'], 3)
+        self.assertEqual([entry['name'] for entry in receipt['entries']],
+                         [entry['name'] for entry in normalized['entries']])
+        rendered = delivery.render_guidance_attestation(
+            packet, self.root, self.url, 'repair_batch', receipt_context=receipt)
+        for entry in normalized['entries']:
+            self.assertIn(entry['name'] + ' (', rendered['body'])
+            self.assertIn('[read in current context window, generation 3]', rendered['body'])
+        self.assertIn('Additional playbook', rendered['body'])
+        extra_line = next(line for line in rendered['body'].splitlines() if 'Additional playbook' in line)
+        self.assertNotIn('read in current context window', extra_line)
+
+        ready_entries = delivery.required_read_packet_entries(normalized)
+        self.assertEqual(len(ready_entries), 3)
+        self.assertTrue(all('source_ref' not in entry for entry in ready_entries))
+
+        omitted = self.packet_with_required_reads(normalized, include_required=False)
+        with self.assertRaisesRegex(ValueError, 'required-guide-1: missing from the packet reread list'):
+            delivery.require_required_read_receipts(normalized, omitted, self.root)
+        with self.assertRaisesRegex(ValueError, 'required-guide-1: missing from the packet reread list'):
+            delivery.require_required_read_receipts(normalized, {}, self.root)
+        no_applicable_entries = dict(normalized, entries=[])
+        with self.assertRaisesRegex(ValueError, 'requires packet.guidance_attestation.reread'):
+            delivery.require_required_read_receipts(no_applicable_entries, {}, self.root)
+
+        wrong_path = self.packet_with_required_reads(normalized)
+        wrong_path['guidance_attestation']['reread'][0]['path'] = str(self.root / 'elsewhere.md')
+        with self.assertRaisesRegex(ValueError, 'path and SHA-256 do not match'):
+            delivery.require_required_read_receipts(normalized, wrong_path, self.root)
+
+        wrong_digest = self.packet_with_required_reads(normalized)
+        wrong_digest['guidance_attestation']['reread'][1]['sha256'] = '0' * 64
+        with self.assertRaisesRegex(ValueError, 'path and SHA-256 do not match'):
+            delivery.require_required_read_receipts(normalized, wrong_digest, self.root)
+
+        stale_raw = self.required_reads_report(state='stale', generation=4)
+        env, _args_path, _report_path = self.install_pattern_buffer_stub(json.dumps(stale_raw))
+        with mock.patch.dict(os.environ, env):
+            stale = delivery.required_reads_status(self.repo, 'codex', 'codex-fixture-session')
+        stale_packet = self.packet_with_required_reads(stale)
+        with self.assertRaisesRegex(ValueError, 'no current receipt for generation 4') as error:
+            delivery.require_required_read_receipts(stale, stale_packet, self.root)
+        for entry in stale['entries']:
+            self.assertIn(entry['name'], str(error.exception))
 
     def test_satisfied_and_explicit_not_applicable_without_writes(self):
         before = {str(p.relative_to(self.repo)): p.read_bytes() for p in self.repo.rglob('*') if p.is_file()}

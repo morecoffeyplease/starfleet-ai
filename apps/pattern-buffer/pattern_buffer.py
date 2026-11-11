@@ -3122,7 +3122,7 @@ def required_reads_command(root, gitdir, args):
         role, _origin, _saved = resolve_role(root, gitdir, config, args.harness, session)
         result = helper.status(sys.modules[__name__], root, gitdir, args.harness, session, role)
         if result is None:
-            raise ValueError("no required-reads list is registered for this worktree")
+            result = {"registered": False}
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
@@ -3250,14 +3250,16 @@ def main():
     override_reads.add_argument("--minutes", required=True, type=int,
                                 help="whole minutes from 1 through 60")
     status_reads = required_actions.add_parser(
-        "status", help="show entry and receipt state for one current context window",
-        description="Report each required entry for the session's current role and generation.",
+        "status", help="print the required-read report for one current context window",
+        description="Print one JSON report for each required entry that applies to the session's role and generation.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example: pattern-buffer --cwd /worktree required-reads status --harness codex --session SESSION_ID")
+        epilog="Example: pattern-buffer --cwd /worktree required-reads status --harness codex --session SESSION_ID --json")
     status_reads.add_argument("--harness", choices=("claude", "codex"), required=True,
                               help="native harness that owns the session")
     status_reads.add_argument("--session", required=True,
                               help="exact session ID; must match the native caller when one is present")
+    status_reads.add_argument("--json", action="store_true", dest="json_output",
+                              help="accepted for explicit machine-readable use; JSON is already the default")
     read_required = sub.add_parser(
         "read-required", help="print a required document or its next unread part",
         description="Print one canonical frame to stdout without changing receipt state. A matching native PostToolUse event records receipt metadata only when the complete output and current inputs pass validation.",

@@ -84,11 +84,22 @@ class LaneInstallTest(unittest.TestCase):
                           ' with open(os.environ["FAKE_LANE_FORWARDED"],"a") as f:\n'
                           '  f.write(json.dumps({"argv":sys.argv[1:],"cwd":os.getcwd()})+"\\n")\n')
         binary.chmod(0o755)
+        pattern_buffer = binary.parent / 'pattern-buffer'
+        pattern_buffer.write_text('#!' + sys.executable + '\nimport json,os,sys\nfrom pathlib import Path\n'
+                                  'with open(os.environ["FAKE_PATTERN_BUFFER_CALLS"],"a") as stream:\n'
+                                  ' stream.write(json.dumps(sys.argv[1:])+"\\n")\n'
+                                  'sys.stdout.write(Path(os.environ["FAKE_PATTERN_BUFFER_REPORT"]).read_text())\n')
+        pattern_buffer.chmod(0o755)
+        self.pattern_buffer_report_path = self.base / 'pattern-buffer-report.json'
+        self.pattern_buffer_report_path.write_text('{"registered":false}\n')
+        self.pattern_buffer_calls = self.base / 'pattern-buffer-calls.jsonl'
         self.env = dict(os.environ, XDG_STATE_HOME=str(self.base / 'xdg-state'),
                         XDG_DATA_HOME=str(self.base / 'xdg-data'),
                         PATH=str(binary.parent) + os.pathsep + os.environ['PATH'],
                         FAKE_LANE_REMOTE=str(self.remote_path), FAKE_LANE_FORWARDED=str(self.forwarded),
-                        FAKE_LANE_API=str(self.api_calls))
+                        FAKE_LANE_API=str(self.api_calls),
+                        FAKE_PATTERN_BUFFER_REPORT=str(self.pattern_buffer_report_path),
+                        FAKE_PATTERN_BUFFER_CALLS=str(self.pattern_buffer_calls))
         self.packet = self.base / 'delivery.json'
         self.packet.write_text(json.dumps({'pr_url': self.url, 'base_ref': 'main', 'design-fidelity': {
             'applicable': False, 'revision': self.head, 'reason': 'No designs in this fixture'}}))
@@ -99,6 +110,26 @@ class LaneInstallTest(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+    def set_pattern_buffer_report(self, report):
+        self.pattern_buffer_report_path.write_text(json.dumps(report) + '\n')
+
+    def required_reads_report(self, state='current', generation=3):
+        entries = []
+        required_dir = self.base / 'required-guidance'
+        required_dir.mkdir(exist_ok=True)
+        for index in range(1, 4):
+            name = 'required-guide-' + str(index)
+            path = required_dir / (name + '.md')
+            path.write_text('Synthetic required guidance ' + str(index) + '\n')
+            entries.append({'name': name, 'path': str(path.resolve()), 'roles': ['implementer'],
+                            'state': state, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'byte_count': path.stat().st_size,
+                            'parts': [{'part': 1, 'state': 'current' if state == 'current' else 'pending'}]})
+        return {'registered': True, 'ok': True, 'integrity_errors': [],
+                'list_path': str(self.base / 'required-reads.json'), 'list_sha256': 'c' * 64,
+                'list_digest_matches': True, 'generation': generation, 'harness': 'codex',
+                'session_id': 'codex-fixture-thread', 'role': 'implementer', 'entries': entries}
 
     def terminal_env(self):
         return {key: value for key, value in self.env.items() if key not in (
@@ -1406,6 +1437,71 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(self.call('record', '--evidence', self.packet, ok=False).returncode, 2)
         self.assertIsNone(json.loads(self.call('status').stdout)['receipt'])
 
+    def test_record_requires_registered_receipts_even_without_guidance_attestation(self):
+        source = self.source_checkout('record-required-reads-without-attestation')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        self.install_from_source(source, lane=True, lane_pr_url=self.url, env=owner_env)
+        self.call_source(source, 'discover', env=owner_env)
+        packet = json.loads(self.packet.read_text())
+        packet['base_ref'] = lane_runtime.read(self.repo)['base_ref']
+        self.packet.write_text(json.dumps(packet))
+
+        explicit_no_list = self.call_source(source, 'record', '--evidence', self.packet,
+                                            '--format', 'json', env=owner_env)
+        self.assertEqual(explicit_no_list.returncode, 0, explicit_no_list.stderr)
+        self.assertNotIn('required_reads', lane_runtime.read(self.repo)['receipt'])
+        calls_after_no_list = self.pattern_buffer_calls.read_text().splitlines()
+        self.assertEqual(len(calls_after_no_list), 1)
+
+        no_pattern_buffer_bin = self.base / 'record-without-pattern-buffer-bin'
+        no_pattern_buffer_bin.mkdir()
+        (no_pattern_buffer_bin / 'git').symlink_to(shutil.which('git'))
+        fake_gh = Path(self.env['PATH'].split(os.pathsep)[0]) / 'gh'
+        (no_pattern_buffer_bin / 'gh').symlink_to(fake_gh)
+        absent_pattern_buffer_env = dict(owner_env, PATH=str(no_pattern_buffer_bin))
+        absent_no_list = self.call_source(source, 'record', '--evidence', self.packet,
+                                          '--format', 'json', env=absent_pattern_buffer_env)
+        self.assertEqual(absent_no_list.returncode, 0, absent_no_list.stderr)
+        explicit_data = json.loads(explicit_no_list.stdout)
+        absent_data = json.loads(absent_no_list.stdout)
+        explicit_data['snapshot'].pop('observed_at', None)
+        absent_data['snapshot'].pop('observed_at', None)
+        self.assertEqual(absent_data, explicit_data)
+        self.assertEqual(self.pattern_buffer_calls.read_text().splitlines(), calls_after_no_list)
+        self.assertNotIn('required_reads', lane_runtime.read(self.repo)['receipt'])
+
+        pending = self.required_reads_report('pending', generation=3)
+        self.set_pattern_buffer_report(pending)
+        refused_pending = self.call_source(source, 'record', '--evidence', self.packet,
+                                           env=owner_env, ok=False)
+        self.assertEqual(refused_pending.returncode, 2)
+        for entry in pending['entries']:
+            self.assertIn(entry['name'], refused_pending.stderr)
+            self.assertIn('read-required', refused_pending.stderr)
+
+        current = self.required_reads_report('current', generation=3)
+        self.set_pattern_buffer_report(current)
+        refused_omitted = self.call_source(source, 'record', '--evidence', self.packet,
+                                          env=owner_env, ok=False)
+        self.assertEqual(refused_omitted.returncode, 2)
+        for entry in current['entries']:
+            self.assertIn(entry['name'], refused_omitted.stderr)
+            self.assertIn('missing from the packet reread list', refused_omitted.stderr)
+
+        suggested = json.loads(self.call_source(source, 'attestation-rereads', env=owner_env).stdout)
+        packet['guidance_attestation'] = {
+            'stage': 'repair_batch',
+            'reread': [{**entry, 'source_ref': 'https://fixture.invalid/guides/' + entry['name']}
+                       for entry in suggested],
+        }
+        self.packet.write_text(json.dumps(packet))
+        accepted = self.call_source(source, 'record', '--evidence', self.packet, env=owner_env)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        required_reads = lane_runtime.read(self.repo)['receipt']['required_reads']
+        self.assertEqual(required_reads['list_sha256'], current['list_sha256'])
+        self.assertEqual(required_reads['generation'], 3)
+        self.assertEqual(required_reads['stage'], 'repair_batch')
+
     def test_published_guidance_attestation_requires_owner_current_packet_and_exact_remote_comment(self):
         source = self.source_checkout('published-guidance-attestation')
         owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
@@ -1443,10 +1539,93 @@ class LaneInstallTest(unittest.TestCase):
             'human_holds_ref': 'No additional hold is recorded.',
         }
         self.packet.write_text(json.dumps(packet))
-        rendered = self.call_source(source, 'attestation-render', '--evidence', self.packet,
-                                    '--stage', 'repair-batch', env=owner_env).stdout
         comment_id = 1001
         comment_url = self.url + '#issuecomment-' + str(comment_id)
+        pending_report = self.required_reads_report('pending', generation=3)
+        self.set_pattern_buffer_report(pending_report)
+
+        suggested = json.loads(self.call_source(source, 'attestation-rereads', env=owner_env).stdout)
+        self.assertEqual([entry['name'] for entry in suggested],
+                         [entry['name'] for entry in pending_report['entries']])
+        self.assertTrue(all('source_ref' not in entry for entry in suggested))
+
+        before_pending_record = lane_runtime.read(self.repo)['receipt']
+        pending_record = self.call_source(source, 'record', '--evidence', self.packet,
+                                          env=owner_env, ok=False)
+        self.assertEqual(pending_record.returncode, 2)
+        for entry in pending_report['entries']:
+            self.assertIn(entry['name'], pending_record.stderr)
+            self.assertIn('read-required', pending_record.stderr)
+        self.assertEqual(lane_runtime.read(self.repo)['receipt'], before_pending_record)
+
+        pending_render = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                          '--stage', 'repair-batch', env=owner_env, ok=False)
+        self.assertEqual(pending_render.returncode, 2)
+        for entry in pending_report['entries']:
+            self.assertIn(entry['name'], pending_render.stderr)
+
+        for stage, record_stage in (('repair-batch', 'repair_batch'), ('opening', 'opening')):
+            packet['guidance_attestation']['stage'] = record_stage
+            if record_stage == 'opening':
+                packet['guidance_attestation'].pop('accepted_batch_ref', None)
+                packet['guidance_attestation'].pop('repair_history_ref', None)
+            else:
+                packet['guidance_attestation']['accepted_batch_ref'] = (
+                    'https://fixture.invalid/starfleet/guard/issues/37#accepted-batch-1')
+                packet['guidance_attestation']['repair_history_ref'] = (
+                    'https://fixture.invalid/starfleet/guard/pull/901#issuecomment-1')
+            self.packet.write_text(json.dumps(packet))
+            pending_start = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                             '--stage', stage, '--comment-url', comment_url, '--enable',
+                                             env=owner_env, ok=False)
+            self.assertEqual(pending_start.returncode, 2)
+            for entry in pending_report['entries']:
+                self.assertIn(entry['name'], pending_start.stderr)
+                self.assertIn('read-required', pending_start.stderr)
+            self.assertNotIn('attestation_required', lane_runtime.read(self.repo))
+
+        packet['guidance_attestation']['stage'] = 'repair_batch'
+        packet['guidance_attestation']['accepted_batch_ref'] = (
+            'https://fixture.invalid/starfleet/guard/issues/37#accepted-batch-1')
+        packet['guidance_attestation']['repair_history_ref'] = (
+            'https://fixture.invalid/starfleet/guard/pull/901#issuecomment-1')
+        current_report = self.required_reads_report('current', generation=3)
+        self.set_pattern_buffer_report(current_report)
+        suggestions = json.loads(self.call_source(source, 'attestation-rereads', env=owner_env).stdout)
+        packet['guidance_attestation']['reread'].extend(
+            {**entry, 'source_ref': 'https://fixture.invalid/starfleet/guard/blob/abc/' + entry['name'] + '.md'}
+            for entry in suggestions)
+        self.packet.write_text(json.dumps(packet))
+
+        rendered = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                    '--stage', 'repair-batch', env=owner_env).stdout
+        for entry in current_report['entries']:
+            self.assertIn(entry['name'], rendered)
+        self.assertEqual(rendered.count('[read in current context window, generation 3]'), 3)
+        self.assertNotIn('[read in current context window',
+                         next(line for line in rendered.splitlines() if 'Current repair playbook' in line))
+
+        recorded = self.call_source(source, 'record', '--evidence', self.packet, env=owner_env)
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        report_context = lane_runtime.read(self.repo)['receipt']['required_reads']
+        self.assertEqual(report_context['list_sha256'], current_report['list_sha256'])
+        self.assertEqual(report_context['generation'], 3)
+        self.assertEqual(report_context['stage'], 'repair_batch')
+
+        reset_report = self.required_reads_report('pending', generation=4)
+        self.set_pattern_buffer_report(reset_report)
+        reset_render = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                        '--stage', 'repair-batch', env=owner_env, ok=False)
+        self.assertIn('generation 4', reset_render.stderr)
+        reset_record = self.call_source(source, 'record', '--evidence', self.packet,
+                                        env=owner_env, ok=False)
+        self.assertIn('generation 4', reset_record.stderr)
+        reset_start = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                       '--stage', 'repair-batch', '--comment-url', comment_url,
+                                       '--enable', env=owner_env, ok=False)
+        self.assertIn('generation 4', reset_start.stderr)
+        self.set_pattern_buffer_report(current_report)
+
         self.remote['comments'] = {str(comment_id): {
             'id': comment_id, 'html_url': comment_url,
             'issue_url': 'https://api.fixture.invalid/repos/starfleet/guard/issues/901', 'body': 'old body'}}
@@ -1504,6 +1683,9 @@ class LaneInstallTest(unittest.TestCase):
         adopted = lane_runtime.read(self.repo)
         self.assertIs(adopted['attestation_required'], True)
         self.assertEqual(adopted['guidance_attestation_ref']['comment_url'], comment_url)
+        self.assertEqual(adopted['guidance_attestation_ref']['required_reads']['list_sha256'],
+                         current_report['list_sha256'])
+        self.assertEqual(adopted['guidance_attestation_ref']['required_reads']['generation'], 3)
 
         def local_status_without_api_calls(env=owner_env, cli_source=source):
             before = self.api_calls.read_text().splitlines() if self.api_calls.exists() else []
@@ -1528,6 +1710,10 @@ class LaneInstallTest(unittest.TestCase):
         self.call_source(source, 'record', '--evidence', self.packet, env=owner_env)
         local_status = local_status_without_api_calls()
         self.assertEqual(local_status['report_status']['state'], 'valid-local-snapshot')
+        self.assertEqual(local_status['guidance_attestation_receipts']['list_sha256'],
+                         current_report['list_sha256'])
+        self.assertEqual(local_status['guidance_attestation_receipts']['generation'], 3)
+        self.assertEqual(len(local_status['guidance_attestation_receipts']['entry_names']), 3)
         wrong_owner_status = local_status_without_api_calls(wrong_actor)
         self.assertEqual(wrong_owner_status['report_status']['state'], 'not-evaluated')
         self.assertIn('belongs to another native session', wrong_owner_status['report_status']['reason'])
@@ -1562,8 +1748,13 @@ class LaneInstallTest(unittest.TestCase):
         self.assertIn('Evidence hash changed', changed_reread_status['report_status']['reason'])
         evidence.write_text('The selected current guidance.')
 
+        pattern_calls_before_delivery = (self.pattern_buffer_calls.read_text().splitlines()
+                                         if self.pattern_buffer_calls.exists() else [])
         current = self.invoke_owner(owner_env, 'pr', 'ready', self.url)
         self.assertEqual(current.returncode, 0, current.stderr)
+        pattern_calls_after_delivery = (self.pattern_buffer_calls.read_text().splitlines()
+                                        if self.pattern_buffer_calls.exists() else [])
+        self.assertEqual(pattern_calls_after_delivery, pattern_calls_before_delivery)
         forwarded_before = self.forwarded.read_bytes()
         forwarded = list(map(json.loads, forwarded_before.splitlines()))
         self.assertEqual([item['argv'] for item in forwarded], [['pr', 'ready', self.url]])
@@ -1654,6 +1845,59 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(unavailable_check.returncode, 2)
         self.assertIn('GitHub GET failed', unavailable_check.stderr)
         self.assertEqual(lane_runtime.read(self.repo)['receipt'], old_receipt)
+
+        no_pattern_buffer_bin = self.base / 'without-pattern-buffer-bin'
+        no_pattern_buffer_bin.mkdir()
+        system_git = shutil.which('git')
+        fake_gh = Path(self.env['PATH'].split(os.pathsep)[0]) / 'gh'
+        (no_pattern_buffer_bin / 'git').symlink_to(system_git)
+        (no_pattern_buffer_bin / 'gh').symlink_to(fake_gh)
+        absent_pattern_buffer_env = dict(owner_env, PATH=str(no_pattern_buffer_bin))
+        self.set_pattern_buffer_report({'registered': False})
+
+        explicit_render = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                           '--stage', 'repair-batch', env=owner_env).stdout
+        absent_render = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                         '--stage', 'repair-batch', env=absent_pattern_buffer_env).stdout
+        self.assertEqual(absent_render, explicit_render)
+        explicit_render_json = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                                '--stage', 'repair-batch', '--format', 'json',
+                                                env=owner_env).stdout
+        absent_render_json = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                              '--stage', 'repair-batch', '--format', 'json',
+                                              env=absent_pattern_buffer_env).stdout
+        self.assertEqual(absent_render_json, explicit_render_json)
+        self.assertNotIn('required_reads', json.loads(absent_render_json))
+
+        explicit_record = self.call_source(source, 'record', '--evidence', self.packet,
+                                           '--format', 'json', env=owner_env).stdout
+        absent_record = self.call_source(source, 'record', '--evidence', self.packet,
+                                         '--format', 'json', env=absent_pattern_buffer_env).stdout
+        explicit_record_data = json.loads(explicit_record)
+        absent_record_data = json.loads(absent_record)
+        explicit_record_data['snapshot'].pop('observed_at', None)
+        absent_record_data['snapshot'].pop('observed_at', None)
+        self.assertEqual(absent_record_data, explicit_record_data)
+        self.assertNotIn('required_reads', lane_runtime.read(self.repo)['receipt'])
+
+        no_list_render = explicit_render
+        self.remote.pop('comment_error', None)
+        self.remote['comments'] = {str(comment_id): {
+            'id': comment_id, 'html_url': comment_url,
+            'issue_url': 'https://api.fixture.invalid/repos/starfleet/guard/issues/901',
+            'body': no_list_render}}
+        self.remote_path.write_text(json.dumps(self.remote))
+        explicit_start = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                          '--stage', 'repair-batch', '--comment-url', comment_url,
+                                          env=owner_env)
+        absent_start = self.call_source(source, 'attestation-start-check', '--evidence', self.packet,
+                                        '--stage', 'repair-batch', '--comment-url', comment_url,
+                                        env=absent_pattern_buffer_env)
+        self.assertEqual(absent_start.stdout, explicit_start.stdout)
+        publication = json.loads(absent_start.stdout)['publication']
+        self.assertNotIn('required_reads', publication)
+        status_after_no_list = json.loads(self.call_source(source, 'status', env=owner_env).stdout)
+        self.assertNotIn('guidance_attestation_receipts', status_after_no_list)
 
     def test_rollback_restores_exact_original_and_retains_passthrough_adapter(self):
         self.install()
