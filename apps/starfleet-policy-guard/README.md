@@ -93,3 +93,24 @@ The plan may restore missing runtime metadata only when the checkout's immutable
 It may correct a stale settings mode only when that checkout records the same settings path and content hash, and the live mode matches the durable seat settings metadata.
 Review every `migration_metadata_recovery` entry and apply only its exact plan hash.
 For this metadata recovery path, changed settings content or mode, mismatched paths, invalid pins, and malformed runtime metadata continue to fail closed.
+
+## Retire a missing attachment
+
+An exact seat owner can retire a recorded attachment when its checkout path is gone or now belongs to a different Git repository or worktree.
+The command refuses a live matching checkout and directs the owner to run `uninstall` from that checkout.
+It also refuses a recorded worktree that exists on another branch, and refuses while an install, migration, handoff, or upgrade recovery is pending.
+It changes only the Policy Guard attachment record, preserves pull request records and their counts, and records the owner, time, and missing-checkout evidence.
+
+For example, review the plan for a deleted temporary checkout, then apply only its exact hash:
+
+```sh
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/temporary-feature
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/temporary-feature --apply --plan-sha256 REVIEWED_PLAN_SHA256
+python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /worktrees/remaining-feature upgrade-plan
+```
+
+If the recorded checkout still exists on another branch, restore its recorded branch and run `uninstall` from it instead of retiring it.
+Use the [Policy Guard guide](guide.md#retire-a-missing-attachment) for the full plan, apply, upgrade, and recovery workflow.
