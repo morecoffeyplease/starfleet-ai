@@ -430,7 +430,8 @@ def require_guidance_attestation(state, cwd, *, local_inspection=False):
     packet, path = attestation_packet(packet_path, state)
     report = receipt.get('report') if isinstance(receipt.get('report'), dict) else None
     rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
-                                                    published.get('stage'), report=report)
+                                                    published.get('stage'), report=report,
+                                                    receipt_context=published.get('required_reads'))
     if (published.get('body_sha256') != rendered['body_sha256'] or
             published.get('attestation_sha256') != rendered['attestation_sha256']):
         raise ValueError('Local guidance attestation changed after publication; render and publish the current stage again')
@@ -450,13 +451,24 @@ def attestation_render(args):
     report = None
     if args.stage == 'opening':
         report = delivery.report(args.cwd, state['base_ref'], state['pr_url'], path)
+    owner = state['lane_owner']
+    receipt_report = delivery.required_reads_status(state['root'], owner['harness'], owner['session_id'])
+    receipt_context = delivery.require_required_read_receipts(receipt_report, packet, path.parent)
     stage = args.stage.replace('-', '_')
     rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
-                                                    stage, report=report)
+                                                    stage, report=report, receipt_context=receipt_context)
     if args.format == 'json':
         print(json.dumps(rendered, indent=2))
     else:
         print(rendered['body'], end='')
+    return 0
+
+
+def attestation_rereads(args):
+    state = attestation_owner_state(read(args.cwd), args.cwd)
+    owner = state['lane_owner']
+    report = delivery.required_reads_status(state['root'], owner['harness'], owner['session_id'])
+    print(json.dumps(delivery.required_read_packet_entries(report), indent=2, ensure_ascii=False))
     return 0
 
 
@@ -472,6 +484,10 @@ def attestation_start_check(args):
         if 'attestation_required' not in state and not args.enable:
             raise ValueError('This legacy target is unchanged; first owner-coordinated adoption requires --enable')
         packet, path = attestation_packet(args.evidence, state)
+        delivery.guidance_attestation(packet, path.parent, state['pr_url'], args.stage.replace('-', '_'))
+        owner = state['lane_owner']
+        receipt_report = delivery.required_reads_status(state['root'], owner['harness'], owner['session_id'])
+        receipt_context = delivery.require_required_read_receipts(receipt_report, packet, path.parent)
         report = None
         if args.stage == 'opening':
             report = delivery_runs.check(state.get('receipt'), args.cwd, state['pr_url'])
@@ -481,7 +497,7 @@ def attestation_start_check(args):
                 raise ValueError('Opening attestation requires a current clean PG report with successful canonical verification')
         stage = args.stage.replace('-', '_')
         rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
-                                                        stage, report=report)
+                                                        stage, report=report, receipt_context=receipt_context)
         executable = captured_gh(state)
         pr_ref, remote_pr_record = remote_pr(args.cwd, state['pr_url'], state['base_ref'],
                                              state.get('head_branch'), executable=executable)
@@ -504,6 +520,8 @@ def attestation_start_check(args):
             'body_sha256': rendered['body_sha256'],
             'attestation_sha256': rendered['attestation_sha256'],
         }
+        if 'required_reads' in rendered:
+            publication['required_reads'] = rendered['required_reads']
         if 'attestation_required' not in state:
             state['attestation_required'] = True
             adopted_now = True
@@ -2241,7 +2259,20 @@ def record(args):
             raise ValueError(enrollment_help(args.cwd))
         if state['source_versions'] != source_versions(state.get('lane_owner', {}).get('harness')):
             raise ValueError('Pinned source changed')
+        receipt_context = None
+        packet = None
+        if state.get('lane_owner'):
+            evidence_path = Path(args.evidence).expanduser().resolve()
+            packet = json.loads(evidence_path.read_text())
+            owner = state['lane_owner']
+            receipt_report = delivery.required_reads_status(state['root'], owner['harness'],
+                                                            owner['session_id'])
+            receipt_context = delivery.require_required_read_receipts(
+                receipt_report, packet, evidence_path.parent)
         receipt = delivery_runs.run(args.cwd, state['base_ref'], state['pr_url'], args.evidence, args.policy)
+        if receipt_context is not None:
+            attestation = packet['guidance_attestation']
+            receipt['required_reads'] = {**receipt_context, 'stage': attestation.get('stage')}
         if state.get('receipt'):
             state.setdefault('history', []).append(state['receipt'])
         state['receipt'] = receipt
@@ -2654,6 +2685,22 @@ def status(cwd, session_id=None, state=None, native_context=None):
                               'notice': 'No network freshness check, readiness approval or merge authority.'},
             'receipt': (state or {}).get('receipt'), 'history': (state or {}).get('history', []),
             'enrollment_help': None if configured else enrollment_help(cwd)}
+    publication = (state or {}).get('guidance_attestation_ref')
+    published_context = publication.get('required_reads') if isinstance(publication, dict) else None
+    report_receipt = (state or {}).get('receipt')
+    recorded_context = report_receipt.get('required_reads') if isinstance(report_receipt, dict) else None
+    receipt_context = published_context if isinstance(published_context, dict) else recorded_context
+    if isinstance(receipt_context, dict):
+        entries = receipt_context.get('entries')
+        result['guidance_attestation_receipts'] = {
+            'stage': (publication.get('stage') if isinstance(publication, dict) else
+                      receipt_context.get('stage')),
+            'list_sha256': receipt_context.get('list_sha256'),
+            'generation': receipt_context.get('generation'),
+            'observed_at': receipt_context.get('observed_at'),
+            'entry_names': ([entry.get('name') for entry in entries if isinstance(entry, dict)]
+                            if isinstance(entries, list) else []),
+        }
     result['setup_guidance'] = setup_guidance(cwd, state, result)
     return result
 
@@ -4073,15 +4120,26 @@ def build_parser():
     sub.add_parser('registrations', help='Read known local PR bindings from an attached checkout or permanent seat')
     sub.add_parser('hook')
     sub.add_parser('session')
-    p = sub.add_parser('record')
+    p = sub.add_parser(
+        'record', help='record a read-only delivery report and validate an included guidance attestation',
+        epilog='Example: lane.py --cwd /worktree record --evidence /private/delivery-evidence.json')
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--policy', type=Path, default=delivery.POLICY)
     p.add_argument('--format', choices=('json', 'text'), default='text')
-    p = sub.add_parser('attestation-render', help='Render a current opening or accepted repair-batch attestation without writes')
+    p = sub.add_parser(
+        'attestation-render', help='render a current opening or accepted repair-batch attestation without writes',
+        epilog='Example: lane.py --cwd /worktree attestation-render --evidence /private/delivery-evidence.json --stage repair-batch')
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--stage', choices=('opening', 'repair-batch'), required=True)
     p.add_argument('--format', choices=('markdown', 'json'), default='markdown')
-    p = sub.add_parser('attestation-start-check', help='Validate one exact published attestation comment and bind it to this PR')
+    sub.add_parser(
+        'attestation-rereads',
+        help='print required-read packet entries; add source_ref values before use',
+        description='Print ready-to-paste reread entries for applicable Pattern Buffer files. Add a source_ref to each entry.',
+        epilog='Example: lane.py --cwd /worktree attestation-rereads')
+    p = sub.add_parser(
+        'attestation-start-check', help='validate one exact published attestation comment and bind it to this PR',
+        epilog='Example: lane.py --cwd /worktree attestation-start-check --evidence /private/delivery-evidence.json --stage repair-batch --comment-url https://github.com/OWNER/REPO/pull/123#issuecomment-ID')
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--stage', choices=('opening', 'repair-batch'), required=True)
     p.add_argument('--comment-url', required=True)
@@ -4155,6 +4213,8 @@ def dispatch(args):
             return record(args)
         elif args.action == 'attestation-render':
             return attestation_render(args)
+        elif args.action == 'attestation-rereads':
+            return attestation_rereads(args)
         elif args.action == 'attestation-start-check':
             return attestation_start_check(args)
         elif args.action == 'gh':

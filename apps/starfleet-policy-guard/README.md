@@ -28,6 +28,7 @@ A recorded report is a covered-delivery requirement, not proof of setup or a pre
 Prime Directive (Policy Guard) is the same delivery tool described by this README and its `lane.py` CLI.
 An owner can explicitly adopt its stage-specific opening and accepted repair-batch attestations for a target; older attachments remain unchanged until adoption.
 The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, the `--enable` adoption command and source/runtime upgrade requirements.
+When Pattern Buffer is installed with a required-reads list, the owner must include current matching read receipts in the attestation; `attestation-rereads` prints the required packet entries and leaves `source_ref` for the owner to supply.
 An attestation requires `assumptions: []`; unknown required facts must be investigated or raised to the configured human on Discord, then resolved before attesting.
 The packet can record honest uncertainty about tool limits and future outcomes, but it cannot prove that the author's reasoning contains no hidden assumptions.
 Existing immutable seats must use the reviewed source-upgrade flow before they can run the new pinned attestation commands.

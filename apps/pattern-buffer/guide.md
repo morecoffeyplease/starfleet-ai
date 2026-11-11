@@ -144,9 +144,14 @@ The owner types the worktree directory name to confirm either change.
 
 ```sh
 pattern-buffer --cwd /absolute/worktree required-reads set --file /absolute/reviewed/required-reads.json
-pattern-buffer --cwd /absolute/worktree required-reads status --harness codex --session ACTUAL_SESSION_ID
+pattern-buffer --cwd /absolute/worktree required-reads status --harness codex --session ACTUAL_SESSION_ID --json
 pattern-buffer --cwd /absolute/worktree required-reads clear
 ```
+
+`required-reads status` emits one JSON document by default, and `--json` is accepted for callers that make the format explicit.
+The stable report has `registered`, `list_sha256`, `generation`, `harness`, `session_id`, `role`, and `entries` fields, with entry name, resolved path, roles, state, SHA-256, byte count and receipt parts.
+Entries for other roles use `not_applicable`, and a worktree with no registered list returns `{"registered": false}` and exits successfully.
+Policy Guard consumes this read-only report when it validates a published guidance attestation; see [Published guidance attestations](../starfleet-policy-guard/guide.md#published-guidance-attestations).
 
 Agents may draft a manifest and run read-only status or doctor checks, but they cannot register or clear the list.
 Agents run under the same operating-system account as the owner, so the terminal check is a cooperative safeguard and does not prove who typed the confirmation.
@@ -179,6 +184,7 @@ The four recorded native default-budget outputs included complete frames, includ
 The observations came from Claude 2.1.322 and Codex 0.167.
 The largest observed Codex tool result was 8490 bytes, which is a sample and not a guaranteed output ceiling.
 These observations do not prove general model reception, comprehension or compliance.
+On Codex, receipts reset at the next user turn after a compaction, not at the compaction itself, so a compaction in the middle of a continuing turn is not covered.
 
 `required-reads status`, `status`, `doctor`, and `guide --print` remain available as read-only diagnostics when the manifest or a required file is invalid.
 Read-only status, doctor and handoff checks do not create locks or change required-read state.

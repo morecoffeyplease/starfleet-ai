@@ -131,6 +131,8 @@ The gate checks the resolved role, current list and required-file digests before
 If the owner registers a list after a main session starts and its generation is zero, the first gated tool call starts generation 1 without recording a receipt or opening the gate.
 Pending and binding denials include `pattern-buffer guide --print` for recovery steps.
 Agents can use `required-reads status`, `status`, `doctor`, and `guide --print` to diagnose a closed gate, then notify the owner to restore a file or review and re-register the list.
+`required-reads status` emits a stable JSON report by default, accepts `--json`, and returns `{"registered": false}` with exit code 0 when no list is registered.
+Policy Guard consumes this read-only report for [published guidance attestations](../starfleet-policy-guard/guide.md#published-guidance-attestations).
 `read-required` prints a canonical frame and performs no state, lock or telemetry writes.
 `PreToolUse` stores a bounded snapshot for the exact native session and tool call, including the current generation, list, entry, part and file identity.
 `PostToolUse` records the existing receipt only when its complete stdout matches that frame and the generation, list and file still match the snapshot.
@@ -143,6 +145,7 @@ The four recorded native default-budget outputs included complete frames, includ
 The observations came from Claude 2.1.322 and Codex 0.167.
 The largest observed Codex tool result was 8490 bytes, which is a sample and not a guaranteed output ceiling.
 These observations do not prove general model reception, comprehension or compliance.
+On Codex, receipts reset at the next user turn after a compaction, not at the compaction itself, so a compaction in the middle of a continuing turn is not covered.
 The installed `PreToolUse` hook entry in harness settings shows configuration presence only, not native activation, trust, denial behavior or delivery.
 See the [printable guide's Required reads section](guide.md#required-reads) for owner recovery steps and command examples.
 

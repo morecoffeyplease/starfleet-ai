@@ -170,6 +170,19 @@ class RequiredReadsTests(unittest.TestCase):
         status = json.loads(self.cli("status", "--harness", "codex", "--session", self.session).stdout)
         self.assertNotIn("required_reads", status)
 
+    def test_required_reads_status_reports_explicit_no_list_with_or_without_json_flag(self):
+        arguments = ("required-reads", "status", "--harness", "codex", "--session", self.session)
+        default = self.cli(*arguments)
+        explicit = self.cli(*arguments, "--json")
+        expected = json.dumps({"registered": False}, indent=2) + "\n"
+
+        self.assertEqual(default.stdout, expected)
+        self.assertEqual(explicit.stdout, expected)
+
+        help_text = self.cli("required-reads", "status", "--help").stdout
+        self.assertIn("--json", help_text)
+        self.assertIn("--session SESSION_ID --json", help_text)
+
     def test_subagent_pretool_does_not_start_required_read_state(self):
         self.register()
         session = "synthetic-required-read-subagent"

@@ -149,6 +149,7 @@ The start check only accepts the exact comment already published to the currentl
 ```sh
 python3 /path/to/installed/runtime/lane.py --cwd /product/worktree record \
   --evidence /path/to/delivery-evidence.json
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree attestation-rereads
 python3 /path/to/installed/runtime/lane.py --cwd /product/worktree attestation-render \
   --evidence /path/to/delivery-evidence.json --stage opening > /tmp/opening-attestation.md
 gh pr comment https://github.com/OWNER/REPO/pull/123 --body-file /tmp/opening-attestation.md
@@ -156,6 +157,18 @@ python3 /path/to/installed/runtime/lane.py --cwd /product/worktree attestation-s
   --evidence /path/to/delivery-evidence.json --stage opening \
   --comment-url 'https://github.com/OWNER/REPO/pull/123#issuecomment-ID' --enable
 ```
+
+When Pattern Buffer is absent from `PATH` or reports `{"registered": false}`, Policy Guard keeps the existing attestation body and publication metadata unchanged.
+With a registered list, `record`, `attestation-render`, and `attestation-start-check` query the installed `pattern-buffer` command once for the actual lane owner's harness, session and attached worktree.
+Every applicable required entry must have a current receipt in the owner's current generation and a `reread` entry with the same resolved path and SHA-256.
+The check also validates any extra reread entries using the existing packet rules, and it preserves those extras without marking them as required reads.
+Missing, stale, omitted, path-mismatched or digest-mismatched entries refuse with their names and the `pattern-buffer ... read-required` commands to run in the owner session.
+A Pattern Buffer integrity error retains its reported reason, while a failed command, timeout or malformed report refuses with a status command and guide recovery path.
+Use `attestation-rereads` to print ready-to-paste `kind`, `name`, `path` and `sha256` values for the applicable required files, then add a `source_ref` for each entry yourself.
+That helper only formats packet entries and does not publish an attestation or grant permission.
+Receipt-backed lines in the rendered `Guidance reread` section include the current context generation.
+The existing report receipt and per-target publication reference retain the list digest, generation, observation time and required entry names for later `status` output.
+Covered ready and merge delivery reconstructs the published body from that stored context and does not start another Pattern Buffer subprocess.
 
 Use `--stage repair-batch` for an accepted batch and include its `accepted_batch_ref` in the packet before rendering.
 Run the start check before starting the repair work.

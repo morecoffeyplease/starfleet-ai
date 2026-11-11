@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 
@@ -15,6 +17,8 @@ POLICY = Path(__file__).resolve().parent / 'config/delivery-checklist.json'
 CHECKS = ('design-fidelity', 'main-awareness', 'merge-conflicts', 'local-verification')
 SKILLS = ('design-fidelity-audit', 'fidelity-audit')
 ERRORS = (ValueError, OSError, TypeError, AttributeError, KeyError)
+PATTERN_BUFFER_TIMEOUT_SECONDS = 5
+PATTERN_BUFFER_REPORT_LIMIT_BYTES = 256 * 1024
 GUIDANCE_ATTESTATION_STATEMENT = '\n'.join((
     'I have chosen the simplest viable approach that meets the approved outcome and constraints, and kept the solution proportionate to the problem it solves.',
     'I have made no claims based on assumptions, and I checked the required reads, investigation, evidence, verification, approved scope, and authority for this work.',
@@ -101,6 +105,193 @@ def artifact(record, directory):
     return path
 
 
+def required_reads_status(worktree, harness, session):
+    executable = shutil.which('pattern-buffer')
+    if executable is None:
+        return None
+    root = Path(worktree).resolve()
+    argv = [str(Path(executable).resolve()), '--cwd', str(root), 'required-reads', 'status',
+            '--harness', harness, '--session', session, '--json']
+    recovery = shlex.join(['pattern-buffer', '--cwd', str(root), 'required-reads', 'status',
+                           '--harness', harness, '--session', session, '--json'])
+
+    def refuse(reason):
+        raise ValueError('Pattern Buffer required-read receipt check could not be completed: ' + reason +
+                         '. Run ' + recovery + ' and inspect the Pattern Buffer guide.')
+
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, encoding='utf-8',
+                                timeout=PATTERN_BUFFER_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired:
+        refuse(f'the status command timed out after {PATTERN_BUFFER_TIMEOUT_SECONDS} seconds')
+    except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+        refuse('the status command failed: ' + str(error))
+
+    if len(result.stdout.encode('utf-8')) > PATTERN_BUFFER_REPORT_LIMIT_BYTES:
+        refuse('the status report exceeded the size limit')
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip())[:512]
+        refuse(f'the status command exited with code {result.returncode}' +
+               (': ' + detail if detail else ''))
+    try:
+        report = json.loads(result.stdout)
+    except (TypeError, ValueError) as error:
+        refuse('the status command returned malformed JSON: ' + str(error))
+    if not isinstance(report, dict):
+        refuse('the status command returned an unsupported report shape')
+    if report.get('registered') is False:
+        if report != {'registered': False}:
+            refuse('the no-list report contained unsupported fields')
+        return None
+    if report.get('registered') is not True:
+        refuse('the status report did not identify whether a list is registered')
+
+    integrity_errors = report.get('integrity_errors')
+    if not isinstance(integrity_errors, list) or any(not isinstance(item, str) for item in integrity_errors):
+        refuse('the status report contained malformed integrity details')
+    entries = report.get('entries')
+    if report.get('ok') is not True or report.get('list_digest_matches') is not True or integrity_errors:
+        details = integrity_errors or ['Pattern Buffer reported that the registered list or a required file failed integrity checks']
+        raise ValueError('Pattern Buffer integrity error: ' + '; '.join(details) + '. Run ' + recovery + '.')
+    if report.get('harness') != harness or report.get('session_id') != session:
+        refuse('the status report belongs to a different native session')
+    role = report.get('role')
+    if role not in ('orchestrator', 'implementer'):
+        refuse('the status report did not identify a supported session role')
+    list_sha256 = report.get('list_sha256')
+    generation = report.get('generation')
+    if (not isinstance(list_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', list_sha256) or
+            type(generation) is not int or generation < 0 or not isinstance(entries, list)):
+        refuse('the status report contained malformed list, generation, or entry data')
+
+    normalized_entries = []
+    names = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            refuse('the status report contained a non-object entry')
+        roles = entry.get('roles')
+        if not isinstance(roles, list) or any(not isinstance(value, str) for value in roles):
+            refuse('the status report contained malformed entry roles')
+        if role not in roles:
+            if entry.get('state') != 'not_applicable':
+                refuse('the status report marked a non-applicable entry as applicable')
+            continue
+        name = entry.get('name')
+        raw_path = entry.get('path')
+        digest = entry.get('sha256')
+        byte_count = entry.get('byte_count')
+        state = entry.get('state')
+        parts = entry.get('parts')
+        if (not isinstance(name, str) or not name or name in names or
+                not isinstance(raw_path, str) or not Path(raw_path).is_absolute() or
+                not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) or
+                type(byte_count) is not int or byte_count < 0 or
+                state not in ('current', 'pending', 'stale', 'integrity_error') or
+                not isinstance(parts, list)):
+            refuse('the status report contained malformed applicable entry data')
+        names.add(name)
+        if state == 'integrity_error':
+            detail = entry.get('detail')
+            raise ValueError('Pattern Buffer integrity error for ' + name + ': ' +
+                             (detail if isinstance(detail, str) and detail else 'required file integrity failed') +
+                             '. Run ' + recovery + '.')
+        normalized_parts = []
+        part_numbers = set()
+        for part in parts:
+            if (not isinstance(part, dict) or type(part.get('part')) is not int or part['part'] < 1 or
+                    part.get('state') not in ('current', 'pending')):
+                refuse('the status report contained malformed receipt parts for ' + name)
+            if part['part'] in part_numbers:
+                refuse('the status report repeated a receipt part for ' + name)
+            part_numbers.add(part['part'])
+            normalized_parts.append({'part': part['part'], 'state': part['state']})
+        if not normalized_parts or part_numbers != set(range(1, len(part_numbers) + 1)):
+            refuse('the status report contained incomplete receipt parts for ' + name)
+        try:
+            resolved_path = Path(raw_path).resolve(strict=True)
+        except OSError as error:
+            raise ValueError('Pattern Buffer reported a required file that is no longer available: ' +
+                             name + ': ' + str(error) + '. Run ' + recovery + '.') from error
+        normalized_entries.append({
+            'name': name,
+            'path': str(resolved_path),
+            'roles': roles,
+            'sha256': digest,
+            'byte_count': byte_count,
+            'state': state,
+            'parts': normalized_parts,
+        })
+    return {'root': str(root), 'list_sha256': list_sha256, 'generation': generation, 'harness': harness,
+            'session_id': session, 'role': role, 'entries': normalized_entries}
+
+
+def required_read_packet_entries(report):
+    if report is None:
+        return []
+    return [{'kind': 'required_read', 'name': entry['name'], 'path': entry['path'],
+             'sha256': entry['sha256']} for entry in report['entries']]
+
+
+def require_required_read_receipts(report, packet, directory):
+    if report is None:
+        return None
+    attestation = packet.get('guidance_attestation') if isinstance(packet, dict) else None
+    if (not isinstance(attestation, dict) or not isinstance(attestation.get('reread'), list)) and not report['entries']:
+        raise ValueError('Pattern Buffer registered list requires packet.guidance_attestation.reread; '
+                         'prepare the owner attestation and inspect lane.py attestation-rereads')
+    sources = attestation.get('reread') if isinstance(attestation, dict) else None
+    sources = sources if isinstance(sources, list) else []
+    failures = []
+    read_commands = []
+    for entry in report['entries']:
+        matching_names = [source for source in sources
+                          if isinstance(source, dict) and source.get('name') == entry['name']]
+        matching_entry = None
+        for source in matching_names:
+            try:
+                source_path = Path(source.get('path', ''))
+                if not source_path.is_absolute():
+                    source_path = Path(directory) / source_path
+                resolved = source_path.resolve(strict=True)
+            except (OSError, TypeError, ValueError):
+                continue
+            if str(resolved) == entry['path'] and source.get('sha256') == entry['sha256']:
+                matching_entry = source
+                break
+        current = (entry['state'] == 'current' and
+                   all(part['state'] == 'current' for part in entry['parts']))
+        reasons = []
+        if not current:
+            reasons.append('no current receipt for generation ' + str(report['generation']))
+        if matching_entry is None:
+            if not matching_names:
+                reasons.append('missing from the packet reread list or its path and SHA-256 do not match')
+            else:
+                reasons.append('packet path and SHA-256 do not match the required file')
+        if reasons:
+            failures.append('- ' + entry['name'] + ': ' + '; '.join(reasons))
+            pending_parts = [part['part'] for part in entry['parts'] if part['state'] != 'current']
+            if not pending_parts:
+                pending_parts = [None]
+            for part_number in pending_parts:
+                argv = ['pattern-buffer', '--cwd', report['root'], 'read-required',
+                        '--harness', report['harness'], '--session', report['session_id'],
+                        '--name', entry['name']]
+                if part_number is not None and (len(entry['parts']) > 1 or part_number > 1):
+                    argv.extend(('--part', str(part_number)))
+                read_commands.append('  Read command: ' + shlex.join(argv))
+    if failures:
+        raise ValueError('Pattern Buffer required-read receipts are missing, stale, or do not match packet.reread:\n' +
+                         '\n'.join(failures + read_commands) +
+                         '\nRead each listed command in the owner session, update packet.reread with the matching '
+                         'resolved paths and SHA-256 values, and rerun the attestation command.')
+    context_entries = [{'name': entry['name'], 'path': entry['path'], 'sha256': entry['sha256']}
+                       for entry in report['entries']]
+    return {'list_sha256': report['list_sha256'], 'generation': report['generation'],
+            'observed_at': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z'),
+            'entries': context_entries}
+
+
 def guidance_attestation(packet, directory, pr_url, stage=None):
     """Validate the one human-authored stage attestation in an evidence packet."""
     record = packet.get('guidance_attestation')
@@ -146,11 +337,25 @@ def guidance_attestation(packet, directory, pr_url, stage=None):
     return record
 
 
-def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
+def render_guidance_attestation(packet, directory, pr_url, stage, report=None, receipt_context=None):
     """Render the approved stage ordering and return digests for the exact body."""
     record = guidance_attestation(packet, directory, pr_url, stage)
     if stage == 'opening' and not opening_report_ready(report):
         raise ValueError('Opening attestation requires a current clean report with successful canonical verification')
+    if receipt_context is not None:
+        if (not isinstance(receipt_context, dict) or
+                not isinstance(receipt_context.get('list_sha256'), str) or
+                not re.fullmatch(r'[0-9a-f]{64}', receipt_context['list_sha256']) or
+                type(receipt_context.get('generation')) is not int or receipt_context['generation'] < 0 or
+                not isinstance(receipt_context.get('observed_at'), str) or
+                not isinstance(receipt_context.get('entries'), list)):
+            raise ValueError('Stored Pattern Buffer receipt context is malformed')
+        for entry in receipt_context['entries']:
+            if (not isinstance(entry, dict) or not isinstance(entry.get('name'), str) or
+                    not entry['name'] or not isinstance(entry.get('path'), str) or
+                    not Path(entry['path']).is_absolute() or not isinstance(entry.get('sha256'), str) or
+                    not re.fullmatch(r'[0-9a-f]{64}', entry['sha256'])):
+                raise ValueError('Stored Pattern Buffer receipt context is malformed')
 
     def lines(values, empty='None recorded'):
         return '\n'.join('- ' + value for value in values) if values else '- ' + empty
@@ -176,11 +381,19 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
             record['approach'] + '\n\nReason: ' + record['approach_reason'],
             'Guidance application: ' + record['guidance_application'],
         ]
-    source_lines = [
-        source['kind'] + ': ' + source['name'] + ' (' + source['source_ref'] + '; ' +
-        str(artifact(source, directory)) + '@sha256:' + source['sha256'] + ')'
-        for source in record['reread']
-    ]
+    source_lines = []
+    matched_receipts = set()
+    for source in record['reread']:
+        path = artifact(source, directory)
+        line = (source['kind'] + ': ' + source['name'] + ' (' + source['source_ref'] + '; ' +
+                str(path) + '@sha256:' + source['sha256'] + ')')
+        receipt_key = (source['name'], str(path.resolve()), source['sha256'])
+        if (receipt_context is not None and receipt_key not in matched_receipts and
+                any((entry['name'], entry['path'], entry['sha256']) == receipt_key
+                    for entry in receipt_context['entries'])):
+            line += ' [read in current context window, generation ' + str(receipt_context['generation']) + ']'
+            matched_receipts.add(receipt_key)
+        source_lines.append(line)
     sections.extend([
         '## Guidance reread',
         lines(source_lines),
@@ -203,9 +416,12 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None):
         ])
     body = '\n\n'.join(sections).rstrip()
     attestation_bytes = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
-    return {'stage': stage, 'body': body,
-            'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
-            'attestation_sha256': hashlib.sha256(attestation_bytes).hexdigest()}
+    rendered = {'stage': stage, 'body': body,
+                'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
+                'attestation_sha256': hashlib.sha256(attestation_bytes).hexdigest()}
+    if receipt_context is not None:
+        rendered['required_reads'] = receipt_context
+    return rendered
 
 
 def opening_report_ready(report):
