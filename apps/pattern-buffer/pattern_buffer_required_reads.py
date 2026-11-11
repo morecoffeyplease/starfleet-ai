@@ -544,7 +544,7 @@ def allowed_cli_command(command, root, harness, session, core):
         return parsed.required_action == "status"
     if parsed.command == "read-required":
         return not parsed.next_entry or parsed.part is None
-    return parsed.command in ("status", "validate", "doctor")
+    return parsed.command in ("status", "validate", "doctor", "guide")
 
 
 def allowed_diagnostic_cli_command(command, root, harness, session, core):

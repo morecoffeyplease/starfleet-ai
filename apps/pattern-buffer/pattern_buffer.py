@@ -3626,27 +3626,29 @@ def main():
                 reference_source = Path(binding.path) if binding else source
             if args.harness in ("claude", "codex"):
                 helper = auxiliary("required_reads")
-                exact_session = bool(args.session)
-                if args.session:
-                    required_session = helper.resolve_session(args.harness, args.session)
-                else:
+                required_registration = helper.registration_path(gitdir)
+                if required_registration.exists() or required_registration.is_symlink():
+                    exact_session = bool(args.session)
+                    if args.session:
+                        required_session = helper.resolve_session(args.harness, args.session)
+                    else:
+                        try:
+                            required_session = helper.resolve_session(args.harness)
+                        except ValueError:
+                            required_session = "validation"
                     try:
-                        required_session = helper.resolve_session(args.harness)
-                    except ValueError:
-                        required_session = "validation"
-                try:
-                    role, _origin, _saved = resolve_role(
-                        root, gitdir, config, args.harness, required_session)
-                except (OSError, ValueError, TypeError, UnicodeError, subprocess.SubprocessError):
-                    role = None
-                required_report = helper.status(
-                    sys.modules[__name__], root, gitdir, args.harness, required_session, role)
-                if required_report is not None:
-                    required_report["session_basis"] = (
-                        "requested session" if exact_session else
-                        "native harness session" if required_session != "validation" else
-                        "validation placeholder; pass --session for an exact session")
-                    result["required_reads"] = required_report
+                        role, _origin, _saved = resolve_role(
+                            root, gitdir, config, args.harness, required_session)
+                    except (OSError, ValueError, TypeError, UnicodeError, subprocess.SubprocessError):
+                        role = None
+                    required_report = helper.status(
+                        sys.modules[__name__], root, gitdir, args.harness, required_session, role)
+                    if required_report is not None:
+                        required_report["session_basis"] = (
+                            "requested session" if exact_session else
+                            "native harness session" if required_session != "validation" else
+                            "validation placeholder; pass --session for an exact session")
+                        result["required_reads"] = required_report
             result["reference_warnings"] = reference_warnings_for_path(reference_source, root)
             print(json.dumps(result, indent=2))
         elif args.command == "handoff-check":

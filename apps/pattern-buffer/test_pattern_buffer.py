@@ -1364,6 +1364,8 @@ else:
         session_support.write_bytes(SCRIPT.with_name("pattern_buffer_sessions.py").read_bytes())
         reliability_support = package / "pattern_buffer_reliability.py"
         reliability_support.write_bytes(SCRIPT.with_name("pattern_buffer_reliability.py").read_bytes())
+        required_reads_support = package / "pattern_buffer_required_reads.py"
+        required_reads_support.write_bytes(SCRIPT.with_name("pattern_buffer_required_reads.py").read_bytes())
         result = subprocess.run([sys.executable, str(source), "install", *options,
                                  "--runtime-dir", str(runtime)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1378,6 +1380,7 @@ else:
         enrollment_support.unlink()
         session_support.unlink()
         reliability_support.unlink()
+        required_reads_support.unlink()
         package.rmdir()
         outside = self.root.parent / "outside-git"
         outside.mkdir()

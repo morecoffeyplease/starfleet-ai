@@ -109,6 +109,46 @@ class RequiredReadsTests(unittest.TestCase):
         status = json.loads(self.cli("status", "--harness", "codex", "--session", self.session).stdout)
         self.assertNotIn("required_reads", status)
 
+    def test_no_list_status_does_not_require_native_session_identity(self):
+        cases = (
+            ("codex", {"CODEX_THREAD_ID": "different-native-session"}),
+            ("claude", {"CLAUDE_CODE_SESSION_ID": "different-native-session"}),
+            ("claude", {"CODEX_THREAD_ID": "different-native-session"}),
+        )
+        for harness, env in cases:
+            with self.subTest(harness=harness, env=env):
+                result = self.cli("status", "--harness", harness, "--session", "synthetic-status-session",
+                                  env=env)
+                report = json.loads(result.stdout)
+                self.assertNotIn("required_reads", report)
+
+    def test_registered_list_status_still_refuses_native_session_mismatch(self):
+        self.register()
+        refusal = self.cli("status", "--harness", "codex", "--session", self.session,
+                           success=False, env={"CODEX_THREAD_ID": "different-native-session"})
+        self.assertIn("conflicts with the current native harness session", refusal.stderr)
+
+    def test_pending_gate_allows_guide_but_denies_work_without_receipt(self):
+        self.register()
+        self.start("startup")
+        before = self.status()
+        self.assertEqual(before["pending_read_count"], 1)
+        self.assertEqual(before["entries"][0]["state"], "pending")
+
+        command = "pattern-buffer guide --print"
+        allowed = self.hook("PreToolUse", tool="Bash", command=command)
+        self.assertEqual(allowed.stdout, "")
+        printed = self.cli("guide", "--print")
+        self.assertIn("## Required reads", printed.stdout)
+
+        after_guide = self.status()
+        self.assertEqual(after_guide["pending_read_count"], 1)
+        self.assertEqual(after_guide["entries"][0]["state"], "pending")
+        denied = self.gate_edit()
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        after_denial = self.status()
+        self.assertEqual(after_denial["entries"][0]["state"], "pending")
+
     def test_receipt_opens_current_generation_and_compaction_resets_it(self):
         self.register()
         startup = self.start("startup")
@@ -129,6 +169,30 @@ class RequiredReadsTests(unittest.TestCase):
         self.assertEqual(reset["entries"][0]["state"], "pending")
         denied_again = self.gate_edit()
         self.assertEqual(denied_again["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_resume_keeps_receipts_while_clear_and_fork_reset_generation(self):
+        self.register()
+        self.start("startup")
+        self.read()
+        before_resume = self.status()
+
+        self.start("resume")
+        resumed = self.status()
+        self.assertEqual(resumed["generation"], before_resume["generation"])
+        self.assertTrue(resumed["gate_open"])
+        self.assertIsNone(self.gate_edit())
+
+        self.start("clear")
+        after_clear = self.status()
+        self.assertEqual(after_clear["generation"], resumed["generation"] + 1)
+        self.assertEqual(after_clear["entries"][0]["state"], "pending")
+        self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        self.start("fork")
+        after_fork = self.status()
+        self.assertEqual(after_fork["generation"], after_clear["generation"] + 1)
+        self.assertEqual(after_fork["entries"][0]["state"], "pending")
+        self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_changed_and_missing_documents_stay_closed_while_diagnostics_work(self):
         self.register()
@@ -187,6 +251,37 @@ class RequiredReadsTests(unittest.TestCase):
                             env={"CODEX_THREAD_ID": self.session})
         self.assertIn("conflicts with the current native harness session", refusal.stderr)
         self.assertEqual(self.status()["entries"][0]["state"], "pending")
+
+    def test_override_accepts_both_duration_bounds_and_resets_with_generation(self):
+        self.register()
+        self.start("startup")
+        for minutes in (0, 61):
+            with self.subTest(minutes=minutes):
+                with mock.patch.object(self.helper, "_require_owner_terminal", return_value=None):
+                    with self.assertRaisesRegex(ValueError, "whole number from 1 to 60"):
+                        self.helper.override(
+                            ci, self.root, self.gitdir, "codex", self.session, "Fixture override", minutes,
+                            confirm=lambda _prompt: self.session)
+
+        for minutes in (1, 60):
+            with self.subTest(minutes=minutes):
+                with mock.patch.object(self.helper, "_require_owner_terminal", return_value=None):
+                    override = self.helper.override(
+                        ci, self.root, self.gitdir, "codex", self.session,
+                        f"Fixture override {minutes}", minutes,
+                        confirm=lambda _prompt: self.session)
+                self.assertTrue(override["override"]["active"])
+                self.assertEqual(override["override"]["reason"], f"Fixture override {minutes}")
+                status = self.status()
+                self.assertTrue(status["override"]["active"])
+                self.assertIsNone(self.gate_edit()["hookSpecificOutput"].get("permissionDecision"))
+
+        before_compact = self.status()
+        self.start("compact")
+        after_compact = self.status()
+        self.assertEqual(after_compact["generation"], before_compact["generation"] + 1)
+        self.assertIsNone(after_compact["override"])
+        self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_multipart_receipts_require_each_utf8_safe_part(self):
         self.document.write_text("λ" * 5000, encoding="utf-8")
