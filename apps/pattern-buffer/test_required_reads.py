@@ -163,10 +163,128 @@ class RequiredReadsTests(unittest.TestCase):
         return result, output.getvalue()
 
     def test_no_registered_list_keeps_gate_inert_and_silent(self):
+        state_file = self.helper.state_path(self.gitdir, "codex", self.session)
         result = self.hook("PreToolUse", tool="Edit")
         self.assertEqual(result.stdout, "")
+        self.assertFalse(state_file.exists())
         status = json.loads(self.cli("status", "--harness", "codex", "--session", self.session).stdout)
         self.assertNotIn("required_reads", status)
+
+    def test_subagent_pretool_does_not_start_required_read_state(self):
+        self.register()
+        session = "synthetic-required-read-subagent"
+        state_file = self.helper.state_path(self.gitdir, "codex", session)
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "cwd": str(self.root),
+            "session_id": session,
+            "agent_id": "synthetic-subagent",
+            "tool_name": "Edit",
+            "tool_input": {},
+        }
+
+        result = self.cli("hook", "--harness", "codex", payload=payload)
+
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(state_file.exists())
+
+    def test_unbound_read_names_missing_native_tool_id_and_recovery(self):
+        self.register()
+        session = "synthetic-missing-native-tool-id"
+        state_file = self.helper.state_path(self.gitdir, "codex", session)
+        command = shlex.join([
+            "pattern-buffer", "--cwd", str(self.root), "read-required",
+            "--harness", "codex", "--session", session, "--name", "engineering-guide",
+        ])
+
+        denied = self.hook("PreToolUse", harness="codex", session=session, tool="Bash",
+                           command=command)
+        denial = json.loads(denied.stdout)["hookSpecificOutput"]
+
+        self.assertEqual(denial["permissionDecision"], "deny")
+        self.assertIn("native tool call ID is missing or malformed",
+                      denial["permissionDecisionReason"])
+        self.assertIn("pattern-buffer guide --print", denial["permissionDecisionReason"])
+        self.assertIn("The gate remains closed", denial["permissionDecisionReason"])
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(state["generation"], 1)
+        self.assertEqual(state["receipts"], [])
+        self.assertIsNone(state["gate_opened_at"])
+
+    def test_running_session_starts_generation_before_first_gate_denial(self):
+        self.register()
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness):
+                session = f"running-before-registration-{harness}"
+                state_file = self.helper.state_path(self.gitdir, harness, session)
+                self.assertFalse(state_file.exists())
+
+                work_command = "git status"
+                denied = self.hook("PreToolUse", harness=harness, session=session, tool="Bash",
+                                   command=work_command, tool_use_id="original-work-call")
+                denial = json.loads(denied.stdout)["hookSpecificOutput"]
+                self.assertEqual(denial["permissionDecision"], "deny")
+
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+                self.assertEqual(state["generation"], 1)
+                self.assertEqual(state["receipts"], [])
+                self.assertEqual(state["pending_reads"], [])
+                self.assertIsNone(state["gate_opened_at"])
+                self.assertIn("engineering-guide", denial["permissionDecisionReason"])
+                self.assertIn("Next run:", denial["permissionDecisionReason"])
+                self.assertIn("pattern-buffer guide --print", denial["permissionDecisionReason"])
+
+                tool_use_id = "running-session-read"
+                read_command = shlex.join([
+                    "pattern-buffer", "--cwd", str(self.root), "read-required",
+                    "--harness", harness, "--session", session, "--name", "engineering-guide",
+                ])
+                arguments = ["read-required", "--harness", harness, "--session", session,
+                             "--name", "engineering-guide"]
+                prepared = self.hook("PreToolUse", harness=harness, session=session, tool="Bash",
+                                     command=read_command, tool_use_id=tool_use_id)
+                self.assertEqual(prepared.stdout, "")
+                printed = self.cli(*arguments).stdout
+                response = ({"stdout": printed[:-1], "stderr": "", "interrupted": False,
+                             "isImage": False, "noOutputExpected": False}
+                            if harness == "claude" else printed)
+                self.hook("PostToolUse", harness=harness, session=session, tool="Bash",
+                          command=read_command, tool_use_id=tool_use_id, tool_response=response)
+
+                status = self.status(session, harness)
+                self.assertTrue(status["gate_open"])
+                self.assertEqual(status["generation"], 1)
+                allowed = self.hook("PreToolUse", harness=harness, session=session, tool="Bash",
+                                    command=work_command, tool_use_id="original-work-call")
+                self.assertEqual(allowed.stdout, "")
+
+                self.start("resume", harness=harness, session=session)
+                resumed = json.loads(state_file.read_text(encoding="utf-8"))
+                self.assertEqual(resumed["generation"], 1)
+                self.assertEqual(len(resumed["receipts"]), 1)
+
+                self.start("compact", harness=harness, session=session)
+                reset = json.loads(state_file.read_text(encoding="utf-8"))
+                self.assertEqual(reset["generation"], 2)
+                self.assertEqual(reset["receipts"], [])
+                self.assertIsNone(reset["gate_opened_at"])
+
+                report = reliability.report(self.root, since="7d")
+                events = [event for event in report["events"]
+                          if event.get("session") == session
+                          and event["event"] == "required_reads.generation_started"]
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["result"], "pretool_gate")
+                self.assertEqual(events[0]["details"]["source"], "pretool_gate")
+                self.assertEqual(events[0]["details"]["generation"], 1)
+                self.assertNotIn("content", events[0])
+                self.assertNotIn("path", events[0]["details"])
+                unknown_event_types = next(
+                    (item for item in report["unknowns"]
+                     if item.get("code") == "unrecognized_event_types"), None)
+                if unknown_event_types:
+                    self.assertNotIn("required_reads.generation_started",
+                                     unknown_event_types["counts"])
 
     def test_no_list_status_does_not_require_native_session_identity(self):
         cases = (
@@ -205,8 +323,13 @@ class RequiredReadsTests(unittest.TestCase):
         self.assertEqual(after_guide["entries"][0]["state"], "pending")
         denied = self.gate_edit()
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("pattern-buffer guide --print",
+                      denied["hookSpecificOutput"]["permissionDecisionReason"])
         after_denial = self.status()
+        self.assertEqual(after_denial["generation"], before["generation"])
         self.assertEqual(after_denial["entries"][0]["state"], "pending")
+        self.assertEqual(reliability.report(self.root, since="7d")["summary"]["by_event"].get(
+            "required_reads.generation_started", 0), 0)
 
     def test_receipt_opens_current_generation_and_compaction_resets_it(self):
         self.register()
