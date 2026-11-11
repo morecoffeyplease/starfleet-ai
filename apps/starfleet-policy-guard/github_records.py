@@ -1,4 +1,4 @@
-"""Explicit live GitHub record operations; never called by pre-tool hooks.
+"""Explicit live GitHub record operations; covered native checks use bounded reads.
 
 GitHub body PATCH has no compare-and-swap contract. These operations require
 single-writer ownership, retain unrelated text, and detect observed interference.
@@ -35,18 +35,21 @@ def reference(url, kind):
             "endpoint": "repos/" + owner + "/" + repo + "/" + collection + "/" + number}
 
 
-def api(ref, method="GET", payload=None):
+def api(ref, method="GET", payload=None, *, executable=None, timeout=30):
     """Authenticated JSON transport; record and ref identities are checked by callers."""
     # gh-axi's published command surface has no generic REST API command.
     # Delegate authentication to gh rather than reading or handling credentials.
-    executable = shutil.which("gh")
+    explicit_executable = executable is not None
+    executable = executable or shutil.which("gh")
     if not executable:
         raise RecordError("GitHub CLI gh is required for live records")
+    if not isinstance(executable, str) or (explicit_executable and not executable.startswith('/')):
+        raise RecordError("GitHub CLI path must be an absolute captured executable")
     argv = [executable, "api", "--hostname", ref["host"], "--method", method, ref["endpoint"]]
     if payload is not None:
         argv += ["--input", "-"]
     result = subprocess.run(argv, input=json.dumps(payload) if payload is not None else "",
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         # A failed write might have reached GitHub. Preserve the pending operation
         # and re-read on explicit sync; never blindly replay a mutation here.
@@ -54,8 +57,8 @@ def api(ref, method="GET", payload=None):
     return json.loads(result.stdout)
 
 
-def request(ref, method="GET", payload=None):
-    value = api(ref, method, payload)
+def request(ref, method="GET", payload=None, *, executable=None, timeout=30):
+    value = api(ref, method, payload, executable=executable, timeout=timeout)
     if not isinstance(value, dict) or not isinstance(value.get("body"), (str, type(None))):
         raise RecordError("Unexpected GitHub response for " + ref["url"])
     if value.get("html_url", "").casefold() != ref["url"].casefold():
@@ -64,18 +67,59 @@ def request(ref, method="GET", payload=None):
     return value
 
 
+def comment_reference(comment_url, pr_url):
+    parsed = urlsplit(comment_url)
+    match = re.fullmatch(r'issuecomment-([1-9][0-9]*)', parsed.fragment)
+    if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.port or parsed.query or
+            not match):
+        raise RecordError('Expected an exact https PR comment URL ending in #issuecomment-ID')
+    base = 'https://' + parsed.netloc + parsed.path
+    comment_pr = reference(base, 'pull')
+    expected_pr = reference(pr_url, 'pull')
+    if comment_pr['url'].casefold() != expected_pr['url'].casefold():
+        raise RecordError('Comment URL must belong to the currently bound pull request')
+    identifier = int(match.group(1))
+    return {'url': comment_pr['url'] + '#issuecomment-' + str(identifier),
+            'pr_url': comment_pr['url'], 'host': comment_pr['host'], 'repo': comment_pr['repo'],
+            'pr_number': comment_pr['number'], 'comment_id': identifier,
+            'endpoint': 'repos/' + comment_pr['repo'] + '/issues/comments/' + str(identifier)}
+
+
+def read_comment(comment_url, pr_url, executable, *, timeout=10):
+    """Read one exact comment with captured gh and verify its pull request membership."""
+    ref = comment_reference(comment_url, pr_url)
+    try:
+        value = api(ref, executable=executable, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RecordError('GitHub comment read timed out; current publication is unverified') from None
+    if not isinstance(value, dict) or type(value.get('id')) is not int or value['id'] != ref['comment_id']:
+        raise RecordError('GitHub returned a different or malformed comment identity')
+    if value.get('html_url', '').casefold() != ref['url'].casefold():
+        raise RecordError('GitHub returned a different comment URL')
+    issue_url = value.get('issue_url')
+    if not isinstance(issue_url, str):
+        raise RecordError('GitHub comment response has no parent issue identity')
+    issue_path = urlsplit(issue_url).path.casefold().rstrip('/')
+    expected_suffix = '/repos/' + ref['repo'] + '/issues/' + str(ref['pr_number'])
+    if not issue_path.endswith(expected_suffix):
+        raise RecordError('GitHub comment does not belong to the currently bound pull request')
+    if not isinstance(value.get('body'), str):
+        raise RecordError('GitHub comment body is unavailable')
+    return {'reference': ref, 'body': value['body']}
+
+
 def target_branch(base_ref):
     return base_ref.removeprefix('refs/remotes/origin/').removeprefix('origin/').removeprefix('refs/heads/')
 
 
-def check_published_snapshot(pr_ref, pr, snapshot):
+def check_published_snapshot(pr_ref, pr, snapshot, *, executable=None):
     """PR base.sha may lag the live branch. Read its exact ref without fetching/rebasing."""
     target = target_branch(snapshot['base_ref'])
     if pr.get('head', {}).get('sha') != snapshot['head'] or pr.get('base', {}).get('ref') != target:
         raise RecordError('Published PR candidate or target changed; refresh evidence and record the report again')
     ref = reference(pr_ref['url'], 'pull')
     ref['endpoint'] = 'repos/' + ref['repo'] + '/git/ref/heads/' + quote(target, safe='')
-    observed = api(ref)
+    observed = api(ref, executable=executable)
     obj = observed.get('object', {}) if isinstance(observed, dict) else {}
     sha = obj.get('sha') if isinstance(obj, dict) else None
     if (not isinstance(observed, dict) or not isinstance(obj, dict) or observed.get('ref') != 'refs/heads/' + target or

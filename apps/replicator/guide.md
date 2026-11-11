@@ -116,7 +116,15 @@ These examples create a candidate and do not carry its model, effort or permissi
 Use the installed native controls that can preserve those settings, and verify the result before any transfer.
 If using terminal scripts, invoke the installed CMUX wrapper or verified shell integration rather than an absolute provider-binary path.
 Confirm that CMUX actually tracks the resulting native session before attempting owner enrollment.
+Keep the successor's initial prompt short.
+Identify its role, the approved mission and safety boundaries, and the installed `replicator guide --print` command.
+From a source checkout, use `python3 apps/replicator/replicator.py guide --print`.
+Let the successor discover the maintained procedure and independently inspect the handoff records.
+Keep private launch recipes and transcripts out of the procedure.
 After startup, inspect the actual native session and verify its provider, model, effort, and effective permissions.
+Inspect flags added by the installed wrapper as well as the flags supplied by the caller.
+Resolve any difference from the user's authorized permission and trust policy before transferring ownership.
+Use the integration's normal permission dialogs when authorized.
 A saved Model Preferences choice, command flag, or registration is configuration evidence and does not prove runtime parity or delivery.
 Do not change shared profiles, settings, permissions, or another session to make parity appear to match.
 If the successor's actual configuration differs or remains unknown, hold the dependent transfer and retain the outgoing session.
@@ -132,6 +140,9 @@ The outgoing summary does not replace the successor's reads.
 For the native attention and timer routes, the successor requires its own exact Hailing Frequencies enrollment.
 Read `hailing-frequencies guide --print` and `pattern-buffer guide --print` before setup.
 Match its actual native session to the current surface, workspace and generation in `cmux current`.
+Use the live panel UUID that matches the session's `CMUX_SURFACE_ID` for Hailing Frequencies enrollment.
+CMUX can also report a distinct durable `stable_surface_id`.
+Confirm which identity the installed command accepts.
 Reuse an unchanged existing enrollment, or self-enroll that exact successor:
 
 ```sh
@@ -149,6 +160,14 @@ The outgoing owner uses the existing Pattern Buffer release command only for the
 pattern-buffer --cwd /worktree enrollment-release --harness codex --session OUTGOING_SESSION_ID --enrollment-id ENROLLMENT_ID --next-harness codex --next-session SUCCESSOR_SESSION_ID --evidence HANDOFF_REFERENCE
 ```
 
+Before release, record the successor's actual identity and reconcile any owned timer or job that still needs the outgoing owner.
+Confirm the supported predecessor cleanup path before releasing its binding.
+Complete any required predecessor-owned operation that the retired binding would prevent, or retain verified continuing custody.
+Do not restore a retired binding or bypass a STOP to finish cleanup.
+An unenrolled successor can report an unassigned role and fail a checkpoint ownership check during preparation.
+Distinguish those status results from a literal native standing-context STOP alarm.
+If an alarm occurs, follow its supported binding-recovery instructions before dependent work.
+
 The successor adopts that exact enrollment from its own session with reviewed standing context and a fresh checkpoint:
 
 ```sh
@@ -162,6 +181,30 @@ Read the installed command help and [Pattern Buffer's session handoff guide](../
 The successor verifies its own task binding, standing context, checkpoint ownership, and actual receipt.
 Do not copy the outgoing session's task binding, checkpoint receipts, permissions, or identity.
 Follow any runtime-matched checkpoint setup command returned by adoption instead of assuming it copied the outgoing checkpoint metadata.
+Create the fresh checkpoint file before adoption and use canonical absolute paths for both input files.
+Use these required checkpoint headings once each, in this order:
+
+```markdown
+# Working checkpoint
+
+## Current state
+
+## Next action
+
+## Decisions and uncertainty
+
+## Active work
+
+## Evidence
+
+## Holds and guidance
+```
+
+Fill each section with current facts and the successor's verified responsibilities.
+Inspect the checkpoint's actual reminder and timer state after enrollment.
+Claude checkpoint setup can create an idle-warning timer.
+Retain or cancel it according to the authorized reminder policy and verify its occurrences.
+Codex has no automatic idle warning, so inspect its recorded state instead of applying Claude-only idle-warning options.
 
 The successor checks its own Policy Guard seat and every applicable checkout attachment.
 Use the documented receiving-owner workflow only from the exact authorized successor session.
@@ -186,6 +229,9 @@ warp-drive transfer REQUEST_ID --harness codex --session SUCCESSOR_SESSION_ID --
 warp-drive inspect REQUEST_ID
 ```
 
+Read the installed Warp-drive guide before deciding whether a transferred request needs an attach.
+Inspect the current helper and execution state first.
+A running command can keep its helper while completion routes to the new owner.
 Do not resubmit a request to imitate a transfer or attach a replacement helper during discovery.
 For a managed Discord thread, inspect its exact owner generation and pending groups before transferring it from the successor's own session:
 
@@ -251,15 +297,24 @@ Use the owning CMUX conversation or the configured Agent Notify thread for opera
 Ask one concrete question with the exact affected scope, current safe boundary, observed status, and decision needed.
 Do not include credentials, private transcripts, or another owner's message body.
 
-## Record the bounded pilot evidence
+## Record the agreed validation
 
-Use this same procedure for the Claude-to-Claude and Codex-to-Codex pilots.
-Keep the two route results separate because one harness does not qualify the other.
-Before either pilot, agree on the exact fixture manifest, command traffic, identities, worktrees, cleanup, and evidence location.
-Exercise one finite timer, one reservation, a second worktree, a maintained plan, and one intentionally omitted or stale custody item.
-The omission case must be detected and must block predecessor retirement until the authoritative record is reconciled.
-Record the observations, exact commands, actual parity, separate acceptances, and custody outcomes in the existing checkpoint or handoff packet.
-These cases show only the tested resource paths and do not prove universal inventory coverage or automatic clock accuracy.
-Do not require an automatic trigger or general automation before the manual pilots.
-Installation does not run a pilot or rotate a live session.
+Agree on validation for the authorized change or real handoff before creating test sessions or traffic.
+Use the same maintained procedure for each supported harness, and record each route's actual results and remaining gaps.
+Keep observations, exact commands, actual parity, separate acceptances, and custody outcomes in the existing checkpoint or handoff packet.
+Configuration checks and partial custody observations leave the full handoff unproven.
+
+When the user authorizes a disposable pilot, bound its identities, worktrees, traffic, cleanup, and evidence location.
+A finite timer, reservation, second worktree, and omitted or stale packet item can exercise relevant custody paths when those resources are in scope.
+Reconcile an omitted required resource before predecessor retirement.
+Do not manufacture a workload, repeat an unchanged test, or add a rehearsal merely to complete a checklist.
+An authorized real handoff can supply operational evidence when the user selects that validation plan.
+
+Preserve the source and evidence when cleaning up owned test resources.
+Use each tool's supported removal controls and verify terminal timer and job states before removing an attention route.
+If a tool retains an active enrollment record after its isolated worktree is disabled, report both facts and preserve the history.
+Inspect the exact native input and process state before ordinary exit, then verify the process ended before closing its tab.
+
+Record which behavior remains untested, including native delivery, interception, or recovery paths that the agreed run did not exercise.
+Installation only makes the guide available.
 A later opt-in configurable trigger with an active-work budget remains a future increment and must invoke this same procedure.

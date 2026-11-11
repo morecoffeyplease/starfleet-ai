@@ -1,8 +1,14 @@
 # shared
 - Worktree: <WORKTREE>
 - Mission: <MISSION>
+- Next deliverable: <NEXT_DELIVERABLE>
+- Holds: <HOLDS>
 - Roadmap: <TRACKER>
 - Assigned items: <AUTHORIZED_ITEM_REFERENCES>
+- Read first: <3-5 exact paths or commands>
+
+After the required reads, give four lines in your own chat. State the accepted outcome, the next deliverable, the holds and any unavailable reads, and what you will not do.
+System and developer instructions take precedence. Follow the latest human instruction, then the standing mission, tracker, checkpoint, and memory or summary. Reconcile conflicts and preserve ownership and holds.
 
 **Scope**
 - If the mission, authoritative tracker or authorized assignment is missing or unclear, ask the user to establish it.
@@ -53,7 +59,7 @@
 - Do not turn uncertainty into a blocker or call it disproved; investigate the cheapest decisive evidence, then defer unresolved claims explicitly.
 - Workers report new findings rather than expanding the batch.
 - If uncertainty remains after checking the deciding evidence, ask the user rather than guess or start a repair.
-- Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
+- Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full; Prime Directive and Policy Guard are names for the same tool.
 - Revisit the relevant rule before each repair decision.
 
 # implementer
@@ -66,6 +72,10 @@
 1. Re-read the mission, roadmap/tracker and current PRs’ issues IN FULL; reconcile actual checkout, PR heads/states, active work, evidence and human holds, don’t rely on assumptions; then update only this lane's tracker sections where facts changed.
    Re-pull before editing; coordinate with other tracker owners.
 2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
+
+**PR openings and accepted repair batches:**
+- At PR opening or accepted repair-batch start, read Published guidance attestations in `python3 /path/to/installed/lane.py guide --print`. Adopted ready and merge actions require current evidence.
+- The owner rereads the applicable files, records references, digests and their effect, resolves prerequisites, and keeps `assumptions: []`. Prepare opening evidence before the PR and publish the exact comment on its draft. Run `attestation-start-check` after publication and before repair work. Use `--enable` for first adoption. Use Outcome, Playbook, Size and Facts in each implementer brief and the PR opening explanation.
 
 **Repair rounds: don't spiral**
 - Use the existing PR or tracker to record dispositions, evidence, and cumulative rounds.
@@ -88,6 +98,4 @@
 **Pattern Buffer checkpoints:** if enrolled, maintain the registered private note after meaningful changes; read/reconcile it on recovery. Path, Git hygiene and controls: apps/pattern-buffer/docs/checkpoints.md
 
 # confirmation
-**Confirm once, after reading**
-- In your own chat, confirm receipt of the injection, completion of the relevant PStack/Poteto reading, and whether the mission or tracker needs updating.
-- If a required read is unavailable or incomplete, say so instead of claiming completion; name the gap and preserve applicable holds.
+Restate the four lines above.

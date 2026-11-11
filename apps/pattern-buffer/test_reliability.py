@@ -3,13 +3,13 @@
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
 import pattern_buffer_reliability as reliability
+from _test_support import isolate_state_home
 
 
 UTC = datetime.timezone.utc
@@ -20,12 +20,9 @@ class ReliabilityTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="pattern-buffer-reliability-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
-        self.state_home = self.base / "state"
+        self.state_home = isolate_state_home(self)
         self.root = self.base / "worktree"
         self.root.mkdir()
-        self.env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)})
-        self.env.start()
-        self.addCleanup(self.env.stop)
 
     @staticmethod
     def at(day, hour=12, second=0):
@@ -78,6 +75,35 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(report["summary"]["emitted"], 1)
         self.assertEqual(report["events"][0]["event_id"], result["event_id"])
         self.assertEqual(report["events"][0]["details"]["usage_percent"], 94.5)
+
+    def test_recovery_details_keep_only_overflow_bytes_and_fixed_failure_codes(self):
+        with mock.patch.object(reliability, "_utc_now", side_effect=[
+                self.at(2, second=0), self.at(2, second=1), self.at(2, second=2)]):
+            emitted = self.emit("standing.injection_emitted", details={
+                "bytes": 9216,
+                "over_budget_bytes": 701,
+                "source_path": str(self.root / "private-context.md"),
+                "source_text": "PRIVATE_SOURCE_TEXT",
+            })
+            failed = self.emit("standing.injection_failed", details={
+                "failure_kind": "runtime_output_limit",
+                "source_path": str(self.root / "private-context.md"),
+            })
+            invalid = self.emit("standing.injection_failed", details={
+                "failure_kind": str(self.root / "private-context.md"),
+            })
+        self.assertTrue(emitted["ok"])
+        self.assertTrue(failed["ok"])
+        self.assertTrue(invalid["ok"])
+        self.assertEqual(invalid["dropped_detail_count"], 1)
+        state_dir, _worktree_id = reliability._state_path(self.root)
+        records = [json.loads(line) for line in next(state_dir.glob("*.jsonl")).read_text().splitlines()]
+        self.assertEqual(records[0]["details"], {"bytes": 9216, "over_budget_bytes": 701})
+        self.assertEqual(records[1]["details"], {"failure_kind": "runtime_output_limit"})
+        raw = json.dumps(records)
+        self.assertNotIn(str(self.root), raw)
+        self.assertNotIn("PRIVATE_SOURCE_TEXT", raw)
+        self.assertNotIn("failure_kind", records[2].get("details", {}))
 
     def test_report_keeps_delivery_states_distinct_and_durations_correlated(self):
         correlation = "pressure-episode-1"

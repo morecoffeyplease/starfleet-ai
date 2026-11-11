@@ -367,7 +367,153 @@ def attached_here(state, cwd):
         return False
 
 
-def require(state, cwd, event=None):
+def attestation_owner_state(state, cwd):
+    if not state or not state.get('lane_owner'):
+        raise ValueError('Guidance attestation requires an enrolled native-owner lane')
+    lane_scope.check_owner(state)
+    if state.get('lane_owner', {}).get('harness') not in ('claude', 'codex'):
+        raise ValueError('Guidance attestation adoption is qualified only for Claude and Codex owners')
+    check_lane_scope(state, cwd)
+    if not active(state, cwd):
+        raise ValueError('Guidance attestation requires the owner checkout to have its current published PR binding')
+    return state
+
+
+def attestation_packet(path, state):
+    path = Path(path).resolve()
+    packet = json.loads(path.read_text())
+    try:
+        packet_pr = github.reference(packet.get('pr_url', ''), 'pull')['url']
+        current_pr = github.reference(state['pr_url'], 'pull')['url']
+    except (AttributeError, TypeError, github.RecordError) as error:
+        raise ValueError('Guidance evidence packet must bind the current PR: ' + str(error)) from error
+    if (packet_pr.casefold() != current_pr.casefold() or
+            packet.get('base_ref') != state.get('base_ref')):
+        raise ValueError('Guidance evidence packet PR and target must match the attached PG binding')
+    return packet, path
+
+
+def captured_gh(state):
+    path = state.get('real_gh')
+    if not isinstance(path, str) or not path:
+        raise ValueError('Attestation publication checks require the GitHub CLI captured by the owner lane')
+    captured = state.get('real_gh_identity')
+    if captured and captured_binary_identity(path) != captured:
+        raise ValueError('Captured GitHub CLI changed since lane enrollment; inspect the owner lane before continuing')
+    if not captured:
+        captured_binary_identity(path)
+    return path
+
+
+def require_guidance_attestation(state, cwd, *, local_inspection=False):
+    published = state.get('guidance_attestation_ref')
+    if (not isinstance(published, dict) or type(published.get('version')) is not int or
+            published['version'] != 1):
+        guide_command = shlex.join([sys.executable, str(SELF), 'guide', '--print'])
+        raise ValueError(
+            'This target requires a published guidance attestation. Before the final start check, print the local '
+            'guide with ' + guide_command + ' and reread its "Published guidance attestations" section. Then run '
+            'attestation-start-check from its owner session.')
+    if published.get('pr_url', '').casefold() != state['pr_url'].casefold():
+        raise ValueError('Published guidance attestation belongs to a different PR binding')
+    binding = {'branch': state['branch'], 'head_branch': state.get('head_branch', state['branch']),
+               'base_ref': state['base_ref']}
+    if any(published.get(key) != value for key, value in binding.items()):
+        raise ValueError('Published guidance attestation belongs to a different branch or target binding')
+    owner = {key: state['lane_owner'][key] for key in ('harness', 'session_id')}
+    if published.get('owner') != owner:
+        raise ValueError('Published guidance attestation belongs to a previous native owner; the current owner must validate its own publication')
+    receipt = state.get('receipt')
+    packet_path = receipt.get('packet_path') if isinstance(receipt, dict) else None
+    if not isinstance(packet_path, str):
+        raise ValueError('Guidance attestation requires the current report packet path; record the report before covered delivery')
+    packet, path = attestation_packet(packet_path, state)
+    report = receipt.get('report') if isinstance(receipt.get('report'), dict) else None
+    rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
+                                                    published.get('stage'), report=report)
+    if (published.get('body_sha256') != rendered['body_sha256'] or
+            published.get('attestation_sha256') != rendered['attestation_sha256']):
+        raise ValueError('Local guidance attestation changed after publication; render and publish the current stage again')
+    if local_inspection:
+        return
+    executable = captured_gh(state)
+    remote = github.read_comment(published.get('comment_url', ''), state['pr_url'], executable, timeout=5)
+    if remote['reference']['comment_id'] != published.get('comment_id'):
+        raise ValueError('Published guidance comment ID does not match its per-PR reference')
+    if remote['body'] != rendered['body']:
+        raise ValueError('Published guidance comment was edited or no longer matches the current attestation; republish a reviewed exact body')
+
+
+def attestation_render(args):
+    state = attestation_owner_state(read(args.cwd), args.cwd)
+    packet, path = attestation_packet(args.evidence, state)
+    report = None
+    if args.stage == 'opening':
+        report = delivery.report(args.cwd, state['base_ref'], state['pr_url'], path)
+    stage = args.stage.replace('-', '_')
+    rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
+                                                    stage, report=report)
+    if args.format == 'json':
+        print(json.dumps(rendered, indent=2))
+    else:
+        print(rendered['body'], end='')
+    return 0
+
+
+def attestation_start_check(args):
+    ensure_no_upgrade_journal(args.cwd)
+    adopted_now = False
+    with locked(args.cwd) as state:
+        attestation_owner_state(state, args.cwd)
+        if 'attestation_required' in state and state.get('attestation_required') is not True:
+            raise ValueError('Malformed attestation adoption state; there is no disable or fallback mode')
+        if state.get('attestation_required') is True and args.enable:
+            raise ValueError('This owner lane is already adopted; omit --enable when binding another PR')
+        if 'attestation_required' not in state and not args.enable:
+            raise ValueError('This legacy target is unchanged; first owner-coordinated adoption requires --enable')
+        packet, path = attestation_packet(args.evidence, state)
+        report = None
+        if args.stage == 'opening':
+            report = delivery_runs.check(state.get('receipt'), args.cwd, state['pr_url'])
+            if report['snapshot']['base_ref'] != state['base_ref']:
+                raise ValueError('Opening attestation report must match the current PG target binding')
+            if not delivery.opening_report_ready(report):
+                raise ValueError('Opening attestation requires a current clean PG report with successful canonical verification')
+        stage = args.stage.replace('-', '_')
+        rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
+                                                        stage, report=report)
+        executable = captured_gh(state)
+        pr_ref, remote_pr_record = remote_pr(args.cwd, state['pr_url'], state['base_ref'],
+                                             state.get('head_branch'), executable=executable)
+        if report is not None:
+            github.check_published_snapshot(pr_ref, remote_pr_record, report['snapshot'], executable=executable)
+        remote_comment = github.read_comment(args.comment_url, state['pr_url'], executable)
+        if remote_comment['body'] != rendered['body']:
+            raise ValueError('Published comment body does not match the exact current rendered attestation')
+        comment_ref = remote_comment['reference']
+        publication = {
+            'version': 1,
+            'pr_url': pr_ref['url'],
+            'branch': state['branch'],
+            'head_branch': state.get('head_branch', state['branch']),
+            'base_ref': state['base_ref'],
+            'owner': {key: state['lane_owner'][key] for key in ('harness', 'session_id')},
+            'comment_url': comment_ref['url'],
+            'comment_id': comment_ref['comment_id'],
+            'stage': rendered['stage'],
+            'body_sha256': rendered['body_sha256'],
+            'attestation_sha256': rendered['attestation_sha256'],
+        }
+        if 'attestation_required' not in state:
+            state['attestation_required'] = True
+            adopted_now = True
+        state['guidance_attestation_ref'] = publication
+    print(json.dumps({'status': 'published_attestation_current', 'adopted': adopted_now,
+                      'publication': publication}, indent=2))
+    return 0
+
+
+def require(state, cwd, event=None, *, local_inspection=False):
     if state and state.get('lane_owner'):
         lane_scope.check_owner(state,event=event)
         check_lane_scope(state, cwd)
@@ -375,6 +521,12 @@ def require(state, cwd, event=None):
         raise ValueError(enrollment_help(cwd))
     if state['source_versions'] != source_versions(state.get('lane_owner', {}).get('harness')):
         raise ValueError('Pinned delivery adapter source changed; restore the reviewed source')
+    if 'attestation_required' in state:
+        if state.get('attestation_required') is not True:
+            raise ValueError('Malformed attestation adoption state; there is no disable or fallback mode')
+        if state.get('lane_owner', {}).get('harness') not in ('claude', 'codex'):
+            raise ValueError('Published guidance attestation checks are qualified only for the supported Claude and Codex delivery paths')
+        require_guidance_attestation(state, cwd, local_inspection=local_inspection)
     try:
         report=delivery_runs.check(state.get('receipt'),cwd,state['pr_url'])
         if report['snapshot']['base_ref']!=state['base_ref']:
@@ -387,12 +539,12 @@ def require(state, cwd, event=None):
                          'Missing checklist items are allowed; report execution is required.') from error
 
 
-def remote_pr(cwd, pr_url, base_ref, head_branch=None, *, observed=None):
+def remote_pr(cwd, pr_url, base_ref, head_branch=None, *, observed=None, executable=None):
     ref = github.reference(pr_url, 'pull')
     repo = github.origin_repo(delivery.value(cwd, 'remote', 'get-url', 'origin'), ref['host'])
     if repo.casefold() != ref['repo'].casefold():
         raise ValueError('Delivery PR does not match worktree origin')
-    pr = observed if observed is not None else github.request(ref)
+    pr = observed if observed is not None else github.request(ref, executable=executable)
     target = github.target_branch(base_ref)
     if (pr.get('state') != 'open' or pr.get('head', {}).get('ref') != (head_branch or branch(cwd)) or
             pr.get('base', {}).get('ref') != target or
@@ -848,7 +1000,8 @@ def plan(args):
         boundary = ('OpenCode 2.2.5 server plugin prototype, native permission assertion, and covered readiness/merge tool only; '
                     'plain direct shell command segments are refused, while alternate APIs and opaque shell routes remain outside coverage')
     elif manages_claude_hooks:
-        boundary = 'Claude lane-local delivery hooks and gh adapter only; no Git/Codex/CPU hooks or fix-round enrollment'
+        boundary = ('Claude lane-local delivery hooks and gh adapter only; adopted attestation targets perform bounded GitHub comment reads; '
+                    'no Git/Codex/CPU hooks or fix-round enrollment')
     else:
         boundary = 'Private seat delivery gh adapter only; no native hooks, resource hooks or fix-round enrollment'
     result = {'root': str(cwd), 'session_root': str(owner), 'branch': branch(cwd),
@@ -2432,7 +2585,7 @@ def status(cwd, session_id=None, state=None, native_context=None):
             receipt_reason = 'An installation upgrade is incomplete; recover it before evaluating this report.'
         else:
             try:
-                require(state, cwd)
+                require(state, cwd, local_inspection=True)
                 receipt_status, receipt_reason = 'valid-local-snapshot', 'Current local candidate, target and inputs match'
             except Exception as error:
                 message = str(error)
@@ -2898,9 +3051,10 @@ def seat_action(seat_identifier, cwd, argv, *, event=None, published=False):
                 raise ValueError('Published PR is closed or merged. Its terminal state was recorded locally; no readiness or merge action was forwarded.')
         report = require(state, product, event=event)
         if published:
+            executable = captured_gh(state) if state.get('attestation_required') is True else None
             ref, remote = remote_pr(product, state['pr_url'], state['base_ref'], state.get('head_branch'),
-                                    observed=observation.get('_remote'))
-            github.check_published_snapshot(ref, remote, report['snapshot'])
+                                    observed=observation.get('_remote'), executable=executable)
+            github.check_published_snapshot(ref, remote, report['snapshot'], executable=executable)
     except Exception as error:
         error.delivery_state = state
         raise
@@ -3034,8 +3188,10 @@ def check_action(cwd, argv, published=False, installation=None, search=True, eve
                              '; coordinate a reviewed rebind with the lane owner, retaining registration history')
         report = require(state, product,event=event)
         if published:
-            ref, remote = remote_pr(product, state['pr_url'], state['base_ref'], state.get('head_branch'))
-            github.check_published_snapshot(ref, remote, report['snapshot'])
+            executable = captured_gh(state) if state.get('attestation_required') is True else None
+            ref, remote = remote_pr(product, state['pr_url'], state['base_ref'], state.get('head_branch'),
+                                    executable=executable)
+            github.check_published_snapshot(ref, remote, report['snapshot'], executable=executable)
             require(read(product), product)
     except Exception as error:
         error.delivery_state = state
@@ -3921,6 +4077,15 @@ def build_parser():
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--policy', type=Path, default=delivery.POLICY)
     p.add_argument('--format', choices=('json', 'text'), default='text')
+    p = sub.add_parser('attestation-render', help='Render a current opening or accepted repair-batch attestation without writes')
+    p.add_argument('--evidence', type=Path, required=True)
+    p.add_argument('--stage', choices=('opening', 'repair-batch'), required=True)
+    p.add_argument('--format', choices=('markdown', 'json'), default='markdown')
+    p = sub.add_parser('attestation-start-check', help='Validate one exact published attestation comment and bind it to this PR')
+    p.add_argument('--evidence', type=Path, required=True)
+    p.add_argument('--stage', choices=('opening', 'repair-batch'), required=True)
+    p.add_argument('--comment-url', required=True)
+    p.add_argument('--enable', action='store_true', help='Explicitly adopt attestation-required behavior for this owner lane')
     p = sub.add_parser('init-evidence', help='Create a PR-bound evidence starter outside Git worktrees; never run checks')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--designs', choices=('yes', 'no'), required=True)
@@ -3988,6 +4153,10 @@ def dispatch(args):
             print(json.dumps(uninstall(args.cwd), indent=2))
         elif args.action == 'record':
             return record(args)
+        elif args.action == 'attestation-render':
+            return attestation_render(args)
+        elif args.action == 'attestation-start-check':
+            return attestation_start_check(args)
         elif args.action == 'gh':
             return gh(args)
         elif args.action == 'guide':

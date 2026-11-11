@@ -13,7 +13,8 @@ import json
 from pathlib import Path
 from urllib.parse import urlencode
 
-BINDING_FIELDS = ('branch', 'head_branch', 'pr_url', 'base_ref', 'receipt', 'history')
+BINDING_FIELDS = ('branch', 'head_branch', 'pr_url', 'base_ref', 'receipt', 'history',
+                  'guidance_attestation_ref')
 OPENCODE_EVENT_SOURCE = 'opencode-server-plugin-v2'
 _NATIVE_EVENT = contextvars.ContextVar('policy_guard_native_event', default=None)
 

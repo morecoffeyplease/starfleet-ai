@@ -36,10 +36,11 @@ From a source checkout, install the selected harness into a new empty runtime us
         --runtime-dir /absolute/path/to/new-empty-runtime
 
 Use the matching harness name and settings file for Claude.
-The generated recovery command preserves whether checkpoint hooks were enabled for that settings file.
+The generated recovery command preserves whether checkpoint processing was enabled for that settings file.
 This updates the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
 The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
 Review the harness's normal reload and trust controls after the install; installation does not confirm delivery.
+The installer keeps a `PostToolUse` hook for required-read completion when checkpoint processing is disabled.
 
 Initialize a directly managed Git worktree with an editable context file.
 
@@ -60,6 +61,20 @@ Profiles are never inferred from a folder name or downloaded from a repository.
 When an existing context file is present, selection records the profile but does not merge or migrate its fragment.
 An owner-linked child worktree always uses its owner's context and cannot select an independent profile.
 
+## Compose reviewed context
+
+Use `compose` to place a reviewed rules file and a per-worktree mission into an ordinary context file.
+The rules file must include `# shared`, `# implementer`, and `# orchestrator`, with an optional final `# confirmation` section.
+The mission file must include `# shared` and may include either role section.
+Mission text comes before rules text in each section, and only the rules file supplies confirmation text.
+The command reports SHA-256 digests, paragraph bytes, exact rendered role budgets, and local reference findings.
+It uses the existing 8192-byte renderer and requires 1024 bytes of remaining headroom per role by default.
+Pass `--harness` and `--session` to calculate a prospective recipient budget against the existing session-enrollment destination.
+Without `--session`, the command labels its `validation` session as a placeholder and does not claim a future-recipient budget.
+`--check` compares bytes without writing, and a differing existing output requires `--replace`.
+The reference checker reads no network targets and reports unsupported Markdown or command-style forms as warnings.
+Compose to a private path, then use the reviewed `session-enroll --reviewed-update --evidence` route for registered exact-session context.
+
 ## Session context and recovery
 
 Use assign for a persistent worktree role or session-enroll for an exact native session that needs a private standing file.
@@ -69,17 +84,28 @@ Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery 
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
 Pattern Buffer appends a short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
 The runtime reminder asks agents to use the installed PStack runtime and Poteto Mode.
-After compaction, the composed guidance asks agents to read the sections relevant to current work in full, not the entire PStack library, and confirm completion in their own chat.
+After compaction, the composed guidance asks agents to read the sections relevant to current work in full, not the entire PStack library.
+The default shared guidance also asks for a four-line own-chat restatement of the accepted outcome, next deliverable, holds, and what the agent will not do.
+It names unavailable required reads and preserves holds.
+For a legacy custom context without `# confirmation`, the runtime appends that same restatement after its PStack reminder.
 It does not install PStack, change roles or authority, or rewrite custom context files.
 The runtime reminder is outside the 8192-byte standing-context budget and counts toward the existing 24 KiB combined injection limit.
 See the [printable guide](guide.md) for the recovery limits.
-The default context template also includes a final `# confirmation` section that Pattern Buffer appends after the selected role for every role.
+The default context template includes a final `# confirmation` section that Pattern Buffer appends after the selected role for every role.
 That section counts toward the 8192-byte standing-context limit.
-It asks agents to confirm injection receipt, completion of relevant PStack and Poteto reading, and mission or tracker updates in their own chat.
-Existing custom context files are not rewritten; they keep the runtime completion-confirmation wording until an owner-reviewed update adds the optional section.
-Owners must adjust their own context if it exceeds either existing limit; Pattern Buffer provides no length exception.
+The default footer asks agents to repeat the four-line restatement in their own chat.
+Custom context files keep their owner-managed confirmation text.
+For an ordinary worktree SessionStart, Pattern Buffer can emit a complete role view above 8192 bytes with a warning when the total context, including runtime, task and checkpoint addenda, stays within 9216 bytes and the existing 24 KiB combined limit.
+Larger overflow and source, parser, read or combined-limit failures produce a bounded notice that asks the agent to read the full source file and notify its owner while preserving unresolved scope and holds.
+The notice is not full context and does not expand authorization.
+Exact-session enrollment and dispatched work retain their blocking integrity behavior.
+Preview shows ordinary-worktree warning and fallback behavior without event-specific checkpoint addenda; validate continues to enforce the authoring-time role budget.
 The default context template includes shared review judgment and orchestrator repair-round guidance.
-Before starting or resuming a review-and-fix cycle, read the [Policy Guard review and fix cycles guide](../starfleet-policy-guard/guide.md#review-and-fix-cycles) in full and revisit the relevant rule before each repair decision.
+Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](../starfleet-policy-guard/guide.md#review-and-fix-cycles) in full and revisit the relevant rule before each repair decision.
+Prime Directive (Policy Guard) is the same delivery tool described as Policy Guard in its CLI and documentation.
+The orchestrator template also points to that tool for its optional published opening and accepted repair-batch attestations.
+Pattern Buffer supplies that notice through its existing SessionStart standing-context injection; it does not detect issues or batches or create, publish or enforce attestation records.
+Read the [published guidance attestation guide](../starfleet-policy-guard/guide.md#published-guidance-attestations) for explicit owner adoption, per-PR publication checks and their bounded ready/merge coverage.
 The read-only `handoff-check` distinguishes approved context and optional checkpoint state from installed-hook compatibility, native binding evidence and actual model delivery.
 Unknown native or delivery evidence stays unknown and does not add a readiness gate.
 
@@ -94,6 +120,29 @@ Use a unique --receipt-file path when an immutable local snapshot is useful; a r
 OpenCode preparation and binding are separate from Claude and Codex launch dispatch, and never start an OpenCode process.
 For an exact-session parent or a child already bound to another owner, use the [supported owner and fresh-child route](docs/implementer-dispatch.md#parents-with-exact-session-context).
 Keep existing enrollments, tasks and human holds intact rather than substituting another mission or moving private registration metadata.
+
+## Required reads
+
+An owner can register a reviewed JSON list of absolute or home-relative document paths and the roles that must read each entry.
+Run `required-reads set` or `required-reads clear` from an interactive terminal outside every harness session, then type the worktree directory name when prompted.
+Agents may draft a list and inspect its status, but only the owner registers or clears it because harness sessions share the owner's operating-system account.
+The owner can temporarily open one exact session with `required-reads override --harness HARNESS --session SESSION_ID --reason REASON --minutes 1-60`; the terminal prompt requires the typed target session ID, and the override expires or resets with the context generation.
+The gate checks the resolved role, current list and required-file digests before allowing work, and known list or file integrity failures remain closed.
+Agents can use `required-reads status`, `status`, `doctor`, and `guide --print` to diagnose a closed gate, then notify the owner to restore a file or review and re-register the list.
+`read-required` prints a canonical frame and performs no state, lock or telemetry writes.
+`PreToolUse` stores a bounded snapshot for the exact native session and tool call, including the current generation, list, entry, part and file identity.
+`PostToolUse` records the existing receipt only when its complete stdout matches that frame and the generation, list and file still match the snapshot.
+A standalone print, a missing or truncated response, a changed snapshot, or an unpaired tool call does not earn a receipt.
+Status, doctor and handoff checks inspect existing state without creating locks or changing required-read state.
+Codex supplies stdout as a string without an exit-status field, so a complete frame does not authenticate process exit.
+Claude supplies stdout with stderr and interruption or output flags, which the hook checks before accepting a frame.
+The Claude hook accepts removal of the final footer newline and compares every other frame byte, including the document bytes and footer digest.
+The four recorded native default-budget outputs included complete frames, including an 8192-byte document part, without an explicit output allowance.
+The observations came from Claude 2.1.322 and Codex 0.167.
+The largest observed Codex tool result was 8490 bytes, which is a sample and not a guaranteed output ceiling.
+These observations do not prove general model reception, comprehension or compliance.
+The installed `PreToolUse` hook entry in harness settings shows configuration presence only, not native activation, trust, denial behavior or delivery.
+See the [printable guide's Required reads section](guide.md#required-reads) for owner recovery steps and command examples.
 
 ## Storage and event behavior
 
@@ -117,7 +166,9 @@ Validation and status report header overhead, usable content bytes and remaining
 Pass the exact session ID when available so the calculation uses the enrolled file path and identity.
 Without `--session`, status labels its placeholder header budget and does not establish exact native-session binding.
 Session enrollment and handoff checks use the same calculation before reviewed text is adopted.
-Oversized or malformed required sources still fail closed and are never truncated.
+Oversized or malformed required sources still block exact-session enrollment and dispatched work.
+Ordinary worktree SessionStart uses the bounded warning or failure-notice policy described in the [printable guide](guide.md).
+Status remains a read-only report of local budgets and delivery evidence, and a configured hook does not establish model reception.
 Doctor reads local registration and content only; it does not certify hook activation, model reception or compliance.
 After installation changes, restart or resume the harness according to its own configuration reload behavior.
 Native delivery checks require a separate bounded pilot in disposable state and are not established by these local tests.

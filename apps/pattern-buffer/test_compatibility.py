@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from test_checkpoints import NOTE
+from _test_support import isolate_state_home
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +27,9 @@ def cli(script, cwd, *args, success=True, env=None):
 
 
 class RenameCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        isolate_state_home(self)
+
     def test_install_refreshes_existing_owned_alias_bundle_within_selected_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -64,6 +68,8 @@ class RenameCompatibilityTests(unittest.TestCase):
                 "pattern_buffer_codex_sessions.py": CURRENT_CLI.with_name("pattern_buffer_sessions.py"),
                 "context_injector_codex_reliability.py": CURRENT_CLI.with_name("pattern_buffer_reliability.py"),
                 "pattern_buffer_codex_reliability.py": CURRENT_CLI.with_name("pattern_buffer_reliability.py"),
+                "context_injector_codex_required_reads.py": CURRENT_CLI.with_name("pattern_buffer_required_reads.py"),
+                "pattern_buffer_codex_required_reads.py": CURRENT_CLI.with_name("pattern_buffer_required_reads.py"),
             }
             for name, source in sources.items():
                 with self.subTest(path=name):
@@ -86,7 +92,8 @@ class RenameCompatibilityTests(unittest.TestCase):
 
             for path in runtime.glob("pattern_buffer_codex*.py"):
                 path.unlink()
-            for name in ("context_injector_codex_sessions.py", "context_injector_codex_reliability.py"):
+            for name in ("context_injector_codex_sessions.py", "context_injector_codex_reliability.py",
+                         "context_injector_codex_required_reads.py"):
                 (runtime / name).unlink()
             checkpoint = runtime / "context_injector_codex_checkpoint.py"
             checkpoint.write_text(checkpoint.read_text().replace(
@@ -113,6 +120,8 @@ class RenameCompatibilityTests(unittest.TestCase):
                 "pattern_buffer_codex_sessions.py": CURRENT_CLI.with_name("pattern_buffer_sessions.py"),
                 "context_injector_codex_reliability.py": CURRENT_CLI.with_name("pattern_buffer_reliability.py"),
                 "pattern_buffer_codex_reliability.py": CURRENT_CLI.with_name("pattern_buffer_reliability.py"),
+                "context_injector_codex_required_reads.py": CURRENT_CLI.with_name("pattern_buffer_required_reads.py"),
+                "pattern_buffer_codex_required_reads.py": CURRENT_CLI.with_name("pattern_buffer_required_reads.py"),
             }
             for name, source in sources.items():
                 with self.subTest(path=name):

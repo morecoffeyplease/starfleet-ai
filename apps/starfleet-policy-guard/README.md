@@ -23,6 +23,18 @@ Standalone reporting and proof-only work do not require enrollment.
 A recorded report is a covered-delivery requirement, not proof of setup or a prerequisite to attach a checkout.
 `status --session-id` selects recorded activation events; it does not identify the actor or establish lane ownership.
 
+## Optional published guidance attestations
+
+Prime Directive (Policy Guard) is the same delivery tool described by this README and its `lane.py` CLI.
+An owner can explicitly adopt its stage-specific opening and accepted repair-batch attestations for a target; older attachments remain unchanged until adoption.
+The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, the `--enable` adoption command and source/runtime upgrade requirements.
+An attestation requires `assumptions: []`; unknown required facts must be investigated or raised to the configured human on Discord, then resolved before attesting.
+The packet can record honest uncertainty about tool limits and future outcomes, but it cannot prove that the author's reasoning contains no hidden assumptions.
+Existing immutable seats must use the reviewed source-upgrade flow before they can run the new pinned attestation commands.
+Adopted targets require a current per-PR comment reference before covered ready or merge actions, with source and comment freshness checked on each supported action.
+Codex coverage is through the explicit seat `gh` entrypoint and Claude coverage is through its supported direct ready/merge hook path; raw push, PR creation, comments and alternate tools are not intercepted.
+The notice comes from Pattern Buffer's existing SessionStart context injection, which does not detect issues or batches.
+
 ## OpenCode 2.2.5 prototype
 
 The local prototype targets only the OpenCode 2.2.5 server plugin API and the dedicated `prime_directive_manage` and `prime_directive_gh` tools.

@@ -67,6 +67,25 @@ class DeliveryTest(unittest.TestCase):
         self.packet.write_text(json.dumps(self.data if data is None else data))
         return delivery.report(self.repo, 'main', self.url, self.packet, policy or delivery.POLICY)
 
+    def guidance_attestation(self, stage='opening'):
+        accepted = ({'accepted_batch_ref': 'https://github.com/example/repo/issues/37#accepted-batch-2',
+                     'repair_history_ref': 'https://github.com/example/repo/pull/1#issuecomment-9'}
+                    if stage == 'repair_batch' else {})
+        return {
+            'version': 1, 'stage': stage, 'issue_ref': 'https://github.com/example/repo/issues/37',
+            **accepted, 'prerequisites_complete': True, 'gaps': [],
+            'reread': [{'kind': 'playbook', 'name': 'Feature playbook',
+                        'source_ref': 'https://github.com/example/repo/blob/abc/playbook.md',
+                        **self.artifact('guidance.md', 'Current reviewed guidance')}],
+            'guidance_application': 'The playbook limits the change to the validated delivery path.',
+            'approach': 'Reuse the existing evidence packet and owner-bound delivery lane.',
+            'approach_reason': 'A narrower change would leave the approved readiness path without the current check.',
+            'evidence_refs': ['main-awareness.evidence at main-review.txt'],
+            'assumptions': [], 'uncertainty': ['A later authenticated GitHub comment read may be unavailable.'],
+            'approved_scope_ref': 'https://github.com/example/repo/issues/37#issuecomment-1',
+            'human_holds_ref': 'No additional hold; issue 37 remains authoritative',
+        }
+
     def item(self, identifier, report=None):
         return next(x for x in (report or self.report())['items'] if x['id'] == identifier)
 
@@ -77,6 +96,92 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(self.item('design-fidelity', result)['status'], 'explicitly-not-applicable')
         after = {str(p.relative_to(self.repo)): p.read_bytes() for p in self.repo.rglob('*') if p.is_file()}
         self.assertEqual(before, after)
+
+    def test_opening_attestation_allows_unrelated_gaps_but_requires_clean_canonical_verification(self):
+        self.data['guidance_attestation'] = self.guidance_attestation()
+        report = self.report()
+        packet = json.loads(self.packet.read_text())
+        rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', report)
+        self.assertIn(delivery.GUIDANCE_ATTESTATION_STATEMENT, rendered['body'])
+        self.assertLess(rendered['body'].index('## Approach'), rendered['body'].index('## Opening attestation'))
+        self.assertLess(rendered['body'].index('## Material uncertainty'), rendered['body'].index('## Opening attestation'))
+        self.assertTrue(rendered['body'].rstrip().endswith(delivery.GUIDANCE_ATTESTATION_STATEMENT))
+
+        self.data['main-awareness']['evidence']['sha256'] = '0' * 64
+        unrelated_gap = self.report()
+        self.assertEqual(unrelated_gap['missing'], 1)
+        self.assertEqual(self.item('local-verification', unrelated_gap)['status'], 'satisfied')
+        packet = json.loads(self.packet.read_text())
+        rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', unrelated_gap)
+        self.assertIn(delivery.GUIDANCE_ATTESTATION_STATEMENT, rendered['body'])
+
+        self.data['main-awareness']['evidence']['sha256'] = self.artifact('main-review.txt', 'Compared target changes')['sha256']
+        self.data['local-verification']['outcome'] = 'nothing-affected'
+        self.data['local-verification']['nothing_affected_reason'] = 'The canonical runner reported no affected targets'
+        nothing_affected = self.report()
+        self.assertEqual(self.item('local-verification', nothing_affected)['status'], 'satisfied')
+        packet = json.loads(self.packet.read_text())
+        delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', nothing_affected)
+
+        self.data['local-verification']['exit_code'] = 1
+        incomplete = self.report()
+        packet = json.loads(self.packet.read_text())
+        self.assertEqual(self.item('local-verification', incomplete)['status'], 'missing')
+        with self.assertRaisesRegex(ValueError, 'successful canonical verification'):
+            delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', incomplete)
+
+    def test_repair_attestation_precedes_work_without_requiring_final_report(self):
+        self.data['guidance_attestation'] = self.guidance_attestation('repair_batch')
+        self.report()
+        packet = json.loads(self.packet.read_text())
+        rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'repair_batch')
+        self.assertTrue(rendered['body'].startswith('# Accepted repair-batch attestation\n\n' +
+                                                     delivery.GUIDANCE_ATTESTATION_STATEMENT))
+        self.assertIn('Accepted batch: https://github.com/example/repo/issues/37#accepted-batch-2', rendered['body'])
+        self.assertNotIn('repair verification passed', rendered['body'].casefold())
+
+    def test_assumptions_must_be_explicitly_empty_and_render_as_none(self):
+        self.data['guidance_attestation'] = self.guidance_attestation()
+        report = self.report()
+        packet = json.loads(self.packet.read_text())
+        rendered = delivery.render_guidance_attestation(packet, self.packet.parent, self.url, 'opening', report)
+        self.assertIn('## Material assumptions\n\n- None', rendered['body'])
+
+        invalid_cases = (
+            ('missing', None, False),
+            ('null', None, True),
+            ('object', {}, True),
+            ('string', 'not-a-list', True),
+            ('nonempty', ['The remote comment will remain readable.'], True),
+        )
+        for name, value, present in invalid_cases:
+            attestation = self.guidance_attestation()
+            if present:
+                attestation['assumptions'] = value
+            else:
+                del attestation['assumptions']
+            with self.subTest(assumptions=name):
+                with self.assertRaisesRegex(ValueError, 'assumptions must be an explicit empty list'):
+                    delivery.guidance_attestation({'guidance_attestation': attestation},
+                                                  self.packet.parent, self.url)
+
+    def test_attestation_gaps_and_changed_reread_bytes_refuse(self):
+        attestation = self.guidance_attestation()
+        attestation['prerequisites_complete'] = False
+        self.data['guidance_attestation'] = attestation
+        self.report()
+        with self.assertRaisesRegex(ValueError, 'not explicitly complete'):
+            delivery.guidance_attestation(json.loads(self.packet.read_text()), self.packet.parent, self.url)
+        attestation['prerequisites_complete'] = True
+        attestation['gaps'] = ['Need a decision']
+        self.report()
+        with self.assertRaisesRegex(ValueError, 'unresolved prerequisite gaps'):
+            delivery.guidance_attestation(json.loads(self.packet.read_text()), self.packet.parent, self.url)
+        attestation['gaps'] = []
+        self.report()
+        (self.root / 'guidance.md').write_text('Changed reviewed guidance')
+        with self.assertRaisesRegex(ValueError, 'Evidence hash changed'):
+            delivery.guidance_attestation(json.loads(self.packet.read_text()), self.packet.parent, self.url)
 
     def test_missing_packet_cannot_produce_baseline_report(self):
         with self.assertRaisesRegex(ValueError, 'required before reporting'):

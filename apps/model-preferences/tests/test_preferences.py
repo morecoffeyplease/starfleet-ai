@@ -393,6 +393,83 @@ class PreferencesTest(unittest.TestCase):
                                "--approval", approval["id"])
         self.assertEqual(self.app.state(f"launches/{result['launch']}", None)["choice"]["role"], "advanced_review")
 
+    def test_light_advanced_standard_instead_dispatch_uses_selected_configured_slot(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        (repo / "app.py").write_text("MODE = 'synthetic new design'\n")
+        plan = self.plan(repo, new_design=True)
+        approval = self.call("approve-review", plan["id"], "--standard-instead",
+                             "--authorization", "Fixture authority selected standard review.")
+        brief = self.root / "standard-instead-review.txt"
+        task = "Review the synthetic new design in app.py."
+        brief.write_text(task)
+        capture, env = self.fake_native_provider("codex")
+
+        cli_result = self.run_cli(env, "dispatch", "--role", "standard_review", "--slot", "1",
+                                  "--cwd", str(repo), "--task-file", str(brief),
+                                  "--review-plan", plan["id"], "--approval", approval["id"])
+        self.assertEqual(cli_result.returncode, 0, cli_result.stderr)
+        result = json.loads(cli_result.stdout)
+        self.assertEqual(result["exit_code"], 0)
+        received = json.loads(capture.read_text())
+        launch = self.app.state(f"launches/{result['launch']}", None)
+        self.assertEqual(launch["choice"]["role"], "standard_review")
+        self.assertEqual((launch["choice"]["model"], launch["choice"]["effort"]),
+                         ("gpt-6.1-sol", "high"))
+        self.assertEqual(launch["slot"], 1)
+        self.assertNotIn("review_cycle", launch)
+        self.assertEqual(received["prompt"][-len(task):], task)
+
+    def test_light_standard_instead_validation_and_cycle_guards_precede_provider(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        brief = self.root / "standard-instead-review.txt"
+        brief.write_text("Review the synthetic design change in app.py.")
+        capture, env = self.fake_native_provider("codex")
+
+        def dispatch_args(plan_id, approval_id=None, extras=()):
+            args = ["dispatch", "--role", "standard_review", "--slot", "1", "--cwd", str(repo),
+                    "--task-file", str(brief), "--review-plan", plan_id]
+            if approval_id:
+                args.extend(("--approval", approval_id))
+            args.extend(extras)
+            return args
+
+        def reject(message, plan_id, approval_id=None, extras=()):
+            if capture.exists():
+                capture.unlink()
+            with patch.dict(os.environ, env):
+                with self.assertRaisesRegex(mp.PreferenceError, message):
+                    self.call(*dispatch_args(plan_id, approval_id, extras))
+            self.assertFalse(capture.exists())
+
+        (repo / "app.py").write_text("MODE = 'synthetic new design'\n")
+        advanced = self.plan(repo, new_design=True)
+        standard_approval = self.call("approve-review", advanced["id"], "--standard-instead",
+                                     "--authorization", "Fixture authority selected standard review.")
+        advanced_approval = self.call("approve-review", advanced["id"],
+                                      "--authorization", "Fixture authority approved advanced review.")
+        reject("explicit permission", advanced["id"])
+        reject("does not cover this scope", advanced["id"], advanced_approval["id"])
+        reject("Review target context", advanced["id"], standard_approval["id"],
+               ("--review-target", "fixture-target", "--review-cycle", "fixture-cycle"))
+        reject("Review target context", advanced["id"], standard_approval["id"], ("--retry-failed",))
+
+        (repo / "app.py").write_text("MODE = 'changed after plan'\n")
+        reject("Review scope/profile changed", advanced["id"], standard_approval["id"])
+
+        self.activate("Claude-Codex")
+        ordinary = self.plan(repo)
+        self.assertEqual(ordinary["role"], "standard_review")
+        self.activate("claude-codex-light")
+        reject("requires --review-target, --review-cycle, and --review-plan", ordinary["id"])
+
+        stale = self.plan(repo, new_design=True)
+        stale_approval = self.call("approve-review", stale["id"], "--standard-instead",
+                                   "--authorization", "Fixture authority selected standard review.")
+        self.activate("Claude-Codex")
+        reject("Review scope/profile changed", stale["id"], stale_approval["id"])
+
     def test_eight_profiles_and_muse_and_qwen_roles(self):
         self.assertEqual(len(self.call("list")["profiles"]), 8)
         examples = mp.example_config()

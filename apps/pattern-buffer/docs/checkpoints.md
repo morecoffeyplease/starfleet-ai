@@ -19,14 +19,19 @@ Pattern Buffer appends a short runtime PStack reminder to every rendered context
 It asks agents to use the installed PStack runtime and Poteto Mode, then after compaction read the sections relevant to current work in full, not the entire PStack library.
 The runtime reminder does not install PStack, change role or authority, or rewrite custom context files.
 It is outside the 8192-byte standing-context budget and counts toward the 24 KiB combined injection limit.
-Oversized context fails rather than being truncated.
+For an ordinary worktree SessionStart, Pattern Buffer can emit a complete role view above 8192 bytes with a warning only when the total output, including runtime, task and checkpoint addenda, is at most 9216 bytes and remains under the 24 KiB combined limit.
+Above that recovery limit, or when the ordinary standing source cannot be read or parsed or the combined limit is exceeded, SessionStart emits a bounded notice that names the source path and asks the agent to read the complete file and notify its owner.
+The notice preserves unresolved scope and holds, states that it is not full context, and does not expand authorization.
+Exact-session enrollment and dispatched work retain their blocking integrity checks.
+Preview shows this ordinary-worktree warning and fallback behavior without event-specific checkpoint addenda, while `validate` continues to enforce the 8192-byte authoring budget.
 The reminder is configured context, not proof of native loading or model receipt.
 
 The default context template ends with an optional `# confirmation` section.
 Pattern Buffer appends a nonempty section after the selected role for every role, and its bytes count toward the 8192-byte standing-context limit.
 Existing custom context files are not rewritten and receive the common footer only after an owner-reviewed update adds the section.
-Legacy custom contexts without the section keep the runtime completion-confirmation wording after compaction.
-Owners must fit their own approved context within the existing 8192-byte standing and 24 KiB combined limits.
+The default shared guidance asks agents to restate the accepted outcome, next deliverable, holds and unavailable reads, and what they will not do.
+Legacy custom contexts without a confirmation section receive the same restatement after the runtime PStack reminder.
+Owners must fit their approved context within the 8192-byte authoring budget and 24 KiB combined limit.
 
 ## Pilot and installation authority
 

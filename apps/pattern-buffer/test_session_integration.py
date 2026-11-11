@@ -11,6 +11,7 @@ import unittest
 import uuid
 
 from test_checkpoints import NOTE
+from _test_support import isolate_state_home
 
 
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
@@ -21,11 +22,12 @@ class SessionIntegrationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name).resolve()
+        self.state_home = isolate_state_home(self)
         self.root = self.home / "repo"
         self.root.mkdir()
         self.session = str(uuid.uuid4())
         self.other = str(uuid.uuid4())
-        self.env = {**os.environ, "HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state"),
+        self.env = {**os.environ, "HOME": str(self.home), "XDG_STATE_HOME": str(self.state_home),
                     "CODEX_THREAD_ID": self.session, "CMUX_AGENT_LAUNCH_KIND": "codex",
                     "CMUX_SURFACE_ID": str(uuid.uuid4())}
         for command in (("init", "-q"), ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
