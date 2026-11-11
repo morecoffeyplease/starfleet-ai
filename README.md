@@ -13,6 +13,7 @@ The repository does not promise publication to npm, PyPI, Homebrew, or another p
 | --- | --- |
 | [Hailing Frequencies](apps/hailing-frequencies/README.md) | Watches explicitly enrolled CMUX sessions and submits guarded attention prompts. |
 | [Agent Notify](apps/hailing-frequencies/agent-notify-guide.md) | Opens one Discord forum post per conversation and can register the thread for its exact enrolled owner. |
+| [Replicator](apps/replicator/README.md) | Prints the maintained guide for an explicitly requested orchestrator handoff. |
 | [Discord Watch](apps/discord-watch/README.md) | Uses one reply worker to queue responses from registered Discord threads for their exact enrolled owners. |
 | [Away Mode](apps/away-mode/README.md) | Records explicit availability and routes human contact through the configured Discord workflow. |
 | [Pattern Buffer](apps/pattern-buffer/README.md) | Restores worktree context for Claude Code and Codex sessions, with opt-in OpenCode context, checkpoint support and lower-anchor pressure reminders. |
@@ -24,6 +25,7 @@ The repository does not promise publication to npm, PyPI, Homebrew, or another p
 
 Each component has its own setup, supported platforms, verification command, and limits.
 Start with the component README and its printable guide when available.
+For an explicitly requested handoff, read the [Replicator README](apps/replicator/README.md) and print its guide from a checkout with `python3 apps/replicator/replicator.py guide --print` or from an installed copy with `replicator guide --print`.
 Installation is opt-in, and components do not start workers or change hooks merely because the source is present.
 The [OpenCode and local Qwen setup guide](docs/opencode-qwen-setup.md) records prerequisites, isolated configuration and qualification limits, with the [runtime lifecycle runbook](docs/qwen-runtime-lifecycle.md) for bounded startup and shutdown.
 The [Qwen operating guide](docs/qwen-operating-guide.md) covers task framing, supervision, evidence, secrets and escalation for orchestrators and implementers.
