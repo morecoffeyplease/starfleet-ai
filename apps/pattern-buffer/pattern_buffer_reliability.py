@@ -70,6 +70,7 @@ _LIFECYCLE_EVENTS = {
     "standing.injection_failed",
     "context.missing_alarm",
     "context.recovered",
+    "required_reads.generation_started",
     "recovery.observed",
     "enrollment.session-enroll",
     "enrollment.assign",

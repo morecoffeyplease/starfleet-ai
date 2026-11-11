@@ -156,6 +156,9 @@ The owner can restore the reviewed file or review and register a corrected manif
 Each session's `PreToolUse` gate checks the registered list, the resolved role, required-file integrity, and receipts for the current context generation.
 A new startup, compaction, clear, or fork starts a fresh generation, while a resume keeps the current generation.
 The SessionStart notice names pending reads and the next `read-required` command.
+An already-running main session with no current generation starts generation 1 on its first gated tool call after the owner registers a list.
+That call still follows the read gate and earns no receipt.
+Pending and read-binding denials include `pattern-buffer guide --print` for recovery steps.
 Use the command to print a whole file or its next numbered part:
 
 ```sh

@@ -128,6 +128,8 @@ Run `required-reads set` or `required-reads clear` from an interactive terminal 
 Agents may draft a list and inspect its status, but only the owner registers or clears it because harness sessions share the owner's operating-system account.
 The owner can temporarily open one exact session with `required-reads override --harness HARNESS --session SESSION_ID --reason REASON --minutes 1-60`; the terminal prompt requires the typed target session ID, and the override expires or resets with the context generation.
 The gate checks the resolved role, current list and required-file digests before allowing work, and known list or file integrity failures remain closed.
+If the owner registers a list after a main session starts and its generation is zero, the first gated tool call starts generation 1 without recording a receipt or opening the gate.
+Pending and binding denials include `pattern-buffer guide --print` for recovery steps.
 Agents can use `required-reads status`, `status`, `doctor`, and `guide --print` to diagnose a closed gate, then notify the owner to restore a file or review and re-register the list.
 `read-required` prints a canonical frame and performs no state, lock or telemetry writes.
 `PreToolUse` stores a bounded snapshot for the exact native session and tool call, including the current generation, list, entry, part and file identity.
