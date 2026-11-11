@@ -29,6 +29,7 @@ import cleanup as seat_cleanup
 APP = Path(__file__).resolve().parent
 SELF = Path(__file__).resolve()
 UPGRADE_JOURNAL = 'upgrade-journal.json'
+RETIREMENT_PROTOCOL = 'policy-guard-missing-checkout-retirement-v1'
 
 
 def root(cwd):
@@ -1563,6 +1564,202 @@ def validate_checkout_runtime(state, seat_manifest):
     raise ValueError('Active seat checkouts do not share one runtime version; preserve history and inspect the seat')
 
 
+def retirement_recovery_command(seat_id, action='recover'):
+    return shlex.join([sys.executable, str(SELF), '--seat-id', seat_id, action, '--inspect'])
+
+
+def ensure_retirement_lifecycle_clear(seat):
+    identifier = seat['seat_id']
+    seat_location = session_store.seat_dir(identifier)
+    journal = seat_location / UPGRADE_JOURNAL
+    if journal.exists() or journal.is_symlink():
+        inspect_command = retirement_recovery_command(identifier)
+        rollback_command = shlex.join([sys.executable, str(SELF), 'upgrade-recover', '--rollback'])
+        raise ValueError('A seat source upgrade is incomplete; inspect the seat with ' + inspect_command +
+                         ', then run ' + rollback_command + ' from the checkout that started the upgrade before ' +
+                         'retiring an attachment. If that checkout is unavailable, preserve the journal and restore ' +
+                         'the original checkout for recovery')
+    if any(seat.get(key) for key in ('install_journal', 'migration_journal', 'handoff_journal')):
+        raise ValueError('A seat installation, migration, or handoff is incomplete; run ' +
+                         retirement_recovery_command(identifier) + ' before retiring an attachment')
+    for item in session_store.all_checkouts(identifier):
+        state = item.get('state')
+        if not isinstance(state, dict):
+            raise ValueError('A registered checkout state is missing or malformed; run ' +
+                             retirement_recovery_command(identifier) + ' before retiring an attachment')
+        phase = state.get('phase')
+        if phase not in ('active', 'removed'):
+            recovery = ('upgrade-recover --rollback from a recorded checkout'
+                        if phase == 'upgrading' else retirement_recovery_command(identifier))
+            raise ValueError('A registered checkout has an interrupted or unknown phase; run ' + recovery +
+                             ' before retiring an attachment')
+
+
+def checkout_pr_records(seat, checkout_id, state):
+    urls = set(state.get('pr_bindings', {}))
+    if state.get('pr_url'):
+        urls.add(state['pr_url'])
+    for url, record in seat.get('prs', {}).items():
+        if checkout_id in record.get('checkout_ids', []):
+            urls.add(url)
+    rows = []
+    for url in sorted(urls):
+        binding = copy.deepcopy(state.get('pr_bindings', {}).get(url))
+        if binding is None and state.get('pr_url') == url:
+            binding = {key: copy.deepcopy(state[key]) for key in lane_scope.BINDING_FIELDS if key in state}
+        rows.append({'url': url, 'seat_record': copy.deepcopy(seat.get('prs', {}).get(url)),
+                     'binding': binding, 'checkout_id': checkout_id})
+    return rows
+
+
+def retirement_checkout_evidence(checkout, state):
+    checkout_path = Path(checkout['root'])
+    recorded_branch = state.get('branch')
+    if not checkout_path.exists() and not checkout_path.is_symlink():
+        return {'state': 'missing', 'reason': 'recorded checkout path does not exist',
+                'path_exists': False, 'recorded_branch': recorded_branch}
+    if checkout_path.is_symlink():
+        return {'state': 'not-recorded-worktree', 'reason': 'recorded checkout path is now a symlink',
+                'path_exists': True, 'path_is_symlink': True,
+                'symlink_target': os.readlink(checkout_path), 'recorded_branch': recorded_branch}
+    if not checkout_path.is_dir():
+        return {'state': 'not-recorded-worktree', 'reason': 'recorded checkout path is not a directory',
+                'path_exists': True, 'path_is_symlink': False, 'recorded_branch': recorded_branch}
+    if not (checkout_path / '.git').exists():
+        return {'state': 'not-recorded-worktree', 'reason': 'recorded checkout path has no Git worktree metadata',
+                'path_exists': True, 'path_is_symlink': False, 'recorded_branch': recorded_branch}
+    try:
+        observed_root = str(root(checkout_path))
+        observed_gitdir = delivery.value(checkout_path, 'rev-parse', '--absolute-git-dir')
+        observed_common_gitdir = delivery.value(checkout_path, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    except (OSError, ValueError) as error:
+        raise ValueError('The existing checkout Git metadata cannot be verified; preserve it and inspect it before retirement') from error
+    try:
+        observed_branch = branch(checkout_path)
+    except ValueError:
+        observed_branch = None
+    try:
+        observed_repository = github.origin_repo(
+            delivery.value(checkout_path, 'remote', 'get-url', 'origin'), checkout.get('host', 'github.com')).casefold()
+    except (OSError, ValueError):
+        observed_repository = None
+    observed = {'root': observed_root, 'repository': observed_repository,
+                'gitdir': observed_gitdir, 'common_gitdir': observed_common_gitdir,
+                'branch': observed_branch}
+    same_worktree = (observed_root == checkout.get('root') and
+                     observed_gitdir == checkout.get('gitdir') and
+                     observed_common_gitdir == checkout.get('common_gitdir'))
+    if same_worktree and observed_branch != recorded_branch:
+        raise ValueError('The recorded checkout exists on another branch; restore its recorded branch and run uninstall from that checkout. Missing-checkout retirement does not apply to a live worktree on another branch')
+    if same_worktree and observed_repository == checkout.get('repository'):
+        raise ValueError('The recorded checkout is live and matches its recorded repository and branch; run uninstall from that checkout')
+    return {'state': 'not-recorded-worktree', 'reason': 'recorded path no longer identifies its recorded repository worktree',
+            'path_exists': True, 'path_is_symlink': False, 'recorded_branch': recorded_branch,
+            'observed': observed}
+
+
+def build_retire_attachment_plan(identifier, checkout_value):
+    seat = session_store.load_seat(identifier)
+    if not seat:
+        raise ValueError('Permanent Policy Guard seat registry is missing; preserve history and use recover --inspect')
+    lane_scope.check_owner({'lane_owner': seat['owner']})
+    ensure_retirement_lifecycle_clear(seat)
+    checkout_value = Path(checkout_value)
+    if not checkout_value.is_absolute():
+        raise ValueError('--checkout must name the absolute recorded checkout path')
+    requested_path = Path(os.path.abspath(checkout_value))
+    rows = session_store.all_checkouts(identifier)
+    item = next((row for row in rows if row.get('root') == str(requested_path)), None)
+    if not item:
+        raise ValueError('The requested path is not a recorded attachment in this seat')
+    state = item.get('state')
+    if not isinstance(state, dict):
+        raise ValueError('The recorded attachment state is missing or malformed; preserve it and use recover --inspect')
+    if (state.get('root') != item.get('root') or state.get('seat_id') != identifier or
+            state.get('branch') is None or not isinstance(state.get('lane_owner'), dict) or
+            {key: state['lane_owner'].get(key) for key in ('harness', 'session_id')} != seat.get('owner')):
+        raise ValueError('The recorded attachment identity is inconsistent with its permanent seat; preserve it and inspect recovery')
+    state_path = Path(item['checkout_dir']) / 'state.json'
+    if state.get('phase') == 'removed':
+        return {'protocol': RETIREMENT_PROTOCOL, 'seat_id': identifier, 'already_retired': True,
+                'attachment': {'checkout_id': item['checkout_id'], 'path': item['root'],
+                               'branch': state.get('branch')},
+                'retirement_receipt': copy.deepcopy(state.get('retirement_receipt')),
+                'history_preserved': True}
+    if state.get('phase') != 'active':
+        raise ValueError('The recorded attachment is not active; preserve its state and use recover --inspect')
+    evidence = retirement_checkout_evidence(item, state)
+    pr_records = checkout_pr_records(seat, item['checkout_id'], state)
+    seat_path = session_store.seat_dir(identifier) / 'seat.json'
+    review = {'protocol': RETIREMENT_PROTOCOL, 'seat_id': identifier,
+              'seat': {'seat_root': seat['seat_root'], 'owner': copy.deepcopy(seat['owner'])},
+              'attachment': {'checkout_id': item['checkout_id'], 'path': item['root'],
+                             'repository': item.get('repository'), 'host': item.get('host'),
+                             'gitdir': item.get('gitdir'), 'common_gitdir': item.get('common_gitdir'),
+                             'branch': state.get('branch')},
+              'checkout_evidence': evidence,
+              'pr_records': pr_records,
+              'preimages': {'seat_manifest': {'path': str(seat_path),
+                                               'sha256': delivery_runs.digest(seat_path)},
+                            'attachment_state': {'path': str(state_path),
+                                                 'sha256': delivery_runs.digest(state_path)},
+                            'pr_records_sha256': text_digest(json.dumps(
+                                pr_records, sort_keys=True, separators=(',', ':')))},
+              'lifecycle_preconditions': {'upgrade_journal': False, 'install_journal': False,
+                                           'migration_journal': False, 'handoff_journal': False}}
+    review['plan_sha256'] = text_digest(json.dumps(review, sort_keys=True, separators=(',', ':')))
+    return review
+
+
+def retire_attachment(args):
+    identifier = selected_seat_id(args)
+    if args.apply:
+        if not args.plan_sha256:
+            raise ValueError('retire-attachment --apply requires --plan-sha256 from a reviewed retire-attachment plan')
+        review = build_retire_attachment_plan(identifier, args.checkout)
+        if review.get('already_retired'):
+            return {'retired': True, 'already_retired': True, 'history_preserved': True,
+                    'seat_id': identifier, 'attachment': review['attachment'],
+                    'retirement_receipt': review.get('retirement_receipt')}
+        if args.plan_sha256 != review['plan_sha256']:
+            raise ValueError('Retirement plan or a bound preimage changed; inspect a fresh retire-attachment plan')
+        with session_store.locked_seat(identifier):
+            current = build_retire_attachment_plan(identifier, args.checkout)
+            if current.get('already_retired'):
+                return {'retired': True, 'already_retired': True, 'history_preserved': True,
+                        'seat_id': identifier, 'attachment': current['attachment'],
+                        'retirement_receipt': current.get('retirement_receipt')}
+            if args.plan_sha256 != current['plan_sha256']:
+                raise ValueError('Retirement plan or a bound preimage changed; inspect a fresh retire-attachment plan')
+            checkout_id = current['attachment']['checkout_id']
+            item = next(row for row in session_store.all_checkouts(identifier)
+                        if row['checkout_id'] == checkout_id)
+            state = copy.deepcopy(item['state'])
+            retired_at = time.time()
+            receipt = {'protocol': RETIREMENT_PROTOCOL, 'seat_id': identifier,
+                       'checkout_id': checkout_id, 'checkout_path': current['attachment']['path'],
+                       'repository': current['attachment']['repository'],
+                       'branch': current['attachment']['branch'],
+                       'owner': copy.deepcopy(current['seat']['owner']), 'retired_at': retired_at,
+                       'checkout_evidence': copy.deepcopy(current['checkout_evidence']),
+                       'plan_sha256': current['plan_sha256'],
+                       'pr_records_sha256': current['preimages']['pr_records_sha256'],
+                       'pr_records_preserved': len(current['pr_records'])}
+            state['phase'] = 'removed'
+            state['removed_at'] = retired_at
+            state['updated_at'] = retired_at
+            state['retirement_receipt'] = receipt
+            state_path = Path(item['checkout_dir']) / 'state.json'
+            refuse_symlinked_path(state_path)
+            write(state_path, json.dumps(state, indent=2) + '\n')
+        return {'retired': True, 'already_retired': False, 'history_preserved': True,
+                'seat_id': identifier, 'attachment': current['attachment'],
+                'retirement_receipt': receipt, 'plan_sha256': current['plan_sha256']}
+    if args.plan_sha256:
+        raise ValueError('Use --apply with --plan-sha256 to apply a reviewed retirement plan')
+    return build_retire_attachment_plan(identifier, args.checkout)
+
+
 def build_upgrade_plan(cwd):
     product = root(cwd)
     ensure_no_upgrade_journal(product)
@@ -1681,8 +1878,26 @@ def build_upgrade_plan(cwd):
             if phase!='active':
                 raise ValueError('A registered checkout has an interrupted or unknown phase; recover before upgrading the seat')
             product_path=Path(prior.get('root',''))
-            if not product_path.is_dir() or root(product_path)!=product_path.resolve() or branch(product_path)!=prior.get('branch'):
-                raise ValueError('An active seat checkout is unavailable or on another branch; preserve it and resolve that checkout before upgrading the seat')
+            try:
+                checkout_available = (product_path.is_dir() and root(product_path) == product_path.resolve() and
+                                      branch(product_path) == prior.get('branch'))
+                if checkout_available:
+                    observed_gitdir = delivery.value(product_path, 'rev-parse', '--absolute-git-dir')
+                    observed_common_gitdir = delivery.value(
+                        product_path, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+                    observed_repository = github.origin_repo(
+                        delivery.value(product_path, 'remote', 'get-url', 'origin'),
+                        prior.get('lane_owner', {}).get('host', 'github.com')).casefold()
+                    checkout_available = (observed_gitdir == item.get('gitdir') and
+                                          observed_common_gitdir == item.get('common_gitdir') and
+                                          observed_repository == item.get('repository'))
+            except (OSError, ValueError):
+                checkout_available = False
+            if not checkout_available:
+                retire_command = shlex.join([sys.executable, str(SELF), '--seat-id', state['seat_id'],
+                                             'retire-attachment', '--checkout', str(product_path)])
+                raise ValueError('An active seat checkout is unavailable or on another branch; when its recorded path is missing or no longer identifies its recorded worktree, review ' +
+                                 retire_command + '. If the recorded worktree exists on another branch, restore its recorded branch and run uninstall from that checkout')
             lane_scope.check_owner(prior)
             check_lane_identity(prior,product_path)
             prior_runtime_missing = validate_checkout_runtime(prior, seat_manifest_before)
@@ -2548,6 +2763,24 @@ def setup_guidance(cwd, state, detail):
     return guidance('none', 'The active attachment, owner and installed source are confirmed. No setup change is recommended; existing report, repository checks and human approval requirements remain separate.')
 
 
+def retired_attachments_for_seat(identifier, seat=None, checkout_rows=None):
+    seat = seat or session_store.load_seat(identifier)
+    checkout_rows = checkout_rows if checkout_rows is not None else session_store.all_checkouts(identifier)
+    retired = []
+    for item in checkout_rows:
+        state = item.get('state') or {}
+        receipt = state.get('retirement_receipt')
+        if state.get('phase') != 'removed' or not isinstance(receipt, dict):
+            continue
+        pr_records = checkout_pr_records(seat, item['checkout_id'], state)
+        retired.append({'checkout_id': item['checkout_id'], 'path': item.get('root'),
+                        'repository': item.get('repository'), 'branch': state.get('branch'),
+                        'attachment_state': 'retired', 'retired_at': receipt.get('retired_at'),
+                        'pr_records': [dict(row, attachment_state='retired') for row in pr_records],
+                        'retirement_receipt': copy.deepcopy(receipt)})
+    return retired
+
+
 def status(cwd, session_id=None, state=None, native_context=None):
     state = read(cwd) if state is None else state
     native_context = native_identity_context() if native_context is None else native_context
@@ -2660,6 +2893,8 @@ def status(cwd, session_id=None, state=None, native_context=None):
     upgrade_state = {'state': 'in-progress' if journal_pending else 'none',
                      'journal_path': str(journal_path) if journal_pending else None,
                      'recovery_command': upgrade_recovery_command(cwd) if journal_pending else None}
+    retired_attachments = (retired_attachments_for_seat(state['seat_id'])
+                          if state and state.get('seat_id') else [])
     result = {'lane_enrolled':lane_enrolled,'lane_owner':(state or {}).get('lane_owner'),
             'owner_history':(state or {}).get('owner_history',[]),'installed_here': installed_here,
             'product_root': product_root, 'branch': current_branch,
@@ -2684,6 +2919,7 @@ def status(cwd, session_id=None, state=None, native_context=None):
             'report_status': {'state': receipt_status, 'reason': receipt_reason,
                               'notice': 'No network freshness check, readiness approval or merge authority.'},
             'receipt': (state or {}).get('receipt'), 'history': (state or {}).get('history', []),
+            'retired_attachments': retired_attachments,
             'enrollment_help': None if configured else enrollment_help(cwd)}
     publication = (state or {}).get('guidance_attestation_ref')
     published_context = publication.get('required_reads') if isinstance(publication, dict) else None
@@ -2756,6 +2992,7 @@ def coverage(cwd, pr_url=None):
                         'settings': (state or {}).get('settings') if (state or {}).get('manages_claude_hooks', bool(state)) else None,
                         'configured_hook_groups': (state or {}).get('groups', {})},
         'delivery_report': {'receipt': detail['report_status'], 'observations': observations},
+        'retired_attachments': detail['retired_attachments'],
         'setup_guidance': detail['setup_guidance'],
         'fix_rounds': {'state': 'not-installed-by-delivery-lane',
                        'paths': {name: 'unverified' for name in (
@@ -2795,22 +3032,30 @@ def seat_status(identifier):
         runtime_files[relative]={'expected_sha256':expected,'actual_sha256':digest,
             'state':'intact' if digest==expected else 'missing-or-changed'}
     adapter_status = managed_adapter_status(seat)
+    checkout_rows = session_store.all_checkouts(identifier)
+    retired = retired_attachments_for_seat(identifier, seat, checkout_rows)
+    retired_by_id = {row['checkout_id']: row for row in retired}
     checkouts=[]
-    for item in session_store.all_checkouts(identifier):
+    for item in checkout_rows:
         state=item.get('state') or {}
+        retirement = retired_by_id.get(item['checkout_id'])
         checkouts.append({'checkout_id':item['checkout_id'],'root':item.get('root'),
             'repository':item.get('repository'),'host':item.get('host'),
             'phase':state.get('phase','missing-or-malformed-state'),'branch':state.get('branch'),
+            'attachment_state': 'retired' if retirement else state.get('phase','missing-or-malformed-state'),
             'current_pr':state.get('pr_url'),'known_prs':sorted(set(state.get('pr_bindings',{})) |
                 ({state['pr_url']} if state.get('pr_url') else set())),
+            'pr_records': retirement['pr_records'] if retirement else [],
+            'retirement_receipt': copy.deepcopy(state.get('retirement_receipt')),
             'last_updated_at':state.get('updated_at')})
     return {'seat_id':identifier,'seat_root':seat['seat_root'],'owner':seat['owner'],
         'owner_context':seat.get('owner_context',{}),'actual_native_identity':actual,
         'actual_session_context':actual_context,'owner_matches':owner_matches,'identity_error':identity_error,
         'hooks_installed':bool(seat.get('hooks_installed')),'adapter':seat.get('adapter'),
         'adapter_state':adapter_status['state'],'adapter_integrity':adapter_status,
-        'runtime':{'version':runtime.get('version'),
+            'runtime':{'version':runtime.get('version'),
             'path':str(runtime_path),'files':runtime_files},'checkouts':checkouts,
+        'retired_attachments': retired,
         'pr_records':len(seat.get('prs',{})),'pending_transition':bool(seat.get('install_journal') or
             seat.get('migration_journal') or seat.get('handoff_journal') or
             (session_store.seat_dir(identifier)/UPGRADE_JOURNAL).exists() or
@@ -2846,6 +3091,10 @@ def coverage_summary(cwd, detail):
         'Observed paths for current session: native hook=' + observations['native_hook']['state'] +
         '; adapter=' + observations['explicit_adapter']['state'],
         'Report: ' + report['state'] + ' - ' + report['reason'],
+        *(['Retired attachments: ' + '; '.join(
+            row['path'] + ' (branch ' + str(row['branch']) + ', ' + str(len(row['pr_records'])) +
+            ' PR records preserved)' for row in detail.get('retired_attachments', []))]
+          if detail.get('retired_attachments') else []),
         'Fix-round enforcement: not installed by the delivery lane; other paths unverified.',
         'Next setup: ' + setup['action'] + ' - ' + setup['reason'],
         *(['Run: ' + setup['command']] if setup.get('command') else []),
@@ -4188,6 +4437,14 @@ def build_parser():
     p.add_argument('--pr-url',required=True)
     p = sub.add_parser('unpin', help='Remove a local PR retention pin')
     p.add_argument('--pr-url',required=True)
+    p = sub.add_parser('retire-attachment', help='Retire a missing Policy Guard checkout with a reviewed plan hash',
+                       description='Plan or apply history-preserving retirement of one missing Policy Guard attachment.',
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog='Example:\n  lane.py --seat-id SEAT_ID retire-attachment --checkout /worktrees/temporary-feature\n  lane.py --seat-id SEAT_ID retire-attachment --checkout /worktrees/temporary-feature --apply --plan-sha256 REVIEWED_PLAN_SHA256')
+    p.add_argument('--checkout', type=Path, required=True,
+                   help='Absolute recorded checkout path to inspect; the command never writes to this path')
+    p.add_argument('--apply', action='store_true', help='Apply only the exact plan named by --plan-sha256')
+    p.add_argument('--plan-sha256', help='Exact hash from a reviewed retire-attachment plan')
     return parser
 
 
@@ -4256,6 +4513,9 @@ def dispatch(args):
             return 0
         elif args.action == 'unpin':
             print(json.dumps(seat_cleanup.set_pinned(selected_seat_id(args),args.pr_url,False),indent=2))
+            return 0
+        elif args.action == 'retire-attachment':
+            print(json.dumps(retire_attachment(args), indent=2))
             return 0
         elif args.action == 'hook':
             return hook(args)

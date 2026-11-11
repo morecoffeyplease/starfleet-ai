@@ -308,6 +308,41 @@ Published-branch discovery runs only on the explicit seat `gh` delivery path.
 Claude's local hook evaluation makes no GitHub calls for legacy targets; an adopted attestation target adds the bounded authenticated comment read described above.
 Neither path intercepts arbitrary shell scripts, other applications, or commands outside its documented entrypoint.
 
+## Retire a missing attachment
+
+Use `retire-attachment` when a recorded checkout path no longer exists or no longer identifies the recorded repository worktree.
+The command requires the exact recorded native owner and the absolute checkout path from the seat record.
+It can run from any surviving attachment, or with global `--seat-id SEAT_ID` when no product checkout is available.
+The default command prints a plan with the seat, attachment path, recorded repository and branch, pull request records, missing-checkout evidence, and preimage hashes.
+Review that output, then apply only with `--apply --plan-sha256 REVIEWED_PLAN_SHA256`.
+The command refuses a live matching worktree and says to run `uninstall` from it.
+It refuses a checkout that still has the recorded worktree identity but is on a different branch.
+For that case, restore the recorded branch and run `uninstall` from the checkout.
+It refuses while a seat install, migration, handoff, or upgrade is incomplete and names the applicable recovery command.
+It never creates, deletes, or modifies a product checkout, branch, or repository metadata.
+The command marks the checkout removed, writes a receipt with owner, time, and evidence, and preserves the attachment state, report history, pull request bindings, and counts.
+`status` and `coverage --summary` from a surviving attachment show retired checkout paths and the preserved pull request records.
+
+For example, a temporary checkout and its branch can both be deleted while another attachment remains live:
+
+```sh
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/temporary-feature
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/temporary-feature --apply --plan-sha256 REVIEWED_PLAN_SHA256
+python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /worktrees/remaining-feature upgrade-plan
+python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /worktrees/remaining-feature upgrade --plan-sha256 REVIEWED_UPGRADE_PLAN_SHA256
+```
+
+If `/worktrees/temporary-feature` still exists as its recorded worktree but is on another branch, use the manual restore route instead:
+
+```sh
+git -C /worktrees/temporary-feature switch RECORDED_BRANCH
+python3 /path/to/installed/runtime/lane.py --cwd /worktrees/temporary-feature uninstall
+```
+
 ## Upgrade an installed seat
 
 Use a clean, committed newer Starfleet source checkout and run the reviewed upgrade from an active attached product checkout:
