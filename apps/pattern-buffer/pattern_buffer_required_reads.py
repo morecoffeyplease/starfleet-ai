@@ -312,11 +312,15 @@ def _state_lock(core, path):
 def session_start(core, root, gitdir, harness, session, source):
     if not session or not registration_path(gitdir).exists():
         return None
-    if source not in RESET_SOURCES | {"resume"}:
+    if source not in RESET_SOURCES | {"resume", "pretool_gate"}:
         return None
     path = state_path(gitdir, harness, session)
+    started_at_gate = False
     with _state_lock(core, path):
         state = _read_state(path, harness, session)
+        if source == "pretool_gate" and state["generation"] > 0:
+            return state
+        started_at_gate = source == "pretool_gate" and state["generation"] == 0
         if source in RESET_SOURCES or state["generation"] == 0:
             state.update(generation=state["generation"] + 1, receipts=[], override=None,
                          gate_opened_at=None, pending_reads=[])
@@ -326,6 +330,10 @@ def session_start(core, root, gitdir, harness, session, source):
         except IntegrityError:
             state["list_sha256"] = None
         _write_state(core, path, state)
+    if started_at_gate:
+        core.record_event(root, "required_reads.generation_started", harness=harness,
+                          session=session, result="pretool_gate",
+                          details={"source": "pretool_gate", "generation": state["generation"]})
     return state
 
 
@@ -671,8 +679,19 @@ def pretool_gate(core, root, gitdir, harness, payload):
             return None
         if not isinstance(session, str) or not session or len(session) > 512:
             return _deny(core, root, harness, session,
-                         "Required reads cannot identify this native session. Notify the worktree owner.",
+                         "Required reads cannot identify this native session because its native session ID "
+                         "is missing or malformed. Retry from the active harness session. If the ID remains "
+                         "unavailable, run `pattern-buffer guide --print` and notify the worktree owner. "
+                         "The gate remains closed.",
                          result="identity_missing")
+        try:
+            session_start(core, root, gitdir, harness, session, "pretool_gate")
+        except (OSError, ValueError, TypeError, UnicodeError) as error:
+            return _deny(core, root, harness, session,
+                         "Required-read session state could not be initialized. "
+                         f"Reason: {type(error).__name__}. "
+                         "Run `pattern-buffer guide --print` and notify the worktree owner. "
+                         "The gate remains closed.", result="state_initialization_failed")
         try:
             config, _source = core.load(root, gitdir)
             role, _origin, _saved = core.resolve_role(root, gitdir, config, harness, session)
@@ -713,14 +732,19 @@ def pretool_gate(core, root, gitdir, harness, payload):
                                                     parsed, command, role)
                 except (IntegrityError, ValueError) as error:
                     return _deny(core, root, harness, session,
-                                 f"Required-read snapshot could not be prepared: {error}. The gate remains closed.",
-                                 result="snapshot_unavailable")
+                                 f"Required read could not be bound because {error}. "
+                                 "Run `pattern-buffer guide --print` for recovery steps, then retry "
+                                 "from the same harness session. Notify the worktree owner if it still fails. "
+                                 "The gate remains closed.", result="binding_failure")
                 if not prepared:
                     if load_list(gitdir) is None:
                         return None
                     return _deny(core, root, harness, session,
-                                 "Required read could not be bound to this native tool call. The gate remains closed.",
-                                 result="identity_missing")
+                                 "Required read could not be bound because Pattern Buffer did not save "
+                                 "a pending snapshot for this native tool call. Retry the read in the same "
+                                 "harness session, then run `pattern-buffer guide --print` for recovery steps. "
+                                 "Notify the worktree owner if it still fails. The gate remains closed.",
+                                 result="snapshot_unavailable")
             return None
         names = [entry["name"] for entry in report["entries"]
                  if entry["state"] in {"pending", "stale", "integrity_error"}]
@@ -733,6 +757,7 @@ def pretool_gate(core, root, gitdir, harness, payload):
             command_note += " If the shell output is truncated, retry with an 8000-token output allowance."
         message = ("Required reads are pending for this context window: " + ", ".join(names) + ". "
                    + command_note + " Read the Required reads section in the Pattern Buffer guide.")
+        message += " Print the guide with `pattern-buffer guide --print`."
         return _deny(core, root, harness, session, message, missing=names)
     except IntegrityError as error:
         message = f"Required-read integrity failure: {error}. Notify the worktree owner. The gate remains closed."
@@ -923,12 +948,12 @@ def _read_command_snapshot(core, root, gitdir, harness, session, role, parsed, t
                            command):
     if (not isinstance(tool_use_id, str) or not tool_use_id or len(tool_use_id) > 512
             or any(ord(character) < 32 or ord(character) == 127 for character in tool_use_id)):
-        return None
+        raise ValueError("the native tool call ID is missing or malformed")
     state_file = state_path(gitdir, harness, session)
     with _state_lock(core, state_file):
         state = _read_state(state_file, harness, session)
         if state["generation"] < 1:
-            return None
+            raise ValueError("the current session has no active required-read generation")
         registration_file = registration_path(gitdir)
         with core.locked(registration_file.with_suffix(".lock")):
             required = load_list(gitdir)
