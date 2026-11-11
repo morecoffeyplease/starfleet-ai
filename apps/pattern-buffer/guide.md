@@ -63,10 +63,12 @@ python3 apps/pattern-buffer/pattern_buffer.py install \
 ```
 
 Use the matching harness name and settings file for Claude.
-The generated recovery command preserves whether checkpoint hooks were enabled for that settings file.
+The generated recovery command preserves whether checkpoint processing was enabled for that settings file.
 This updates only the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
 The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
 Review the harness's normal reload and trust controls after the install; installation does not confirm delivery.
+The installer keeps a `PostToolUse` hook for required-read completion when checkpoint processing is disabled.
+In that mode, the hook skips checkpoint processing and handles only required-read completion.
 
 The generic `pattern-buffer` launcher goes to `$HOME/.local/bin` for a standard install.
 Add that directory to `PATH` using your usual shell setup if you want the short command.
@@ -161,13 +163,22 @@ pattern-buffer --cwd /absolute/worktree read-required --harness codex --session 
 pattern-buffer --cwd /absolute/worktree read-required --harness codex --session ACTUAL_SESSION_ID --name engineering-guide
 ```
 
-The command flushes the selected bytes before it records only the path, file digest, byte count, part, list digest, time, and generation.
-Receipt state contains no document contents.
-A receipt proves that the command flushed those bytes for that session generation; it does not prove that the model received, understood, or followed them.
-The current 8192-byte part target for each harness is a provisional fixture-supported estimate.
-Native model-facing output size remains unverified, so owners should treat large-file behavior as pending native confirmation.
+`read-required` prints a canonical frame and performs no state, lock or telemetry writes.
+The frame includes the entry name, part number, document byte count and file digest.
+`PreToolUse` stores a bounded snapshot for the exact native session and tool call, including the current generation, list, entry, part and file identity.
+`PostToolUse` records the existing receipt only when its complete stdout matches that frame and the generation, list and file still match the snapshot.
+A standalone print, a missing or truncated response, a changed snapshot, or an unpaired tool call does not earn a receipt.
+Receipt state contains metadata only and no document contents.
+Codex supplies stdout as a string without an exit-status field, so a complete frame does not authenticate process exit.
+Claude supplies stdout with stderr and interruption or output flags, which the hook checks before accepting a frame.
+The Claude hook accepts removal of the final footer newline and compares every other frame byte, including the document bytes and footer digest.
+The four recorded native default-budget outputs included complete frames, including an 8192-byte document part, without an explicit output allowance.
+The observations came from Claude 2.1.322 and Codex 0.167.
+The largest observed Codex tool result was 8490 bytes, which is a sample and not a guaranteed output ceiling.
+These observations do not prove general model reception, comprehension or compliance.
 
 `required-reads status`, `status`, `doctor`, and `guide --print` remain available as read-only diagnostics when the manifest or a required file is invalid.
+Read-only status, doctor and handoff checks do not create locks or change required-read state.
 Doctor reports the registered digest, applicable files, pending session reads, the next command, and whether the selected settings file contains the Pattern Buffer `PreToolUse` hook.
 Hook presence in settings does not prove that the harness loaded or trusted the hook, honored a denial, or delivered its output.
 When no required-read manifest is registered, the gate stays inert and adds no hook output.

@@ -1,5 +1,7 @@
 """Focused required-read CLI and hook controls with isolated state."""
 
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 import pattern_buffer as ci
@@ -17,6 +20,7 @@ from _test_support import isolate_state_home
 
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
 OWNER_SESSION_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID")
+MISSING = object()
 
 
 class RequiredReadsTests(unittest.TestCase):
@@ -35,6 +39,7 @@ class RequiredReadsTests(unittest.TestCase):
                  "commit", "--allow-empty", "-qm", "Fixture")
         self.session = "codex-required-reads-session"
         self.env = {**os.environ, "HOME": str(self.home), "XDG_STATE_HOME": str(self.state_home)}
+        self.env.pop(ci.DISPATCH_ENV, None)
         for name in OWNER_SESSION_VARIABLES:
             self.env.pop(name, None)
         self.cli("init", "--default-role", "orchestrator")
@@ -73,7 +78,8 @@ class RequiredReadsTests(unittest.TestCase):
                 ci, self.root, self.gitdir, str(self.manifest_path),
                 confirm=lambda _prompt: self.root.name)
 
-    def hook(self, event, *, source="startup", tool="Edit", command=None, session=None, env=None):
+    def hook(self, event, *, source="startup", tool="Edit", command=None, session=None,
+             harness="codex", tool_use_id=None, tool_response=MISSING, env=None):
         payload = {
             "hook_event_name": event,
             "source": source,
@@ -82,10 +88,14 @@ class RequiredReadsTests(unittest.TestCase):
             "tool_name": tool,
             "tool_input": {"command": command} if command is not None else {},
         }
-        return self.cli("hook", "--harness", "codex", payload=payload, env=env)
+        if tool_use_id is not None:
+            payload["tool_use_id"] = tool_use_id
+        if tool_response is not MISSING:
+            payload["tool_response"] = tool_response
+        return self.cli("hook", "--harness", harness, payload=payload, env=env)
 
-    def start(self, source="startup"):
-        return self.hook("SessionStart", source=source)
+    def start(self, source="startup", *, harness="codex", session=None):
+        return self.hook("SessionStart", source=source, harness=harness, session=session)
 
     def gate_edit(self):
         result = self.hook("PreToolUse", tool="Edit")
@@ -98,10 +108,59 @@ class RequiredReadsTests(unittest.TestCase):
             arguments.extend(("--part", str(part)))
         return self.cli(*arguments, success=success, env=env)
 
-    def status(self, session=None):
-        result = self.cli("required-reads", "status", "--harness", "codex",
+    def prepare_read(self, *, harness="codex", name="engineering-guide", part=None,
+                     session=None, tool_use_id="required-read-tool-use"):
+        session = session or self.session
+        command = ["pattern-buffer", "--cwd", str(self.root), "read-required",
+                   "--harness", harness, "--session", session, "--name", name]
+        arguments = ["read-required", "--harness", harness, "--session", session, "--name", name]
+        if part is not None:
+            command.extend(("--part", str(part)))
+            arguments.extend(("--part", str(part)))
+        command_text = shlex.join(command)
+        prepared = self.hook("PreToolUse", tool="Bash", command=command_text,
+                             session=session, harness=harness, tool_use_id=tool_use_id)
+        self.assertEqual(prepared.stdout, "")
+        return command_text, arguments
+
+    def post_read(self, command, *, harness="codex", session=None, tool_use_id="required-read-tool-use",
+                  tool_response=MISSING):
+        return self.hook("PostToolUse", tool="Bash", command=command,
+                         session=session or self.session, harness=harness,
+                         tool_use_id=tool_use_id, tool_response=tool_response)
+
+    def native_read(self, *, harness="codex", name="engineering-guide", part=None,
+                    session=None, tool_use_id="required-read-tool-use", response_shape=None):
+        session = session or self.session
+        command_text, arguments = self.prepare_read(
+            harness=harness, name=name, part=part, session=session, tool_use_id=tool_use_id)
+        printed = self.cli(*arguments)
+        stdout = printed.stdout[:-1] if response_shape == "claude" else printed.stdout
+        if response_shape == "claude":
+            tool_response = {"stdout": stdout, "stderr": "", "interrupted": False,
+                             "isImage": False, "noOutputExpected": False}
+        else:
+            tool_response = stdout
+        finalized = self.post_read(command_text, session=session, harness=harness,
+                                   tool_use_id=tool_use_id, tool_response=tool_response)
+        return printed, finalized
+
+    def status(self, session=None, harness="codex"):
+        result = self.cli("required-reads", "status", "--harness", harness,
                           "--session", session or self.session)
         return json.loads(result.stdout)
+
+    def receipt_event_count(self):
+        return reliability.report(self.root, since="7d")["summary"]["by_event"].get(
+            "required_reads.receipt_recorded", 0)
+
+    def invoke_hook(self, payload, *, harness="codex", args=()):
+        stream = io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode("utf-8")), encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(ci.sys, "argv", [str(SCRIPT), "hook", "--harness", harness, *args]):
+            with mock.patch.object(ci.sys, "stdin", stream), redirect_stdout(output):
+                result = ci.main()
+        return result, output.getvalue()
 
     def test_no_registered_list_keeps_gate_inert_and_silent(self):
         result = self.hook("PreToolUse", tool="Edit")
@@ -156,7 +215,7 @@ class RequiredReadsTests(unittest.TestCase):
         denied = self.gate_edit()
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
 
-        self.read()
+        self.native_read()
         opened = self.status()
         self.assertTrue(opened["gate_open"])
         self.assertEqual(opened["pending_read_count"], 0)
@@ -170,10 +229,215 @@ class RequiredReadsTests(unittest.TestCase):
         denied_again = self.gate_edit()
         self.assertEqual(denied_again["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_both_recorded_native_response_shapes_finalize_the_complete_frame(self):
+        self.register()
+        cases = (("codex", "codex-recorded-session", None),
+                 ("claude", "claude-recorded-session", "claude"))
+        for harness, session, response_shape in cases:
+            with self.subTest(harness=harness):
+                self.start(harness=harness, session=session)
+                printed, _ = self.native_read(
+                    harness=harness, session=session, response_shape=response_shape,
+                    tool_use_id=f"{harness}-tool-use")
+                expected_document = b"# Engineering guide\nRead this complete fixture.\n"
+                digest = hashlib.sha256(expected_document).hexdigest()
+                expected = (f"--- Pattern Buffer required read: engineering-guide "
+                            f"(part 1 of 1, {len(expected_document)} bytes) ---\n"
+                            f"{expected_document.decode('utf-8')}\n"
+                            f"--- End required read: sha256={digest} ---\n")
+                self.assertEqual(printed.stdout, expected)
+                report = self.status(session, harness)
+                self.assertEqual(report["pending_read_count"], 0)
+                self.assertEqual(report["entries"][0]["state"], "current")
+        self.assertEqual(self.receipt_event_count(), 2)
+
+    def test_standalone_print_is_stdout_only_under_readonly_worktree_metadata(self):
+        self.register()
+        state_file = self.helper.state_path(self.gitdir, "codex", self.session)
+        state_directory = state_file.parent
+        context_directory = state_directory.parent
+        self.assertFalse(state_directory.exists())
+        before_receipts = self.receipt_event_count()
+        original_mode = context_directory.stat().st_mode & 0o777
+        os.chmod(context_directory, original_mode & ~0o222)
+        try:
+            printed = self.read()
+        finally:
+            os.chmod(context_directory, original_mode)
+
+        expected_document = b"# Engineering guide\nRead this complete fixture.\n"
+        digest = hashlib.sha256(expected_document).hexdigest()
+        expected = (f"--- Pattern Buffer required read: engineering-guide "
+                    f"(part 1 of 1, {len(expected_document)} bytes) ---\n"
+                    f"{expected_document.decode('utf-8')}\n"
+                    f"--- End required read: sha256={digest} ---\n")
+        self.assertEqual(printed.stdout, expected)
+        self.assertEqual(printed.stderr, "")
+        self.assertFalse(state_directory.exists())
+        self.assertFalse(state_file.exists())
+        self.assertEqual(self.receipt_event_count(), before_receipts)
+
+    def test_status_doctor_and_handoff_remain_readonly_without_writable_metadata(self):
+        self.register()
+        self.start()
+        settings = self.home / "codex-settings.json"
+        settings.write_text(json.dumps(ci.hook_config("codex", SCRIPT, with_checkpoints=False)),
+                            encoding="utf-8")
+        context_directory = self.gitdir / "context-injector"
+        paths = [context_directory, *context_directory.rglob("*")]
+        modes = {path: path.stat().st_mode & 0o777 for path in paths}
+        before = {path.relative_to(context_directory).as_posix():
+                  path.read_bytes() if path.is_file() else None for path in paths
+                  if path != context_directory}
+        for path in sorted(paths, key=lambda item: len(item.parts), reverse=True):
+            os.chmod(path, modes[path] & ~0o222)
+        try:
+            status = self.cli("required-reads", "status", "--harness", "codex",
+                              "--session", self.session)
+            doctor = self.cli("doctor", "--harness", "codex", "--session", self.session,
+                              "--settings", str(settings))
+            handoff = self.cli("handoff-check", "--harness", "codex", "--session", self.session,
+                               "--settings", str(settings))
+        finally:
+            for path in sorted(paths, key=lambda item: len(item.parts), reverse=True):
+                os.chmod(path, modes[path])
+
+        self.assertEqual(json.loads(status.stdout)["pending_read_count"], 1)
+        self.assertIn("Required reads list", doctor.stdout)
+        self.assertTrue(json.loads(handoff.stdout)["configuration_ready"])
+        after_paths = [context_directory, *context_directory.rglob("*")]
+        after = {path.relative_to(context_directory).as_posix():
+                 path.read_bytes() if path.is_file() else None for path in after_paths
+                 if path != context_directory}
+        self.assertEqual(after, before)
+
+    def test_posttool_rejects_truncated_mismatched_and_unpaired_frames(self):
+        self.register()
+        self.start()
+        for tool_use_id, transform in (
+                ("truncated-frame", lambda text: text[:-1]),
+                ("mismatched-frame", lambda text: text.replace("sha256=", "sha256=0", 1))):
+            with self.subTest(tool_use_id=tool_use_id):
+                command, arguments = self.prepare_read(tool_use_id=tool_use_id)
+                printed = self.cli(*arguments)
+                self.post_read(command, tool_use_id=tool_use_id,
+                               tool_response=transform(printed.stdout))
+                self.assertEqual(self.status()["entries"][0]["state"], "pending")
+        command = shlex.join(["pattern-buffer", "--cwd", str(self.root), "read-required",
+                              "--harness", "codex", "--session", self.session,
+                              "--name", "engineering-guide"])
+        printed = self.read()
+        self.post_read(command, tool_use_id="unknown-tool-use", tool_response=printed.stdout)
+        self.assertEqual(self.status()["entries"][0]["state"], "pending")
+        self.assertEqual(self.receipt_event_count(), 0)
+
+    def test_completion_requires_exact_session_tool_id_and_command_binding(self):
+        self.register()
+        self.start()
+        tool_use_id = "exact-caller-tool-use"
+        command, arguments = self.prepare_read(tool_use_id=tool_use_id)
+        printed = self.cli(*arguments)
+        self.post_read(command, session="foreign-session", tool_use_id=tool_use_id,
+                       tool_response=printed.stdout)
+        self.post_read(command, tool_use_id="foreign-tool-use", tool_response=printed.stdout)
+        self.hook("PostToolUse", tool="Read", command=command, tool_use_id=tool_use_id,
+                  tool_response=printed.stdout)
+        self.post_read(command + " --part 1", tool_use_id=tool_use_id,
+                       tool_response=printed.stdout)
+        self.assertEqual(self.status()["entries"][0]["state"], "pending")
+
+        self.post_read(command, tool_use_id=tool_use_id, tool_response=printed.stdout)
+        self.assertEqual(self.status()["entries"][0]["state"], "current")
+        self.assertEqual(self.receipt_event_count(), 1)
+
+    def test_posttool_rejects_available_claude_failure_flags(self):
+        self.register()
+        session = "claude-failure-session"
+        self.start(harness="claude", session=session)
+        cases = (("interrupted", True), ("isImage", True),
+                 ("noOutputExpected", True), ("stderr", "fixture failure"))
+        for index, (key, value) in enumerate(cases):
+            with self.subTest(flag=key):
+                tool_use_id = f"claude-failure-{index}"
+                command, arguments = self.prepare_read(
+                    harness="claude", session=session, tool_use_id=tool_use_id)
+                printed = self.cli(*arguments)
+                response = {"stdout": printed.stdout, "stderr": "", "interrupted": False,
+                            "isImage": False, "noOutputExpected": False}
+                response[key] = value
+                self.post_read(command, harness="claude", session=session,
+                               tool_use_id=tool_use_id, tool_response=response)
+                self.assertEqual(self.status(session, "claude")["entries"][0]["state"], "pending")
+        self.assertEqual(self.receipt_event_count(), 0)
+
+    def test_posttool_rechecks_generation_list_and_file_identity(self):
+        self.register()
+        self.start()
+        for scenario in ("generation", "list", "file"):
+            with self.subTest(scenario=scenario):
+                if scenario == "file":
+                    self.register()
+                tool_use_id = f"changed-{scenario}"
+                command, arguments = self.prepare_read(tool_use_id=tool_use_id)
+                printed = self.cli(*arguments)
+                if scenario == "generation":
+                    self.start("compact")
+                    state_file = self.helper.state_path(self.gitdir, "codex", self.session)
+                    self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["pending_reads"], [])
+                elif scenario == "list":
+                    self.register(entries=[
+                        {"name": "engineering-guide", "path": str(self.document),
+                         "roles": ["orchestrator"]},
+                        {"name": "second-guide", "path": str(self.document),
+                         "roles": ["orchestrator"]},
+                    ])
+                else:
+                    self.document.write_text("# Changed synthetic guide\n", encoding="utf-8")
+                self.post_read(command, tool_use_id=tool_use_id, tool_response=printed.stdout)
+                self.assertEqual(self.receipt_event_count(), 0)
+                self.assertEqual(self.status()["pending_read_count"], 1 if scenario != "list" else 2)
+
+    def test_same_tool_call_and_completion_retries_are_idempotent(self):
+        self.register()
+        self.start()
+        tool_use_id = "idempotent-tool-use"
+        command, arguments = self.prepare_read(tool_use_id=tool_use_id)
+        self.prepare_read(tool_use_id=tool_use_id)
+        state_file = self.helper.state_path(self.gitdir, "codex", self.session)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["pending_reads"]), 1)
+
+        printed = self.cli(*arguments)
+        self.post_read(command, tool_use_id=tool_use_id, tool_response=printed.stdout)
+        self.post_read(command, tool_use_id=tool_use_id, tool_response=printed.stdout)
+        self.assertEqual(self.status()["entries"][0]["state"], "current")
+        self.assertEqual(self.receipt_event_count(), 1)
+
+    def test_no_checkpoints_installs_receipt_only_posttool_handler(self):
+        self.register()
+        config = ci.hook_config("codex", SCRIPT, with_checkpoints=False)
+        self.assertEqual(set(config["hooks"]), {"SessionStart", "PreToolUse", "PostToolUse"})
+        handler = config["hooks"]["PostToolUse"][0]["hooks"][0]
+        self.assertIn("--required-reads-only", shlex.split(handler["command"], comments=True))
+        self.assertFalse(ci.installed_checkpoints_enabled(config, "codex"))
+
+        self.start()
+        tool_use_id = "recovery-only-tool-use"
+        command, arguments = self.prepare_read(tool_use_id=tool_use_id)
+        printed = self.cli(*arguments)
+        payload = {"hook_event_name": "PostToolUse", "cwd": str(self.root),
+                   "session_id": self.session, "tool_name": "Bash", "tool_use_id": tool_use_id,
+                   "tool_input": {"command": command}, "tool_response": printed.stdout}
+        with mock.patch.object(ci, "checkpoint_event", side_effect=AssertionError("checkpoint processing ran")):
+            result, output = self.invoke_hook(payload, args=("--required-reads-only",))
+        self.assertEqual(result, 0)
+        self.assertEqual(output, "")
+        self.assertEqual(self.status()["entries"][0]["state"], "current")
+
     def test_resume_keeps_receipts_while_clear_and_fork_reset_generation(self):
         self.register()
         self.start("startup")
-        self.read()
+        self.native_read()
         before_resume = self.status()
 
         self.start("resume")
@@ -197,7 +461,7 @@ class RequiredReadsTests(unittest.TestCase):
     def test_changed_and_missing_documents_stay_closed_while_diagnostics_work(self):
         self.register()
         self.start("startup")
-        self.read()
+        self.native_read()
         self.document.write_text("# Changed guide\n", encoding="utf-8")
         stale = self.status()
         self.assertEqual(stale["entries"][0]["state"], "stale")
@@ -290,13 +554,13 @@ class RequiredReadsTests(unittest.TestCase):
         initial = self.status()
         self.assertEqual(len(initial["entries"][0]["parts"]), 2)
 
-        self.read(part=1)
+        self.native_read(part=1, tool_use_id="multipart-part-1")
         after_first = self.status()
         self.assertEqual([part["state"] for part in after_first["entries"][0]["parts"]],
                          ["current", "pending"])
         self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
 
-        self.read(part=2)
+        self.native_read(part=2, tool_use_id="multipart-part-2")
         self.assertTrue(self.status()["gate_open"])
         self.assertIsNone(self.gate_edit())
 

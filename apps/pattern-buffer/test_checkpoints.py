@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import uuid
 
+import pattern_buffer as ci
 import pattern_buffer_checkpoint as checkpoints
 from _test_support import isolate_state_home
 
@@ -485,7 +486,13 @@ else:
         self.cli('install', '--harness', 'codex', '--settings', str(settings), '--runtime-dir', str(self.root.parent / 'rt'), '--no-checkpoints')
         cfg = json.loads(settings.read_text())
         self.assertNotIn('PreCompact', cfg['hooks'])
-        self.assertEqual(cfg['hooks']['PostToolUse'], [{'hooks': [other]}])
+        posttool_handlers = [handler for group in cfg['hooks']['PostToolUse']
+                             for handler in group['hooks']]
+        self.assertIn(other, posttool_handlers)
+        required_only = [handler for handler in posttool_handlers if ci.owned(handler, 'codex')]
+        self.assertEqual(len(required_only), 1)
+        self.assertIn('--required-reads-only', required_only[0]['command'])
+        self.assertFalse(ci.installed_checkpoints_enabled(cfg, 'codex'))
 
     def test_truncated_trace_sets_uncertainty_instead_of_resetting_count(self):
         self.enroll()

@@ -18,6 +18,7 @@ ENTRY_LIMIT = 64
 NAME_LIMIT = 80
 REASON_LIMIT = 500
 PART_SIZE = {"claude": 8192, "codex": 8192}
+PENDING_READ_LIMIT = 64
 ROLES = {"implementer", "orchestrator"}
 OWNER_SESSION_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID")
 RESET_SOURCES = {"startup", "compact", "clear", "fork"}
@@ -56,6 +57,15 @@ class RequiredList:
     entries: tuple[Entry, ...]
     registration_identity: tuple[int, int, int, int, int]
     list_identity: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class ReadSelection:
+    entry: Entry
+    snapshot: FileSnapshot
+    part: int
+    part_count: int
+    piece: bytes
 
 
 def registration_path(gitdir):
@@ -222,7 +232,7 @@ def _state_parent(path):
 def _new_state(harness, session):
     return {"schema_version": 1, "harness": harness, "session_id": session,
             "generation": 0, "receipts": [], "override": None,
-            "gate_opened_at": None, "list_sha256": None}
+            "gate_opened_at": None, "list_sha256": None, "pending_reads": []}
 
 
 def _read_state(path, harness, session):
@@ -244,6 +254,48 @@ def _read_state(path, harness, session):
         raise IntegrityError("required-reads receipts are malformed")
     if state.get("override") is not None and not isinstance(state["override"], dict):
         raise IntegrityError("required-reads override state is malformed")
+    pending = state.setdefault("pending_reads", [])
+    if not isinstance(pending, list) or len(pending) > PENDING_READ_LIMIT:
+        raise IntegrityError("required-reads pending snapshots are malformed")
+    pending_keys = {"tool_use_id", "command_sha256", "generation", "role", "list_sha256",
+                    "registration_identity", "list_identity", "name", "path", "part",
+                    "part_count", "file_sha256", "file_identity", "file_byte_count",
+                    "byte_count", "prepared_at"}
+    for item in pending:
+        if (not isinstance(item, dict) or set(item) != pending_keys
+                or not isinstance(item.get("tool_use_id"), str)
+                or not item["tool_use_id"] or len(item["tool_use_id"]) > 512
+                or not isinstance(item.get("command_sha256"), str)
+                or len(item["command_sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in item["command_sha256"])
+                or not isinstance(item.get("generation"), int)
+                or item["generation"] < 1
+                or item.get("role") is not None and item.get("role") not in ROLES
+                or not isinstance(item.get("list_sha256"), str)
+                or len(item["list_sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in item["list_sha256"])
+                or not isinstance(item.get("file_sha256"), str)
+                or len(item["file_sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in item["file_sha256"])
+                or not isinstance(item.get("registration_identity"), list)
+                or not isinstance(item.get("list_identity"), list)
+                or not isinstance(item.get("file_identity"), list)
+                or any(not isinstance(identity, list) or len(identity) != 5
+                       or any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                              for value in identity)
+                       for identity in (item["registration_identity"], item["list_identity"],
+                                        item["file_identity"]))
+                or not isinstance(item.get("name"), str)
+                or not isinstance(item.get("path"), str)
+                or not isinstance(item.get("part"), int) or isinstance(item["part"], bool)
+                or not isinstance(item.get("part_count"), int) or isinstance(item["part_count"], bool)
+                or not 1 <= item["part"] <= item["part_count"]
+                or not isinstance(item.get("file_byte_count"), int)
+                or not 0 <= item["file_byte_count"] <= DOCUMENT_LIMIT
+                or not isinstance(item.get("byte_count"), int)
+                or not 0 <= item["byte_count"] <= PART_SIZE[harness]
+                or not isinstance(item.get("prepared_at"), (int, float))):
+            raise IntegrityError("required-reads pending snapshots are malformed")
     return state
 
 
@@ -267,7 +319,7 @@ def session_start(core, root, gitdir, harness, session, source):
         state = _read_state(path, harness, session)
         if source in RESET_SOURCES or state["generation"] == 0:
             state.update(generation=state["generation"] + 1, receipts=[], override=None,
-                         gate_opened_at=None)
+                         gate_opened_at=None, pending_reads=[])
         try:
             required = load_list(gitdir)
             state["list_sha256"] = required.digest if required else None
@@ -654,6 +706,21 @@ def pretool_gate(core, root, gitdir, harness, payload):
         if harness == "claude" and tool in {"Read", "Glob", "Grep"}:
             return None
         if tool == "Bash" and allowed_cli_command(command, root, harness, session, core):
+            parsed = _parse_allowed_cli_command(command, root, harness, session, core)
+            if parsed is not None and parsed.command == "read-required":
+                try:
+                    prepared = prepare_pending_read(core, root, gitdir, harness, payload,
+                                                    parsed, command, role)
+                except (IntegrityError, ValueError) as error:
+                    return _deny(core, root, harness, session,
+                                 f"Required-read snapshot could not be prepared: {error}. The gate remains closed.",
+                                 result="snapshot_unavailable")
+                if not prepared:
+                    if load_list(gitdir) is None:
+                        return None
+                    return _deny(core, root, harness, session,
+                                 "Required read could not be bound to this native tool call. The gate remains closed.",
+                                 result="identity_missing")
             return None
         names = [entry["name"] for entry in report["entries"]
                  if entry["state"] in {"pending", "stale", "integrity_error"}]
@@ -791,13 +858,10 @@ def _same_list_snapshot(before, after):
             and before.list_identity == after.list_identity)
 
 
-def read_required(core, root, gitdir, harness, session, name=None, part=None, next_entry=False,
-                  role=None, output=None):
-    required = load_list(gitdir)
-    if required is None:
-        raise ValueError("no required-reads list is registered for this worktree")
+def _select_read(core, root, gitdir, harness, session, role, required, state,
+                 name=None, part=None, next_entry=False):
     if next_entry:
-        report = status(core, root, gitdir, harness, session, role)
+        report = _status_from_state(core, root, required, state, harness, session, role)
         for item in report["entries"]:
             if item["state"] in ("pending", "stale"):
                 name = item["name"]
@@ -824,56 +888,234 @@ def read_required(core, root, gitdir, harness, session, name=None, part=None, ne
     if not isinstance(part, int) or isinstance(part, bool) or not 1 <= part <= len(ranges):
         raise ValueError(f"--part must be from 1 to {len(ranges)} for {name}")
     offset, end = ranges[part - 1]
-    piece = snapshot.data[offset:end]
-    state_file, initial = _current_state(core, gitdir, harness, session)
-    generation = initial["generation"]
-    stream = output or getattr(sys.stdout, "buffer", sys.stdout)
-    header = (f"--- Pattern Buffer required read: {entry.name} "
-              f"(part {part} of {len(ranges)}, {len(piece)} bytes) ---\n").encode("utf-8")
-    footer = f"\n--- End required read: sha256={snapshot.sha256} ---\n".encode("utf-8")
+    return ReadSelection(entry, snapshot, part, len(ranges), snapshot.data[offset:end])
+
+
+def _read_frame(selection):
+    header = (f"--- Pattern Buffer required read: {selection.entry.name} "
+              f"(part {selection.part} of {selection.part_count}, "
+              f"{len(selection.piece)} bytes) ---\n").encode("utf-8")
+    footer = f"\n--- End required read: sha256={selection.snapshot.sha256} ---\n".encode("utf-8")
+    return header + selection.piece + footer
+
+
+def _write_frame(stream, frame):
     try:
-        stream.write(header)
-        stream.write(piece)
-        stream.write(footer)
+        stream.write(frame)
     except TypeError:
-        stream.write(header.decode("utf-8"))
-        stream.write(piece.decode("utf-8"))
-        stream.write(footer.decode("utf-8"))
+        stream.write(frame.decode("utf-8"))
     stream.flush()
 
-    receipt = {"generation": generation, "list_sha256": required.digest,
-               "name": entry.name, "path": str(entry.path), "sha256": snapshot.sha256,
-               "file_identity": list(snapshot.identity), "file_byte_count": len(snapshot.data),
-               "byte_count": len(piece), "part": part, "part_count": len(ranges),
-               "recorded_at": time.time()}
+
+def read_required(core, root, gitdir, harness, session, name=None, part=None, next_entry=False,
+                  role=None, output=None):
+    required = load_list(gitdir)
+    if required is None:
+        raise ValueError("no required-reads list is registered for this worktree")
+    state = _read_state(state_path(gitdir, harness, session), harness, session)
+    selection = _select_read(core, root, gitdir, harness, session, role, required, state,
+                             name=name, part=part, next_entry=next_entry)
+    stream = output or getattr(sys.stdout, "buffer", sys.stdout)
+    _write_frame(stream, _read_frame(selection))
+
+
+def _read_command_snapshot(core, root, gitdir, harness, session, role, parsed, tool_use_id,
+                           command):
+    if (not isinstance(tool_use_id, str) or not tool_use_id or len(tool_use_id) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in tool_use_id)):
+        return None
+    state_file = state_path(gitdir, harness, session)
+    with _state_lock(core, state_file):
+        state = _read_state(state_file, harness, session)
+        if state["generation"] < 1:
+            return None
+        registration_file = registration_path(gitdir)
+        with core.locked(registration_file.with_suffix(".lock")):
+            required = load_list(gitdir)
+            if required is None:
+                return None
+            selection = _select_read(
+                core, root, gitdir, harness, session, role, required, state,
+                name=parsed.name, part=parsed.part, next_entry=parsed.next_entry)
+            latest_required = load_list(gitdir)
+            latest_file = _snapshot(selection.entry.path, DOCUMENT_LIMIT,
+                                    f"required file {selection.entry.name}")
+            if (latest_required is None or not _same_list_snapshot(required, latest_required)
+                    or latest_file.identity != selection.snapshot.identity
+                    or latest_file.sha256 != selection.snapshot.sha256):
+                raise IntegrityError("required-read inputs changed before the read command")
+            snapshot = {
+                "tool_use_id": tool_use_id,
+                "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+                "generation": state["generation"],
+                "role": role,
+                "list_sha256": required.digest,
+                "registration_identity": list(required.registration_identity),
+                "list_identity": list(required.list_identity),
+                "name": selection.entry.name,
+                "path": str(selection.entry.path),
+                "part": selection.part,
+                "part_count": selection.part_count,
+                "file_sha256": selection.snapshot.sha256,
+                "file_identity": list(selection.snapshot.identity),
+                "file_byte_count": len(selection.snapshot.data),
+                "byte_count": len(selection.piece),
+                "prepared_at": time.time(),
+            }
+            pending = [item for item in state["pending_reads"]
+                       if item.get("tool_use_id") != tool_use_id]
+            pending.append(snapshot)
+            state["pending_reads"] = pending[-PENDING_READ_LIMIT:]
+            _write_state(core, state_file, state)
+    return snapshot
+
+
+def prepare_pending_read(core, root, gitdir, harness, payload, parsed, command, role):
+    if payload.get("agent_id"):
+        return False
+    session = payload.get("session_id")
+    if not isinstance(session, str) or not session or len(session) > 512:
+        return False
+    return _read_command_snapshot(core, root, gitdir, harness, session, role, parsed,
+                                   payload.get("tool_use_id"), command) is not None
+
+
+def _response_stdout(harness, payload):
+    response = payload.get("tool_response")
+    if harness == "codex" and isinstance(response, str):
+        try:
+            return response.encode("utf-8"), False
+        except UnicodeError:
+            return None, False
+    if harness != "claude" or not isinstance(response, dict):
+        return None, False
+    stdout = response.get("stdout")
+    if not isinstance(stdout, str):
+        return None, True
+    stderr = response.get("stderr", "")
+    if not isinstance(stderr, str) or stderr:
+        return None, True
+    for flag in ("interrupted", "isImage", "noOutputExpected"):
+        value = response.get(flag, False)
+        if not isinstance(value, bool) or value:
+            return None, True
+    try:
+        return stdout.encode("utf-8"), True
+    except UnicodeError:
+        return None, True
+
+
+def _pending_matches_state(snapshot, required, selection, state):
+    return (snapshot.get("generation") == state["generation"]
+            and snapshot.get("list_sha256") == required.digest
+            and snapshot.get("registration_identity") == list(required.registration_identity)
+            and snapshot.get("list_identity") == list(required.list_identity)
+            and snapshot.get("name") == selection.entry.name
+            and snapshot.get("path") == str(selection.entry.path)
+            and snapshot.get("part") == selection.part
+            and snapshot.get("part_count") == selection.part_count
+            and snapshot.get("file_sha256") == selection.snapshot.sha256
+            and snapshot.get("file_identity") == list(selection.snapshot.identity)
+            and snapshot.get("file_byte_count") == len(selection.snapshot.data)
+            and snapshot.get("byte_count") == len(selection.piece))
+
+
+def posttool_finalize(core, root, gitdir, harness, payload):
+    if payload.get("agent_id"):
+        return False
+    session = payload.get("session_id")
+    tool_use_id = payload.get("tool_use_id")
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if (not isinstance(session, str) or not session or len(session) > 512
+            or not isinstance(tool_use_id, str) or not tool_use_id or len(tool_use_id) > 512
+            or payload.get("tool_name") != "Bash" or not isinstance(command, str)):
+        return False
+    parsed = _parse_allowed_cli_command(command, root, harness, session, core)
+    if parsed is None or parsed.command != "read-required":
+        return False
+    if load_list(gitdir) is None:
+        return False
+    state_file = state_path(gitdir, harness, session)
+    if not state_file.exists() and not state_file.is_symlink():
+        return False
+    command_digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+    stdout, normalize_footer = _response_stdout(harness, payload)
+    if not isinstance(stdout, bytes):
+        stdout = None
     opened = False
     with _state_lock(core, state_file):
         current = _read_state(state_file, harness, session)
-        if current["generation"] != generation:
-            raise ValueError("context window changed after output; no receipt was recorded")
-        registration_file = registration_path(gitdir)
-        with core.locked(registration_file.with_suffix(".lock")):
-            latest_required = load_list(gitdir)
-            if latest_required is None or not _same_list_snapshot(required, latest_required):
-                raise ValueError("required-reads list changed after output; no receipt was recorded")
-            latest_file = _snapshot(entry.path, DOCUMENT_LIMIT, f"required file {entry.name}")
-            if (latest_file.identity != snapshot.identity or latest_file.sha256 != snapshot.sha256):
-                raise ValueError("required file changed after output; no receipt was recorded")
-        current["list_sha256"] = required.digest
-        current["receipts"] = [item for item in current["receipts"]
-                               if not (item.get("name") == entry.name and item.get("part") == part)]
-        current["receipts"].append(receipt)
-        current["receipts"].sort(key=lambda item: (item.get("name", ""), item.get("part", 0)))
-        report = _status_from_state(core, root, latest_required, current, harness, session, role)
-        if report and report["pending_count"] == 0 and current.get("gate_opened_at") is None:
-            current["gate_opened_at"] = time.time()
-            opened = True
+        pending = next((item for item in current["pending_reads"]
+                        if item.get("tool_use_id") == tool_use_id), None)
+        if pending is None or pending.get("command_sha256") != command_digest:
+            return False
+        current["pending_reads"] = [item for item in current["pending_reads"]
+                                    if item.get("tool_use_id") != tool_use_id]
+        success = False
+        required = None
+        selection = None
+        if stdout is not None:
+            registration_file = registration_path(gitdir)
+            with core.locked(registration_file.with_suffix(".lock")):
+                try:
+                    required = load_list(gitdir)
+                    if (required is not None
+                            and pending.get("generation") == current["generation"]
+                            and pending.get("list_sha256") == required.digest
+                            and pending.get("registration_identity") == list(required.registration_identity)
+                            and pending.get("list_identity") == list(required.list_identity)):
+                        entry = next((item for item in required.entries
+                                      if item.name == pending.get("name")
+                                      and str(item.path) == pending.get("path")), None)
+                        if entry is not None:
+                            snapshot = _snapshot(entry.path, DOCUMENT_LIMIT,
+                                                 f"required file {entry.name}")
+                            snapshot.data.decode("utf-8")
+                            ranges = _part_ranges(snapshot.data, PART_SIZE[harness])
+                            part = pending.get("part")
+                            if isinstance(part, int) and not isinstance(part, bool) and 1 <= part <= len(ranges):
+                                offset, end = ranges[part - 1]
+                                selection = ReadSelection(entry, snapshot, part, len(ranges),
+                                                          snapshot.data[offset:end])
+                                frame = _read_frame(selection)
+                                success = (_pending_matches_state(pending, required, selection, current)
+                                           and (stdout == frame or
+                                                normalize_footer and frame.endswith(b"\n")
+                                                and stdout == frame[:-1]))
+                except (IntegrityError, UnicodeError, OSError, ValueError):
+                    success = False
+        if success and required is not None and selection is not None:
+            generation = current["generation"]
+            receipt = {"generation": generation, "list_sha256": required.digest,
+                       "name": selection.entry.name, "path": str(selection.entry.path),
+                       "sha256": selection.snapshot.sha256,
+                       "file_identity": list(selection.snapshot.identity),
+                       "file_byte_count": len(selection.snapshot.data),
+                       "byte_count": len(selection.piece), "part": selection.part,
+                       "part_count": selection.part_count, "recorded_at": time.time()}
+            current["list_sha256"] = required.digest
+            current["receipts"] = [item for item in current["receipts"]
+                                   if not (item.get("name") == selection.entry.name
+                                           and item.get("part") == selection.part)]
+            current["receipts"].append(receipt)
+            current["receipts"].sort(key=lambda item: (item.get("name", ""), item.get("part", 0)))
+            report = _status_from_state(core, root, required, current, harness, session,
+                                        role=pending.get("role"))
+            if report["pending_count"] == 0 and current.get("gate_opened_at") is None:
+                current["gate_opened_at"] = time.time()
+                opened = True
         _write_state(core, state_file, current)
+    if not success or selection is None:
+        return False
     core.record_event(root, "required_reads.receipt_recorded", harness=harness, session=session,
-                      result="recorded", details={"name": entry.name, "sha256": snapshot.sha256,
-                                                   "byte_count": len(piece), "part": part,
-                                                   "part_count": len(ranges), "generation": generation})
+                      result="recorded", details={"name": selection.entry.name,
+                                                   "sha256": selection.snapshot.sha256,
+                                                   "byte_count": len(selection.piece),
+                                                   "part": selection.part,
+                                                   "part_count": selection.part_count,
+                                                   "generation": generation})
     if opened:
         core.record_event(root, "required_reads.gate_opened", harness=harness, session=session,
                           result="receipts_complete", details={"generation": generation})
-    return receipt
+    return True

@@ -727,8 +727,9 @@ def self_enroll(root, gitdir, args):
 def hook_config(harness, script=None, with_checkpoints=True, opencode_plugin=None):
     if harness == "opencode":
         return {"plugins": [str(Path(opencode_plugin or opencode_plugin_directory()).resolve())]}
-    command = shlex.join([sys.executable, str(script or Path(__file__).resolve()),
-                          "hook", "--harness", harness]) + marker(harness)
+    command_args = [sys.executable, str(script or Path(__file__).resolve()),
+                    "hook", "--harness", harness]
+    command = shlex.join(command_args) + marker(harness)
     handler = {"type": "command", "command": command, "timeout": 5}
     if harness == "codex":
         # Full output is strictly bounded in render, including the exact task brief.
@@ -742,6 +743,10 @@ def hook_config(harness, script=None, with_checkpoints=True, opencode_plugin=Non
             if event == "PreCompact":
                 extra_handler.pop("additionalContextLimit", None)
             result["hooks"][event] = [{"hooks": [extra_handler]}]
+    else:
+        read_handler = dict(handler)
+        read_handler["command"] = shlex.join([*command_args, "--required-reads-only"]) + marker(harness)
+        result["hooks"]["PostToolUse"] = [{"hooks": [read_handler]}]
     return result
 
 
@@ -975,10 +980,15 @@ def reconcile_hook_groups(groups, harness, additions):
 
 
 def installed_checkpoints_enabled(data, harness):
-    events = ("PreCompact", "PostToolUse", "UserPromptSubmit")
+    events = ("PreCompact", "UserPromptSubmit")
     if any(owned(handler, harness) for event in events
            for group in data.get("hooks", {}).get(event, []) for handler in group["hooks"]):
         return True
+    for group in data.get("hooks", {}).get("PostToolUse", []):
+        for handler in group["hooks"]:
+            command = handler.get("command", "")
+            if owned(handler, harness) and "--required-reads-only" not in command:
+                return True
     status_line = data.get("statusLine")
     command = status_line.get("command") if isinstance(status_line, dict) else None
     return (harness == "claude" and isinstance(command, str)
@@ -2972,7 +2982,7 @@ def check_required_context(root, gitdir, harness, session, agent=""):
     return None
 
 
-def hook(harness):
+def hook(harness, checkpoints_enabled=True):
     raw = sys.stdin.buffer.read(HOOK_INPUT_LIMIT + 1)
     if len(raw) > HOOK_INPUT_LIMIT:
         raise ValueError("hook input too large")
@@ -3000,6 +3010,10 @@ def hook(harness):
         if decision:
             print(json.dumps(decision, ensure_ascii=False), flush=True)
         return
+    if event == "PostToolUse":
+        required_reads.posttool_finalize(sys.modules[__name__], root, gitdir, harness, payload)
+        if not checkpoints_enabled:
+            return
     if event == "SessionStart" and not payload.get("agent_id"):
         required_reads.session_start(sys.modules[__name__], root, gitdir, harness,
                                      payload.get("session_id"), payload.get("source"))
@@ -3245,8 +3259,8 @@ def main():
     status_reads.add_argument("--session", required=True,
                               help="exact session ID; must match the native caller when one is present")
     read_required = sub.add_parser(
-        "read-required", help="print a required document and record its current-generation receipt",
-        description="Print one required document or the next unread part, then record only its path, digest, byte count, part, and time.",
+        "read-required", help="print a required document or its next unread part",
+        description="Print one canonical frame to stdout without changing receipt state. A matching native PostToolUse event records receipt metadata only when the complete output and current inputs pass validation.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n  pattern-buffer read-required --harness codex --name engineering-guide\n  pattern-buffer read-required --harness codex --next")
     read_required.add_argument("--harness", choices=("claude", "codex"), required=True,
@@ -3271,9 +3285,9 @@ def main():
             cmd.add_argument("--bin-dir", help="install the pattern-buffer launcher here; defaults to ~/.local/bin for standard installs and the runtime directory for custom --runtime-dir installs")
             mode = cmd.add_mutually_exclusive_group()
             mode.add_argument("--checkpoints", action="store_true", default=True,
-                              help="include the standard checkpoint hooks (default; does not enroll sessions)")
+                              help="include checkpoint processing hooks (default; does not enroll sessions)")
             mode.add_argument("--no-checkpoints", action="store_false", dest="checkpoints",
-                              help="explicit recovery-only installation without pressure hooks or Claude telemetry")
+                              help="disable checkpoint processing while retaining required-read receipt handling")
     for name in ("assign", "preview"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--harness", choices=HARNESS_CHOICES, required=True)
@@ -3338,6 +3352,7 @@ def main():
     cmd.add_argument("--agent", default="", help="existing agent ID used in the rendered preview header")
     cmd = sub.add_parser("hook")
     cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+    cmd.add_argument("--required-reads-only", action="store_true", help=argparse.SUPPRESS)
     cmd = sub.add_parser("hook-config", help="print configuration to merge manually")
     cmd.add_argument("--harness", choices=HARNESS_CHOICES, required=True)
     cmd.add_argument("--runtime-dir", help="select the OpenCode plugin runtime directory")
@@ -3399,7 +3414,7 @@ def main():
             sys.stdout.write(bounded(guide_source(), FILE_LIMIT))
             return 0
         if args.command == "hook":
-            hook(args.harness)
+            hook(args.harness, checkpoints_enabled=not args.required_reads_only)
             return 0
         if args.command == "hook-config":
             if args.harness == "opencode" and not args.checkpoints:
