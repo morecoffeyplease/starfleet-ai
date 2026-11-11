@@ -727,20 +727,26 @@ def self_enroll(root, gitdir, args):
 def hook_config(harness, script=None, with_checkpoints=True, opencode_plugin=None):
     if harness == "opencode":
         return {"plugins": [str(Path(opencode_plugin or opencode_plugin_directory()).resolve())]}
-    command = shlex.join([sys.executable, str(script or Path(__file__).resolve()),
-                          "hook", "--harness", harness]) + marker(harness)
+    command_args = [sys.executable, str(script or Path(__file__).resolve()),
+                    "hook", "--harness", harness]
+    command = shlex.join(command_args) + marker(harness)
     handler = {"type": "command", "command": command, "timeout": 5}
     if harness == "codex":
         # Full output is strictly bounded in render, including the exact task brief.
         handler["additionalContextLimit"] = 0
     result = {"hooks": {"SessionStart": [{
         "matcher": "startup|resume|compact|fork|clear", "hooks": [handler]}]}}
+    result["hooks"]["PreToolUse"] = [{"hooks": [dict(handler)]}]
     if with_checkpoints:
         for event in ("PreCompact", "PostToolUse", "UserPromptSubmit"):
             extra_handler = dict(handler)
             if event == "PreCompact":
                 extra_handler.pop("additionalContextLimit", None)
             result["hooks"][event] = [{"hooks": [extra_handler]}]
+    else:
+        read_handler = dict(handler)
+        read_handler["command"] = shlex.join([*command_args, "--required-reads-only"]) + marker(harness)
+        result["hooks"]["PostToolUse"] = [{"hooks": [read_handler]}]
     return result
 
 
@@ -755,7 +761,7 @@ def opencode_plugin_directory(runtime_dir=None):
     runtime = opencode_runtime_directory(runtime_dir) if runtime_dir else Path(__file__).resolve().parent
     return runtime / "opencode-plugin"
 
-RUNTIME_HELPERS = ("checkpoint", "enrollment", "sessions", "reliability")
+RUNTIME_HELPERS = ("checkpoint", "enrollment", "sessions", "reliability", "required_reads")
 
 
 def runtime_bundle_paths(script):
@@ -896,6 +902,7 @@ def prepare_install(args):
         "enrollment": bounded(enrollment_source(), 256 * 1024),
         "sessions": bounded(auxiliary_source("sessions"), 256 * 1024),
         "reliability": bounded(auxiliary_source("reliability"), 256 * 1024),
+        "required_reads": bounded(auxiliary_source("required_reads"), 256 * 1024),
     }
     launcher_template = sources["launcher_template"]
     runtime_binding = "RUNTIME_DIR = None"
@@ -926,7 +933,7 @@ def read_settings(path):
     data = json.loads(bounded(path, 1024 * 1024))
     if not isinstance(data, dict) or not isinstance(data.get("hooks", {}), dict):
         raise ValueError("settings and hooks must be JSON objects")
-    for event in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit"):
+    for event in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit", "PreToolUse"):
         groups = data.get("hooks", {}).get(event, [])
         if not isinstance(groups, list):
             raise ValueError(f"{event} must be an array")
@@ -973,10 +980,15 @@ def reconcile_hook_groups(groups, harness, additions):
 
 
 def installed_checkpoints_enabled(data, harness):
-    events = ("PreCompact", "PostToolUse", "UserPromptSubmit")
+    events = ("PreCompact", "UserPromptSubmit")
     if any(owned(handler, harness) for event in events
            for group in data.get("hooks", {}).get(event, []) for handler in group["hooks"]):
         return True
+    for group in data.get("hooks", {}).get("PostToolUse", []):
+        for handler in group["hooks"]:
+            command = handler.get("command", "")
+            if owned(handler, harness) and "--required-reads-only" not in command:
+                return True
     status_line = data.get("statusLine")
     command = status_line.get("command") if isinstance(status_line, dict) else None
     return (harness == "claude" and isinstance(command, str)
@@ -1017,7 +1029,7 @@ def configure_hooks(args):
         runtime = install["runtime"] if install else None
         additions_by_event = (hook_config(args.harness, runtime, args.checkpoints)["hooks"]
                               if install else {})
-        for event in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit"):
+        for event in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit", "PreToolUse"):
             groups = reconcile_hook_groups(hooks.get(event, []), args.harness,
                                            additions_by_event.get(event, []))
             if groups:
@@ -2414,6 +2426,26 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
         checks["hook_runtime"] = {"ok": False, "detail": f"Local hook/runtime preflight failed: {error}",
                                   "next_action": next_action}
 
+    required_reads_report = None
+    try:
+        required_reads_helper = auxiliary("required_reads")
+        required_reads_report = required_reads_helper.status(
+            sys.modules[__name__], root, gitdir, harness, session, resolved_role.get("role"))
+        if required_reads_report is not None:
+            required_reads_ok = required_reads_report.get("ok", False)
+            checks["required_reads"] = {
+                "ok": required_reads_ok,
+                "detail": ("Required-read list and applicable files are valid." if required_reads_ok else
+                           "Required-read list or an applicable file failed its integrity check."),
+                "next_action": ("No required-read integrity repair is needed." if required_reads_ok else
+                                "Ask the worktree owner to repair and re-register the reviewed list or restore its required files."),
+            }
+    except (OSError, ValueError, TypeError, UnicodeError, KeyError, ImportError) as error:
+        checks["required_reads"] = {
+            "ok": False,
+            "detail": f"Required-read status is unavailable: {error}",
+            "next_action": "Ask the worktree owner to inspect the required-read registration and files.",
+        }
     configuration_ready = all(check["ok"] for check in checks.values())
     checkpoint = checkpoint_handoff_report(root, gitdir, harness, session, resolved_role.get("role"),
                                            resolved_role.get("source"))
@@ -2428,7 +2460,7 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
         "next_action": "Use the existing reliability report for retained local receipt events, then confirm actual reception through ordinary in-session observation.",
     }
     delivery_note = "Model reception is not recorded by this check; configuration and emitted hook output do not prove it."
-    return {
+    result = {
         "target_worktree": str(root),
         "harness": harness,
         "session": session,
@@ -2466,6 +2498,16 @@ def handoff_report(root, gitdir, config_path, harness, session, explicit_setting
             "This check is read-only and does not enroll, assign, install, repair, or dispatch.",
         ],
     }
+    if required_reads_report is not None:
+        result["required_reads"] = {
+            "state": "valid" if required_reads_report.get("ok") else "integrity_error",
+            "generation": required_reads_report.get("generation"),
+            "pending_read_count": required_reads_report.get("pending_read_count"),
+            "next_command": required_reads_report.get("next_command"),
+            "integrity_errors": required_reads_report.get("integrity_errors", []),
+            "receipt_limit": "A local receipt records emitted bytes for this generation; it does not prove model reception or comprehension.",
+        }
+    return result
 
 
 def render_failure_kind(error):
@@ -2940,7 +2982,7 @@ def check_required_context(root, gitdir, harness, session, agent=""):
     return None
 
 
-def hook(harness):
+def hook(harness, checkpoints_enabled=True):
     raw = sys.stdin.buffer.read(HOOK_INPUT_LIMIT + 1)
     if len(raw) > HOOK_INPUT_LIMIT:
         raise ValueError("hook input too large")
@@ -2948,7 +2990,7 @@ def hook(harness):
     if not isinstance(payload, dict):
         raise ValueError("hook input must be an object")
     event = payload.get("hook_event_name")
-    if event not in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit"):
+    if event not in ("SessionStart", "PreCompact", "PostToolUse", "UserPromptSubmit", "PreToolUse"):
         return
     if event == "SessionStart" and payload.get("source") not in ("startup", "resume", "compact", "fork", "clear"):
         return
@@ -2961,7 +3003,21 @@ def hook(harness):
         if event != "SessionStart":
             return  # Standard pressure hooks are inert outside Git worktrees too.
         raise
-    if not (gitdir / "context-injector" / "config.json").exists():
+    config_path = gitdir / "context-injector" / "config.json"
+    required_reads = auxiliary("required_reads")
+    if event == "PreToolUse":
+        decision = required_reads.pretool_gate(sys.modules[__name__], root, gitdir, harness, payload)
+        if decision:
+            print(json.dumps(decision, ensure_ascii=False), flush=True)
+        return
+    if event == "PostToolUse":
+        required_reads.posttool_finalize(sys.modules[__name__], root, gitdir, harness, payload)
+        if not checkpoints_enabled:
+            return
+    if event == "SessionStart" and not payload.get("agent_id"):
+        required_reads.session_start(sys.modules[__name__], root, gitdir, harness,
+                                     payload.get("session_id"), payload.get("source"))
+    if not config_path.exists():
         return  # This checkout has not opted in.
     config, _ = load(root, gitdir)
     if enabled(config):
@@ -2984,6 +3040,13 @@ def hook(harness):
     try:
         config, _ = load(root, gitdir)
         if not enabled(config):
+            notice = required_reads.session_start_notice(
+                sys.modules[__name__], root, gitdir, harness,
+                payload.get("session_id"), payload.get("agent_id") or "")
+            if notice:
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                           "additionalContext": notice}},
+                                 ensure_ascii=False), flush=True)
             return
         if token and payload.get("source") == "startup":
             if payload.get("agent_id"):
@@ -2997,6 +3060,11 @@ def hook(harness):
             output = rendered
         else:
             extra = checkpoint_event(root, gitdir, harness, payload)
+            notice = required_reads.session_start_notice(
+                sys.modules[__name__], root, gitdir, harness,
+                payload.get("session_id"), payload.get("agent_id") or "")
+            if notice:
+                extra = "\n\n".join(part for part in (extra, notice) if part)
             output = finalize_rendered_context(rendered, extra)
         text = output.text
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
@@ -3036,6 +3104,37 @@ def checkpoint_event(root, gitdir, harness, payload):
         if payload.get("hook_event_name") == "SessionStart":
             return "Checkpoint unavailable. Reconstruct current state from live evidence; preserve existing jobs and human holds."
         return ""
+
+
+def required_reads_command(root, gitdir, args):
+    helper = auxiliary("required_reads")
+    config, _source = load(root, gitdir)
+    if args.required_reads_action == "set":
+        result = helper.set_list(sys.modules[__name__], root, gitdir, args.file)
+    elif args.required_reads_action == "clear":
+        result = helper.clear_list(sys.modules[__name__], root, gitdir)
+    elif args.required_reads_action == "override":
+        session = helper.resolve_session(args.harness, args.session)
+        result = helper.override(sys.modules[__name__], root, gitdir, args.harness, session,
+                                 args.reason, args.minutes)
+    else:
+        session = helper.resolve_session(args.harness, args.session)
+        role, _origin, _saved = resolve_role(root, gitdir, config, args.harness, session)
+        result = helper.status(sys.modules[__name__], root, gitdir, args.harness, session, role)
+        if result is None:
+            raise ValueError("no required-reads list is registered for this worktree")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def read_required_command(root, gitdir, args):
+    helper = auxiliary("required_reads")
+    config, _source = load(root, gitdir)
+    session = helper.resolve_session(args.harness, args.session)
+    role, _origin, _saved = resolve_role(root, gitdir, config, args.harness, session)
+    if args.next_entry and args.part is not None:
+        raise ValueError("--part applies only with --name")
+    helper.read_required(sys.modules[__name__], root, gitdir, args.harness, session,
+                         name=args.name, part=args.part, next_entry=args.next_entry, role=role)
 
 
 def statusline(delegate_json):
@@ -3121,6 +3220,58 @@ def main():
     status.add_argument("--session", help="report the exact session's selected standing context")
     status.add_argument("--settings", help="inspect an explicit settings JSON file")
     status.add_argument("--runtime-dir", help="inspect the OpenCode plugin in an explicit runtime directory")
+    required_reads = sub.add_parser(
+        "required-reads", help="manage and inspect owner-reviewed required reads",
+        description="Register the owner-reviewed documents that gate tool use for each session role.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  pattern-buffer --cwd /worktree required-reads set --file ~/required-reads.json\n  pattern-buffer --cwd /worktree required-reads status --harness codex --session SESSION_ID")
+    required_actions = required_reads.add_subparsers(dest="required_reads_action", required=True)
+    set_reads = required_actions.add_parser(
+        "set", help="register a reviewed list after owner confirmation",
+        description="Register the reviewed JSON list for this worktree. Run it from an interactive terminal outside a harness session.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: pattern-buffer --cwd /worktree required-reads set --file ~/required-reads.json")
+    set_reads.add_argument("--file", required=True,
+                           help="reviewed UTF-8 JSON list file with schema_version 1 and entries")
+    clear_reads = required_actions.add_parser(
+        "clear", help="remove the registered list after owner confirmation",
+        description="Remove required-read registration for this worktree. Run it from an interactive terminal outside a harness session.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: pattern-buffer --cwd /worktree required-reads clear")
+    override_reads = required_actions.add_parser(
+        "override", help="open one session's gate for 1 to 60 minutes",
+        description="Open the required-reads gate for one session's current context generation. The owner confirms the target session in an interactive terminal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: pattern-buffer --cwd /worktree required-reads override --harness codex --session SESSION_ID --reason 'Urgent recovery' --minutes 10")
+    override_reads.add_argument("--harness", choices=("claude", "codex"), required=True,
+                                help="native harness that owns the target session")
+    override_reads.add_argument("--session", required=True, help="exact target session ID")
+    override_reads.add_argument("--reason", required=True, help="visible reason for opening the gate")
+    override_reads.add_argument("--minutes", required=True, type=int,
+                                help="whole minutes from 1 through 60")
+    status_reads = required_actions.add_parser(
+        "status", help="show entry and receipt state for one current context window",
+        description="Report each required entry for the session's current role and generation.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: pattern-buffer --cwd /worktree required-reads status --harness codex --session SESSION_ID")
+    status_reads.add_argument("--harness", choices=("claude", "codex"), required=True,
+                              help="native harness that owns the session")
+    status_reads.add_argument("--session", required=True,
+                              help="exact session ID; must match the native caller when one is present")
+    read_required = sub.add_parser(
+        "read-required", help="print a required document or its next unread part",
+        description="Print one canonical frame to stdout without changing receipt state. A matching native PostToolUse event records receipt metadata only when the complete output and current inputs pass validation.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  pattern-buffer read-required --harness codex --name engineering-guide\n  pattern-buffer read-required --harness codex --next")
+    read_required.add_argument("--harness", choices=("claude", "codex"), required=True,
+                               help="native harness that owns the session")
+    read_required.add_argument("--session", help="exact session ID; defaults to the native harness session")
+    read_choice = read_required.add_mutually_exclusive_group(required=True)
+    read_choice.add_argument("--name", help="registered entry name to print")
+    read_choice.add_argument("--next", action="store_true", dest="next_entry",
+                             help="print the next unread entry or part for this role")
+    read_required.add_argument("--part", type=int,
+                               help="1-based part number for a file larger than the harness piece size")
     handoff = sub.add_parser("handoff-check", help="read-only context, checkpoint, runtime, and evidence check for a successor")
     handoff.add_argument("--harness", choices=("claude", "codex"), required=True)
     handoff.add_argument("--session", required=True)
@@ -3134,9 +3285,9 @@ def main():
             cmd.add_argument("--bin-dir", help="install the pattern-buffer launcher here; defaults to ~/.local/bin for standard installs and the runtime directory for custom --runtime-dir installs")
             mode = cmd.add_mutually_exclusive_group()
             mode.add_argument("--checkpoints", action="store_true", default=True,
-                              help="include the standard checkpoint hooks (default; does not enroll sessions)")
+                              help="include checkpoint processing hooks (default; does not enroll sessions)")
             mode.add_argument("--no-checkpoints", action="store_false", dest="checkpoints",
-                              help="explicit recovery-only installation without pressure hooks or Claude telemetry")
+                              help="disable checkpoint processing while retaining required-read receipt handling")
     for name in ("assign", "preview"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--harness", choices=HARNESS_CHOICES, required=True)
@@ -3186,6 +3337,8 @@ def main():
         cmd.add_argument("--harness", choices=("claude", "codex"), default="codex")
         cmd.add_argument("--session", default="validation", help="session identity to include in the budget")
         cmd.add_argument("--agent", default="")
+        if name == "doctor":
+            cmd.add_argument("--settings", help="inspect this harness settings file without changing it")
     cmd = sub.add_parser("compose", help="compose reviewed rules and a worktree mission into a private context file")
     cmd.add_argument("--rules", required=True, help="absolute shared and role rules file")
     cmd.add_argument("--mission", required=True, help="absolute per-worktree mission file")
@@ -3199,6 +3352,7 @@ def main():
     cmd.add_argument("--agent", default="", help="existing agent ID used in the rendered preview header")
     cmd = sub.add_parser("hook")
     cmd.add_argument("--harness", choices=("claude", "codex"), required=True)
+    cmd.add_argument("--required-reads-only", action="store_true", help=argparse.SUPPRESS)
     cmd = sub.add_parser("hook-config", help="print configuration to merge manually")
     cmd.add_argument("--harness", choices=HARNESS_CHOICES, required=True)
     cmd.add_argument("--runtime-dir", help="select the OpenCode plugin runtime directory")
@@ -3260,7 +3414,7 @@ def main():
             sys.stdout.write(bounded(guide_source(), FILE_LIMIT))
             return 0
         if args.command == "hook":
-            hook(args.harness)
+            hook(args.harness, checkpoints_enabled=not args.required_reads_only)
             return 0
         if args.command == "hook-config":
             if args.harness == "opencode" and not args.checkpoints:
@@ -3279,7 +3433,13 @@ def main():
             return 0
         root, gitdir = checkout(args.cwd)
         config_path = gitdir / "context-injector" / "config.json"
-        if args.command == "reliability":
+        if args.command == "required-reads":
+            required_reads_command(root, gitdir, args)
+            return 0
+        elif args.command == "read-required":
+            read_required_command(root, gitdir, args)
+            return 0
+        elif args.command == "reliability":
             report = auxiliary("reliability").report(root, since=args.since)
             if report.get("ok"):
                 report["idle_timer_receipts"] = idle_receipt_report(root, report["since"])
@@ -3452,6 +3612,10 @@ def main():
                         owned(handler, args.harness)
                         for group in data.get("hooks", {}).get("SessionStart", [])
                         for handler in group["hooks"])
+                    result["owned_required_reads_pretool_handlers"] = sum(
+                        owned(handler, args.harness)
+                        for group in data.get("hooks", {}).get("PreToolUse", [])
+                        for handler in group["hooks"])
                 budget_session = args.session or (
                     "ses_" + "A" * 508 if args.harness == "opencode" else "validation")
                 try:
@@ -3475,6 +3639,31 @@ def main():
                               context_file=str(binding.path) if binding else str(source),
                               context_required=binding is not None)
                 reference_source = Path(binding.path) if binding else source
+            if args.harness in ("claude", "codex"):
+                helper = auxiliary("required_reads")
+                required_registration = helper.registration_path(gitdir)
+                if required_registration.exists() or required_registration.is_symlink():
+                    exact_session = bool(args.session)
+                    if args.session:
+                        required_session = helper.resolve_session(args.harness, args.session)
+                    else:
+                        try:
+                            required_session = helper.resolve_session(args.harness)
+                        except ValueError:
+                            required_session = "validation"
+                    try:
+                        role, _origin, _saved = resolve_role(
+                            root, gitdir, config, args.harness, required_session)
+                    except (OSError, ValueError, TypeError, UnicodeError, subprocess.SubprocessError):
+                        role = None
+                    required_report = helper.status(
+                        sys.modules[__name__], root, gitdir, args.harness, required_session, role)
+                    if required_report is not None:
+                        required_report["session_basis"] = (
+                            "requested session" if exact_session else
+                            "native harness session" if required_session != "validation" else
+                            "validation placeholder; pass --session for an exact session")
+                        result["required_reads"] = required_report
             result["reference_warnings"] = reference_warnings_for_path(reference_source, root)
             print(json.dumps(result, indent=2))
         elif args.command == "handoff-check":
@@ -3593,11 +3782,48 @@ def main():
                               "in its exact rendered budget", file=sys.stderr)
                 if not budget.get("ok", False):
                     failures.append(f"{role}: {budget.get('detail', 'context does not fit')}")
-            if failures:
+            if failures and args.command != "doctor":
                 raise ValueError("; ".join(failures))
-            print(f"Context valid: {report['source']}; default role: {config.get('default_role') or 'unassigned'}")
+            if failures:
+                print(f"Context issues reported: {report['source']}")
+            else:
+                print(f"Context valid: {report['source']}; default role: {config.get('default_role') or 'unassigned'}")
             if args.command == "doctor":
-                print("Local data checked only. Hook installation, trust, delivery, and subagents are NOT verified.")
+                helper = auxiliary("required_reads")
+                try:
+                    required_report = helper.status(
+                        sys.modules[__name__], root, gitdir, args.harness, args.session,
+                        resolve_role(root, gitdir, config, args.harness, args.session, args.agent)[0])
+                except (OSError, ValueError, TypeError, UnicodeError, KeyError, ImportError) as error:
+                    required_report = {"registered": True, "ok": False,
+                                       "integrity_errors": [str(error)]}
+                if required_report is not None:
+                    digest_state = ("matches registration" if required_report.get("list_digest_matches")
+                                    else "invalid or unavailable")
+                    print(f"Required reads list: {required_report.get('list_path') or required_report.get('registration_path')} ({digest_state}).")
+                    for item in required_report.get("entries", []):
+                        print(f"  {item['name']}: {item['state']} ({item['path']})")
+                    for detail in required_report.get("integrity_errors", []):
+                        print(f"  Integrity error: {detail}")
+                    print(f"  Session {required_report.get('session_id')}, generation {required_report.get('generation')}, "
+                          f"pending reads {required_report.get('pending_read_count')}.")
+                    if required_report.get("next_command"):
+                        print(f"  Next command: {required_report['next_command']}")
+                    if not required_report.get("ok", False):
+                        failures.append("required-read list or file integrity failed")
+                    settings = settings_path(args.harness, args.settings)
+                    try:
+                        settings_data = read_settings(settings)
+                        pretool_groups = settings_data.get("hooks", {}).get("PreToolUse", [])
+                        pretool_count = sum(owned(handler, args.harness)
+                                            for group in pretool_groups for handler in group["hooks"])
+                        print(f"PreToolUse hook configured for {args.harness}: {pretool_count}; "
+                              "native activation and delivery remain unverified.")
+                    except (OSError, ValueError, TypeError, UnicodeError) as error:
+                        print(f"PreToolUse hook presence unavailable: {error}; native activation remains unverified.")
+                if failures:
+                    raise ValueError("; ".join(failures))
+                print("Local registration and file state checked only. Hook presence is configuration evidence, not native activation or model receipt.")
         return 0
     except (OSError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError) as error:
         print(f"pattern-buffer: {error}", file=sys.stderr)

@@ -36,10 +36,11 @@ From a source checkout, install the selected harness into a new empty runtime us
         --runtime-dir /absolute/path/to/new-empty-runtime
 
 Use the matching harness name and settings file for Claude.
-The generated recovery command preserves whether checkpoint hooks were enabled for that settings file.
+The generated recovery command preserves whether checkpoint processing was enabled for that settings file.
 This updates the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
 The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
 Review the harness's normal reload and trust controls after the install; installation does not confirm delivery.
+The installer keeps a `PostToolUse` hook for required-read completion when checkpoint processing is disabled.
 
 Initialize a directly managed Git worktree with an editable context file.
 
@@ -119,6 +120,29 @@ Use a unique --receipt-file path when an immutable local snapshot is useful; a r
 OpenCode preparation and binding are separate from Claude and Codex launch dispatch, and never start an OpenCode process.
 For an exact-session parent or a child already bound to another owner, use the [supported owner and fresh-child route](docs/implementer-dispatch.md#parents-with-exact-session-context).
 Keep existing enrollments, tasks and human holds intact rather than substituting another mission or moving private registration metadata.
+
+## Required reads
+
+An owner can register a reviewed JSON list of absolute or home-relative document paths and the roles that must read each entry.
+Run `required-reads set` or `required-reads clear` from an interactive terminal outside every harness session, then type the worktree directory name when prompted.
+Agents may draft a list and inspect its status, but only the owner registers or clears it because harness sessions share the owner's operating-system account.
+The owner can temporarily open one exact session with `required-reads override --harness HARNESS --session SESSION_ID --reason REASON --minutes 1-60`; the terminal prompt requires the typed target session ID, and the override expires or resets with the context generation.
+The gate checks the resolved role, current list and required-file digests before allowing work, and known list or file integrity failures remain closed.
+Agents can use `required-reads status`, `status`, `doctor`, and `guide --print` to diagnose a closed gate, then notify the owner to restore a file or review and re-register the list.
+`read-required` prints a canonical frame and performs no state, lock or telemetry writes.
+`PreToolUse` stores a bounded snapshot for the exact native session and tool call, including the current generation, list, entry, part and file identity.
+`PostToolUse` records the existing receipt only when its complete stdout matches that frame and the generation, list and file still match the snapshot.
+A standalone print, a missing or truncated response, a changed snapshot, or an unpaired tool call does not earn a receipt.
+Status, doctor and handoff checks inspect existing state without creating locks or changing required-read state.
+Codex supplies stdout as a string without an exit-status field, so a complete frame does not authenticate process exit.
+Claude supplies stdout with stderr and interruption or output flags, which the hook checks before accepting a frame.
+The Claude hook accepts removal of the final footer newline and compares every other frame byte, including the document bytes and footer digest.
+The four recorded native default-budget outputs included complete frames, including an 8192-byte document part, without an explicit output allowance.
+The observations came from Claude 2.1.322 and Codex 0.167.
+The largest observed Codex tool result was 8490 bytes, which is a sample and not a guaranteed output ceiling.
+These observations do not prove general model reception, comprehension or compliance.
+The installed `PreToolUse` hook entry in harness settings shows configuration presence only, not native activation, trust, denial behavior or delivery.
+See the [printable guide's Required reads section](guide.md#required-reads) for owner recovery steps and command examples.
 
 ## Storage and event behavior
 

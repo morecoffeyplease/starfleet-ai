@@ -63,10 +63,12 @@ python3 apps/pattern-buffer/pattern_buffer.py install \
 ```
 
 Use the matching harness name and settings file for Claude.
-The generated recovery command preserves whether checkpoint hooks were enabled for that settings file.
+The generated recovery command preserves whether checkpoint processing was enabled for that settings file.
 This updates only the selected harness's owned hook command and leaves worktree enrollment and checkpoint files in place.
 The existing PATH launcher remains unchanged; use the new runtime's `pattern-buffer` launcher by explicit path for commands against the recovered runtime.
 Review the harness's normal reload and trust controls after the install; installation does not confirm delivery.
+The installer keeps a `PostToolUse` hook for required-read completion when checkpoint processing is disabled.
+In that mode, the hook skips checkpoint processing and handles only required-read completion.
 
 The generic `pattern-buffer` launcher goes to `$HOME/.local/bin` for a standard install.
 Add that directory to `PATH` using your usual shell setup if you want the short command.
@@ -121,6 +123,77 @@ The notice preserves unresolved scope and holds, states that it is not full cont
 Preview shows the ordinary-worktree warning and fallback behavior but omits event-specific checkpoint addenda, so the actual SessionStart total can differ.
 The hook uses the harness-reported working directory, not the directory from which installation was run.
 Unregistered worktrees emit no context.
+
+## Required reads
+
+The worktree owner may register a reviewed manifest that names each required document, its absolute or home-relative path, and its applicable roles.
+An entry applies to `orchestrator`, `implementer`, or both roles.
+For example:
+
+```json
+{
+  "schema_version": 1,
+  "entries": [
+    {"name": "engineering-guide", "path": "~/guides/engineering.md", "roles": ["orchestrator", "implementer"]}
+  ]
+}
+```
+
+The owner registers or clears the manifest from an interactive terminal outside every harness session.
+The owner types the worktree directory name to confirm either change.
+
+```sh
+pattern-buffer --cwd /absolute/worktree required-reads set --file /absolute/reviewed/required-reads.json
+pattern-buffer --cwd /absolute/worktree required-reads status --harness codex --session ACTUAL_SESSION_ID
+pattern-buffer --cwd /absolute/worktree required-reads clear
+```
+
+Agents may draft a manifest and run read-only status or doctor checks, but they cannot register or clear the list.
+Agents run under the same operating-system account as the owner, so the terminal check is a cooperative safeguard and does not prove who typed the confirmation.
+If the manifest or a required file is missing or changed, stop and notify the owner instead of editing or replacing the registered requirements.
+The owner can restore the reviewed file or review and register a corrected manifest after confirming every entry.
+
+Each session's `PreToolUse` gate checks the registered list, the resolved role, required-file integrity, and receipts for the current context generation.
+A new startup, compaction, clear, or fork starts a fresh generation, while a resume keeps the current generation.
+The SessionStart notice names pending reads and the next `read-required` command.
+Use the command to print a whole file or its next numbered part:
+
+```sh
+pattern-buffer --cwd /absolute/worktree read-required --harness codex --session ACTUAL_SESSION_ID --next
+pattern-buffer --cwd /absolute/worktree read-required --harness codex --session ACTUAL_SESSION_ID --name engineering-guide
+```
+
+`read-required` prints a canonical frame and performs no state, lock or telemetry writes.
+The frame includes the entry name, part number, document byte count and file digest.
+`PreToolUse` stores a bounded snapshot for the exact native session and tool call, including the current generation, list, entry, part and file identity.
+`PostToolUse` records the existing receipt only when its complete stdout matches that frame and the generation, list and file still match the snapshot.
+A standalone print, a missing or truncated response, a changed snapshot, or an unpaired tool call does not earn a receipt.
+Receipt state contains metadata only and no document contents.
+Codex supplies stdout as a string without an exit-status field, so a complete frame does not authenticate process exit.
+Claude supplies stdout with stderr and interruption or output flags, which the hook checks before accepting a frame.
+The Claude hook accepts removal of the final footer newline and compares every other frame byte, including the document bytes and footer digest.
+The four recorded native default-budget outputs included complete frames, including an 8192-byte document part, without an explicit output allowance.
+The observations came from Claude 2.1.322 and Codex 0.167.
+The largest observed Codex tool result was 8490 bytes, which is a sample and not a guaranteed output ceiling.
+These observations do not prove general model reception, comprehension or compliance.
+
+`required-reads status`, `status`, `doctor`, and `guide --print` remain available as read-only diagnostics when the manifest or a required file is invalid.
+Read-only status, doctor and handoff checks do not create locks or change required-read state.
+Doctor reports the registered digest, applicable files, pending session reads, the next command, and whether the selected settings file contains the Pattern Buffer `PreToolUse` hook.
+Hook presence in settings does not prove that the harness loaded or trusted the hook, honored a denial, or delivered its output.
+When no required-read manifest is registered, the gate stays inert and adds no hook output.
+
+An owner can temporarily open the gate for one exact target session with a visible reason and an expiry between one and sixty minutes:
+
+```sh
+pattern-buffer --cwd /absolute/worktree required-reads override \
+  --harness codex --session ACTUAL_SESSION_ID \
+  --reason "Urgent recovery" --minutes 10
+```
+
+The owner runs the override from an interactive terminal outside every harness session and types the target session ID to confirm it.
+The override belongs only to that session's current generation and ends when it expires or the generation changes.
+An override does not repair a changed manifest or missing required file.
 
 ### Compose rules and mission
 
