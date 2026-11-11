@@ -120,6 +120,20 @@ OpenCode preparation and binding are separate from Claude and Codex launch dispa
 For an exact-session parent or a child already bound to another owner, use the [supported owner and fresh-child route](docs/implementer-dispatch.md#parents-with-exact-session-context).
 Keep existing enrollments, tasks and human holds intact rather than substituting another mission or moving private registration metadata.
 
+## Required reads
+
+An owner can register a reviewed JSON list of absolute or home-relative document paths and the roles that must read each entry.
+Run `required-reads set` or `required-reads clear` from an interactive terminal outside every harness session, then type the worktree directory name when prompted.
+Agents may draft a list and inspect its status, but only the owner registers or clears it because harness sessions share the owner's operating-system account.
+The owner can temporarily open one exact session with `required-reads override --harness HARNESS --session SESSION_ID --reason REASON --minutes 1-60`; the terminal prompt requires the typed target session ID, and the override expires or resets with the context generation.
+The gate checks the resolved role, current list and required-file digests before allowing work, and known list or file integrity failures remain closed.
+Agents can use `required-reads status`, `status`, `doctor`, and `guide --print` to diagnose a closed gate, then notify the owner to restore a file or review and re-register the list.
+`read-required` prints the required file or one numbered part before recording only its path, digest, size, part and generation metadata.
+Receipts establish that the command flushed those bytes for the current session generation; they do not establish model reception, comprehension or compliance.
+The installed `PreToolUse` hook entry in harness settings shows configuration presence only, not native activation, trust, denial behavior or delivery.
+The current 8192-byte per-part targets for Claude and Codex are provisional fixture-supported estimates; native model-facing output measurements remain unverified.
+See the [printable guide's Required reads section](guide.md#required-reads) for owner recovery steps and command examples.
+
 ## Storage and event behavior
 
 Worktree configuration and task records live under the worktree's private Git directory.

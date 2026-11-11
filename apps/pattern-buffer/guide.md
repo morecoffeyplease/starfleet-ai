@@ -122,6 +122,68 @@ Preview shows the ordinary-worktree warning and fallback behavior but omits even
 The hook uses the harness-reported working directory, not the directory from which installation was run.
 Unregistered worktrees emit no context.
 
+## Required reads
+
+The worktree owner may register a reviewed manifest that names each required document, its absolute or home-relative path, and its applicable roles.
+An entry applies to `orchestrator`, `implementer`, or both roles.
+For example:
+
+```json
+{
+  "schema_version": 1,
+  "entries": [
+    {"name": "engineering-guide", "path": "~/guides/engineering.md", "roles": ["orchestrator", "implementer"]}
+  ]
+}
+```
+
+The owner registers or clears the manifest from an interactive terminal outside every harness session.
+The owner types the worktree directory name to confirm either change.
+
+```sh
+pattern-buffer --cwd /absolute/worktree required-reads set --file /absolute/reviewed/required-reads.json
+pattern-buffer --cwd /absolute/worktree required-reads status --harness codex --session ACTUAL_SESSION_ID
+pattern-buffer --cwd /absolute/worktree required-reads clear
+```
+
+Agents may draft a manifest and run read-only status or doctor checks, but they cannot register or clear the list.
+Agents run under the same operating-system account as the owner, so the terminal check is a cooperative safeguard and does not prove who typed the confirmation.
+If the manifest or a required file is missing or changed, stop and notify the owner instead of editing or replacing the registered requirements.
+The owner can restore the reviewed file or review and register a corrected manifest after confirming every entry.
+
+Each session's `PreToolUse` gate checks the registered list, the resolved role, required-file integrity, and receipts for the current context generation.
+A new startup, compaction, clear, or fork starts a fresh generation, while a resume keeps the current generation.
+The SessionStart notice names pending reads and the next `read-required` command.
+Use the command to print a whole file or its next numbered part:
+
+```sh
+pattern-buffer --cwd /absolute/worktree read-required --harness codex --session ACTUAL_SESSION_ID --next
+pattern-buffer --cwd /absolute/worktree read-required --harness codex --session ACTUAL_SESSION_ID --name engineering-guide
+```
+
+The command flushes the selected bytes before it records only the path, file digest, byte count, part, list digest, time, and generation.
+Receipt state contains no document contents.
+A receipt proves that the command flushed those bytes for that session generation; it does not prove that the model received, understood, or followed them.
+The current 8192-byte part target for each harness is a provisional fixture-supported estimate.
+Native model-facing output size remains unverified, so owners should treat large-file behavior as pending native confirmation.
+
+`required-reads status`, `status`, `doctor`, and `guide --print` remain available as read-only diagnostics when the manifest or a required file is invalid.
+Doctor reports the registered digest, applicable files, pending session reads, the next command, and whether the selected settings file contains the Pattern Buffer `PreToolUse` hook.
+Hook presence in settings does not prove that the harness loaded or trusted the hook, honored a denial, or delivered its output.
+When no required-read manifest is registered, the gate stays inert and adds no hook output.
+
+An owner can temporarily open the gate for one exact target session with a visible reason and an expiry between one and sixty minutes:
+
+```sh
+pattern-buffer --cwd /absolute/worktree required-reads override \
+  --harness codex --session ACTUAL_SESSION_ID \
+  --reason "Urgent recovery" --minutes 10
+```
+
+The owner runs the override from an interactive terminal outside every harness session and types the target session ID to confirm it.
+The override belongs only to that session's current generation and ends when it expires or the generation changes.
+An override does not repair a changed manifest or missing required file.
+
 ### Compose rules and mission
 
 Use `compose` to combine reviewed project rules with a per-worktree mission.
