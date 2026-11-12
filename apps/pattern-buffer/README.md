@@ -84,6 +84,7 @@ Use assign for a persistent worktree role or session-enroll for an exact native 
 Session enrollment replaces the worktree context for that exact identity and fails closed when required context is missing or invalid.
 Use the [session enrollment guide](docs/session-enrollments.md) for replacement handoffs, identity checks, trust limits and recovery.
 Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery notes, pressure reminders and Hailing Frequencies idle receipts.
+For enrolled Claude and Codex sessions, the standard recovery hook also gates ordinary tools until the latest published checkpoint is delivered in complete framed parts after an observed compaction.
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
 Pattern Buffer appends a short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
 The runtime reminder asks agents to use the installed PStack runtime and Poteto Mode.
