@@ -2765,17 +2765,95 @@ class DiscordWatchTests(unittest.TestCase):
         global_api.get("/gateway/bot")
         self.assertEqual(global_api.global_not_before, TEST_NOW + 15)
 
-    def test_managed_health_is_specific_to_the_requested_thread(self):
+    def test_managed_health_uses_configured_scope_for_quiet_and_new_threads(self):
         self.register()
-        self.app.scan(send=True, origin="worker")
+        self.app.scan(send=True)
+        self.app._record_worker_start(send=True, only_thread=None)
+        self.app._dispatch_turn(send=True)
+        self.app.register("200")
+        self.app.scan(only_thread="200")
         with mock.patch.object(self.app, "_lock_is_held", return_value=True):
-            self.assertTrue(self.app.managed(THREAD)["worker_health"]["ready_for_wakes"])
-            with contextlib.closing(self.app.database(create=False)) as db:
-                with db:
-                    db.execute("UPDATE meta SET value=? WHERE key='last_send_scope'", (json.dumps(["999"]),))
-            health = self.app.managed(THREAD)["worker_health"]
-            self.assertFalse(health["ready_for_wakes"])
-            self.assertFalse(health["thread_in_send_scope"])
+            quiet_health = self.app.managed(THREAD)["worker_health"]
+            new_health = self.app.managed("200")["worker_health"]
+        self.assertTrue(quiet_health["ready_for_wakes"])
+        self.assertEqual(quiet_health["last_send_scope"], [])
+        self.assertFalse(quiet_health["thread_in_send_scope"])
+        self.assertTrue(quiet_health["thread_covered_by_worker_scope"])
+        self.assertTrue(new_health["ready_for_wakes"])
+        self.assertEqual(new_health["last_scan_mode"], "observe")
+        self.assertEqual(new_health["worker_send_scope"], {"type": "all_threads"})
+        self.assertFalse(new_health["thread_in_send_scope"])
+        self.assertTrue(new_health["thread_covered_by_worker_scope"])
+
+    def test_managed_health_keeps_limited_worker_scope_separate_from_dispatch_worklist(self):
+        self.register()
+        self.app.register("200")
+        self.app.scan(send=True)
+        self.app._record_worker_start(send=True, only_thread=THREAD)
+        self.app._dispatch_turn(send=True, only_thread=THREAD)
+        with mock.patch.object(self.app, "_lock_is_held", return_value=True):
+            selected_health = self.app.managed(THREAD)["worker_health"]
+            excluded_health = self.app.managed("200")["worker_health"]
+        self.assertTrue(selected_health["ready_for_wakes"])
+        self.assertEqual(selected_health["worker_send_scope"], {"type": "thread", "thread_id": THREAD})
+        self.assertTrue(selected_health["thread_covered_by_worker_scope"])
+        self.assertFalse(excluded_health["ready_for_wakes"])
+        self.assertEqual(excluded_health["last_send_scope"], [THREAD])
+        self.assertFalse(excluded_health["thread_in_send_scope"])
+        self.assertFalse(excluded_health["thread_covered_by_worker_scope"])
+        self.assertIn("This thread is outside the worker's configured send scope", excluded_health["warnings"])
+
+    def test_managed_health_preserves_stopped_stale_observe_and_legacy_diagnostics(self):
+        self.register()
+        self.app.scan(send=True)
+        self.app._record_worker_start(send=True, only_thread=None)
+        self.app._dispatch_turn(send=True)
+        with mock.patch.object(self.app, "_lock_is_held", return_value=False):
+            stopped = self.app.managed(THREAD)["worker_health"]
+        self.assertFalse(stopped["worker_running"])
+        self.assertFalse(stopped["ready_for_wakes"])
+        self.assertTrue(stopped["thread_covered_by_worker_scope"])
+
+        self.clock[0] += 61
+        with mock.patch.object(self.app, "_lock_is_held", return_value=True):
+            stale = self.app.managed(THREAD)["worker_health"]
+        self.assertTrue(stale["worker_running"])
+        self.assertFalse(stale["worker_heartbeat_fresh"])
+        self.assertFalse(stale["ready_for_wakes"])
+
+        self.app.scan()
+        self.app._record_worker_start(send=False, only_thread=None)
+        self.app._dispatch_turn(send=False)
+        with mock.patch.object(self.app, "_lock_is_held", return_value=True):
+            observe_only = self.app.managed(THREAD)["worker_health"]
+        self.assertFalse(observe_only["worker_send_enabled"])
+        self.assertFalse(observe_only["ready_for_wakes"])
+        self.assertIn("The configured worker is observe-only", observe_only["warnings"])
+
+        self.app.scan()
+        self.app._record_worker_start(send=True, only_thread=None)
+        self.app._dispatch_turn(send=True)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("UPDATE meta SET value=? WHERE key='last_worker_tick_at'",
+                           (str(self.clock[0]),))
+        with mock.patch.object(self.app, "_lock_is_held", return_value=True):
+            legacy_heartbeat = self.app.managed(THREAD)["worker_health"]
+        self.assertTrue(legacy_heartbeat["worker_heartbeat_fresh"])
+        self.assertTrue(legacy_heartbeat["worker_send_enabled"])
+        self.assertFalse(legacy_heartbeat["worker_configuration_matches_heartbeat"])
+        self.assertFalse(legacy_heartbeat["ready_for_wakes"])
+
+        with contextlib.closing(self.app.database(create=False)) as db:
+            with db:
+                db.execute("DELETE FROM meta WHERE key='worker_sender_config'")
+                db.execute("UPDATE meta SET value='send' WHERE key='last_scan_mode'")
+                db.execute("UPDATE meta SET value=? WHERE key='last_send_scope'", (json.dumps([THREAD]),))
+        with mock.patch.object(self.app, "_lock_is_held", return_value=True):
+            legacy = self.app.managed(THREAD)["worker_health"]
+        self.assertIsNone(legacy["worker_send_enabled"])
+        self.assertFalse(legacy["ready_for_wakes"])
+        self.assertIn("Worker sender configuration is missing or invalid", legacy["warnings"])
 
     def test_failed_api_scan_does_not_refresh_success_health(self):
         self.register()

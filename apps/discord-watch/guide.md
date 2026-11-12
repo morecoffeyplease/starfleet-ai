@@ -95,6 +95,8 @@ The legacy agent-notify listener should stop polling a thread after `managed` re
 Reusing `register` from the same exact owner after local closure, a Closed tag, or archiving does not reopen the registration or reset its cursor, cutoff, or owner generation.
 An idempotent repeat of `--after` may use either the immutable initial cutoff or the current committed cursor.
 Its JSON includes worker health, and a stale worker warning does not change ownership or the central managed route.
+Worker health reports configured sender coverage separately from `last_send_scope`, which contains the latest dispatch worklist.
+An unrestricted sending worker covers quiet and newly registered threads before they have queued replies.
 Previously queued per-message records migrate into singleton frozen groups without resetting message state or attempt evidence.
 New groups are not sealed while the thread has an incomplete REST catch-up boundary or incomplete current-epoch Gateway recovery coverage.
 Worker submission and default foreground pulls wait for both per-thread ordering barriers, while explicit frozen-group and exact-message receipts remain available to the exact owner.
