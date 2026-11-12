@@ -154,6 +154,23 @@ class RequiredReadsTests(unittest.TestCase):
         return reliability.report(self.root, since="7d")["summary"]["by_event"].get(
             "required_reads.receipt_recorded", 0)
 
+    def initialize_checkpoint(self):
+        self.cli("checkpoint-init", "--harness", "codex", "--session", self.session,
+                 "--compact-at", "95")
+
+    def save_checkpoint(self):
+        note = ("# Working checkpoint\n\n"
+                "## Current state\nA private hook integration fixture.\n\n"
+                "## Next action\nRead the exact published frame before ordinary work.\n\n"
+                "## Decisions and uncertainty\nAuthority remains with the owner.\n\n"
+                "## Active work\nNo running work.\n\n"
+                "## Evidence\nSynthetic fixture only.\n\n"
+                "## Holds and guidance\nPreserve all owner holds.\n")
+        source = self.home / "checkpoint.md"
+        source.write_text(note, encoding="utf-8")
+        return json.loads(self.cli("checkpoint-save", "--harness", "codex", "--session",
+                                   self.session, "--file", str(source)).stdout)
+
     def invoke_hook(self, payload, *, harness="codex", args=()):
         stream = io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode("utf-8")), encoding="utf-8")
         output = io.StringIO()
@@ -783,6 +800,71 @@ class RequiredReadsTests(unittest.TestCase):
         after_compact = self.status()
         self.assertEqual(after_compact["generation"], before_compact["generation"] + 1)
         self.assertIsNone(after_compact["override"])
+        self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_static_override_notice_does_not_skip_checkpoint_recovery_gate(self):
+        self.register()
+        self.initialize_checkpoint()
+        self.start("compact")
+        with mock.patch.object(self.helper, "_require_owner_terminal", return_value=None):
+            self.helper.override(
+                ci, self.root, self.gitdir, "codex", self.session,
+                "Fixture override must not bypass checkpoint recovery", 10,
+                confirm=lambda _prompt: self.session)
+
+        result = self.gate_edit()
+        output = result["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("Required reads are open by owner override", output["permissionDecisionReason"])
+        self.assertIn("Pattern Buffer checkpoint recovery is required", output["permissionDecisionReason"])
+
+    def test_static_read_command_remains_available_while_checkpoint_recovery_is_pending(self):
+        self.register()
+        self.initialize_checkpoint()
+        self.start("compact")
+
+        self.native_read(tool_use_id="static-read-while-checkpoint-pending")
+        self.assertTrue(self.status()["gate_open"])
+        checkpoint = json.loads(self.cli("checkpoint-status", "--harness", "codex",
+                                         "--session", self.session).stdout)
+        self.assertTrue(checkpoint["recovery"]["required"])
+
+    def test_required_reads_json_status_remains_available_during_checkpoint_recovery(self):
+        self.initialize_checkpoint()
+        self.start("compact")
+        command = shlex.join([
+            "pattern-buffer", "--cwd", str(self.root), "required-reads", "status",
+            "--harness", "codex", "--session", self.session, "--json"])
+
+        hook = self.hook("PreToolUse", tool="Bash", command=command,
+                         tool_use_id="json-required-read-status-diagnostic")
+        self.assertEqual(hook.stdout, "")
+        status = json.loads(self.cli("required-reads", "status", "--harness", "codex",
+                                     "--session", self.session, "--json").stdout)
+        self.assertEqual(status, {"registered": False})
+
+    def test_checkpoint_frame_read_remains_available_while_static_read_is_pending(self):
+        self.register()
+        self.initialize_checkpoint()
+        self.save_checkpoint()
+        self.start("compact")
+
+        command = shlex.join([
+            "pattern-buffer", "--cwd", str(self.root), "checkpoint-read", "--harness", "codex",
+            "--session", self.session, "--part", "1"])
+        prepared = self.hook("PreToolUse", tool="Bash", command=command,
+                             tool_use_id="checkpoint-read-while-static-pending")
+        self.assertEqual(prepared.stdout, "")
+        frame = self.cli("checkpoint-read", "--harness", "codex", "--session", self.session,
+                         "--part", "1").stdout
+        completed = self.hook("PostToolUse", tool="Bash", command=command,
+                              tool_use_id="checkpoint-read-while-static-pending", tool_response=frame)
+        self.assertEqual(completed.stdout, "")
+
+        checkpoint = json.loads(self.cli("checkpoint-status", "--harness", "codex",
+                                         "--session", self.session).stdout)
+        self.assertFalse(checkpoint["recovery"]["required"])
+        self.assertEqual(self.status()["entries"][0]["state"], "pending")
         self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_multipart_receipts_require_each_utf8_safe_part(self):

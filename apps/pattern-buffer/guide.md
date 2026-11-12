@@ -31,10 +31,10 @@ It contains the approved mission, authoritative tracker, assignment, durable rul
 Change it only within its approval requirements.
 
 **The checkpoint** is the current implementation snapshot for your future self.
-Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
-Refresh it as a current snapshot and replace outdated state rather than appending.
-Remove completed work, superseded decisions and obsolete commands.
-Link useful history instead of repeating it.
+Preserve the facts needed to continue correctly without relying on automatic-summary coverage, and record each current-state fact once.
+Keep the current PR, worktree, revision and phase, the next action, active work, current decisions and relevant rejected approaches, exact commands needed to continue or recover, dependencies, exact job IDs and result locations, completed proof, evidence pointers, uncertainties, specific human grants or holds, and necessary operational exceptions.
+Reference mandatory guidance for general procedures instead of repeating them in the checkpoint.
+Prune superseded state and completed history, and link useful history instead of repeating it.
 A checkpoint does not change standing context or grant authority.
 
 ## Install or reuse the existing hooks
@@ -321,6 +321,17 @@ Check local enrollment with:
 ```sh
 pattern-buffer --cwd /absolute/worktree checkpoint-status --harness codex --session SESSION_UUID
 ```
+
+After an observed compaction, an enrolled Claude or Codex session must receive its latest published checkpoint before ordinary tool calls resume.
+Use the exact `checkpoint-read --part N` command supplied by the recovery hook, then check `checkpoint-status` for `recovery.required`, received parts and the next command.
+Only complete matching output paired with the native `PreToolUse` and `PostToolUse` events for every part of one published version clears the prerequisite; a standalone print or a native file-reader call does not create this receipt.
+A later checkpoint save in the same recovery generation does not reopen a completed read, while the next observed compaction requires a new read even when the note bytes are unchanged.
+The static required-read gate remains independent, so its `read-required` operation can proceed while checkpoint recovery is pending, and framed checkpoint reads can proceed while a static required read is pending.
+If the publication is missing or unreadable, keep recovery unresolved, inspect only that session's checkpoint, previous copy and owned draft, and edit only the owned draft until a valid publication can be read.
+Unknown history stays explicit, and older decisions or human holds remain authoritative unless their owner changes them.
+When history is uncertain and no new PreCompact capture or counted boundary distinguishes a compact signal, the gate may require a duplicate reread instead of relying on a completed receipt.
+This enforcement uses the existing standard Claude and Codex `PreToolUse` and `PostToolUse` hooks; the OpenCode context plugin remains outside this gate.
+Codex recovery still depends on an observed compaction hook signal, so a compaction during a continuing turn without that signal is not covered.
 
 Read the [checkpoint lifecycle guide](docs/checkpoints.md) for file locations, Git-ignore behavior, ownership, save/read commands and recovery limits.
 
