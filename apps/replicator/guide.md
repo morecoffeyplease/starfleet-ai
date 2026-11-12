@@ -13,17 +13,50 @@ If `replicator` is already installed, reuse it with `replicator guide --print`.
 Reuse existing tool installations, exact-owner registrations, hooks and workers.
 The successor's required receiving setup is part of the procedure; installation alone does not complete it.
 
-## Confirm the request and mission
+## Prepare the handoff before transition actions
 
 1. Confirm the explicit request, the outgoing session, the target worktree, the permitted successor route, and the current approval boundary.
 2. Read the approved goal, current issue or roadmap, latest human decisions, active work, evidence, repair counts, and holds.
 3. Ask the outgoing owner for the next concrete deliverable, current decisions, and any unresolved assumptions before repeating an investigation.
 4. Preserve the approved goal and scope unless the authorized user changes them.
-5. Reach a safe boundary before preparing the successor, and stop starting new product work at that boundary.
-6. Let active commands finish or record their exact continuing owner and recovery path.
-7. Update approved standing context and the roadmap through their existing owner workflows.
-8. Record the current branch, head, uncommitted changes, active jobs, evidence, holds, and next action in the existing checkpoint or handoff packet.
+5. Write a usable handoff in the existing checkpoint or handoff packet before any launch, enrollment, release, transfer, or retirement action.
+   Include the exact worktree, branch, head, uncommitted changes, active jobs, evidence, holds, and next action.
+6. Reach a safe boundary before preparing the successor, and stop starting new product work at that boundary.
+7. Let active commands finish or record their exact continuing owner and recovery path.
+8. Update approved standing context and the roadmap through their existing owner workflows.
 9. Keep one product writer at a time, and do not stop a worker or cancel work merely to make handoff easier.
+10. Update the handoff packet after each authorized transition action, and reconcile new work, evidence, messages, and holds before custody changes.
+
+## Run the read-only preflight
+
+Run preflight from the exact native caller and target worktree.
+Pass the context and guidance files that the successor must read:
+
+```sh
+replicator preflight \
+  --context-file /path/to/standing-context.md \
+  --guidance-file /path/to/AGENTS.md
+```
+
+Add `--json` for a structured report.
+Add `--skip-tool NAME` for each tool the user explicitly excludes from the handoff.
+Preflight records each exclusion as `skipped` and does not enroll or inspect the excluded tool.
+
+Preflight reads the supplied files to verify access to actual bytes.
+It does not print file paths, file contents, credentials, or native peer lists.
+The report includes separate checks for the exact native caller, Git worktree identity, context access, guidance access, model, effort, permissions, and explicit tool exclusions.
+The current CMUX snapshot provides caller identity and state, but no model, effort, or effective permission fields.
+Preflight therefore reports those settings as `unknown` today.
+Observe each setting through a supported native control scoped to the exact session before transferring custody.
+Do not infer settings from Model Preferences, launch arguments, environment overrides, or another session.
+
+Preflight uses `cmux current --json --limit 200` and bounded read-only Git commands.
+It does not run tool doctors, start sessions, change files, enroll tools, or verify native delivery.
+It reports custody acceptance, predecessor cleanup, native delivery, and pilot status as not assessed.
+An unavailable or ambiguous CMUX observation remains `unknown` and does not identify the refusal cause.
+If a context read fails, keep dependent handoff work blocked and repeat the same read after access recovers.
+Successful stat or mode checks do not prove that file bytes are readable.
+Git errors can follow unreadable metadata, so do not repair permissions or Git metadata from an error alone.
 
 ## Inspect the actual checkout and tools
 
@@ -63,6 +96,7 @@ Use `--harness claude` for Claude sessions and `--harness codex` for Codex sessi
 Inspect the Policy Guard seat status for every attached checkout, then inspect coverage from each applicable checkout.
 Do not infer a native identity from a title, a parent session, a saved profile, or a worktree default.
 An empty result covers only the exact owner and scope queried.
+Preflight does not replace these tool-specific owner checks.
 
 ## Record applicable resources
 
@@ -71,6 +105,8 @@ Check Pattern Buffer owner tasks and native child sessions, exact Hailing Freque
 Inspect only records owned by the outgoing session or resources explicitly in scope for this handoff.
 Enroll only the exact successor when a documented tool requires enrollment for this handoff.
 Do not blanket-enroll sessions or tools.
+Record each explicit user exclusion as excluded in the handoff packet, and do not enroll a tool to fill an excluded row.
+Verify each applicable tool with its exact owner and report unavailable dependent capabilities.
 Use `discord-watch status` and `managed THREAD_ID` to inspect managed threads without receiving another session's replies.
 Use `agent-notify wait POST_ID --timeout SECONDS` only for the exact conversation you own, and record any receipt it creates.
 If the supported tools cannot enumerate a required owned resource completely, record the scope as blocked instead of claiming it is empty.
@@ -86,6 +122,8 @@ End each row with one of these outcomes:
 
 Unknown ownership, an omitted applicable resource, unsupported required transfer, or unresolved human hold blocks the dependent transition and predecessor retirement.
 Continue independent authorized work when it does not depend on the unresolved item.
+Keep active children, jobs, retained results, pending replies, human drafts, and shared services under their verified owners.
+Do not stop, clear, or remove them to simplify a handoff.
 
 ## Review work and drift
 
@@ -98,23 +136,29 @@ It records the judgment and material answers in the existing checkpoint or roadm
 Only work or retirement that depends on a material unresolved issue stays on hold.
 Do not rewrite the goal, weaken required proof, expand repair authority, or add a model, panel, or mandatory questionnaire.
 
-## Start a successor through CMUX
+## Start a successor with the authorized command
 
 Observe the outgoing session's actual provider, model, effort, and effective permissions before launch.
-Use CMUX's existing agent-session integration for the same native harness.
-Read `cmux new-surface --help` to confirm the installed command and its current options.
+Preserve the exact minimal launch command and working directory authorized by the user.
+Use CMUX's agent-session integration when that integration is the authorized route.
+Read `cmux new-surface --help` when that is the authorized route.
+Do not replace an authorized command with another launch route.
+Do not add settings, environment, compaction, version, or permission overrides.
+Inspect wrapper-added arguments and verify the actual native settings after startup.
+If the authorized command cannot run, report the blocker and retain the outgoing owner.
 
-For example, use the observed workspace and exact worktree:
+These commands are examples only when the user authorized the CMUX route.
+Use the observed workspace and exact worktree:
 
 ```sh
 cmux new-surface --type agent-session --provider claude --workspace WORKSPACE_ID --working-directory /worktree
 cmux new-surface --type agent-session --provider codex --workspace WORKSPACE_ID --working-directory /worktree
 ```
 
-Do not launch a provider binary directly or invent CMUX lifecycle flags.
-These examples create a candidate and do not carry its model, effort or permission settings.
-Use the installed native controls that can preserve those settings, and verify the result before any transfer.
-If using terminal scripts, invoke the installed CMUX wrapper or verified shell integration rather than an absolute provider-binary path.
+These commands create a candidate and do not carry its model, effort, or permission settings.
+Use supported native controls to preserve those settings, and verify the result before any transfer.
+Do not invent CMUX lifecycle flags or switch to an unapproved provider-binary route.
+If an authorized terminal script is part of the command, invoke its installed wrapper or verified shell integration.
 Confirm that CMUX actually tracks the resulting native session before attempting owner enrollment.
 Keep the successor's initial prompt short.
 Identify its role, the approved mission and safety boundaries, and the installed `replicator guide --print` command.
@@ -129,6 +173,8 @@ A saved Model Preferences choice, command flag, or registration is configuration
 Do not change shared profiles, settings, permissions, or another session to make parity appear to match.
 If the successor's actual configuration differs or remains unknown, hold the dependent transfer and retain the outgoing session.
 Claude evidence does not qualify Codex, and Codex evidence does not qualify Claude.
+Observe a child's effective permission level in that exact child session.
+A parent's launch permission does not prove a child's permission level.
 
 ## Read and bind the successor independently
 
@@ -218,6 +264,9 @@ Use the actual outgoing harness for `--from-harness`.
 This rebind affects every attachment in that seat and requires fresh receiving evidence; it is not a single-worktree operation.
 Record each attachment and receiving result in the same resource section.
 Do not inherit the outgoing owner's receipt or claim that a configured hook proves actual receiving behavior.
+An explicit delivery-adapter probe proves only that adapter path.
+A successful Git command does not prove that a native hook activated.
+Verify a covered native action through its supported owner workflow.
 
 ## Preserve owned work and conversations
 
@@ -271,6 +320,14 @@ Do not assume atomic transfer, reset cadence, or create a second continuation fo
 Cancellation cannot retract input that the native tool already submitted.
 If no supported sequence preserves the exact schedule and pending occurrence without a duplicate or gap, retain the outgoing owner and hold dependent retirement.
 
+Before removing the outgoing owner's Hailing Frequencies enrollment, disable its checkpoint reminders through the owning Pattern Buffer workflow.
+Inspect every owned timer and occurrence through its exact owner.
+Complete or drain each occurrence through its supported owner workflow before removing the attention enrollment.
+Preserve timer cadence, deadlines, request identity, and any pending occurrence.
+The stale-generation cleanup limitation tracked by #58 remains unresolved.
+If a stale occurrence cannot be settled through a supported owner path, keep the required enrollment and predecessor in place.
+Do not cancel a foreign timer or record an unverified cleanup as complete.
+
 ## Reconcile cutover and acceptance
 
 Immediately before custody changes, repeat the authoritative queries for resources that could have arrived during preparation.
@@ -284,6 +341,8 @@ Do not treat a prepared command, registration, hook, guide print, or submitted w
 Retire only the exact predecessor through its supported normal CMUX control after both acceptances and all required resource rows are resolved.
 Do not force input, kill a process, clear a human hold, consume a foreign receipt, or remove shared services.
 If ownership, permission parity, receipt, or required custody remains unknown, keep the predecessor available and hold only the dependent transition.
+Operational readiness, custody acceptance, and predecessor cleanup are separate results.
+Preflight reports operational observations only and cannot accept custody or complete cleanup.
 
 ## Recover an interrupted handoff
 
