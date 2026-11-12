@@ -1196,6 +1196,11 @@ def _load_state(ci, root, gitdir, harness, session):
         raise ValueError("unsupported checkpoint metadata version")
     if state.get("identity") != _identity(root, gitdir, harness, session):
         raise ValueError("checkpoint identity changed")
+    state.setdefault("recovery_precompact_identity", None)
+    if (state["recovery_precompact_identity"] is not None
+            and (not isinstance(state["recovery_precompact_identity"], str)
+                 or re.fullmatch(r"[0-9a-f]{64}", state["recovery_precompact_identity"]) is None)):
+        raise ValueError("checkpoint recovery precompact identity is invalid")
     _validate_recovery_state(state)
     required = ("checkpoint_path", "previous_path", "compact_at", "lead_points", "threshold_source",
                 "reminders", "enabled", "reviewed_at", "saved_revision", "note_sha256",
@@ -1566,6 +1571,7 @@ def handle_cli(ci, root, gitdir, args):
                      "observed_generation": 0, "generation_uncertain": True,
                      "generation_scope": ("observed completion events; event coverage uncertain"
                                           if harness == "opencode" else "since enrollment"),
+                     "recovery_precompact_identity": None,
                      "uncertainty": ("native compaction completion events may be missed while the plugin is inactive"
                                      if harness == "opencode" else "no transcript provenance observed yet"),
                      "transcript": None,
@@ -1880,6 +1886,29 @@ def _usage(state, harness, payload, transcript, identity):
     return None
 
 
+def _precompact_capture_identity(state):
+    capture = state.get("precompact")
+    if not isinstance(capture, dict):
+        return None
+    identity = capture.get("identity")
+    if not isinstance(identity, dict) or set(identity) != {"path", "dev", "ino"}:
+        return None
+    if (not isinstance(identity.get("path"), str)
+            or any(isinstance(identity.get(key), bool) or not isinstance(identity.get(key), int)
+                   for key in ("dev", "ino"))):
+        return None
+    size, mtime_ns = capture.get("size"), capture.get("mtime_ns")
+    if (isinstance(size, bool) or not isinstance(size, int) or size < 0
+            or isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int)
+            or not isinstance(capture.get("captured_at"), str)
+            or not isinstance(capture.get("tail_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", capture["tail_sha256"]) is None):
+        return None
+    value = {"identity": identity, "size": size, "mtime_ns": mtime_ns,
+             "captured_at": capture["captured_at"], "tail_sha256": capture["tail_sha256"]}
+    return _digest(json.dumps(value, sort_keys=True).encode())
+
+
 def _count_boundaries(harness, data, session):
     count = 0
     uncertain = False
@@ -1948,6 +1977,7 @@ def event(ci, root, gitdir, harness, payload):
                 _arm_idle_timer(state, harness, session, intent, ci)
                 _write_json(state_path, state, ci)
             generation_before = state["observed_generation"]
+            pending_boundary_before = bool(state.get("pending_compact_boundary"))
             transcript, identity = _transcript_identity(ci, root, harness, session, payload)
             if transcript is None and name == "SessionStart" and not payload.get("transcript_path"):
                 state["generation_uncertain"] = True
@@ -2012,7 +2042,8 @@ def event(ci, root, gitdir, harness, payload):
                         end = offset + complete if complete else offset
                     state["transcript"] = {**identity, "offset": end}
                     _write_json(state_path, state, ci)
-            generation_changed = state["observed_generation"] > generation_before
+            generation_delta = state["observed_generation"] - generation_before
+            generation_changed = generation_delta > 0
             if generation_changed:
                 state["pending_compact_boundary"] = False
             elif name == "SessionStart" and payload.get("source") == "compact":
@@ -2025,11 +2056,39 @@ def event(ci, root, gitdir, harness, payload):
                                                  state.get("observed_generation")], sort_keys=True).encode())
                 recovery_provenance = ({key: identity.get(key) for key in ("path", "dev", "ino")}
                                        if transcript is not None and isinstance(identity, dict) else None)
-                recovery_correlation = _digest(json.dumps(
-                    [session, recovery_provenance, state.get("observed_generation")],
-                    sort_keys=True).encode())
+                recovery = _validate_recovery_state(state)
+                precompact_identity = _precompact_capture_identity(state)
+                new_precompact_capture = (precompact_identity is not None
+                                          and precompact_identity != state.get("recovery_precompact_identity"))
+                pending_boundary_confirmed = (
+                    pending_boundary_before and generation_delta == 1 and not new_precompact_capture
+                    and not state.get("generation_uncertain")
+                    and recovery.get("freshness_reason") ==
+                    "the latest compaction boundary is pending or may be a duplicate recovery event")
+                if pending_boundary_confirmed:
+                    recovery_correlation = recovery.get("event_correlation")
+                elif generation_changed:
+                    recovery_correlation = _digest(json.dumps(
+                        [session, recovery_provenance, state.get("observed_generation")],
+                        sort_keys=True).encode())
+                elif new_precompact_capture:
+                    recovery_correlation = _digest(json.dumps(
+                        [session, "precompact", precompact_identity], sort_keys=True).encode())
+                elif precompact_identity is not None and recovery.get("event_correlation"):
+                    recovery_correlation = recovery["event_correlation"]
+                else:
+                    recovery_correlation = _digest(json.dumps(
+                        [session, recovery_provenance, state.get("observed_generation")],
+                        sort_keys=True).encode())
+                same_event = recovery.get("event_correlation") == recovery_correlation
+                conservative_unknown_retry = (
+                    same_event and bool(state.get("generation_uncertain"))
+                    and not generation_changed and not pending_boundary_confirmed)
                 uncertain = bool(state.get("generation_uncertain") or state.get("pending_compact_boundary"))
-                _start_recovery_generation(ci, root, state, recovery_correlation, generation_changed)
+                _start_recovery_generation(ci, root, state, recovery_correlation, generation_changed,
+                                           conservative_unknown_retry)
+                if precompact_identity is not None:
+                    state["recovery_precompact_identity"] = precompact_identity
                 _write_json(state_path, state, ci)
                 _record(ci, root, state, "compaction.unknown" if uncertain else "compaction.observed",
                         "uncertain" if uncertain else "observed", correlation,
@@ -2220,10 +2279,11 @@ def _recovery_freshness(state, boundary_generation=None):
     return "unknown", "checkpoint publication metadata is newer than the confirmed compaction history", boundary_generation
 
 
-def _start_recovery_generation(ci, root, state, correlation, generation_changed):
+def _start_recovery_generation(ci, root, state, correlation, generation_changed,
+                               conservative_unknown_retry=False):
     recovery = _validate_recovery_state(state)
     same_event = recovery.get("event_correlation") == correlation
-    if same_event:
+    if same_event and not conservative_unknown_retry:
         return False
     boundary_generation = state.get("observed_generation", 0) - (1 if generation_changed else 0)
     freshness, reason, boundary_generation = _recovery_freshness(state, boundary_generation)

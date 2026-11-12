@@ -328,6 +328,8 @@ Duplicate delivery of the same retained boundary must not increment the counter 
 Some hosts run the recovery hook before persisting their boundary; recovery labels that boundary pending rather than pretending the count already includes it.
 When a later tool hook observes the boundary, it supplies one updated freshness notice.
 Without new transcript provenance, duplicate recovery delivery and a not-yet-persisted boundary remain ambiguous.
+A new `PreCompact` transcript capture can distinguish another recovery even when an oversized boundary record cannot be counted.
+When count history is uncertain and an explicit compact signal has no new capture or boundary evidence, the gate starts a fresh recovery generation and may request a duplicate reread rather than reuse a completed receipt.
 A bounded unread gap, replaced/truncated transcript or absent provenance is reported as uncertainty rather than a guaranteed lifetime total.
 A compact-boundary JSONL record larger than the 256 KiB scan window cannot be parsed as a complete record and may leave the generation count uncertain; this uncertainty no longer suppresses pressure reminders.
 Elapsed time, generations and revision differences are freshness signals, not automatic proof that a note is wrong.

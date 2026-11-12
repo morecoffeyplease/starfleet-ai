@@ -108,6 +108,11 @@ class CheckpointTests(unittest.TestCase):
             self.append(row)
         return self.event(harness=harness, session=session, source='compact')
 
+    def large_compact(self):
+        self.event(name='PreCompact')
+        self.append({'type': 'compacted', 'message': 'x' * (checkpoints.TRACE_LIMIT * 5)})
+        return self.event(source='compact')
+
     def checkpoint_status(self, harness='codex', session='pilot'):
         return json.loads(self.command('checkpoint-status', harness, session).stdout)
 
@@ -971,6 +976,82 @@ else:
         status = self.checkpoint_status()
         self.assertEqual(status['recovery']['freshness'], 'unknown')
         self.assertIn('freshness is unknown', unknown.stdout)
+
+    def test_distinct_large_compactions_use_precompact_capture_without_guessing_count(self):
+        self.enroll()
+        self.save()
+        self.event(source='startup')
+
+        self.large_compact()
+        first = self.checkpoint_status()
+        self.assertEqual(first['observed_generation'], 0)
+        self.assertTrue(first['generation_uncertain'])
+        self.assertEqual(first['recovery']['generation'], 1)
+        self.assertTrue(first['recovery']['required'])
+        self.assertEqual(first['recovery']['freshness'], 'unknown')
+        self.recovery_read(1, tool_use_id='first-large-compaction-read')
+        self.assertFalse(self.checkpoint_status()['recovery']['required'])
+
+        self.large_compact()
+        second = self.checkpoint_status()
+        self.assertEqual(second['observed_generation'], 0)
+        self.assertTrue(second['generation_uncertain'])
+        self.assertEqual(second['recovery']['generation'], 2)
+        self.assertTrue(second['recovery']['required'])
+        self.assertEqual(second['recovery']['freshness'], 'unknown')
+        ordinary = self.pretool(tool='Edit', tool_use_id='ordinary-after-second-large-compaction')
+        self.assertEqual(json.loads(ordinary.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_uncertain_compact_without_new_provenance_resets_partial_receipt(self):
+        registered = self.enroll()
+        self.note.write_text(NOTE + 'x' * 2200)
+        self.save()
+        self.event(source='startup')
+
+        self.large_compact()
+        before = self.checkpoint_status()
+        self.assertEqual(before['observed_generation'], 0)
+        self.assertEqual(before['recovery']['generation'], 1)
+        self.assertEqual(before['recovery']['part_count'], 2)
+        self.recovery_read(1, tool_use_id='partial-unknown-recovery-read')
+        self.assertEqual(self.checkpoint_status()['recovery']['received_parts'], [1])
+
+        repeated = self.event(source='compact')
+        after = self.checkpoint_status()
+        self.assertIn('recovery generation 2', repeated.stdout)
+        self.assertEqual(after['observed_generation'], 0)
+        self.assertEqual(after['recovery']['generation'], 2)
+        self.assertTrue(after['recovery']['required'])
+        self.assertEqual(after['recovery']['freshness'], 'unknown')
+        self.assertEqual(after['recovery']['received_parts'], [])
+        self.assertEqual(registered['draft_path'], after['draft_path'])
+        self.recovery_read(1, tool_use_id='restart-unknown-recovery-part-1')
+        self.recovery_read(2, tool_use_id='restart-unknown-recovery-part-2')
+        completed = self.checkpoint_status()['recovery']
+        self.assertFalse(completed['required'])
+
+        self.event(source='compact')
+        reopened = self.checkpoint_status()['recovery']
+        self.assertEqual(reopened['generation'], 3)
+        self.assertTrue(reopened['required'])
+        self.assertEqual(reopened['freshness'], 'unknown')
+        self.assertEqual(reopened['received_parts'], [])
+
+    def test_confirmed_duplicate_compact_after_completion_preserves_receipt(self):
+        self.enroll()
+        self.save()
+        self.event(source='startup')
+        self.compact()
+        self.recovery_read(1, tool_use_id='confirmed-compact-duplicate-read')
+        first = self.checkpoint_status()['recovery']
+        self.assertFalse(first['required'])
+
+        self.append({'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'ordinary row'}})
+        self.event(source='compact')
+        repeated = self.checkpoint_status()['recovery']
+        self.assertEqual(repeated['generation'], first['generation'])
+        self.assertFalse(repeated['required'])
+        self.assertEqual(repeated['receipt'], first['receipt'])
 
     def test_max_budget_unicode_checkpoint_completes_through_framed_cli_receipts(self):
         registered = self.enroll()
