@@ -66,10 +66,11 @@ python3 /path/to/installed/runtime/lane.py --cwd /product/worktree coverage --su
 
 ## Rebind an existing seat from a source checkout
 
-After an authorized transfer, a current source checkout can run the `rebind-owner` CLI when the installed runtime is unavailable.
+After an authorized same-harness transfer, a current source checkout can run the `rebind-owner` CLI when the installed CLI entrypoint is unavailable or outdated, provided the seat-recorded runtime remains present and intact.
 The command verifies the seat-recorded immutable runtime path, version, complete file manifest and hashes before checking active attachment pins.
 It preserves the installed runtime pin, adapter and hook targets, and leaves removed attachment records unchanged.
-This handoff path does not upgrade or repair the seat runtime, and changed or missing runtime files fail closed for recovery.
+This same-harness maintenance path does not upgrade or repair the seat runtime, and changed or missing runtime files fail closed for recovery.
+Cross-harness handoffs still require the executing source to match the complete seat-recorded runtime.
 See the [setup guide](guide.md#inspect-hand-off-and-recover) for the exact owner handoff command and limits.
 
 ## Report and delivery boundaries

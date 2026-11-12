@@ -178,6 +178,26 @@ def runtime_source_versions(runtime, harness):
     return {name: runtime['files'][name] for name in names}
 
 
+def permanent_handoff_source_versions(seat, harness):
+    try:
+        incoming = source_versions(harness)
+    except OSError:
+        raise ValueError('Incoming delivery adapter source is missing or unavailable; no owner handoff was recorded') from None
+    runtime = seat.get('runtime') if isinstance(seat, dict) else None
+    if (not isinstance(runtime, dict) or not isinstance(runtime.get('version'), str) or
+            not isinstance(runtime.get('path'), str) or not Path(runtime['path']).is_absolute() or
+            not isinstance(runtime.get('files'), dict)):
+        raise ValueError('Permanent seat runtime metadata is malformed; preserve it and inspect status')
+    try:
+        verified = session_store.recorded_runtime_plan(APP, runtime['files'])
+    except (OSError, TypeError, ValueError):
+        raise ValueError('Permanent seat runtime is changed or unavailable; preserve it and inspect status') from None
+    if (verified['version'] != runtime['version'] or verified['path'] != runtime['path'] or
+            any(runtime['files'].get(name) != digest for name, digest in incoming.items())):
+        raise ValueError('Incoming delivery adapter source differs from the permanent seat runtime; no owner handoff was recorded')
+    return incoming
+
+
 def source_revision(runtime=None):
     try:
         return delivery.value(APP, 'rev-parse', 'HEAD')
@@ -672,7 +692,9 @@ def rebind_owner(args):
                 raise ValueError('A previous owner handoff is incomplete; use recover --rollback before another transfer')
             checkout_rows = session_store.all_checkouts(identifier)
             runtime = permanent_handoff_runtime(seat)
-            outgoing_versions = runtime_source_versions(runtime, previous['harness'])
+            same_harness = previous['harness'] == identity['harness']
+            outgoing_versions = (runtime_source_versions(runtime, previous['harness']) if same_harness
+                                 else source_versions(previous['harness']))
             for item in checkout_rows:
                 state = item.get('state')
                 if not state:
@@ -685,7 +707,8 @@ def rebind_owner(args):
                     raise ValueError('Permanent seat and checkout owners differ; preserve history and inspect status')
                 if state.get('source_versions') != outgoing_versions:
                     raise ValueError('Pinned delivery adapter source changed; restore the reviewed source')
-            incoming_versions = runtime_source_versions(runtime, identity['harness'])
+            incoming_versions = (runtime_source_versions(runtime, identity['harness']) if same_harness
+                                 else permanent_handoff_source_versions(seat, identity['harness']))
             target_groups=copy.deepcopy(seat.get('groups',{}))
             target_hooks_installed=bool(seat.get('hooks_installed'))
             target_settings=copy.deepcopy(seat.get('settings'))
