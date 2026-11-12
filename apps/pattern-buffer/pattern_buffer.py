@@ -3114,7 +3114,8 @@ def checkpoint_event(root, gitdir, harness, payload):
 
 def required_reads_command(root, gitdir, args):
     helper = auxiliary("required_reads")
-    config, _source = load(root, gitdir)
+    if args.required_reads_action in ("set", "clear", "override"):
+        load(root, gitdir)
     if args.required_reads_action == "set":
         result = helper.set_list(sys.modules[__name__], root, gitdir, args.file)
     elif args.required_reads_action == "clear":
@@ -3125,10 +3126,19 @@ def required_reads_command(root, gitdir, args):
                                  args.reason, args.minutes)
     else:
         session = helper.resolve_session(args.harness, args.session)
-        role, _origin, _saved = resolve_role(root, gitdir, config, args.harness, session)
-        result = helper.status(sys.modules[__name__], root, gitdir, args.harness, session, role)
-        if result is None:
-            result = {"registered": False}
+        try:
+            required = helper.load_list(gitdir)
+        except helper.IntegrityError as error:
+            result = helper.status(sys.modules[__name__], root, gitdir, args.harness, session, None,
+                                   registration_error=error)
+        else:
+            if required is None:
+                result = {"registered": False}
+            else:
+                config, _source = load(root, gitdir)
+                role, _origin, _saved = resolve_role(root, gitdir, config, args.harness, session)
+                result = helper.status(sys.modules[__name__], root, gitdir, args.harness, session, role,
+                                       required_list=required)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
