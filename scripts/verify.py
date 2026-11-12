@@ -2,6 +2,7 @@
 """Run the maintained local verification commands for every Starfleet component."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import shutil
@@ -24,6 +25,34 @@ PYTHON_CHECKS = (
     ("Warp-drive", ("apps/warp-drive/verify.py",)),
 )
 
+PYTHON_PLATFORMS = (
+    ("ubuntu-latest", "3.10"),
+    ("ubuntu-latest", "3.14"),
+    ("macos-15-intel", "3.10"),
+    ("macos-15-intel", "3.14"),
+)
+
+
+def select_python_checks(name=None):
+    if name is None:
+        return PYTHON_CHECKS
+    for check in PYTHON_CHECKS:
+        if check[0] == name:
+            return (check,)
+    raise ValueError(f"Unknown Python check: {name!r}")
+
+
+def python_component_matrix():
+    return [
+        {"os": operating_system, "python": version, "check": label}
+        for operating_system, version in PYTHON_PLATFORMS
+        for label, _ in PYTHON_CHECKS
+    ]
+
+
+def python_verification_succeeded(component_result, preparation_result):
+    return component_result == "success" and preparation_result == "success"
+
 
 def run(label, command, cwd=ROOT, env=None):
     print(f"== {label} ==", flush=True)
@@ -31,13 +60,19 @@ def run(label, command, cwd=ROOT, env=None):
     return result.returncode
 
 
-def verify_python():
+def verify_python(check_name=None):
     failures = []
-    for label, arguments in PYTHON_CHECKS:
+    for label, arguments in select_python_checks(check_name):
         code = run(label, [sys.executable, *arguments])
         if code:
             failures.append((label, code))
     return failures
+
+
+def verify_runner_tests():
+    label = "Verification runner tests"
+    code = run(label, [sys.executable, "-m", "unittest", "scripts.tests.test_verify", "-v"])
+    return [(label, code)] if code else []
 
 
 def verify_markup():
@@ -94,17 +129,57 @@ def verify_markup():
     return []
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--python-only",
         action="store_true",
         help="run all maintained Python checks and skip Node.js and browser verification",
     )
-    args = parser.parse_args()
+    mode.add_argument(
+        "--python-check",
+        choices=tuple(label for label, _ in PYTHON_CHECKS),
+        metavar="NAME",
+        help="run one maintained Python check by its exact label",
+    )
+    mode.add_argument(
+        "--print-python-matrix",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    mode.add_argument(
+        "--require-python-results",
+        nargs=2,
+        metavar=("COMPONENTS", "PREPARATION"),
+        help=argparse.SUPPRESS,
+    )
+    return parser
 
-    failures = verify_python()
-    if not args.python_only:
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if args.print_python_matrix:
+        print(json.dumps({"include": python_component_matrix()}, separators=(",", ":")))
+        return 0
+    if args.require_python_results is not None:
+        component_result, preparation_result = args.require_python_results
+        if python_verification_succeeded(component_result, preparation_result):
+            return 0
+        print(
+            "Python verification requires successful component and preparation jobs "
+            f"(component result: {component_result!r}, "
+            f"preparation result: {preparation_result!r}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    failures = []
+    if args.python_check is None:
+        failures.extend(verify_runner_tests())
+    failures.extend(verify_python(args.python_check))
+    if not (args.python_only or args.python_check):
         failures.extend(verify_markup())
     if failures:
         print("\nVerification failures:", file=sys.stderr)
