@@ -45,7 +45,8 @@ OPENCODE_PRESSURE_REASONS = {
 SNAPSHOT_PRUNING = (
     "Refresh this as a current snapshot. "
     "Preserve the specific facts needed to continue correctly without relying on the automatic summary, and record each fact once. "
-    "Keep the next action and active work, current decisions and relevant rejected approaches, exact active job IDs, "
+    "Keep the next action and active work, current decisions and relevant rejected approaches, "
+    "exact commands needed to continue or recover, exact active job IDs, "
     "evidence pointers, uncertainties and specific human grants or holds. "
     "Reference mandatory guidance instead of repeating general procedures, and prune superseded state and completed history. "
     "Link useful history instead of repeating it."
