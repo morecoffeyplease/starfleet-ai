@@ -908,7 +908,13 @@ def prepare_install(args):
     runtime_binding = "RUNTIME_DIR = None"
     if launcher_template.count(runtime_binding) != 1:
         raise ValueError("Pattern Buffer launcher template is malformed")
+    python_shebang = "#!/usr/bin/env python3"
+    if launcher_template.count(python_shebang) != 1:
+        raise ValueError("Pattern Buffer launcher template is malformed")
+    if not Path(sys.executable).is_absolute():
+        raise ValueError("Pattern Buffer launcher requires an absolute installation interpreter")
     launcher_source = launcher_template.replace(runtime_binding, f"RUNTIME_DIR = {str(base)!r}")
+    launcher_source = launcher_source.replace(python_shebang, f"#!{sys.executable}", 1)
     for launcher_path in {runtime_launcher, launcher}:
         if not launcher_path.exists():
             continue

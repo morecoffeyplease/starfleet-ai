@@ -27,6 +27,9 @@ It does not change another runtime directory, another harness's settings, or nat
     pattern-buffer install --harness codex
     pattern-buffer install --harness claude
 
+The installed launcher pins the Python executable used for installation, so a different `python3` on `PATH` cannot select an older runtime.
+Reinstall after replacing or moving that interpreter.
+
 If installation refuses an unowned or damaged runtime entrypoint, preserve that runtime.
 From a source checkout, install the selected harness into a new empty runtime using the same settings file:
 
