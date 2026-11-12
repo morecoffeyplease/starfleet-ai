@@ -42,6 +42,8 @@ Starfleet Markup requires Node.js 22 or newer for its local source workflow.
 
 When the user asks an orchestrator to install or set up Starfleet, cover every component listed above unless the user names a smaller tool set or explicitly leaves a tool disabled.
 Do not stop after Pattern Buffer and Hailing Frequencies.
+Report an explicitly excluded tool as "Skipped by user instruction" and leave it disabled.
+Exclude it from setup completeness failures, and explain any dependent capability that remains unavailable.
 
 1. Read each component's maintained setup and usage instructions, including its installed `guide --print` command when available.
 2. Install each tool that provides a runtime, or verify that its existing installation is current for the coordinated release.
