@@ -329,6 +329,7 @@ A later checkpoint save in the same recovery generation does not reopen a comple
 The static required-read gate remains independent, so its `read-required` operation can proceed while checkpoint recovery is pending, and framed checkpoint reads can proceed while a static required read is pending.
 If the publication is missing or unreadable, keep recovery unresolved, inspect only that session's checkpoint, previous copy and owned draft, and edit only the owned draft until a valid publication can be read.
 Unknown history stays explicit, and older decisions or human holds remain authoritative unless their owner changes them.
+When history is uncertain and no new PreCompact capture or counted boundary distinguishes a compact signal, the gate may require a duplicate reread instead of relying on a completed receipt.
 This enforcement uses the existing standard Claude and Codex `PreToolUse` and `PostToolUse` hooks; the OpenCode context plugin remains outside this gate.
 Codex recovery still depends on an observed compaction hook signal, so a compaction during a continuing turn without that signal is not covered.
 
