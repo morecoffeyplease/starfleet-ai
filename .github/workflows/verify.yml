@@ -15,9 +15,58 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  python-matrix:
+    name: Prepare Python component matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      components: ${{ steps.matrix.outputs.value }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+      - name: Test verification runner
+        run: python3 -m unittest scripts.tests.test_verify -v
+      - id: matrix
+        name: Build component matrix
+        shell: bash
+        run: echo "value=$(python3 scripts/verify.py --print-python-matrix)" >> "$GITHUB_OUTPUT"
+
+  python-components:
+    name: Python component (${{ matrix.os }}, Python ${{ matrix.python }}, ${{ matrix.check }})
+    needs: python-matrix
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.python-matrix.outputs.components) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run Python component check
+        env:
+          PYTHON_CHECK: ${{ matrix.check }}
+        run: python3 scripts/verify.py --python-check "$PYTHON_CHECK"
+
   python:
     name: Python verification (${{ matrix.os }}, Python ${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
+    needs: [python-matrix, python-components]
+    if: always()
+    runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -41,9 +90,14 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python }}
-      - name: Run all Python component checks
-        run: python3 scripts/verify.py --python-only
+          python-version: "3.10"
+      - name: Require complete Python component matrix
+        env:
+          PYTHON_COMPONENTS_RESULT: ${{ needs.python-components.result }}
+          PYTHON_PREPARATION_RESULT: ${{ needs.python-matrix.result }}
+        run: >-
+          python3 scripts/verify.py --require-python-results
+          "$PYTHON_COMPONENTS_RESULT" "$PYTHON_PREPARATION_RESULT"
 
 
   markup:

@@ -75,15 +75,17 @@ Run the full aggregate verification from the repository root:
 python3 scripts/verify.py
 ```
 
-The Python-only portion is also available for CI matrices:
+The Python-only portion is also available when the Node.js browser suite is outside the verification scope:
 
 ```sh
 python3 scripts/verify.py --python-only
 ```
 
-The aggregate runner uses each component's maintained verification and test commands.
+The aggregate runner checks its own selection and matrix behavior, then uses each component's maintained verification and test commands.
 Starfleet Markup verification uses its checked-in npm lockfile and a local Chromium browser.
 The test suite uses synthetic data and does not contact a live model, CMUX session, or Discord account.
+Hosted GitHub Actions runs each maintained Python command in its own job across Ubuntu and macOS with an overall parallel cap of four.
+The existing Python verification checks require the complete component matrix and its preparation to succeed.
 Hosted GitHub Actions is the routine CI path; local verification is welcome.
 
 ## Contributing

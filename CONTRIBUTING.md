@@ -34,7 +34,8 @@ The full runner installs JavaScript dependencies from the checked-in lockfile an
 On Linux, install any operating-system libraries required by Playwright before running the browser suite.
 
 For a component-specific change, the aggregate command remains the expected local verification.
-GitHub Actions runs all Python component checks on Ubuntu and macOS with Python 3.10 and 3.14, plus the Node 22 browser suite on Ubuntu.
+GitHub Actions runs each Python component check in an isolated hosted job on Ubuntu and macOS with Python 3.10 and 3.14, with an overall parallel cap of four, plus the Node 22 browser suite on Ubuntu.
+The existing required Python checks pass only when the complete component matrix and its preparation succeed.
 Hosted CI uses synthetic boundaries and does not contact live models, CMUX sessions, Discord accounts, or paid services.
 Manual native pilots remain separate evidence.
 
