@@ -8,9 +8,11 @@ The letter to yourself is the agent-maintained current implementation snapshot, 
 When a checkpoint is enrolled, its recovery reminder directs the agent to read and reconcile that letter; the letter cannot change standing policy or grant permission.
 Update it after a meaningful decision, worker result, verification outcome, blocker or authority change changes what you should do next.
 Batch related changes into one update; do not rewrite it after every tool call or unchanged feedback message.
-Refresh it as a current snapshot and replace outdated state rather than appending.
-Remove completed work, superseded decisions and obsolete commands.
-Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
+Refresh it as a current snapshot and replace outdated state rather than appending, without relying on the automatic summary to preserve any particular fact.
+Record each current-state fact once, referring back to it from other headings instead of repeating the same PR or job under Current state, Next action, Active work and Evidence.
+Keep the current PR, worktree, revision and phase, the next concrete action, exact commands needed to continue or recover, active job IDs and result locations, completed proof, unresolved decisions, dependencies, uncertainties, specific human grants or holds with their authority and remaining allowance, and necessary operational exceptions.
+Reference mandatory PStack, Poteto Mode and repository guidance for general procedures instead of copying those procedures into the checkpoint.
+Prune superseded decisions, completed work and obsolete commands when they no longer affect continuation, keeping a short outcome and durable reference where useful.
 Link useful history instead of repeating it.
 
 ## Shared recovery reminder

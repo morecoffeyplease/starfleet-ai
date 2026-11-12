@@ -31,10 +31,10 @@ It contains the approved mission, authoritative tracker, assignment, durable rul
 Change it only within its approval requirements.
 
 **The checkpoint** is the current implementation snapshot for your future self.
-Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
-Refresh it as a current snapshot and replace outdated state rather than appending.
-Remove completed work, superseded decisions and obsolete commands.
-Link useful history instead of repeating it.
+Preserve the facts needed to continue correctly without relying on automatic-summary coverage, and record each current-state fact once.
+Keep the current PR, worktree, revision and phase, the next action, active work, current decisions and relevant rejected approaches, exact commands needed to continue or recover, dependencies, exact job IDs and result locations, completed proof, evidence pointers, uncertainties, specific human grants or holds, and necessary operational exceptions.
+Reference mandatory guidance for general procedures instead of repeating them in the checkpoint.
+Prune superseded state and completed history, and link useful history instead of repeating it.
 A checkpoint does not change standing context or grant authority.
 
 ## Install or reuse the existing hooks

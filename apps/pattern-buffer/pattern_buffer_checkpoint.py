@@ -43,10 +43,11 @@ OPENCODE_PRESSURE_REASONS = {
     "auto_compaction_disabled", "new_generation", "checkpoint_disabled",
 }
 SNAPSHOT_PRUNING = (
-    "Refresh this as a current snapshot. Replace outdated state rather than append. "
-    "Remove completed work, superseded decisions and obsolete commands. Keep the next action and active work, "
-    "current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, "
-    "active job IDs, evidence pointers, uncertainties and human holds. "
+    "Refresh this as a current snapshot. "
+    "Preserve the specific facts needed to continue correctly without relying on the automatic summary, and record each fact once. "
+    "Keep the next action and active work, current decisions and relevant rejected approaches, exact active job IDs, "
+    "evidence pointers, uncertainties and specific human grants or holds. "
+    "Reference mandatory guidance instead of repeating general procedures, and prune superseded state and completed history. "
     "Link useful history instead of repeating it."
 )
 
