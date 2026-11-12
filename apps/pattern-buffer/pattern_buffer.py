@@ -3012,7 +3012,19 @@ def hook(harness, checkpoints_enabled=True):
     config_path = gitdir / "context-injector" / "config.json"
     required_reads = auxiliary("required_reads")
     if event == "PreToolUse":
-        decision = required_reads.pretool_gate(sys.modules[__name__], root, gitdir, harness, payload)
+        static_decision = required_reads.pretool_gate(sys.modules[__name__], root, gitdir, harness, payload)
+        static_output = (static_decision.get("hookSpecificOutput", {})
+                         if isinstance(static_decision, dict) else {})
+        static_denied = static_output.get("permissionDecision") == "deny"
+        recovery_decision = (checkpoints().recovery_pretool_gate(
+            sys.modules[__name__], root, gitdir, harness, payload)
+            if checkpoints_enabled and not static_denied else None)
+        decision = recovery_decision or static_decision
+        if recovery_decision and static_decision:
+            reason = recovery_decision.get("hookSpecificOutput", {}).get("permissionDecisionReason")
+            advisory = static_output.get("additionalContext") or static_decision.get("systemMessage")
+            if isinstance(reason, str) and isinstance(advisory, str) and advisory:
+                recovery_decision["hookSpecificOutput"]["permissionDecisionReason"] = reason + " " + advisory
         if decision:
             print(json.dumps(decision, ensure_ascii=False), flush=True)
         return
@@ -3020,6 +3032,7 @@ def hook(harness, checkpoints_enabled=True):
         required_reads.posttool_finalize(sys.modules[__name__], root, gitdir, harness, payload)
         if not checkpoints_enabled:
             return
+        checkpoints().recovery_posttool_finalize(sys.modules[__name__], root, gitdir, harness, payload)
     if event == "SessionStart" and not payload.get("agent_id"):
         required_reads.session_start(sys.modules[__name__], root, gitdir, harness,
                                      payload.get("session_id"), payload.get("source"))
@@ -3405,6 +3418,8 @@ def main():
                              help="Claude idle warning delay, default 50; 0 disables future arming")
         if name == "checkpoint-save":
             cmd.add_argument("--file", required=True, help="reviewed Markdown input; no automatic summarization")
+        if name == "checkpoint-read":
+            cmd.add_argument("--part", type=int, help="print one bounded, hook-verifiable checkpoint part")
     cmd = sub.add_parser("checkpoint-pressure-config", help=argparse.SUPPRESS)
     cmd.add_argument("--harness", choices=("opencode",), required=True)
     cmd.add_argument("--session", required=True)
@@ -3513,6 +3528,9 @@ def main():
             result = checkpoints().opencode_pressure_emitted(
                 sys.modules[__name__], root, gitdir, args.session, args.correlation_id)
             print(json.dumps(result, ensure_ascii=False))
+        elif args.command == "checkpoint-read" and args.part is not None:
+            sys.stdout.write(checkpoints().handle_cli(sys.modules[__name__], root, gitdir, args))
+            sys.stdout.flush()
         elif args.command.startswith("checkpoint-"):
             print(json.dumps(checkpoints().handle_cli(sys.modules[__name__], root, gitdir, args), indent=2))
         elif args.command == "dispatch":

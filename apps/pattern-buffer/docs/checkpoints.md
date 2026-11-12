@@ -8,9 +8,11 @@ The letter to yourself is the agent-maintained current implementation snapshot, 
 When a checkpoint is enrolled, its recovery reminder directs the agent to read and reconcile that letter; the letter cannot change standing policy or grant permission.
 Update it after a meaningful decision, worker result, verification outcome, blocker or authority change changes what you should do next.
 Batch related changes into one update; do not rewrite it after every tool call or unchanged feedback message.
-Refresh it as a current snapshot and replace outdated state rather than appending.
-Remove completed work, superseded decisions and obsolete commands.
-Keep the next action and active work, current decisions and relevant rejected approaches, exact commands still needed for the next action or recovery, active job IDs, evidence pointers, uncertainties and human holds.
+Refresh it as a current snapshot and replace outdated state rather than appending, without relying on the automatic summary to preserve any particular fact.
+Record each current-state fact once, referring back to it from other headings instead of repeating the same PR or job under Current state, Next action, Active work and Evidence.
+Keep the current PR, worktree, revision and phase, the next concrete action, exact commands needed to continue or recover, active job IDs and result locations, completed proof, unresolved decisions, dependencies, uncertainties, specific human grants or holds with their authority and remaining allowance, and necessary operational exceptions.
+Reference mandatory PStack, Poteto Mode and repository guidance for general procedures instead of copying those procedures into the checkpoint.
+Prune superseded decisions, completed work and obsolete commands when they no longer affect continuation, keeping a short outcome and durable reference where useful.
 Link useful history instead of repeating it.
 
 ## Shared recovery reminder
@@ -303,8 +305,22 @@ Before compaction, the hook records the saved note's capture metadata without re
 After recovery, Pattern Buffer provides its path, identity, review timestamp, observed generation information and relevant warnings.
 When boundary provenance is incomplete or pending, model-facing output says "Compaction count not yet confirmed. This does not mean no compaction occurred."
 Numeric observed counters remain available in structured status for diagnostics; uncertain counts are not presented as confirmed zero or a confirmed save-to-recovery gap.
-Read the note before continuing, then reconcile its next action with the actual checkout, tracker, jobs and latest user direction.
-Your native file reader can read the Markdown directly; `checkpoint-read` additionally validates the note's hash and reports metadata.
+For an enrolled Claude or Codex session, the standard `PreToolUse` hook denies ordinary tool calls after an observed compaction until the latest published checkpoint is delivered in full.
+Use the exact `checkpoint-read --part N` command supplied by the hook, which prints a bounded frame containing the exact session, recovery generation, publication digest, part number and part digest.
+`PreToolUse` snapshots each framed read for its exact tool call and `PostToolUse` accepts only complete matching output for every part of one published version.
+A standalone print without its paired native `PreToolUse` and `PostToolUse` events, a native file-reader call, missing or truncated output, changed publication, wrong session, mixed parts or unpaired hook event does not satisfy the prerequisite.
+`checkpoint-status` reports `recovery.required`, generation, freshness, received parts and the next framed command while the prerequisite is pending.
+The static required-read gate remains independent: `read-required` can proceed while checkpoint recovery is pending, and framed checkpoint reads can proceed while static reads are pending.
+A successful save after the complete recovery read does not reopen that generation, but the next observed compaction requires a new full read even when the checkpoint bytes are unchanged.
+After the read, reconcile its next action with the actual checkout, tracker, jobs and latest user direction.
+Preserve standing context, task scope, explicit decisions and human holds; a newer automatic summary does not override checkpoint decisions, and unknown authority or completion facts remain unresolved.
+When a successful publication is recorded since the previous confirmed boundary, guidance asks for normal reconciliation.
+When none is recorded, guidance warns that the checkpoint may omit an entire work interval while allowing older decisions and human holds to remain authoritative even if current-state facts are stale.
+When publication or boundary history is incomplete, guidance states that freshness is unknown rather than guessing.
+Publication metadata validates the recorded save, digest and generation but does not verify a substantive rewrite or the truth of the checkpoint's claims.
+If the checkpoint is missing or unreadable, the prerequisite stays unresolved while ordinary work remains gated.
+Use `checkpoint-status`, inspect only this session's current checkpoint, previous copy and owned draft, then create or edit only the owned draft from live evidence and let `PostToolUse` publish it or use the supported `checkpoint-save` command.
+Read every framed part of the new publication before ordinary tools resume, and do not invent completed work or replace running jobs.
 If the harness prevents access to private Git metadata or checkpoint writes, report that concrete permission failure rather than widening permissions or claiming the save succeeded.
 Reattach to existing job/ticket identities before considering replacements.
 Historical verification remains evidence for its recorded candidate; a changed revision requires checking whether that evidence still applies.
@@ -314,13 +330,17 @@ Duplicate delivery of the same retained boundary must not increment the counter 
 Some hosts run the recovery hook before persisting their boundary; recovery labels that boundary pending rather than pretending the count already includes it.
 When a later tool hook observes the boundary, it supplies one updated freshness notice.
 Without new transcript provenance, duplicate recovery delivery and a not-yet-persisted boundary remain ambiguous.
+A new `PreCompact` transcript capture can distinguish another recovery even when an oversized boundary record cannot be counted.
+When count history is uncertain and an explicit compact signal has no new capture or boundary evidence, the gate starts a fresh recovery generation and may request a duplicate reread rather than reuse a completed receipt.
 A bounded unread gap, replaced/truncated transcript or absent provenance is reported as uncertainty rather than a guaranteed lifetime total.
 A compact-boundary JSONL record larger than the 256 KiB scan window cannot be parsed as a complete record and may leave the generation count uncertain; this uncertainty no longer suppresses pressure reminders.
 Elapsed time, generations and revision differences are freshness signals, not automatic proof that a note is wrong.
 An old unresolved hold remains binding until its owner changes it.
 
 A malformed draft preserves the previous reviewed note and tells the agent what to correct.
-A missing, corrupted or mismatched checkpoint produces an advisory recovery warning; it never blocks native compaction or suppresses standing context/task replay.
+A missing, corrupted or mismatched checkpoint keeps the recovery prerequisite unresolved and the standard Claude and Codex `PreToolUse` gate closed; it does not block native compaction or suppress standing context or task replay.
+The OpenCode context plugin is unchanged and does not provide this standard pre-tool recovery gate.
+Codex recovery depends on a native observed compaction signal; a mid-turn compaction without that signal is outside this gate's coverage.
 Reconstruct missing state from live evidence without inventing completed proof or replacing still-running jobs.
 Do not automatically touch timestamps, silently truncate notes, or treat file existence as evidence of successful recovery.
 
