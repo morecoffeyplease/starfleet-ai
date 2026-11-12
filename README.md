@@ -38,6 +38,46 @@ Read the selected component documentation for its required CMUX capabilities, su
 Python 3.10 or newer is required by the repository-wide verification suite.
 Starfleet Markup requires Node.js 22 or newer for its local source workflow.
 
+## Set up an orchestrator with all Starfleet tools
+
+When the user asks an orchestrator to install or set up Starfleet, cover every component listed above unless the user names a smaller tool set or explicitly leaves a tool disabled.
+Do not stop after Pattern Buffer and Hailing Frequencies.
+
+1. Read each component's maintained setup and usage instructions, including its installed `guide --print` command when available.
+2. Install each tool that provides a runtime, or verify that its existing installation is current for the coordinated release.
+   Use the component's supported installer and preserve existing configuration and owned state.
+3. Complete every supported registration for your actual native session, worktree and orchestrator role.
+   Reuse unchanged registrations, and use the documented owner handoff when replacing a session.
+   Register packaged skills with the current harness where the component requires agent discovery.
+4. Verify each installation and registration with the component's documented status, doctor or enrollment command.
+   Check shared worker health without starting a second worker.
+5. Report each component as ready, blocked or without a registration step for this role.
+   Name missing credentials, unsupported capabilities, explicit holds and required native trust interactions instead of silently skipping a tool.
+   Keep configured readiness separate from observed message or feedback receipt.
+
+Use the following checklist with the linked component instructions.
+
+| Tool | Orchestrator setup and registration |
+| --- | --- |
+| [Hailing Frequencies](apps/hailing-frequencies/guide.md) | Enroll the exact native session and surface, then verify the existing worker and intended send coverage. |
+| [Temporal Beacon](apps/hailing-frequencies/temporal-beacon.md) | Verify the installed command, register its packaged skill and check its shared Hailing enrollment and worker; no second daemon or test timer is needed. |
+| [Agent Notify](apps/hailing-frequencies/agent-notify-guide.md) | Verify the command and configured Discord route, and register its packaged skill; keep credentials private. |
+| [Discord Watch](apps/discord-watch/guide.md) | Verify the existing reply worker and the exact ownership of each real conversation you open or inherit through a supported handoff. |
+| [Pattern Buffer](apps/pattern-buffer/guide.md) | Set up the approved mission and standing context, then enroll the actual orchestrator's checkpoint and verify its recovery configuration. |
+| [Model Preferences](apps/model-preferences/README.md) | Read the saved profile, check startup against the intended profile, and enroll and acknowledge adoption from the actual orchestrator session. |
+| [Away Mode](apps/away-mode/guide.md) | Enroll the actual lane and read current presence; registration does not change the user's availability. |
+| [Warp-drive](apps/warp-drive/guide.md) | Verify the command and existing scheduler, and use the exact enrolled owner for reservations; no separate per-session Warp enrollment or dummy job is required. |
+| [Policy Guard](apps/starfleet-policy-guard/guide.md) | Complete the supported owner setup for the assigned checkout, including a pre-PR attachment when needed; preserve existing seats, pins and owner history. |
+| [Starfleet Markup](apps/starfleet-markup/guide.md) | Verify the runtime and supported feedback adapter, and read the review workflow; create an owned review only when the user requests one. |
+| [Replicator](apps/replicator/guide.md) | Install or verify the runtime and read the handoff guide; setup alone does not start a handoff or replace an agent. |
+
+The Context Injector compatibility command belongs to the Pattern Buffer installation, not a second mission or worker.
+Some tools register an owned resource when it exists, rather than registering the session globally.
+Do not create fake PRs, reviews, conversations, jobs or timers to manufacture an enrollment receipt.
+Reuse shared commands, hooks and workers, and preserve other agents, shared model profiles, human holds and machine-wide service policy.
+A new shared service or an existing worker restart still requires coordination with its owner.
+Implementers follow their parent's dispatch and task-replay instructions instead of enrolling an orchestrator checkpoint or taking over the parent's resources.
+
 ## Choose a component
 
 1. Read the component README and guide.
@@ -98,3 +138,14 @@ Community-concern issues are public; read the warning in the form before submitt
 ## License
 
 Starfleet AI is licensed under the [MIT License](LICENSE).
+
+## Check Claude Code weekly usage
+
+If the local Claude Code status line writes `~/.claude/cache/rate-limits.json`, read it with `cat ~/.claude/cache/rate-limits.json`.
+This optional cache is written by local status-line configuration, such as `~/.claude/statusline-command.sh`; installing Starfleet does not create it.
+Before using the percentage, compare its `ts` epoch seconds with the current time from `date +%s`.
+If the cache is more than 180 seconds old, report its age and treat the reading as stale.
+If the file or `rate_limits.seven_day` is missing, report "unavailable" rather than guessing.
+For a fresh reading, `rate_limits.seven_day.used_percentage` is the percentage used, and `100 - used_percentage` is the percentage remaining.
+Convert `rate_limits.seven_day.resets_at` to local time with `date -r <epoch-seconds>` on macOS.
+This reports Claude Code weekly usage only, not Codex limits; never write, rotate or delete the cache.
