@@ -371,6 +371,18 @@ Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID registrations`
 Run `coverage --summary` or `status` from an attached checkout to inspect local configuration and observations.
 Configured hooks and adapters are not proof that the native runtime loaded or used them.
 Use `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID rebind-owner --from-harness claude --from-session OUTGOING_SESSION_ID --confirm-handoff` only after an authorized transfer to the incoming actual native session.
+If the installed CLI entrypoint is unavailable or outdated, a current source checkout can run this command for an existing permanent seat after an authorized same-harness transfer, provided the seat-recorded runtime remains present and intact:
+
+```sh
+python3 /path/to/current/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --seat-id SEAT_ID rebind-owner --from-harness claude \
+  --from-session OUTGOING_SESSION_ID --confirm-handoff
+```
+
+That path verifies the seat-recorded immutable runtime path, version, complete file manifest and hashes before checking active attachment pins.
+It preserves the installed runtime pin, adapter and hook targets, and leaves removed attachment records unchanged.
+It does not upgrade or repair the seat runtime; changed or missing runtime files fail closed for recovery.
+Cross-harness handoffs still require the executing source to match the complete seat-recorded runtime.
 `--from-harness` and `--from-session` identify the exact outgoing owner; the incoming harness and session are detected from the current native runtime.
 Handoff preserves history and requires a fresh report from the incoming owner.
 For a cross-harness handoff, the transaction adds or removes only the seat-owned Claude hook pair as needed and preserves unrelated settings.
