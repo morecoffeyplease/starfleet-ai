@@ -153,6 +153,7 @@ pattern-buffer --cwd /absolute/worktree required-reads clear
 `required-reads status` emits one JSON document by default, and `--json` is accepted for callers that make the format explicit.
 The stable report has `registered`, `list_sha256`, `generation`, `harness`, `session_id`, `role`, and `entries` fields, with entry name, resolved path, roles, state, SHA-256, byte count and receipt parts.
 Entries for other roles use `not_applicable`, and a worktree with no registered list returns `{"registered": false}` and exits successfully.
+It can report an absent list in a plain Git worktree without initializing Pattern Buffer.
 Policy Guard consumes this read-only report when it validates a published guidance attestation; see [Published guidance attestations](../starfleet-policy-guard/guide.md#published-guidance-attestations).
 
 Agents may draft a manifest and run read-only status or doctor checks, but they cannot register or clear the list.

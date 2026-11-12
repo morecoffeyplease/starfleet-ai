@@ -135,6 +135,7 @@ If the owner registers a list after a main session starts and its generation is 
 Pending and binding denials include `pattern-buffer guide --print` for recovery steps.
 Agents can use `required-reads status`, `status`, `doctor`, and `guide --print` to diagnose a closed gate, then notify the owner to restore a file or review and re-register the list.
 `required-reads status` emits a stable JSON report by default, accepts `--json`, and returns `{"registered": false}` with exit code 0 when no list is registered.
+It can report an absent list in a plain Git worktree without initializing Pattern Buffer.
 Policy Guard consumes this read-only report for [published guidance attestations](../starfleet-policy-guard/guide.md#published-guidance-attestations).
 `read-required` prints a canonical frame and performs no state, lock or telemetry writes.
 `PreToolUse` stores a bounded snapshot for the exact native session and tool call, including the current generation, list, entry, part and file identity.

@@ -183,6 +183,108 @@ class RequiredReadsTests(unittest.TestCase):
         self.assertIn("--json", help_text)
         self.assertIn("--session SESSION_ID --json", help_text)
 
+    def test_uninitialized_git_status_reports_no_list_without_creating_worktree_state(self):
+        root = self.home / "plain-git-repo"
+        subprocess.run(["git", "init", "-q", str(root)], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c",
+                        "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm",
+                        "Fixture"], check=True, env=self.env)
+        gitdir = Path(subprocess.run(["git", "-C", str(root), "rev-parse", "--absolute-git-dir"],
+                                     check=True, capture_output=True, text=True,
+                                     env=self.env).stdout.strip())
+        arguments = [sys.executable, str(SCRIPT), "--cwd", str(root), "required-reads", "status",
+                     "--harness", "codex", "--session", self.session]
+        context_dir = gitdir / "context-injector"
+        self.assertFalse(context_dir.exists())
+
+        uninitialized = subprocess.run(arguments, capture_output=True, text=True, env=self.env)
+        self.assertEqual(uninitialized.returncode, 0, uninitialized.stdout + uninitialized.stderr)
+        self.assertEqual(json.loads(uninitialized.stdout), {"registered": False})
+        self.assertFalse(context_dir.exists())
+
+        initialized = subprocess.run([sys.executable, str(SCRIPT), "--cwd", str(root), "init",
+                                      "--default-role", "orchestrator"],
+                                     capture_output=True, text=True, env=self.env)
+        self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+        config_path = context_dir / "config.json"
+        config_before = config_path.read_bytes()
+        registered = subprocess.run(arguments, capture_output=True, text=True, env=self.env)
+        self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
+        self.assertEqual(json.loads(registered.stdout), {"registered": False})
+        self.assertEqual(config_path.read_bytes(), config_before)
+        self.assertFalse((context_dir / "required-reads").exists())
+
+    def test_uninitialized_status_preserves_required_read_registration_integrity_errors(self):
+        root = self.home / "invalid-registration-repo"
+        subprocess.run(["git", "init", "-q", str(root)], check=True, env=self.env)
+        gitdir = Path(subprocess.run(["git", "-C", str(root), "rev-parse", "--absolute-git-dir"],
+                                     check=True, capture_output=True, text=True,
+                                     env=self.env).stdout.strip())
+        context_dir = gitdir / "context-injector"
+        context_dir.mkdir()
+        registration = context_dir / "required-reads.json"
+        arguments = [sys.executable, str(SCRIPT), "--cwd", str(root), "required-reads", "status",
+                     "--harness", "codex", "--session", self.session]
+        cases = (
+            ("malformed", "required-reads registration is malformed"),
+            ("symlink", "required-reads registration is unsafe"),
+            ("missing-list", "registered required-reads list is missing, unreadable, or unsafe"),
+            ("changed-list", "registered required-reads list changed since registration"),
+        )
+        for name, expected_error in cases:
+            with self.subTest(registration=name):
+                if registration.exists() or registration.is_symlink():
+                    registration.unlink()
+                if name == "malformed":
+                    registration.write_text("not json\n", encoding="utf-8")
+                elif name == "symlink":
+                    target = self.home / "registration-target.json"
+                    target.write_text("{}\n", encoding="utf-8")
+                    registration.symlink_to(target)
+                else:
+                    missing_list = self.home / "missing-required-reads.json"
+                    if name == "changed-list":
+                        missing_list = self.home / "changed-required-reads.json"
+                        missing_list.write_text('{"schema_version":1,"entries":[]}', encoding="utf-8")
+                    registration.write_text(json.dumps({
+                        "schema_version": 1,
+                        "path": str(missing_list),
+                        "sha256": "0" * 64,
+                    }), encoding="utf-8")
+
+                result = subprocess.run(arguments, capture_output=True, text=True, env=self.env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = json.loads(result.stdout)
+                self.assertTrue(report["registered"])
+                self.assertFalse(report["ok"])
+                self.assertFalse(report["gate_open"])
+                self.assertTrue(
+                    any(error == expected_error or error.startswith(expected_error + ": ")
+                        for error in report["integrity_errors"]),
+                    report["integrity_errors"],
+                )
+                self.assertFalse((context_dir / "config.json").exists())
+                self.assertFalse((context_dir / "required-reads").exists())
+
+        document = self.home / "registered-required-read.md"
+        document.write_text("# Registered guide\n", encoding="utf-8")
+        list_path = self.home / "valid-required-reads.json"
+        list_bytes = json.dumps({
+            "schema_version": 1,
+            "entries": [{"name": "registered-guide", "path": str(document),
+                         "roles": ["orchestrator"]}],
+        }).encode("utf-8")
+        list_path.write_bytes(list_bytes)
+        registration.write_text(json.dumps({
+            "schema_version": 1,
+            "path": str(list_path),
+            "sha256": hashlib.sha256(list_bytes).hexdigest(),
+        }), encoding="utf-8")
+        valid_registered = subprocess.run(arguments, capture_output=True, text=True, env=self.env)
+        self.assertEqual(valid_registered.returncode, 1, valid_registered.stdout + valid_registered.stderr)
+        self.assertIn("config.json", valid_registered.stderr)
+        self.assertFalse((context_dir / "required-reads").exists())
+
     def test_subagent_pretool_does_not_start_required_read_state(self):
         self.register()
         session = "synthetic-required-read-subagent"

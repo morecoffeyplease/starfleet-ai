@@ -427,9 +427,11 @@ def _entry_state(core, entry, required, state, harness):
             "parts": parts}
 
 
-def status(core, root, gitdir, harness, session, role):
+def status(core, root, gitdir, harness, session, role, required_list=None, registration_error=None):
     try:
-        required = load_list(gitdir)
+        if registration_error is not None:
+            raise registration_error
+        required = required_list if required_list is not None else load_list(gitdir)
     except IntegrityError as error:
         return {
             "registered": True,
