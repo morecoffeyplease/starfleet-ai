@@ -15,6 +15,8 @@ python3 "$HOME/.local/share/starfleet-ai/context-injector/pattern_buffer_claude.
 ```
 
 The standard installer puts `pattern-buffer` in `$HOME/.local/bin` and canonical per-harness CLIs beside the existing runtimes.
+The installed launcher pins the Python executable used for installation, so a different `python3` on `PATH` cannot select an older runtime.
+Reinstall after replacing or moving that interpreter.
 The per-harness commands above use the default runtime location; replace it with `$XDG_DATA_HOME/starfleet-ai/context-injector` when `XDG_DATA_HOME` is set.
 If the launcher is not on `PATH`, run `$HOME/.local/bin/pattern-buffer guide --print`.
 With a custom `--runtime-dir`, the installer places the generic launcher in that runtime directory unless `--bin-dir` is supplied.

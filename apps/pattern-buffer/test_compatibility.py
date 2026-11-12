@@ -296,6 +296,45 @@ class RenameCompatibilityTests(unittest.TestCase):
             self.assertIn(str(runtime / "context_injector_codex.py"), settings.read_text())
             self.assertEqual((runtime / "pattern_buffer.py").read_bytes(), CURRENT_CLI.read_bytes())
 
+    def test_installed_launcher_uses_its_install_interpreter_when_path_has_older_python(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            home = folder / "home"
+            settings = home / "hooks.json"
+            install_env = {**os.environ, "HOME": str(home), "XDG_DATA_HOME": str(home / "data"),
+                           "CODEX_HOME": str(home / ".codex")}
+            install = subprocess.run([sys.executable, str(CURRENT_CLI), "install", "--harness", "codex",
+                                       "--settings", str(settings)], capture_output=True, text=True,
+                                      env=install_env)
+            self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+
+            launcher = home / ".local" / "bin" / "pattern-buffer"
+            runtime = home / "data" / "starfleet-ai" / "context-injector"
+            self.assertEqual(launcher.read_text().splitlines()[0], f"#!{sys.executable}")
+            self.assertEqual((runtime / "pattern-buffer").read_bytes(), launcher.read_bytes())
+
+            old_python_dir = folder / "old-python-bin"
+            old_python_dir.mkdir()
+            old_python = old_python_dir / "python3"
+            old_python.write_text("#!/bin/sh\n"
+                                  "if [ \"$1\" = \"--version\" ]; then\n"
+                                  "  printf 'Python 3.9.6\\n'\n"
+                                  "  exit 0\n"
+                                  "fi\n"
+                                  "printf 'TypeError: unsupported operand type for union annotation\\n' >&2\n"
+                                  "exit 1\n")
+            old_python.chmod(0o755)
+            launcher_env = {**install_env, "PATH": str(old_python_dir)}
+            selected = subprocess.run(["python3", "--version"], capture_output=True, text=True,
+                                      env=launcher_env)
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            self.assertEqual(selected.stdout.strip(), "Python 3.9.6")
+
+            result = subprocess.run([str(launcher), "guide", "--print"], capture_output=True,
+                                    text=True, env=launcher_env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("# Pattern Buffer guide", result.stdout)
+
     def test_legacy_installer_redeploys_the_registered_runtime_and_stable_hook(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
