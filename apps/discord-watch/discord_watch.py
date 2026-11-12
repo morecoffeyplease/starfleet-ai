@@ -320,6 +320,7 @@ class Watch:
         self.gateway_factory = gateway_factory
         self._configured_user_id = None
         self.global_not_before = 0.0
+        self.worker_generation = None
         os.umask(0o077)
 
     @contextlib.contextmanager
@@ -1965,7 +1966,9 @@ class Watch:
             if api_success:
                 values["last_api_success_at"] = str(at)
             if origin == "worker":
-                values["last_worker_tick_at"] = str(at)
+                values["last_worker_tick_at"] = (
+                    json.dumps({"at": at, "generation": self.worker_generation}, separators=(",", ":"))
+                    if self.worker_generation is not None else str(at))
             errors = [item for item in report["threads"] if item.get("status") == "error"]
             values["last_scan_errors"] = str(len(errors))
             for key, value in values.items():
@@ -1973,6 +1976,19 @@ class Watch:
                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
             if origin == "worker":
                 db.execute("DELETE FROM meta WHERE key='last_worker_error'")
+
+    def _record_worker_start(self, send, only_thread):
+        generation = os.urandom(16).hex()
+        worker_config = {"generation": generation, "send": bool(send),
+                         "only_thread": None if only_thread is None else snowflake(only_thread, "thread ID")}
+        with contextlib.closing(self.database(create=False)) as db:
+            with db:
+                db.execute("INSERT INTO meta(key,value) VALUES('worker_sender_config',?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (json.dumps(worker_config, separators=(",", ":")),))
+                db.execute("DELETE FROM meta WHERE key='last_worker_tick_at'")
+                db.execute("DELETE FROM meta WHERE key='last_worker_error'")
+        self.worker_generation = generation
 
     def _record_worker_failure(self, send, only_thread, error):
         try:
@@ -2165,7 +2181,8 @@ class Watch:
 
     def _health(self, db, thread_id=None):
         keys = ("last_scan_at", "last_scan_mode", "last_scan_origin", "last_scan_errors",
-                "last_api_success_at", "last_worker_tick_at", "last_send_scope", "last_worker_error")
+                "last_api_success_at", "last_worker_tick_at", "last_send_scope",
+                "last_worker_error", "worker_sender_config")
         meta = dict(db.execute("SELECT key,value FROM meta WHERE key IN (" +
                                ",".join("?" for _ in keys) + ")", keys))
         now = self.clock()
@@ -2174,7 +2191,23 @@ class Watch:
                 return max(0, now - float(meta[key])) if meta.get(key) else None
             except (ValueError, TypeError):
                 return None
-        worker_age = age_of("last_worker_tick_at")
+        worker_age = None
+        worker_tick_generation = None
+        try:
+            worker_tick = json.loads(meta.get("last_worker_tick_at", "null"))
+            if isinstance(worker_tick, dict):
+                tick_at = worker_tick.get("at")
+                generation = worker_tick.get("generation")
+                if (isinstance(tick_at, (int, float)) and not isinstance(tick_at, bool) and
+                        math.isfinite(tick_at) and isinstance(generation, str) and
+                        len(generation) == 32 and
+                        all(char in "0123456789abcdef" for char in generation)):
+                    worker_age = max(0, now - tick_at)
+                    worker_tick_generation = generation
+            elif isinstance(worker_tick, (int, float)) and not isinstance(worker_tick, bool) and math.isfinite(worker_tick):
+                worker_age = max(0, now - worker_tick)
+        except (TypeError, ValueError):
+            pass
         api_age = age_of("last_api_success_at")
         heartbeat_fresh = worker_age is not None and worker_age <= max(60, POLL_INTERVAL * 5)
         api_fresh = api_age is not None and api_age <= max(60, POLL_INTERVAL * 5)
@@ -2185,11 +2218,43 @@ class Watch:
             "FROM gateway_state WHERE id=1").fetchone()
         send_scope = []
         try:
-            send_scope = json.loads(meta.get("last_send_scope", "[]"))
+            parsed_send_scope = json.loads(meta.get("last_send_scope", "[]"))
+            if isinstance(parsed_send_scope, list) and all(isinstance(item, str) for item in parsed_send_scope):
+                send_scope = parsed_send_scope
         except ValueError:
             pass
         in_scope = thread_id in send_scope if thread_id is not None else bool(send_scope)
-        send_enabled = meta.get("last_scan_mode") == "send"
+        worker_config = None
+        try:
+            parsed_config = json.loads(meta.get("worker_sender_config", ""))
+            if (isinstance(parsed_config, dict) and
+                    isinstance(parsed_config.get("generation"), str) and
+                    len(parsed_config["generation"]) == 32 and
+                    all(char in "0123456789abcdef" for char in parsed_config["generation"]) and
+                    isinstance(parsed_config.get("send"), bool) and
+                    (parsed_config.get("only_thread") is None or
+                     isinstance(parsed_config.get("only_thread"), str))):
+                only_thread = parsed_config["only_thread"]
+                if only_thread is not None:
+                    only_thread = snowflake(only_thread, "thread ID")
+                worker_config = {"generation": parsed_config["generation"],
+                                 "send": parsed_config["send"], "only_thread": only_thread}
+        except (TypeError, ValueError):
+            pass
+        worker_configuration_matches_heartbeat = (
+            worker_config is not None and
+            worker_tick_generation == worker_config["generation"])
+        send_enabled = worker_config["send"] if worker_config is not None else None
+        configured_scope_covers_thread = None
+        if worker_config is not None:
+            configured_scope_covers_thread = bool(
+                worker_config["send"] and
+                (thread_id is None or worker_config["only_thread"] is None or
+                 worker_config["only_thread"] == thread_id))
+        worker_send_scope = None
+        if worker_config is not None:
+            worker_send_scope = ({"type": "all_threads"} if worker_config["only_thread"] is None else
+                                 {"type": "thread", "thread_id": worker_config["only_thread"]})
         thread_error, thread_poll_age = None, None
         if thread_id is not None:
             row = db.execute("SELECT last_error_json,last_poll_at FROM threads WHERE thread_id=?",
@@ -2202,7 +2267,9 @@ class Watch:
                     thread_poll_age = None
         thread_api_fresh = thread_id is None or (
             thread_poll_age is not None and thread_poll_age <= max(60, POLL_INTERVAL * 5))
-        ready = worker_running and heartbeat_fresh and api_fresh and send_enabled and in_scope and thread_api_fresh
+        ready = (worker_running and heartbeat_fresh and api_fresh and send_enabled is True and
+                 worker_configuration_matches_heartbeat and configured_scope_covers_thread is True and
+                 thread_api_fresh)
         warnings = []
         if not worker_running:
             warnings.append("No Discord Watch worker currently holds the worker lock")
@@ -2210,10 +2277,14 @@ class Watch:
             warnings.append("Worker heartbeat is missing or stale")
         if not api_fresh:
             warnings.append("No successful Discord API poll is fresh")
-        if not send_enabled:
-            warnings.append("The latest scan was observe-only or has not run")
-        if thread_id is not None and not in_scope:
-            warnings.append("This thread is outside the latest send scope")
+        if worker_config is None:
+            warnings.append("Worker sender configuration is missing or invalid")
+        elif not worker_configuration_matches_heartbeat:
+            warnings.append("Worker sender configuration does not match its latest heartbeat")
+        if send_enabled is False:
+            warnings.append("The configured worker is observe-only")
+        if thread_id is not None and worker_config is not None and send_enabled and not configured_scope_covers_thread:
+            warnings.append("This thread is outside the worker's configured send scope")
         if thread_id is not None and not thread_api_fresh:
             warnings.append("This thread has no fresh successful API poll")
         if thread_error:
@@ -2234,6 +2305,11 @@ class Watch:
                 "last_scan_mode": meta.get("last_scan_mode"),
                 "last_scan_errors": int(meta.get("last_scan_errors", "0")),
                 "last_worker_error": meta.get("last_worker_error"),
+                "worker_send_enabled": send_enabled,
+                "worker_send_scope": worker_send_scope,
+                "worker_configuration_matches_heartbeat": worker_configuration_matches_heartbeat,
+                "thread_covered_by_worker_scope": (configured_scope_covers_thread
+                                                    if thread_id is not None else None),
                 "last_send_scope": send_scope,
                 "thread_in_send_scope": in_scope if thread_id is not None else None,
                 "thread_last_poll_age_seconds": thread_poll_age,
@@ -2478,6 +2554,7 @@ class Watch:
                 raise ValueError("A Discord Watch worker already owns this state") from None
             stopping = False
             stop_event = stop_event or threading.Event()
+            self._record_worker_start(send, only_thread)
             original_handlers = {}
             def stop(signum, frame):
                 nonlocal stopping
