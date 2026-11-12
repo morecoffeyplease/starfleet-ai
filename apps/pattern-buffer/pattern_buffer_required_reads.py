@@ -538,6 +538,18 @@ def _allowed_command_parser():
     required_status = required_actions.add_parser("status", add_help=False, allow_abbrev=False)
     required_status.add_argument("--harness", choices=("claude", "codex"), required=True)
     required_status.add_argument("--session", required=True)
+    required_status.add_argument("--json", action="store_true")
+    checkpoint_read = commands.add_parser("checkpoint-read", add_help=False, allow_abbrev=False)
+    checkpoint_read.add_argument("--harness", choices=("claude", "codex"), required=True)
+    checkpoint_read.add_argument("--session", required=True)
+    checkpoint_read.add_argument("--part", type=int)
+    checkpoint_status = commands.add_parser("checkpoint-status", add_help=False, allow_abbrev=False)
+    checkpoint_status.add_argument("--harness", choices=("claude", "codex"), required=True)
+    checkpoint_status.add_argument("--session", required=True)
+    checkpoint_save = commands.add_parser("checkpoint-save", add_help=False, allow_abbrev=False)
+    checkpoint_save.add_argument("--harness", choices=("claude", "codex"), required=True)
+    checkpoint_save.add_argument("--session", required=True)
+    checkpoint_save.add_argument("--file", required=True)
     status = commands.add_parser("status", add_help=False, allow_abbrev=False)
     status.add_argument("--harness", choices=("claude", "codex"))
     status.add_argument("--session")
@@ -606,7 +618,8 @@ def allowed_cli_command(command, root, harness, session, core):
         return parsed.required_action == "status"
     if parsed.command == "read-required":
         return not parsed.next_entry or parsed.part is None
-    return parsed.command in ("status", "validate", "doctor", "guide")
+    return parsed.command in ("status", "validate", "doctor", "guide",
+                              "checkpoint-read", "checkpoint-status")
 
 
 def allowed_diagnostic_cli_command(command, root, harness, session, core):
@@ -615,7 +628,8 @@ def allowed_diagnostic_cli_command(command, root, harness, session, core):
         return False
     if parsed.command == "required-reads":
         return parsed.required_action == "status"
-    return parsed.command in ("status", "validate", "doctor", "guide")
+    return parsed.command in ("status", "validate", "doctor", "guide",
+                              "checkpoint-read", "checkpoint-status")
 
 
 def _hook_result(message, decision=None, warning=False):

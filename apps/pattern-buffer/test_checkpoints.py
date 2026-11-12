@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -64,6 +65,65 @@ class CheckpointTests(unittest.TestCase):
         payload = {'hook_event_name': name, 'session_id': session, 'cwd': str(self.root),
                    'source': 'compact', 'transcript_path': str(self.trace), **extra}
         return self.cli('hook', '--harness', harness, data=payload, env=env)
+
+    def pretool(self, *, harness='codex', session='pilot', tool='Edit', tool_input=None,
+                tool_use_id='checkpoint-tool-use'):
+        payload = {'hook_event_name': 'PreToolUse', 'session_id': session, 'cwd': str(self.root),
+                   'tool_name': tool, 'tool_use_id': tool_use_id, 'tool_input': tool_input or {}}
+        return self.cli('hook', '--harness', harness, data=payload)
+
+    def posttool(self, *, harness='codex', session='pilot', tool='Bash', tool_input=None,
+                 tool_use_id='checkpoint-tool-use', tool_response=None):
+        payload = {'hook_event_name': 'PostToolUse', 'session_id': session, 'cwd': str(self.root),
+                   'tool_name': tool, 'tool_use_id': tool_use_id, 'tool_input': tool_input or {},
+                   'tool_response': tool_response}
+        return self.cli('hook', '--harness', harness, data=payload)
+
+    def recovery_read(self, part, *, harness='codex', session='pilot', tool_use_id='checkpoint-tool-use',
+                      response_shape=None, transform=None):
+        command = shlex.join(['pattern-buffer', '--cwd', str(self.root), 'checkpoint-read',
+                              '--harness', harness, '--session', session, '--part', str(part)])
+        tool_input = {'command': command}
+        prepared = self.pretool(harness=harness, session=session, tool='Bash',
+                                tool_input=tool_input, tool_use_id=tool_use_id)
+        self.assertEqual(prepared.stdout, '')
+        printed = self.command('checkpoint-read', harness, session, '--part', str(part))
+        stdout = printed.stdout[:-1] if response_shape == 'claude' else printed.stdout
+        if response_shape == 'claude':
+            response = {'stdout': stdout, 'stderr': '', 'interrupted': False,
+                        'isImage': False, 'noOutputExpected': False}
+        else:
+            response = stdout
+        if transform:
+            response = transform(response)
+        finalized = self.posttool(harness=harness, session=session, tool='Bash',
+                                  tool_input=tool_input, tool_use_id=tool_use_id,
+                                  tool_response=response)
+        return printed, finalized
+
+    def compact(self, harness='codex', session='pilot', boundary=True):
+        if boundary:
+            row = ({'type': 'compacted'} if harness == 'codex' else
+                   {'type': 'system', 'subtype': 'compact_boundary'})
+            self.append(row)
+        return self.event(harness=harness, session=session, source='compact')
+
+    def checkpoint_status(self, harness='codex', session='pilot'):
+        return json.loads(self.command('checkpoint-status', harness, session).stdout)
+
+    def note_at_body_limit(self, body_limit, *, unicode_filler=True):
+        placeholder = '__PAD__'
+        note = NOTE.replace('The configured human authority must approve deployment; preserve that hold.',
+                            placeholder)
+        remaining = body_limit - len(note.encode('utf-8')) + len(placeholder.encode('utf-8'))
+        self.assertGreaterEqual(remaining, 0)
+        if unicode_filler:
+            filler = '界' * (remaining // 3) + 'x' * (remaining % 3)
+        else:
+            filler = 'x' * remaining
+        result = note.replace(placeholder, filler)
+        self.assertEqual(len(result.encode('utf-8')), body_limit)
+        return result
 
     def append(self, row):
         with self.trace.open('a') as f:
@@ -736,6 +796,198 @@ else:
         report = json.loads(self.command('checkpoint-status').stdout)
         self.assertEqual(report['observed_generation'], 1)
         self.assertFalse(report['pending_compact_boundary'])
+
+    def test_recovery_requires_paired_exact_read_and_later_save_does_not_reopen(self):
+        self.enroll()
+        self.save()
+        self.compact()
+        ordinary = self.pretool(tool='Edit', tool_use_id='ordinary-before-read')
+        denial = json.loads(ordinary.stdout)['hookSpecificOutput']
+        self.assertEqual(denial['permissionDecision'], 'deny')
+        command = self.checkpoint_status()['recovery']['next_command']
+        words = shlex.split(command)
+        self.assertIn('checkpoint-read', words)
+        self.assertEqual(words[words.index('--part') + 1], '1')
+        self.assertTrue(self.checkpoint_status()['recovery']['required'])
+
+        direct = self.command('checkpoint-read', 'codex', 'pilot', '--part', '1')
+        self.assertIn('checkpoint content begins', direct.stdout)
+        self.assertTrue(self.checkpoint_status()['recovery']['required'])
+
+        save_command = shlex.join(['pattern-buffer', '--cwd', str(self.root), 'checkpoint-save',
+                                   '--harness', 'codex', '--session', 'pilot', '--file',
+                                   self.checkpoint_status()['draft_path']])
+        save_before_read = self.pretool(tool='Bash', tool_input={'command': save_command},
+                                        tool_use_id='valid-publication-cannot-bypass-read')
+        self.assertEqual(json.loads(save_before_read.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+
+        command = shlex.join(['pattern-buffer', '--cwd', str(self.root), 'checkpoint-read',
+                              '--harness', 'codex', '--session', 'pilot', '--part', '1'])
+        wrong_session = self.posttool(session='other', tool_input={'command': command},
+                                      tool_use_id='wrong-session-read',
+                                      tool_response=direct.stdout)
+        self.assertEqual(wrong_session.stdout, '')
+        self.assertTrue(self.checkpoint_status()['recovery']['required'])
+
+        def truncate(frame):
+            return frame[:-20]
+
+        self.recovery_read(1, tool_use_id='truncated-read', transform=truncate)
+        self.assertTrue(self.checkpoint_status()['recovery']['required'])
+        self.recovery_read(1, tool_use_id='complete-read')
+        self.assertFalse(self.checkpoint_status()['recovery']['required'])
+
+        self.note.write_text(NOTE.replace('ORBIT-42', 'SAME-GENERATION-LATER-SAVE'))
+        self.save()
+        report = self.checkpoint_status()
+        self.assertFalse(report['recovery']['required'])
+        self.assertFalse(report['recovery']['receipt']['latest_checkpoint_matches_read'])
+        self.assertEqual(self.pretool(tool='Edit', tool_use_id='ordinary-after-read').stdout, '')
+
+    def test_unenrolled_session_stays_silent_for_checkpoint_recovery(self):
+        self.enroll()
+        self.save()
+        self.compact()
+        result = self.pretool(session='pb62-no-checkpoint', tool='Edit')
+        self.assertEqual(result.stdout, '')
+        gitdir = Path(self.git('rev-parse', '--absolute-git-dir').stdout.strip())
+        self.assertFalse(checkpoints._state_path(gitdir, 'codex', 'pb62-no-checkpoint').exists())
+        self.assertTrue(self.checkpoint_status()['recovery']['required'])
+
+    def test_multipart_recovery_rejects_mixed_versions_and_duplicate_hooks(self):
+        registered = self.enroll()
+        self.note.write_text(NOTE.replace('ORBIT-42', 'VERSION-ONE') + 'x' * 2200)
+        self.save()
+        first_compact = self.compact()
+        self.assertTrue(first_compact.stdout)
+        status = self.checkpoint_status()
+        self.assertEqual(status['recovery']['generation'], 1)
+        self.assertEqual(status['recovery']['freshness'], 'unknown')
+        self.assertTrue(status['recovery']['required'])
+        words = shlex.split(status['recovery']['next_command'])
+        self.assertIn('checkpoint-read', words)
+        self.assertEqual(words[words.index('--part') + 1], '1')
+
+        repeated = self.event(source='compact')
+        self.assertIn('recovery generation 1', repeated.stdout)
+        self.assertEqual(self.checkpoint_status()['recovery']['generation'], 1)
+
+        self.recovery_read(1, tool_use_id='part-one')
+        status = self.checkpoint_status()
+        self.assertEqual(status['recovery']['received_parts'], [1])
+        self.append({'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'ordinary row'}})
+        repeated_between_parts = self.event(source='compact')
+        self.assertIn('recovery generation 1', repeated_between_parts.stdout)
+        self.assertEqual(self.checkpoint_status()['recovery']['received_parts'], [1])
+
+        self.note.write_text(NOTE.replace('ORBIT-42', 'VERSION-TWO') + 'y' * 2200)
+        self.save()
+        self.recovery_read(2, tool_use_id='mixed-version-part-two')
+        status = self.checkpoint_status()
+        self.assertTrue(status['recovery']['required'])
+        self.assertEqual(status['recovery']['received_parts'], [2])
+
+        latest = json.loads(self.command('checkpoint-read').stdout)['note']
+        self.assertIn('VERSION-TWO', latest)
+        latest_path = Path(status['checkpoint_path'])
+        self.assertEqual(len(latest_path.read_bytes()), status['note_bytes'])
+        self.assertEqual(registered['draft_path'], status['draft_path'])
+        self.recovery_read(1, tool_use_id='latest-version-part-one')
+        self.assertFalse(self.checkpoint_status()['recovery']['required'])
+
+        self.append({'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'later ordinary row'}})
+        repeated_after_completion = self.event(source='compact')
+        self.assertTrue(repeated_after_completion.stdout)
+        status = self.checkpoint_status()['recovery']
+        self.assertFalse(status['required'])
+        self.assertEqual(status['receipt']['generation'], 1)
+
+        self.append({'type': 'compacted'})
+        next_compaction = self.event(source='compact')
+        self.assertIn('recovery generation 2', next_compaction.stdout)
+        status = self.checkpoint_status()['recovery']
+        self.assertTrue(status['required'])
+        self.assertEqual(status['generation'], 2)
+        self.assertEqual(status['receipt']['generation'], 1)
+
+    def test_recovery_receipt_uses_supported_codex_and_claude_response_shapes(self):
+        for harness in ('codex', 'claude'):
+            with self.subTest(harness=harness):
+                self.enroll(harness=harness, session='pilot-' + harness)
+                self.save(harness=harness, session='pilot-' + harness)
+                self.compact(harness=harness, session='pilot-' + harness)
+                self.recovery_read(1, harness=harness, session='pilot-' + harness,
+                                   response_shape='claude' if harness == 'claude' else None)
+                self.assertFalse(self.checkpoint_status(harness, 'pilot-' + harness)['recovery']['required'])
+
+    def test_missing_publication_can_be_repaired_only_through_owned_draft(self):
+        registered = self.enroll()
+        saved = self.save()
+        self.compact()
+        checkpoint = Path(saved['checkpoint_path'])
+        checkpoint.unlink()
+        draft = Path(registered['draft_path'])
+        save_command = shlex.join(['pattern-buffer', '--cwd', str(self.root), 'checkpoint-save',
+                                   '--harness', 'codex', '--session', 'pilot', '--file', str(draft)])
+        save_repair = self.pretool(tool='Bash', tool_input={'command': save_command},
+                                   tool_use_id='supported-save-for-missing-publication')
+        self.assertEqual(save_repair.stdout, '')
+        ordinary = self.pretool(tool='Edit', tool_input={'file_path': str(self.root / 'product.py')},
+                                tool_use_id='ordinary-with-missing-checkpoint')
+        self.assertEqual(json.loads(ordinary.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+        repair = self.pretool(tool='Write', tool_input={'file_path': str(draft), 'content': NOTE},
+                              tool_use_id='repair-owned-draft')
+        self.assertEqual(repair.stdout, '')
+        draft.write_text(NOTE.replace('ORBIT-42', 'RECOVERED-FROM-LIVE-EVIDENCE'))
+        published = self.posttool(tool='Write', tool_input={'file_path': str(draft)},
+                                  tool_use_id='repair-owned-draft', tool_response='written')
+        self.assertIn('Checkpoint published', published.stdout)
+        self.assertTrue(self.checkpoint_status()['recovery']['required'])
+        self.recovery_read(1, tool_use_id='read-repaired-publication')
+        self.assertFalse(self.checkpoint_status()['recovery']['required'])
+
+    def test_recovery_freshness_distinguishes_stale_normal_and_unknown_history(self):
+        self.enroll()
+        self.save()
+        first = self.compact()
+        self.assertIn('freshness is unknown', first.stdout)
+        self.recovery_read(1, tool_use_id='read-first-generation')
+
+        stale = self.compact()
+        status = self.checkpoint_status()
+        self.assertEqual(status['recovery']['freshness'], 'stale')
+        self.assertIn('may omit an entire work interval', stale.stdout)
+        self.recovery_read(1, tool_use_id='read-stale-generation')
+
+        self.save()
+        normal = self.compact()
+        status = self.checkpoint_status()
+        self.assertEqual(status['recovery']['freshness'], 'current')
+        self.assertIn('Publication metadata records a checkpoint save since confirmed compaction generation 2.',
+                      normal.stdout)
+        self.recovery_read(1, tool_use_id='read-current-generation')
+
+        unknown = self.event(source='compact', transcript_path='/does/not/exist')
+        status = self.checkpoint_status()
+        self.assertEqual(status['recovery']['freshness'], 'unknown')
+        self.assertIn('freshness is unknown', unknown.stdout)
+
+    def test_max_budget_unicode_checkpoint_completes_through_framed_cli_receipts(self):
+        registered = self.enroll()
+        max_note = self.note_at_body_limit(registered['draft_body_limit_bytes'])
+        self.note.write_text(max_note)
+        saved = self.save()
+        self.assertEqual(saved['note_bytes'], checkpoints.NOTE_LIMIT)
+        self.compact()
+        first, _ = self.recovery_read(1, tool_use_id='max-note-part-1')
+        match = re.search(r'^part: 1 of (\d+)$', first.stdout, re.MULTILINE)
+        self.assertIsNotNone(match)
+        part_count = int(match.group(1))
+        self.assertLessEqual(part_count, checkpoints.RECOVERY_MAX_PARTS)
+        for part in range(2, part_count + 1):
+            frame, _ = self.recovery_read(part, tool_use_id=f'max-note-part-{part}')
+            self.assertIn(f'part: {part} of {part_count}', frame.stdout)
+        self.assertFalse(self.checkpoint_status()['recovery']['required'])
 
 
 if __name__ == '__main__':

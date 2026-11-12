@@ -17,6 +17,9 @@ from urllib.parse import urlsplit
 
 NOTE_LIMIT = 8192
 TRACE_LIMIT = 256 * 1024
+RECOVERY_PART_BYTES = 2048
+RECOVERY_MAX_PARTS = math.ceil(NOTE_LIMIT / (RECOVERY_PART_BYTES - 3))
+RECOVERY_PENDING_READ_LIMIT = 32
 REMINDER_REARM_HYSTERESIS = 5.0
 ATTENTION_INPUT_LIMIT = 4096
 ATTENTION_OUTPUT_LIMIT = 8192
@@ -639,6 +642,131 @@ def _read_note(state, ci):
     return note, None
 
 
+def _empty_recovery_state():
+    return {"generation": 0, "event_correlation": None, "required": False,
+            "freshness": "unknown", "freshness_reason": "no observed recovery generation",
+            "boundary_generation": None, "received": None, "receipt": None,
+            "pending_reads": []}
+
+
+def _validate_recovery_state(state):
+    recovery = state.setdefault("recovery", _empty_recovery_state())
+    fields = {"generation", "event_correlation", "required", "freshness", "freshness_reason",
+              "boundary_generation", "received", "receipt", "pending_reads"}
+    if not isinstance(recovery, dict) or set(recovery) != fields:
+        raise ValueError("checkpoint recovery metadata is invalid")
+    generation = recovery.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError("checkpoint recovery generation is invalid")
+    correlation = recovery.get("event_correlation")
+    if correlation is not None and (not isinstance(correlation, str)
+                                    or re.fullmatch(r"[0-9a-f]{64}", correlation) is None):
+        raise ValueError("checkpoint recovery event correlation is invalid")
+    if not isinstance(recovery.get("required"), bool):
+        raise ValueError("checkpoint recovery requirement flag is invalid")
+    if recovery.get("freshness") not in ("unknown", "current", "stale"):
+        raise ValueError("checkpoint recovery freshness is invalid")
+    if recovery.get("freshness_reason") is not None and not isinstance(recovery["freshness_reason"], str):
+        raise ValueError("checkpoint recovery freshness reason is invalid")
+    boundary = recovery.get("boundary_generation")
+    if boundary is not None and (isinstance(boundary, bool) or not isinstance(boundary, int) or boundary < 0):
+        raise ValueError("checkpoint recovery boundary generation is invalid")
+    for key in ("received", "receipt"):
+        record = recovery.get(key)
+        if record is None:
+            continue
+        expected = ({"note_sha256", "published_at", "part_count", "parts"}
+                    if key == "received" else
+                    {"generation", "note_sha256", "published_at", "part_count", "completed_at"})
+        if not isinstance(record, dict) or set(record) != expected:
+            raise ValueError("checkpoint recovery receipt is invalid")
+        digest = record.get("note_sha256")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("checkpoint recovery receipt digest is invalid")
+        if not isinstance(record.get("published_at"), str):
+            raise ValueError("checkpoint recovery receipt publication time is invalid")
+        part_count = record.get("part_count")
+        if (isinstance(part_count, bool) or not isinstance(part_count, int)
+                or not 1 <= part_count <= RECOVERY_MAX_PARTS):
+            raise ValueError("checkpoint recovery receipt part count is invalid")
+        if key == "received":
+            parts = record.get("parts")
+            if (not isinstance(parts, list) or len(parts) > part_count
+                    or any(isinstance(part, bool) or not isinstance(part, int)
+                           or not 1 <= part <= part_count for part in parts)
+                    or len(set(parts)) != len(parts)):
+                raise ValueError("checkpoint recovery read parts are invalid")
+        else:
+            receipt_generation = record.get("generation")
+            if (isinstance(receipt_generation, bool) or not isinstance(receipt_generation, int)
+                    or receipt_generation < 1 or not isinstance(record.get("completed_at"), str)):
+                raise ValueError("checkpoint recovery receipt generation is invalid")
+    pending = recovery.get("pending_reads")
+    if not isinstance(pending, list) or len(pending) > RECOVERY_PENDING_READ_LIMIT:
+        raise ValueError("checkpoint pending recovery reads are invalid")
+    for item in pending:
+        if not isinstance(item, dict) or set(item) != {
+                "tool_use_id", "command_sha256", "generation", "note_sha256",
+                "published_at", "part", "part_count"}:
+            raise ValueError("checkpoint pending recovery read is invalid")
+        if not isinstance(item.get("tool_use_id"), str) or not item["tool_use_id"] or len(item["tool_use_id"]) > 512:
+            raise ValueError("checkpoint pending recovery tool ID is invalid")
+        if any(not isinstance(item.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", item[key]) is None
+               for key in ("command_sha256", "note_sha256")):
+            raise ValueError("checkpoint pending recovery digest is invalid")
+        if not isinstance(item.get("published_at"), str):
+            raise ValueError("checkpoint pending recovery publication time is invalid")
+        pending_generation = item.get("generation")
+        if isinstance(pending_generation, bool) or not isinstance(pending_generation, int) or pending_generation < 1:
+            raise ValueError("checkpoint pending recovery generation is invalid")
+        for key in ("part", "part_count"):
+            value = item.get(key)
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or not 1 <= value <= RECOVERY_MAX_PARTS):
+                raise ValueError("checkpoint pending recovery part is invalid")
+        if item["part"] > item["part_count"]:
+            raise ValueError("checkpoint pending recovery part is out of range")
+    return recovery
+
+
+def _checkpoint_part_ranges(data, size=RECOVERY_PART_BYTES):
+    if not data:
+        return [(0, 0)]
+    ranges = []
+    start = 0
+    while start < len(data):
+        end = min(start + size, len(data))
+        while end < len(data) and end > start and data[end] & 0xC0 == 0x80:
+            end -= 1
+        if end == start:
+            raise ValueError("checkpoint read part size cannot contain a UTF-8 character")
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _checkpoint_read_frame(state, note, part):
+    data = note.encode("utf-8")
+    ranges = _checkpoint_part_ranges(data)
+    if isinstance(part, bool) or not isinstance(part, int) or not 1 <= part <= len(ranges):
+        raise ValueError(f"--part must be from 1 to {len(ranges)}")
+    start, end = ranges[part - 1]
+    piece = data[start:end]
+    identity = state["identity"]
+    frame = (f"--- Pattern Buffer checkpoint read v1 ---\n"
+             f"harness: {identity['harness']}\n"
+             f"session: {identity['session']}\n"
+             f"recovery-generation: {_validate_recovery_state(state)['generation']}\n"
+             f"checkpoint-sha256: {state['note_sha256']}\n"
+             f"published-at: {state['published_at']}\n"
+             f"part: {part} of {len(ranges)}\n"
+             f"part-sha256: {_digest(piece)}\n"
+             f"part-bytes: {len(piece)}\n"
+             "--- checkpoint content begins ---\n").encode("utf-8")
+    footer = b"\n--- checkpoint content ends ---\n"
+    return frame + piece + footer
+
+
 def _empty_opencode_pressure():
     return {"descriptor": None, "descriptor_sha256": None, "status": "unknown",
             "reason": "descriptor_missing", "last_observed_at": None,
@@ -1068,6 +1196,7 @@ def _load_state(ci, root, gitdir, harness, session):
         raise ValueError("unsupported checkpoint metadata version")
     if state.get("identity") != _identity(root, gitdir, harness, session):
         raise ValueError("checkpoint identity changed")
+    _validate_recovery_state(state)
     required = ("checkpoint_path", "previous_path", "compact_at", "lead_points", "threshold_source",
                 "reminders", "enabled", "reviewed_at", "saved_revision", "note_sha256",
                 "saved_generation", "external", "observed_generation", "generation_uncertain",
@@ -1294,6 +1423,45 @@ def _report(ci, root, gitdir, harness, session, state, include_note=False):
               "pending_compact_boundary": bool(state.get("pending_compact_boundary")),
               "uncertainty": state.get("uncertainty") or ("compaction boundary not yet persisted or duplicate recovery hook" if state.get("pending_compact_boundary") else None),
               "warnings": [warning] if warning else [], "delivery_state": "not_tracked"}
+    recovery = _validate_recovery_state(state)
+    received = recovery.get("received")
+    receipt = recovery.get("receipt")
+    current_recovery_digest = state.get("note_sha256")
+    current_recovery_parts = (_checkpoint_part_ranges(note.encode("utf-8"))
+                              if note is not None and warning is None else [])
+    recovery_read_command = None
+    if recovery.get("required") and current_recovery_parts:
+        if (received is None or received.get("note_sha256") != current_recovery_digest
+                or received.get("published_at") != state.get("published_at")
+                or received.get("part_count") != len(current_recovery_parts)):
+            current_parts = []
+        else:
+            current_parts = received.get("parts", [])
+        next_part = next((part for part in range(1, len(current_recovery_parts) + 1)
+                          if part not in current_parts), 1)
+        recovery_read_command = shlex.join([
+            "pattern-buffer", "--cwd", str(root), "checkpoint-read", "--harness", harness,
+            "--session", session, "--part", str(next_part)])
+    result["recovery"] = {
+        "required": recovery.get("required", False),
+        "generation": recovery.get("generation", 0),
+        "freshness": recovery.get("freshness", "unknown"),
+        "freshness_reason": recovery.get("freshness_reason"),
+        "boundary_generation": recovery.get("boundary_generation"),
+        "received_parts": (list(received.get("parts", []))
+                           if received and received.get("note_sha256") == current_recovery_digest
+                           and received.get("published_at") == state.get("published_at") else []),
+        "part_count": len(current_recovery_parts),
+        "receipt": ({"generation": receipt["generation"],
+                     "note_sha256": receipt["note_sha256"],
+                     "published_at": receipt["published_at"],
+                     "completed_at": receipt["completed_at"],
+                     "part_count": receipt["part_count"],
+                     "current_generation": receipt["generation"] == recovery.get("generation"),
+                     "latest_checkpoint_matches_read": receipt["note_sha256"] == current_recovery_digest}
+                    if receipt else None),
+        "next_command": recovery_read_command,
+    }
     result["idle_warning_minutes"] = state.get("idle_warning_minutes", 0)
     result["idle_timer"] = state.get("idle_timer")
     if (state.get("idle_timer") or {}).get("status") == "cancel_unconfirmed":
@@ -1403,7 +1571,7 @@ def handle_cli(ci, root, gitdir, args):
                      "transcript": None,
                      "reminded_generation": None, "usage": None,
                      "draft_path": str(draft), "draft_signature": draft_signature,
-                     "published_at": None}
+                     "published_at": None, "recovery": _empty_recovery_state()}
             if harness == "opencode":
                 state["recent_compaction_event_ids"] = []
                 state["last_compaction_event_sequence"] = None
@@ -1460,6 +1628,12 @@ def handle_cli(ci, root, gitdir, args):
         if command == "checkpoint-status":
             return _report(ci, root, gitdir, harness, session, state)
         if command == "checkpoint-read":
+            part = getattr(args, "part", None)
+            if part is not None:
+                note, warning = _read_note(state, ci)
+                if note is None or warning:
+                    raise ValueError(warning or "checkpoint note is unavailable")
+                return _checkpoint_read_frame(state, note, part).decode("utf-8")
             return _report(ci, root, gitdir, harness, session, state, True)
     raise ValueError("unknown checkpoint command")
 
@@ -1849,13 +2023,21 @@ def event(ci, root, gitdir, harness, payload):
             if name == "SessionStart" and payload.get("source") == "compact":
                 correlation = _digest(json.dumps([session, state.get("transcript"),
                                                  state.get("observed_generation")], sort_keys=True).encode())
+                recovery_provenance = ({key: identity.get(key) for key in ("path", "dev", "ino")}
+                                       if transcript is not None and isinstance(identity, dict) else None)
+                recovery_correlation = _digest(json.dumps(
+                    [session, recovery_provenance, state.get("observed_generation")],
+                    sort_keys=True).encode())
                 uncertain = bool(state.get("generation_uncertain") or state.get("pending_compact_boundary"))
+                _start_recovery_generation(ci, root, state, recovery_correlation, generation_changed)
+                _write_json(state_path, state, ci)
                 _record(ci, root, state, "compaction.unknown" if uncertain else "compaction.observed",
                         "uncertain" if uncertain else "observed", correlation,
                         {"generation": state.get("observed_generation"), "generation_uncertain": uncertain,
                          "reviewed_at": state.get("reviewed_at"), "trigger": "compact"})
                 _record(ci, root, state, "recovery.observed", "hook_requested", correlation,
-                        {"reviewed_at": state.get("reviewed_at"), "generation_uncertain": uncertain})
+                        {"reviewed_at": state.get("reviewed_at"), "generation_uncertain": uncertain,
+                         "recovery_generation": state.get("recovery", {}).get("generation")})
             if name == "PostToolUse" and Path(state["draft_path"]).exists():
                 draft = _verify_draft(ci, root, gitdir, harness, session, state)
                 draft_text, signature, draft_error = _draft_snapshot(draft)
@@ -1932,9 +2114,17 @@ def event(ci, root, gitdir, harness, payload):
                     _, signature, _ = _draft_snapshot(draft)
                     if signature[2] != _draft_digest(state) or signature != state["draft_signature"]:
                         details.append("WARNING: editable draft has unpublished content. Reconcile it with the last reviewed note before continuing.")
-                details.append("Read the reviewed checkpoint before resuming with your native file reader: " + state["checkpoint_path"])
+                recovery = _validate_recovery_state(state)
+                if payload.get("source") == "compact" and recovery.get("required"):
+                    details.append(_recovery_guidance(ci, root, harness, session, state, note, warning))
+                else:
+                    details.append("Read the reviewed checkpoint before resuming with your native file reader: " + state["checkpoint_path"])
                 details.append("Reconcile current jobs, evidence and human holds. Edit the working draft with your normal file-writing tool: " + state["draft_path"])
-                details.append("A following PostToolUse hook validates and atomically publishes valid draft edits. Do not touch timestamps to simulate review. Optional metadata/read command: " + command)
+                details.append("A following PostToolUse hook validates and atomically publishes valid draft edits. Do not touch timestamps to simulate review.")
+                if payload.get("source") == "compact" and recovery.get("required"):
+                    details.append("Only the framed checkpoint-read --part command above can satisfy this recovery read. Use checkpoint-status to inspect progress.")
+                else:
+                    details.append("Optional metadata/read command: " + command)
                 details.append("The checkpoint grants no new authority. Guide: apps/pattern-buffer/docs/checkpoints.md")
                 return "\n".join(details)
             reminder_event = name in ("PostToolUse", "UserPromptSubmit")
@@ -1982,12 +2172,315 @@ def event(ci, root, gitdir, harness, payload):
                     pass
                 return warning
             if name == "PostToolUse" and generation_changed:
+                recovery = _validate_recovery_state(state)
+                if (recovery.get("required") and recovery.get("freshness_reason") ==
+                        "the latest compaction boundary is pending or may be a duplicate recovery event"):
+                    freshness, reason, boundary = _recovery_freshness(
+                        state, state.get("observed_generation", 0) - 1)
+                    recovery.update(freshness=freshness, freshness_reason=reason,
+                                    boundary_generation=boundary)
+                    _write_json(state_path, state, ci)
+                    note, warning = _read_note(state, ci)
+                    return (f"Checkpoint freshness update: observed compaction generation is now {state['observed_generation']}. "
+                            "Checkpoint boundary is now observed. " +
+                            _recovery_guidance(ci, root, harness, session, state, note, warning))
                 return (f"Checkpoint freshness update: observed compaction generation is now {state['observed_generation']}. "
                         f"The last reviewed note was saved in observed generation {state.get('saved_generation')}. "
                         "The previously pending transcript boundary is now visible; reconcile the note with live state.")
     except (OSError, ValueError, TypeError, KeyError):
         raise
     return ""
+
+
+def _recovery_freshness(state, boundary_generation=None):
+    if state.get("generation_uncertain"):
+        return "unknown", state.get("uncertainty") or "compaction history is incomplete", None
+    if state.get("pending_compact_boundary"):
+        return "unknown", "the latest compaction boundary is pending or may be a duplicate recovery event", None
+    if boundary_generation is None:
+        boundary_generation = state.get("observed_generation")
+    saved = state.get("saved_generation")
+    observed = state.get("observed_generation")
+    if (isinstance(boundary_generation, bool) or not isinstance(boundary_generation, int)
+            or boundary_generation < 0 or isinstance(observed, bool) or not isinstance(observed, int)
+            or observed < 0 or isinstance(saved, bool)):
+        return "unknown", "checkpoint publication or compaction history is incomplete", boundary_generation
+    if boundary_generation == 0:
+        if isinstance(saved, int) and saved == observed and observed > 0:
+            return "current", None, boundary_generation
+        return "unknown", "no previous confirmed compaction boundary is available for comparison", boundary_generation
+    if saved is None:
+        return "stale", "no successful checkpoint publication is recorded since the last confirmed compaction boundary", boundary_generation
+    if not isinstance(saved, int):
+        return "unknown", "checkpoint publication metadata is incomplete", boundary_generation
+    if boundary_generation <= saved <= observed:
+        return "current", None, boundary_generation
+    if saved < boundary_generation:
+        return "stale", "no successful checkpoint publication is recorded since the last confirmed compaction boundary", boundary_generation
+    return "unknown", "checkpoint publication metadata is newer than the confirmed compaction history", boundary_generation
+
+
+def _start_recovery_generation(ci, root, state, correlation, generation_changed):
+    recovery = _validate_recovery_state(state)
+    same_event = recovery.get("event_correlation") == correlation
+    if same_event:
+        return False
+    boundary_generation = state.get("observed_generation", 0) - (1 if generation_changed else 0)
+    freshness, reason, boundary_generation = _recovery_freshness(state, boundary_generation)
+    recovery.update(generation=recovery["generation"] + 1,
+                    event_correlation=correlation, required=True,
+                    freshness=freshness, freshness_reason=reason,
+                    boundary_generation=boundary_generation,
+                    received=None, pending_reads=[])
+    _record(ci, root, state, "recovery.read_required", "pending", correlation,
+            {"recovery_generation": recovery["generation"],
+             "observed_generation": state.get("observed_generation"),
+             "freshness": freshness, "freshness_reason": reason})
+    return True
+
+
+def _recovery_freshness_text(recovery):
+    boundary = recovery.get("boundary_generation")
+    if recovery.get("freshness") == "stale":
+        return (f"WARNING: No successful checkpoint publication is recorded since confirmed compaction generation {boundary}. "
+                "The checkpoint may omit an entire work interval. Older decisions and human holds may remain authoritative "
+                "even when current-state facts are stale. Reconcile current-state facts with the automatic summary, "
+                "live checkout, tracker and job evidence; preserve decisions and holds unless their owner changes them.")
+    if recovery.get("freshness") == "current":
+        if boundary == 0:
+            return ("Publication metadata records a save after the first confirmed compaction boundary. "
+                    "Reconcile it normally with the current automatic summary, live checkout, tracker and job evidence.")
+        return (f"Publication metadata records a checkpoint save since confirmed compaction generation {boundary}. "
+                "Reconcile it normally with the current automatic summary, live checkout, tracker and job evidence.")
+    reason = recovery.get("freshness_reason") or "compaction or publication history is incomplete"
+    return (f"WARNING: Checkpoint freshness is unknown because {reason}. "
+            "Do not assume it covers the last work interval. Reconcile current-state facts with the automatic summary "
+            "and live evidence, while preserving approved scope, explicit decisions and human holds. "
+            "Unknown authority or completion facts remain unresolved.")
+
+
+def _recovery_guidance(ci, root, harness, session, state, note, note_warning):
+    recovery = _validate_recovery_state(state)
+    lines = [f"Pattern Buffer checkpoint recovery is required for exact session {session}, "
+             f"recovery generation {recovery['generation']}.",
+             _recovery_freshness_text(recovery)]
+    lines.append("Publication metadata identifies the published bytes; it does not verify checkpoint claims or prove a substantive rewrite.")
+    lines.append("Preserve standing context, task scope and human holds. A newer automatic summary does not override checkpoint decisions, and unknown authority or completion facts remain unresolved.")
+    if note is None or note_warning:
+        status_command = shlex.join(["pattern-buffer", "--cwd", str(root), "checkpoint-status",
+                                     "--harness", harness, "--session", session])
+        save_command = shlex.join(["pattern-buffer", "--cwd", str(root), "checkpoint-save",
+                                   "--harness", harness, "--session", session,
+                                   "--file", state["draft_path"]])
+        lines.append("WARNING: The reviewed checkpoint is missing or unreadable, so the prerequisite remains unresolved.")
+        lines.append("Status command for this exact session: " + status_command + ".")
+        lines.append("You may inspect only this session's checkpoint, previous copy and owned draft; create or edit only the owned draft at " + state["draft_path"] + ".")
+        lines.append("Reconstruct only from current live evidence, then let PostToolUse publish a valid draft or run this supported save command when the independent static read gate allows it: " + save_command + ".")
+        lines.append("Read every framed part of the new publication before ordinary work resumes.")
+        lines.append("Do not invent completed work, replace running jobs, or treat a command invocation as a completed recovery read.")
+        return " ".join(lines)
+    data = note.encode("utf-8")
+    ranges = _checkpoint_part_ranges(data)
+    received = recovery.get("received")
+    parts = (received.get("parts", []) if received
+             and received.get("note_sha256") == state.get("note_sha256")
+             and received.get("published_at") == state.get("published_at")
+             and received.get("part_count") == len(ranges) else [])
+    next_part = next((part for part in range(1, len(ranges) + 1) if part not in parts), 1)
+    command = shlex.join(["pattern-buffer", "--cwd", str(root), "checkpoint-read",
+                          "--harness", harness, "--session", session,
+                          "--part", str(next_part)])
+    lines.append("Read every bounded part of the latest published checkpoint through its exact framed command. "
+                 "Only complete matching PostToolUse output for all parts of one published version opens this gate.")
+    lines.append("Next command: " + command + ".")
+    lines.append("Use checkpoint-status to see the remaining parts. Preserve standing context, task scope and human holds.")
+    return " ".join(lines)
+
+
+def _parse_hook_cli(ci, root, harness, session, payload):
+    if payload.get("tool_name") != "Bash":
+        return None, None
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return None, command
+    required_reads = ci.auxiliary("required_reads")
+    return required_reads._parse_allowed_cli_command(command, root, harness, session, ci), command
+
+
+def _recovery_repair_tool_allowed(payload, state):
+    tool = payload.get("tool_name")
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return False
+    target = tool_input.get("file_path") or tool_input.get("path")
+    if not isinstance(target, str) or not Path(target).is_absolute():
+        return False
+    if tool == "Read":
+        return target in {state["checkpoint_path"], state["previous_path"], state["draft_path"]}
+    if tool in ("Edit", "Write"):
+        return target == state["draft_path"]
+    return False
+
+
+def recovery_pretool_gate(ci, root, gitdir, harness, payload):
+    if harness not in ("claude", "codex") or payload.get("agent_id"):
+        return None
+    session = payload.get("session_id")
+    if not isinstance(session, str) or not session or len(session) > 512:
+        return None
+    required_reads = ci.auxiliary("required_reads")
+    parsed, command = _parse_hook_cli(ci, root, harness, session, payload)
+    read_part = (parsed.part if parsed is not None and parsed.command == "checkpoint-read" else None)
+    if parsed is not None:
+        if parsed.command == "checkpoint-status":
+            return None
+        if parsed.command == "read-required" and required_reads.allowed_cli_command(
+                command, root, harness, session, ci):
+            return None
+        if required_reads.allowed_diagnostic_cli_command(command, root, harness, session, ci):
+            if parsed.command != "checkpoint-read" or read_part is None:
+                return None
+    config_path = gitdir / "context-injector" / "config.json"
+    state_path = _state_path(gitdir, harness, session)
+    if not config_path.exists() or not state_path.exists():
+        return None
+    try:
+        config, _ = ci.load(root, gitdir)
+        if not ci.enabled(config):
+            return None
+        role, _, binding = ci.resolve_role(root, gitdir, config, harness, session)
+        if role != "orchestrator" or binding.get("task_id"):
+            return None
+        with ci.locked(_lock_path(state_path)):
+            _, state = _load_state(ci, root, gitdir, harness, session)
+            recovery = _validate_recovery_state(state)
+            if parsed is not None and parsed.command == "checkpoint-save":
+                note, warning = _read_note(state, ci)
+                source = Path(parsed.file).expanduser()
+                draft = Path(state["draft_path"])
+                if (not recovery.get("required")
+                        or (note is None or warning) and source.is_absolute()
+                        and not source.is_symlink()
+                        and source.resolve(strict=False) == draft.resolve(strict=False)):
+                    return None
+            if not state.get("enabled") or not recovery.get("required"):
+                return None
+            note, warning = _read_note(state, ci)
+            if (note is None or warning) and _recovery_repair_tool_allowed(payload, state):
+                return None
+            if parsed is not None and parsed.command == "checkpoint-read" and read_part is not None:
+                if note is not None and warning is None:
+                    ranges = _checkpoint_part_ranges(note.encode("utf-8"))
+                    tool_use_id = payload.get("tool_use_id")
+                    if (1 <= read_part <= len(ranges) and isinstance(tool_use_id, str)
+                            and tool_use_id and len(tool_use_id) <= 512
+                            and not any(ord(character) < 32 or ord(character) == 127 for character in tool_use_id)):
+                        pending = [item for item in recovery["pending_reads"]
+                                   if item.get("tool_use_id") != tool_use_id]
+                        pending.append({"tool_use_id": tool_use_id,
+                                        "command_sha256": _digest(command.encode("utf-8")),
+                                        "generation": recovery["generation"],
+                                        "note_sha256": state["note_sha256"],
+                                        "published_at": state["published_at"],
+                                        "part": read_part, "part_count": len(ranges)})
+                        recovery["pending_reads"] = pending[-RECOVERY_PENDING_READ_LIMIT:]
+                        _write_json(state_path, state, ci)
+                return None
+            message = _recovery_guidance(ci, root, harness, session, state, *_read_note(state, ci))
+            _record(ci, root, state, "recovery.gate_denied", "pending",
+                    recovery.get("event_correlation"),
+                    {"recovery_generation": recovery["generation"],
+                     "freshness": recovery["freshness"]})
+            return required_reads._hook_result(message, decision="deny")
+    except (OSError, ValueError, TypeError, UnicodeError, KeyError) as error:
+        message = ("Pattern Buffer could not verify checkpoint recovery state for this enrolled session. "
+                   f"Reason: {type(error).__name__}. Run pattern-buffer guide --print and checkpoint-status, "
+                   "preserve the current note and notify the owner. The recovery gate remains closed.")
+        return required_reads._hook_result(message, decision="deny")
+
+
+def recovery_posttool_finalize(ci, root, gitdir, harness, payload):
+    if harness not in ("claude", "codex") or payload.get("agent_id"):
+        return False
+    session = payload.get("session_id")
+    tool_use_id = payload.get("tool_use_id")
+    if (not isinstance(session, str) or not session or len(session) > 512
+            or not isinstance(tool_use_id, str) or not tool_use_id or len(tool_use_id) > 512):
+        return False
+    required_reads = ci.auxiliary("required_reads")
+    parsed, command = _parse_hook_cli(ci, root, harness, session, payload)
+    if parsed is None or parsed.command != "checkpoint-read" or parsed.part is None:
+        return False
+    state_path = _state_path(gitdir, harness, session)
+    if not state_path.exists() and not state_path.is_symlink():
+        return False
+    stdout, normalize_footer = required_reads._response_stdout(harness, payload)
+    command_digest = _digest(command.encode("utf-8"))
+    with ci.locked(_lock_path(state_path)):
+        _, state = _load_state(ci, root, gitdir, harness, session)
+        recovery = _validate_recovery_state(state)
+        pending = next((item for item in recovery["pending_reads"]
+                        if item.get("tool_use_id") == tool_use_id), None)
+        if pending is None:
+            return False
+        recovery["pending_reads"] = [item for item in recovery["pending_reads"]
+                                     if item.get("tool_use_id") != tool_use_id]
+        success = False
+        note = None
+        ranges = []
+        if (pending.get("command_sha256") == command_digest
+                and pending.get("generation") == recovery["generation"]
+                and recovery.get("required") and parsed.part == pending.get("part")):
+            note, warning = _read_note(state, ci)
+            if note is not None and warning is None:
+                data = note.encode("utf-8")
+                ranges = _checkpoint_part_ranges(data)
+                if (pending.get("note_sha256") == state.get("note_sha256")
+                        and pending.get("published_at") == state.get("published_at")
+                        and pending.get("part_count") == len(ranges)
+                        and 1 <= pending.get("part", 0) <= len(ranges)):
+                    frame = _checkpoint_read_frame(state, note, pending["part"])
+                    success = (isinstance(stdout, bytes) and
+                               (stdout == frame or normalize_footer and frame.endswith(b"\n")
+                                and stdout == frame[:-1]))
+        if success and note is not None:
+            received = recovery.get("received")
+            if (received is None or received.get("note_sha256") != state["note_sha256"]
+                    or received.get("published_at") != state["published_at"]
+                    or received.get("part_count") != len(ranges)):
+                received = {"note_sha256": state["note_sha256"],
+                            "published_at": state["published_at"],
+                            "part_count": len(ranges), "parts": []}
+            if pending["part"] not in received["parts"]:
+                received["parts"].append(pending["part"])
+                received["parts"].sort()
+            recovery["received"] = received
+            if len(received["parts"]) == received["part_count"]:
+                recovery["required"] = False
+                recovery["receipt"] = {"generation": recovery["generation"],
+                                        "note_sha256": received["note_sha256"],
+                                        "published_at": received["published_at"],
+                                        "part_count": received["part_count"],
+                                        "completed_at": _now()}
+                _record(ci, root, state, "recovery.read_completed", "complete",
+                        recovery.get("event_correlation"),
+                        {"recovery_generation": recovery["generation"],
+                         "note_sha256": received["note_sha256"],
+                         "part_count": received["part_count"]})
+            else:
+                _record(ci, root, state, "recovery.read_part_received", "partial",
+                        recovery.get("event_correlation"),
+                        {"recovery_generation": recovery["generation"],
+                         "note_sha256": received["note_sha256"],
+                         "part": pending["part"], "part_count": received["part_count"]})
+        else:
+            _record(ci, root, state, "recovery.read_rejected", "incomplete",
+                    recovery.get("event_correlation"),
+                    {"recovery_generation": recovery["generation"],
+                     "part": pending.get("part")})
+        _write_json(state_path, state, ci)
+    return success
 
 
 def statusline(ci, harness, payload):
