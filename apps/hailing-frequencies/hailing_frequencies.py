@@ -35,7 +35,8 @@ DISCORD_REPLY_READINESS = "discord_reply"
 CMUX_READINESS_POLICIES = frozenset((NATIVE_PROMPT_READINESS, DISCORD_REPLY_READINESS))
 INSTALL_MARKER = "# starfleet-hailing-frequencies:v1"
 RUNTIME_SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py", "guide.md",
-                        "agent-notify", "agent-notify-guide.md", "opencode_adapter.py")
+                        "agent-notify", "agent-notify-guide.md", "discord_cleanup.py",
+                        "discord-cleanup.md", "opencode_adapter.py")
 RUNTIME_SKILL_NAMES = ("skills/temporal-beacon/SKILL.md", "skills/agent-notify/SKILL.md")
 OPENCODE_SESSION = re.compile(r"^ses_[A-Za-z0-9]+$")
 OPENCODE_MESSAGE = re.compile(r"^msg_[A-Za-z0-9]+$")
@@ -1332,6 +1333,20 @@ def parser():
     attention = sub.add_parser("attention-once", help="Submit one deduplicated prompt to your own enrolled session")
     attention.add_argument("--session", required=True)
     attention.add_argument("--event-key", required=True)
+    cleanup = sub.add_parser("discord-cleanup", help="Preview and delete closed Discord forum threads")
+    cleanup_commands = cleanup.add_subparsers(dest="cleanup_action", required=True)
+    cleanup_guide = cleanup_commands.add_parser("guide", help="Print the cleanup guide without configuration or writes")
+    cleanup_guide.add_argument("--print", action="store_true")
+    cleanup_plan = cleanup_commands.add_parser("plan", help="Read Discord and save a private deletion preview")
+    cleanup_plan.add_argument("--start", required=True, help="Inclusive UTC date or ISO 8601 timestamp")
+    cleanup_plan.add_argument("--end", required=True, help="Exclusive UTC date or ISO 8601 timestamp")
+    cleanup_plan.add_argument("--output", type=Path, required=True)
+    cleanup_apply = cleanup_commands.add_parser("apply", help="Permanently delete the exact reviewed selection")
+    cleanup_apply.add_argument("--plan", type=Path, required=True)
+    cleanup_apply.add_argument("--confirm", required=True, help="SHA-256 printed by plan")
+    for command in (cleanup_plan, cleanup_apply):
+        command.add_argument("--notify-home", type=Path,
+                             default=Path(os.environ.get("AGENT_NOTIFY_HOME", "~/.config/agent-notify")).expanduser())
     temporal = sub.add_parser("temporal", help="Manage durable exact-session wake timers")
     temporal.add_argument("--state-dir", type=Path, default=argparse.SUPPRESS)
     temporal.add_argument("--cmux", default=argparse.SUPPRESS)
@@ -1367,6 +1382,12 @@ def main(argv=None):
     if args.command == "guide":
         sys.stdout.write(Path(__file__).with_name("guide.md").read_text(encoding="utf-8"))
         return None
+    if args.command == "discord-cleanup":
+        if args.cleanup_action == "guide":
+            sys.stdout.write(Path(__file__).with_name("discord-cleanup.md").read_text(encoding="utf-8"))
+            return None
+        import discord_cleanup
+        return discord_cleanup.main(args)
     app = Monitor(args.state_dir, Cmux(args.cmux))
     if args.command == "attention-once":
         stream = getattr(sys.stdin, "buffer", sys.stdin)
