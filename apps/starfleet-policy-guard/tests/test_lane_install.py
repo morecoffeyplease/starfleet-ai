@@ -266,6 +266,46 @@ class LaneInstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
+    def call_seat_rebind(self, source, seat_id, from_harness, from_session, env, ok=True):
+        return self.call_source(source, '--seat-id', seat_id, 'rebind-owner',
+                                '--from-harness', from_harness, '--from-session', from_session,
+                                '--confirm-handoff', env=env, ok=ok)
+
+    def prepare_seat_with_retired_attachment(self, label):
+        owner, owner_env = self.native_owner_fixture()
+        source = self.source_checkout(label + '-old-runtime', marker_file='lane.py')
+        active = self.add_native_seat_attachment(source, owner, self.repo, owner_env)
+        retired_path = self.base / (label + ' retired attachment')
+        retired_branch = 'feature/' + label + '-retired'
+        retired = self.add_native_seat_attachment(
+            source, owner, retired_path, owner_env, retired_branch)
+        seat_id = active['seat_id']
+        runtime = Path(active['seat_runtime_path'])
+        self.assertEqual(retired['seat_id'], seat_id)
+        attachment = next(row for row in lane_runtime.session_store.all_checkouts(seat_id)
+                          if row['root'] == str(retired_path.resolve()))
+        state_path = Path(attachment['checkout_dir']) / 'state.json'
+        self.seed_attachment_pr_history(seat_id, attachment['checkout_id'], state_path)
+
+        removed_worktree = subprocess.run(
+            ['git', '-C', str(self.repo), 'worktree', 'remove', '--force', str(retired_path)],
+            capture_output=True, text=True, env=owner_env)
+        self.assertEqual(removed_worktree.returncode, 0, removed_worktree.stderr)
+        removed_branch = subprocess.run(
+            ['git', '-C', str(self.repo), 'branch', '-D', retired_branch],
+            capture_output=True, text=True, env=owner_env)
+        self.assertEqual(removed_branch.returncode, 0, removed_branch.stderr)
+
+        planned = self.call_seat_retirement(runtime, seat_id, retired_path,
+                                            env=owner_env, cwd=self.repo)
+        plan = json.loads(planned.stdout)
+        applied = self.call_seat_retirement(runtime, seat_id, retired_path, '--apply',
+                                            '--plan-sha256', plan['plan_sha256'],
+                                            env=owner_env, cwd=self.repo)
+        self.assertTrue(json.loads(applied.stdout)['retired'])
+        return {'owner': owner, 'owner_env': owner_env, 'source': source, 'seat_id': seat_id,
+                'runtime': runtime, 'active': active, 'retired_state_path': state_path}
+
     def native_owner_fixture(self):
         owner = self.owner_seat()
         owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='claude',
@@ -2907,6 +2947,184 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(repeat_apply.returncode, 0, repeat_apply.stderr)
         self.assertTrue(json.loads(repeat_apply.stdout)['already_retired'])
         self.assertEqual(state_path.read_bytes(), before_repeat)
+
+    def test_rebind_owner_accepts_matching_retired_source_pin_control(self):
+        fixture = self.prepare_seat_with_retired_attachment('issue60-matching-retired')
+        incoming_env = dict(fixture['owner_env'], CLAUDE_CODE_SESSION_ID='claude-incoming-matching')
+
+        handoff = self.call_seat_rebind(
+            fixture['runtime'], fixture['seat_id'], 'claude',
+            fixture['owner_env']['CLAUDE_CODE_SESSION_ID'], incoming_env, ok=False)
+
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
+        self.assertTrue(json.loads(handoff.stdout)['rebound'])
+        self.assertEqual(lane_runtime.session_store.load_seat(fixture['seat_id'])['owner']['session_id'],
+                         incoming_env['CLAUDE_CODE_SESSION_ID'])
+
+    def test_rebind_owner_preserves_retired_historical_source_pins_after_upgrade(self):
+        fixture = self.prepare_seat_with_retired_attachment('issue60-stale-retired')
+        new_source = self.source_checkout('issue60-retired-upgrade-source', marker_file='lane_scope.py')
+        upgrade_plan = self.call_source(new_source, '--cwd', self.repo, 'upgrade-plan',
+                                        env=fixture['owner_env'])
+        self.assertEqual(upgrade_plan.returncode, 0, upgrade_plan.stderr)
+        proposed = json.loads(upgrade_plan.stdout)
+        upgraded = self.call_source(new_source, '--cwd', self.repo, 'upgrade', '--plan-sha256',
+                                    proposed['plan_sha256'], env=fixture['owner_env'])
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+
+        seat_before = lane_runtime.session_store.load_seat(fixture['seat_id'])
+        rows = lane_runtime.session_store.all_checkouts(fixture['seat_id'])
+        active = next(row['state'] for row in rows if row['state']['phase'] == 'active')
+        retired = next(row['state'] for row in rows if row['state']['phase'] == 'removed')
+        retired_state_path = fixture['retired_state_path']
+        retired_state_bytes = retired_state_path.read_bytes()
+        self.assertNotEqual(active['source_versions'], retired['source_versions'])
+        self.assertEqual(active['source_versions'], {
+            name: seat_before['runtime']['files'][name] for name in active['source_versions']})
+
+        incoming_env = dict(fixture['owner_env'], CLAUDE_CODE_SESSION_ID='claude-incoming-historical')
+        handoff = self.call_seat_rebind(
+            Path(seat_before['runtime']['path']), fixture['seat_id'], 'claude',
+            fixture['owner_env']['CLAUDE_CODE_SESSION_ID'], incoming_env, ok=False)
+
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
+        self.assertTrue(json.loads(handoff.stdout)['history_preserved'])
+        self.assertEqual(retired_state_path.read_bytes(), retired_state_bytes)
+        retired_after = json.loads(retired_state_path.read_bytes())
+        self.assertEqual(retired_after['phase'], 'removed')
+        self.assertEqual(retired_after['pr_bindings'], retired['pr_bindings'])
+        self.assertEqual(retired_after['history'], retired['history'])
+        seat_after = lane_runtime.session_store.load_seat(fixture['seat_id'])
+        self.assertEqual(seat_after['runtime'], seat_before['runtime'])
+        self.assertEqual(seat_after['owner']['session_id'], incoming_env['CLAUDE_CODE_SESSION_ID'])
+
+    def test_rebind_owner_refuses_stale_active_source_pin_without_changing_state(self):
+        owner, owner_env = self.native_owner_fixture()
+        source = self.source_checkout('issue60-stale-active-pin', marker_file='lane.py')
+        attached = self.add_native_seat_attachment(source, owner, self.repo, owner_env)
+        seat_id = attached['seat_id']
+        runtime = Path(attached['seat_runtime_path'])
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        state = json.loads(state_path.read_text())
+        state['source_versions']['lane.py'] = '0' * 64
+        state_path.write_text(json.dumps(state, indent=2) + '\n')
+        state_before = state_path.read_bytes()
+        seat_path = lane_runtime.session_store.seat_dir(seat_id) / 'seat.json'
+        seat_before = seat_path.read_bytes()
+        incoming_env = dict(owner_env, CLAUDE_CODE_SESSION_ID='claude-incoming-active-pin')
+
+        handoff = self.call_seat_rebind(runtime, seat_id, 'claude',
+                                        owner_env['CLAUDE_CODE_SESSION_ID'], incoming_env, ok=False)
+
+        self.assertEqual(handoff.returncode, 2)
+        self.assertIn('Pinned delivery adapter source changed', handoff.stderr)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertEqual(seat_path.read_bytes(), seat_before)
+
+    def test_new_source_rebinds_verified_older_seat_without_repinning_or_replacing_adapter(self):
+        owner, owner_env = self.native_owner_fixture()
+        old_source = self.source_checkout('issue60-older-seat-runtime', marker_file='lane.py')
+        new_source = self.source_checkout('issue60-new-maintenance-cli', marker_file='lane_scope.py')
+        attached = self.add_native_seat_attachment(old_source, owner, self.repo, owner_env)
+        seat_id = attached['seat_id']
+        seat_before = lane_runtime.session_store.load_seat(seat_id)
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        state_before = json.loads(state_path.read_text())
+        runtime_path = Path(seat_before['runtime']['path'])
+        runtime_before = lane_runtime.session_store.recorded_runtime_plan(
+            runtime_path, seat_before['runtime']['files'])
+        self.assertEqual(runtime_before, {'version': seat_before['runtime']['version'],
+                                          'path': seat_before['runtime']['path'],
+                                          'files': seat_before['runtime']['files']})
+        adapter_path = lane_runtime.session_store.seat_dir(seat_id) / 'bin' / 'gh'
+        adapter_before = adapter_path.read_bytes()
+        settings_path = owner / '.claude/settings.local.json'
+        settings_before = settings_path.read_bytes()
+        incoming_env = dict(owner_env, CLAUDE_CODE_SESSION_ID='claude-incoming-new-cli')
+
+        handoff = self.call_seat_rebind(
+            new_source, seat_id, 'claude', owner_env['CLAUDE_CODE_SESSION_ID'], incoming_env, ok=False)
+
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
+        self.assertTrue(json.loads(handoff.stdout)['rebound'])
+        seat_after = lane_runtime.session_store.load_seat(seat_id)
+        state_after = json.loads(state_path.read_text())
+        self.assertEqual(seat_after['runtime'], seat_before['runtime'])
+        runtime_after = lane_runtime.session_store.recorded_runtime_plan(
+            runtime_path, seat_after['runtime']['files'])
+        self.assertEqual(runtime_after, runtime_before)
+        self.assertEqual(state_after['source_versions'], state_before['source_versions'])
+        self.assertEqual(state_after['source'], state_before['source'])
+        self.assertEqual(state_after['source_revision'], state_before['source_revision'])
+        self.assertEqual(state_after['adapter'], state_before['adapter'])
+        self.assertEqual(adapter_path.read_bytes(), adapter_before)
+        self.assertEqual(settings_path.read_bytes(), settings_before)
+        self.assertTrue(runtime_path.is_dir())
+
+        state_after['source_versions']['lane.py'] = 'f' * 64
+        state_path.write_text(json.dumps(state_after, indent=2) + '\n')
+        corrupt_state = state_path.read_bytes()
+        seat_after_bytes = (lane_runtime.session_store.seat_dir(seat_id) / 'seat.json').read_bytes()
+        next_owner_env = dict(incoming_env, CLAUDE_CODE_SESSION_ID='claude-incoming-third')
+        stale_active = self.call_seat_rebind(
+            new_source, seat_id, 'claude', incoming_env['CLAUDE_CODE_SESSION_ID'], next_owner_env, ok=False)
+        self.assertEqual(stale_active.returncode, 2)
+        self.assertIn('Pinned delivery adapter source changed', stale_active.stderr)
+        self.assertEqual(state_path.read_bytes(), corrupt_state)
+        self.assertEqual((lane_runtime.session_store.seat_dir(seat_id) / 'seat.json').read_bytes(),
+                         seat_after_bytes)
+        self.assertEqual(adapter_path.read_bytes(), adapter_before)
+        self.assertEqual(settings_path.read_bytes(), settings_before)
+
+    def test_new_source_rebind_refuses_changed_recorded_runtime_without_writes(self):
+        owner, owner_env = self.native_owner_fixture()
+        old_source = self.source_checkout('issue60-changed-runtime-old', marker_file='lane.py')
+        new_source = self.source_checkout('issue60-changed-runtime-new', marker_file='lane_scope.py')
+        attached = self.add_native_seat_attachment(old_source, owner, self.repo, owner_env)
+        seat_id = attached['seat_id']
+        seat_path = lane_runtime.session_store.seat_dir(seat_id) / 'seat.json'
+        seat_before = seat_path.read_bytes()
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        state_before = state_path.read_bytes()
+        runtime_path = Path(lane_runtime.session_store.load_seat(seat_id)['runtime']['path'])
+        runtime_file = runtime_path / 'lane_scope.py'
+        runtime_file.chmod(0o644)
+        runtime_file.write_bytes(runtime_file.read_bytes() + b'\n# synthetic changed runtime\n')
+        runtime_file.chmod(0o444)
+        runtime_file_after = runtime_file.read_bytes()
+        incoming_env = dict(owner_env, CLAUDE_CODE_SESSION_ID='claude-incoming-changed-runtime')
+
+        handoff = self.call_seat_rebind(
+            new_source, seat_id, 'claude', owner_env['CLAUDE_CODE_SESSION_ID'], incoming_env, ok=False)
+
+        self.assertEqual(handoff.returncode, 2)
+        self.assertIn('Permanent seat runtime is changed or unavailable', handoff.stderr)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertEqual(seat_path.read_bytes(), seat_before)
+        self.assertEqual(runtime_file.read_bytes(), runtime_file_after)
+
+    def test_new_source_rebind_refuses_mismatched_recorded_runtime_version_without_writes(self):
+        owner, owner_env = self.native_owner_fixture()
+        old_source = self.source_checkout('issue60-runtime-version-old', marker_file='lane.py')
+        new_source = self.source_checkout('issue60-runtime-version-new', marker_file='lane_scope.py')
+        attached = self.add_native_seat_attachment(old_source, owner, self.repo, owner_env)
+        seat_id = attached['seat_id']
+        seat_path = lane_runtime.session_store.seat_dir(seat_id) / 'seat.json'
+        seat = json.loads(seat_path.read_text())
+        seat['runtime']['version'] = 'f' * 64
+        seat_path.write_text(json.dumps(seat, indent=2) + '\n')
+        seat_before = seat_path.read_bytes()
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        state_before = state_path.read_bytes()
+        incoming_env = dict(owner_env, CLAUDE_CODE_SESSION_ID='claude-incoming-runtime-version')
+
+        handoff = self.call_seat_rebind(
+            new_source, seat_id, 'claude', owner_env['CLAUDE_CODE_SESSION_ID'], incoming_env, ok=False)
+
+        self.assertEqual(handoff.returncode, 2)
+        self.assertIn('Permanent seat runtime path is not its recorded immutable runtime', handoff.stderr)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertEqual(seat_path.read_bytes(), seat_before)
 
     def test_missing_only_attachment_works_by_seat_id_and_refuses_wrong_owner_and_stale_plan(self):
         owner, owner_env = self.native_owner_fixture()

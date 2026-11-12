@@ -137,32 +137,45 @@ def locked(cwd):
             session_store.save_seat(manifest)
 
 
-def source_versions(harness=None):
+def source_version_names(harness=None):
     names = ['lane.py', 'lane_scope.py', 'delivery.py', 'delivery_runs.py',
              'github_records.py', 'session_store.py', 'cleanup.py']
     if harness == 'opencode':
         names.extend(('opencode-plugin/index.ts', 'opencode-plugin/policy.js'))
-    return {name: delivery_runs.digest(APP / name) for name in names}
+    return names
 
 
-def permanent_handoff_source_versions(seat, harness):
-    try:
-        incoming = source_versions(harness)
-    except OSError:
-        raise ValueError('Incoming delivery adapter source is missing or unavailable; no owner handoff was recorded') from None
+def source_versions(harness=None):
+    return {name: delivery_runs.digest(APP / name) for name in source_version_names(harness)}
+
+
+def permanent_handoff_runtime(seat):
     runtime = seat.get('runtime') if isinstance(seat, dict) else None
     if (not isinstance(runtime, dict) or not isinstance(runtime.get('version'), str) or
             not isinstance(runtime.get('path'), str) or not Path(runtime['path']).is_absolute() or
             not isinstance(runtime.get('files'), dict)):
         raise ValueError('Permanent seat runtime metadata is malformed; preserve it and inspect status')
+    runtime_path = Path(runtime['path'])
+    expected_path = session_store.runtime_root() / runtime['version']
+    if runtime_path != expected_path:
+        raise ValueError('Permanent seat runtime path is not its recorded immutable runtime; inspect status')
     try:
-        verified = session_store.recorded_runtime_plan(APP, runtime['files'])
+        session_store._refuse_symlinked_path(runtime_path)
+        session_store._require_sealed_runtime(runtime_path)
+        verified = session_store.recorded_runtime_plan(runtime_path, runtime['files'])
     except (OSError, TypeError, ValueError):
         raise ValueError('Permanent seat runtime is changed or unavailable; preserve it and inspect status') from None
     if (verified['version'] != runtime['version'] or verified['path'] != runtime['path'] or
-            any(runtime['files'].get(name) != digest for name, digest in incoming.items())):
-        raise ValueError('Incoming delivery adapter source differs from the permanent seat runtime; no owner handoff was recorded')
-    return incoming
+            verified['files'] != runtime['files']):
+        raise ValueError('Permanent seat runtime metadata differs from its immutable runtime; inspect status')
+    return runtime
+
+
+def runtime_source_versions(runtime, harness):
+    names = source_version_names(harness)
+    if any(name not in runtime['files'] for name in names):
+        raise ValueError('Permanent seat runtime does not contain the incoming adapter source; no owner handoff was recorded')
+    return {name: runtime['files'][name] for name in names}
 
 
 def source_revision(runtime=None):
@@ -658,10 +671,13 @@ def rebind_owner(args):
             if seat.get('handoff_journal'):
                 raise ValueError('A previous owner handoff is incomplete; use recover --rollback before another transfer')
             checkout_rows = session_store.all_checkouts(identifier)
-            outgoing_versions = source_versions(previous['harness'])
+            runtime = permanent_handoff_runtime(seat)
+            outgoing_versions = runtime_source_versions(runtime, previous['harness'])
             for item in checkout_rows:
                 state = item.get('state')
                 if not state:
+                    continue
+                if state.get('phase') == 'removed':
                     continue
                 state_owner = state.get('lane_owner')
                 if (not isinstance(state_owner, dict) or
@@ -669,7 +685,7 @@ def rebind_owner(args):
                     raise ValueError('Permanent seat and checkout owners differ; preserve history and inspect status')
                 if state.get('source_versions') != outgoing_versions:
                     raise ValueError('Pinned delivery adapter source changed; restore the reviewed source')
-            incoming_versions = permanent_handoff_source_versions(seat, identity['harness'])
+            incoming_versions = runtime_source_versions(runtime, identity['harness'])
             target_groups=copy.deepcopy(seat.get('groups',{}))
             target_hooks_installed=bool(seat.get('hooks_installed'))
             target_settings=copy.deepcopy(seat.get('settings'))
@@ -725,6 +741,8 @@ def rebind_owner(args):
             for item in checkout_rows:
                 state=item.get('state')
                 if not state:
+                    continue
+                if state.get('phase') == 'removed':
                     continue
                 path=Path(item['checkout_dir'])/'state.json'
                 if not path.resolve().is_relative_to(session_store.seat_dir(identifier).resolve()):
@@ -4354,7 +4372,7 @@ def build_parser():
     p.add_argument('--rollback', action='store_true', required=True,
                    help='Explicitly restore the previous source pin and owned files')
     sub.add_parser('discover',help='Read the published PR for this enrolled product branch and preserve per-PR report history')
-    p = sub.add_parser('rebind-owner',help='Explicitly authorized native-session handoff; no implicit inheritance')
+    p = sub.add_parser('rebind-owner',help='Explicitly authorized native-session handoff after validating the seat runtime; no implicit inheritance')
     p.add_argument('--from-harness',choices=('claude','codex','opencode'),required=True)
     p.add_argument('--from-session',required=True)
     p.add_argument('--confirm-handoff',action='store_true',required=True)
