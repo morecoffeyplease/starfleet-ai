@@ -83,7 +83,7 @@ The current delivery seat does not enforce fix rounds, and this guide does not c
 ## Published guidance attestations
 
 Prime Directive (Policy Guard) is the same delivery tool described by this guide and the `lane.py` CLI.
-This optional protocol binds one opening or accepted repair-batch attestation to the existing evidence packet and current PR binding.
+This optional protocol binds an opening, accepted repair-batch, or successor-validation attestation to the existing evidence packet and current PR binding.
 The human owner selects and rereads the applicable guidance, playbooks, principles and repository fix-guidance before editing the packet.
 The evidence packet may be authored manually before a PR exists, while the current renderer and publication check require the published owner-bound PR binding.
 For each reread file, record its kind, name, actual source reference, local path and SHA-256 of its current bytes.
@@ -99,6 +99,44 @@ Resolve an unknown required fact by investigating it or asking the configured hu
 Disclosing an unknown as an assumption or uncertainty does not complete a prerequisite or waive missing evidence, verification, scope or authority.
 The `uncertainty` list may still record honest tool-capability limits or future outcomes, such as a later authenticated comment read being unavailable.
 Do not claim future repair verification is complete.
+
+After a supported `rebind-owner` handoff on an already adopted target, the current native owner can use `stage: "successor_validation"` to reconcile work that is already complete.
+The `prior_publication_ref` must be an exact copy of the current `guidance_attestation_ref` object shown in the owner session's `status` JSON, including any nested predecessor reference.
+The packet must include `repair_history_ref` and a `reconciliation` object with nonempty `inherited_work`, `repair_history`, `scope_and_holds`, and `current_owner_work` entries.
+Do not include `accepted_batch_ref` on this stage.
+The renderer links the exact inherited comment and its recorded body hash, and includes the current candidate SHA from the successful report.
+This stage records current responsibility for covered delivery and creates no repair batch, round count, authorship claim, or approval transfer.
+The current owner must reread applicable guidance and reconcile completed work, current scope, holds, and candidate evidence before rendering.
+The current review explains why the inherited approach remains the simplest viable route and proportionate to the approved outcome, makes no claims based on assumptions, checks current evidence, verification, scope, and authority, and resolves any unknown required fact before attesting.
+
+Use the same evidence packet and current owner session for these commands.
+Copy the full `guidance_attestation_ref` value from the first command into `prior_publication_ref` before recording.
+Use the current `attestation-rereads` output to populate any registered required-read entries in `reread`.
+
+```sh
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree status > /tmp/policy-guard-status.json
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree attestation-rereads
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree record \
+  --evidence /path/to/delivery-evidence.json
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree attestation-render \
+  --evidence /path/to/delivery-evidence.json --stage successor-validation > /tmp/successor-validation.md
+gh pr comment https://github.com/OWNER/REPO/pull/123 --body-file /tmp/successor-validation.md
+python3 /path/to/installed/runtime/lane.py --cwd /product/worktree attestation-start-check \
+  --evidence /path/to/delivery-evidence.json --stage successor-validation \
+  --comment-url 'https://github.com/OWNER/REPO/pull/123#issuecomment-ID'
+```
+
+Successor rendering and start-check require a current clean report with successful canonical verification, including an explicit successful nothing-affected result when applicable.
+The start check also verifies the exact inherited publication, the ordered supported owner-history path, the current local and published branch mapping, the inherited comment's current authenticated body hash, and the new exact comment.
+It cannot run with `--enable`, and an inherited publication by itself still fails covered ready or merge delivery.
+The incoming owner must record a fresh report before start-check, and current required-read receipts must match that owner's current session and file bytes.
+The next handoff links the then-current publication, retaining the immediate predecessor reference and the existing owner-history path.
+
+When the packet, candidate, and required-read context remain unchanged, a repeated start-check for the same exact successor comment is idempotent and keeps the same inherited predecessor.
+When a successor report, packet, source read, or remote successor comment becomes stale, update the current packet and report, render a new body, post it as a new comment, and run start-check with that new comment URL.
+Do not edit an earlier comment to replace its published body.
+A missing or changed inherited comment fails closed because the exact prior publication can no longer be verified.
+The tool does not infer comment authorship, renew human approval, create a repair batch, or reset repair history.
 
 ```json
 {
@@ -133,7 +171,7 @@ An opening render requires a current clean report with successful canonical veri
 Unrelated report gaps remain independent from the mandatory opening-attestation prerequisite.
 Its body presents the approach, completed evidence, reread references, scope, holds and declared uncertainty, renders assumptions as explicit `None`, then ends with the attestation.
 A repair-batch render does not require the final candidate report, begins with its completed prerequisite attestation, and never claims future fix verification passed.
-Both bodies include this statement:
+Opening and repair-batch bodies include this statement:
 
 > I have chosen the simplest viable approach that meets the approved outcome and constraints, and kept the solution proportionate to the problem it solves.
 > I have made no claims based on assumptions, and I checked the required reads, investigation, evidence, verification, approved scope, and authority for this work.
@@ -176,7 +214,8 @@ The first owner-coordinated adoption uses `--enable`; it is accepted only after 
 That sets checkout-level `attestation_required: true` and records the exact publication reference under the current PR binding.
 Legacy attachments with no flag remain unchanged until this explicit adoption.
 Existing immutable seats must first receive the reviewed source through the normal `upgrade-plan` and `upgrade` flow; pinned runtime source is never hand-edited.
-For each later PR, discover its current binding and validate its own published comment with the same command without `--enable`; publication references do not transfer between PRs or owners.
+For each later PR, discover its current binding and validate its own published comment with the same command without `--enable`.
+Opening and repair-batch publications remain bound to their original owner and PR; after a supported owner handoff, successor validation creates a separate current-owner publication that links the exact predecessor.
 There is no disable or fallback flag.
 
 An adopted target refuses covered ready or merge unless its current packet attestation, exact local reread bytes and per-PR publication reference match.
@@ -346,6 +385,12 @@ python3 /path/to/installed/runtime/lane.py --cwd /worktrees/temporary-feature un
 ## Upgrade an installed seat
 
 Use a clean, committed newer Starfleet source checkout and run the reviewed upgrade from an active attached product checkout:
+
+`upgrade-plan` reads the executing installer source's Git revision, while the product checkout supplies the installed seat state.
+An immutable runtime has no Git-backed source checkout and cannot produce an upgrade plan.
+If `setup_guidance.reason` says the executing CLI has no clean committed source and `setup_guidance.command` is null, no exact compatible source entrypoint is recorded.
+Choose a verified matching clean committed newer Starfleet source checkout before planning.
+Policy Guard does not search local directories or fetch sources to guess compatibility.
 
 ```sh
 python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade-plan

@@ -691,6 +691,165 @@ class PreferencesTest(unittest.TestCase):
                       "--task-file", str(brief), "--review-plan", plan["id"],
                       "--approval", approval["id"])
 
+    def test_review_cli_guidance_covers_approval_authority_and_staleness_read_only(self):
+        self.activate("Codex-only")
+        repo = self.repo()
+        env = dict(os.environ)
+
+        def cli(*args):
+            result = self.run_cli(env, *args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        def make_plan(**changes):
+            facts = self.facts(**changes)
+            return cli("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(facts))
+
+        def inspect_readonly(plan_id, full=False):
+            def snapshot(directory):
+                return {str(path.relative_to(directory)): path.read_bytes()
+                        for path in directory.rglob("*") if path.is_file()}
+
+            before_config = snapshot(self.config_dir)
+            before_state = snapshot(self.state_dir)
+            report = cli("review-inspect", plan_id, *( ["--full"] if full else []))
+            self.assertEqual(snapshot(self.config_dir), before_config)
+            self.assertEqual(snapshot(self.state_dir), before_state)
+            return report["review_guidance"]
+
+        standard = make_plan()
+        standard_guidance = inspect_readonly(standard["id"])
+        self.assertEqual(standard["role"], "standard_review")
+        self.assertEqual(standard_guidance["approval_required"], False)
+        self.assertEqual(standard_guidance["approval_status"], "not_required")
+        self.assertEqual(standard_guidance["plan_status"], "current")
+        self.assertEqual(standard_guidance["review_slots"][0]["harness"], "codex")
+        self.assertEqual(standard_guidance["review_slots"][0]["model"], "gpt-6.1-sol")
+        self.assertEqual(inspect_readonly(standard["id"], full=True), standard_guidance)
+
+        advanced = make_plan(money=True)
+        advanced_guidance = inspect_readonly(advanced["id"])
+        self.assertEqual(advanced["role"], "advanced_review")
+        self.assertEqual(advanced_guidance["approval_status"], "missing")
+        self.assertEqual(advanced_guidance["approval_authority"], {"status": "configured", "label": "user"})
+        self.assertIn("--config-dir", advanced_guidance["next_action_command"])
+        self.assertIn("--state-dir", advanced_guidance["next_action_command"])
+
+        standard_decision_plan = make_plan(money=True)
+        decision_result = cli("approve-review", standard_decision_plan["id"], "--standard-instead",
+                              "--authorization", "Synthetic authority selected standard review.")
+        decision_guidance = inspect_readonly(standard_decision_plan["id"])
+        self.assertEqual(decision_guidance["approval_status"], "standard_instead")
+        self.assertEqual(decision_guidance["review_role"], "standard_review")
+        self.assertIn(decision_result["id"], decision_guidance["next_action_command"])
+
+        legacy = make_plan()
+        legacy_state = self.app.state(f"reviews/{legacy['id']}", None)
+        legacy_state.pop("selection_snapshot")
+        self.app.save_state(f"reviews/{legacy['id']}", legacy_state)
+        config = self.app.config()
+        config["approval_authority"] = {"label": "new authority"}
+        mp.write(self.app.config_path, config)
+        stale_selection = inspect_readonly(advanced["id"])
+        self.assertEqual(stale_selection["selection_status"], "stale")
+        self.assertEqual(stale_selection["plan_status"], "stale")
+        self.assertEqual(stale_selection["approval_authority"], {"status": "configured", "label": "user"})
+        self.assertEqual(stale_selection["approval_status"], "stale")
+        legacy_stale = inspect_readonly(legacy["id"])
+        self.assertEqual(legacy_stale["approval_authority"], {"status": "unknown", "label": None})
+        self.assertEqual(legacy_stale["selection_source"], "unknown")
+        self.assertEqual(legacy_stale["review_options"], [])
+
+        config["approval_authority"] = {"label": None}
+        mp.write(self.app.config_path, config)
+        unset_plan = make_plan(money=True)
+        unset_guidance = inspect_readonly(unset_plan["id"])
+        self.assertEqual(unset_guidance["approval_authority"], {"status": "unset", "label": None})
+        self.assertIn("create a fresh plan", unset_guidance["next_action"].lower())
+        self.assertIn("authority-set", unset_guidance["next_action_command"])
+
+        config["approval_authority"] = {"label": "user"}
+        mp.write(self.app.config_path, config)
+        (repo / "app.py").write_text("changed after the saved plan\n")
+        stale_scope = inspect_readonly(standard["id"])
+        self.assertEqual(stale_scope["selection_status"], "current")
+        self.assertEqual(stale_scope["scope_status"], "stale")
+        self.assertEqual(stale_scope["plan_status"], "stale")
+        self.assertFalse((self.state_dir / "launches").exists())
+
+        approval_plan = make_plan(money=True)
+        approval_directory = self.state_dir / "approvals"
+        approval_directory.mkdir(exist_ok=True)
+        (approval_directory / "unreadable.json").write_text("{")
+        unreadable = inspect_readonly(approval_plan["id"])
+        self.assertEqual(unreadable["approval_records_status"], "unknown")
+        self.assertEqual(unreadable["approval_status"], "unknown")
+
+    def test_light_review_cli_guidance_uses_frozen_cycle_slots_and_context(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        env = dict(os.environ)
+
+        def cli(*args):
+            result = self.run_cli(env, *args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        target_id = str(uuid.uuid4())
+        cli("review-target", "create", "--cwd", str(repo), "--id", target_id)
+        facts = self.facts()
+        first = cli("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(facts),
+                    "--target", target_id, "--cycle-key", "first")
+        first_guidance = first["review_guidance"]
+        self.assertEqual([item["slot"] for item in first_guidance["review_slots"]], [1, 2])
+        self.assertIn("--review-target", first_guidance["next_action_command"])
+        self.assertIn("--review-cycle", first_guidance["next_action_command"])
+
+        target = self.app.state(f"review-targets/{target_id}", None)
+        cycle = target["cycles"][0]
+        for slot in cycle["slots"]:
+            launch_id = uuid.uuid4().hex
+            self.app.save_state(f"launches/{launch_id}", {
+                "id": launch_id,
+                "review_cycle": {"target_id": target_id, "cycle_id": cycle["id"],
+                                 "plan_id": first["id"], "slot": slot["number"]},
+                "choice": slot["choice"], "slot": slot["number"], "task_digest": "a" * 64,
+                "status": "exited", "exit_code": 0})
+            slot["launches"].append({"plan_id": first["id"], "launch_id": launch_id})
+        mp.save_target(self.app, target)
+
+        later = cli("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(facts),
+                    "--target", target_id, "--cycle-key", "later", "--previous-cycle", cycle["id"])
+        later_guidance = later["review_guidance"]
+        self.assertEqual([item["slot"] for item in later_guidance["review_slots"]], [1])
+        self.assertEqual([item["slot"] for item in later_guidance["review_options"][0]["slots"]], [1])
+        self.assertIn("--review-target", later_guidance["next_action_command"])
+        self.assertIn("--review-cycle", later_guidance["next_action_command"])
+
+        (repo / "app.py").write_text("changed to refresh the active cycle\n")
+        cli("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(facts),
+            "--target", target_id, "--cycle-key", "later", "--previous-cycle", cycle["id"])
+        (repo / "app.py").write_text("original\n")
+        historical = cli("review-inspect", later["id"])["review_guidance"]
+        self.assertEqual(historical["selection_status"], "current")
+        self.assertEqual(historical["scope_status"], "current")
+        self.assertEqual(historical["review_cycle_status"], "stale")
+        self.assertEqual(historical["plan_status"], "stale")
+        self.assertEqual([item["slot"] for item in historical["review_slots"]], [1])
+        self.assertIsNone(historical["next_action_command"])
+
+    def test_qwen_review_guidance_keeps_fresh_authorization_per_launch(self):
+        self.activate("Codex-Qwen")
+        repo = self.repo()
+        facts = self.facts()
+        result = self.run_cli(dict(os.environ), "review-plan", "--cwd", str(repo), "--base", "HEAD",
+                              "--facts", str(facts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        guidance = json.loads(result.stdout)["review_guidance"]
+        self.assertEqual(guidance["fresh_review_authorization_required"], True)
+        self.assertIn("--review-authorization", guidance["next_action"])
+        self.assertIn("--review-authorization", guidance["next_action_command"])
+
     def test_codex_muse_single_advanced_review_requires_permission_before_launch(self):
         self.assert_single_advanced_review_requires_permission("Codex-Muse")
 

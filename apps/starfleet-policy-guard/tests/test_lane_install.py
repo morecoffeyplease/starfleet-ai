@@ -62,7 +62,7 @@ class LaneInstallTest(unittest.TestCase):
         self.api_calls = self.base / 'api-calls.jsonl'
         binary = self.base / 'bin/gh'
         binary.parent.mkdir()
-        binary.write_text('#!' + sys.executable + '\nimport json,os,sys\nfrom pathlib import Path\nfrom urllib.parse import parse_qs,unquote,urlsplit\n'
+        binary.write_text('#!' + sys.executable + '\nimport json,os,sys,time\nfrom pathlib import Path\nfrom urllib.parse import parse_qs,unquote,urlsplit\n'
                           'if sys.argv[1:2] == ["api"]:\n'
                           ' with open(os.environ["FAKE_LANE_API"],"a") as f:\n'
                           '  f.write(json.dumps({"endpoint":sys.argv[-1]})+"\\n")\n'
@@ -78,6 +78,7 @@ class LaneInstallTest(unittest.TestCase):
                           '  print(json.dumps(data.get("target_response", {"ref":"refs/heads/"+branch,"object":{"type":"commit","sha":data.get("target_head",primary["base"]["sha"])}})))\n'
                           ' elif "/issues/comments/" in sys.argv[-1]:\n'
                           '  if data.get("comment_error"): sys.exit(1)\n'
+                          '  time.sleep(float(data.get("comment_delay", 0)))\n'
                           '  print(json.dumps(data["comments"][sys.argv[-1].split("/")[-1]]))\n'
                           ' else: print(json.dumps(data["records"][sys.argv[-1].split("/")[-1]] if "records" in data else data))\n'
                           'else:\n'
@@ -173,6 +174,14 @@ class LaneInstallTest(unittest.TestCase):
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr)
         return result
+
+    def fixture_snapshot(self):
+        return {str(path.relative_to(self.base)): (
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    path.stat().st_mode & 0o777,
+                    path.stat().st_mtime_ns)
+                for path in self.base.rglob('*')
+                if path.is_file() and '__pycache__' not in path.parts}
 
     def source_checkout(self, label, marker_file='lane.py'):
         source = self.base / ('policy guard source ' + label)
@@ -1597,6 +1606,273 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(required_reads['generation'], 3)
         self.assertEqual(required_reads['stage'], 'repair_batch')
 
+    def test_successor_validation_reuses_exact_publications_across_two_handoffs(self):
+        source = self.source_checkout_same_fingerprints('successor-validation')
+        readme = self.repo / 'README.md'
+        readme.write_text('Canonical verification: python3 verify.py\n')
+        self.git('add', 'README.md')
+        self.git('commit', '-m', 'add canonical verification fixture')
+        self.head = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.remote['head']['sha'] = self.head
+        self.remote_path.write_text(json.dumps(self.remote))
+
+        owner_a = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex',
+                       CODEX_THREAD_ID='codex-fixture-thread')
+        self.install_from_source(source, lane=True, lane_pr_url=self.url, env=owner_a)
+        self.call_source(source, 'discover', env=owner_a)
+        state = lane_runtime.read(self.repo)
+        packet = json.loads(self.packet.read_text())
+        packet.update(pr_url=self.url, base_ref=state['base_ref'])
+        packet['design-fidelity']['revision'] = self.head
+        verify_log = self.base / 'verify-success.txt'
+        verify_log.write_text('Synthetic successful canonical verification evidence.\n')
+        packet['local-verification'] = {
+            'revision': self.head,
+            'command': ['python3', 'verify.py'],
+            'command_source': {'path': str(readme), 'sha256': hashlib.sha256(readme.read_bytes()).hexdigest()},
+            'exit_code': 0,
+            'outcome': 'passed',
+            'evidence': {'path': str(verify_log), 'sha256': hashlib.sha256(verify_log.read_bytes()).hexdigest()},
+            'inputs': [],
+            'input_scope': 'Synthetic fixture has no external verification inputs',
+        }
+        old_guidance = self.base / 'old-owner-guidance.md'
+        old_guidance.write_text('Synthetic guidance read by the first owner.\n')
+        packet['guidance_attestation'] = {
+            'version': 1, 'stage': 'repair_batch',
+            'issue_ref': 'https://fixture.invalid/starfleet/guard/issues/37',
+            'accepted_batch_ref': 'https://fixture.invalid/starfleet/guard/issues/37#accepted-batch-1',
+            'repair_history_ref': self.url + '#issuecomment-1',
+            'prerequisites_complete': True, 'gaps': [],
+            'reread': [{'kind': 'playbook', 'name': 'Existing repair playbook',
+                        'source_ref': 'https://fixture.invalid/starfleet/guard/blob/abc/playbook.md',
+                        'path': str(old_guidance),
+                        'sha256': hashlib.sha256(old_guidance.read_bytes()).hexdigest()}],
+            'guidance_application': 'The playbook bounds the existing batch to the approved target.',
+            'approach': 'Keep the existing delivery path.',
+            'approach_reason': 'The current covered path checks this publication.',
+            'evidence_refs': ['The current synthetic PR packet.'],
+            'assumptions': [], 'uncertainty': ['The fixture does not establish live GitHub delivery.'],
+            'approved_scope_ref': 'https://fixture.invalid/starfleet/guard/issues/37#approved-scope',
+            'human_holds_ref': 'No additional hold is represented in this fixture.',
+        }
+        self.packet.write_text(json.dumps(packet))
+        comment_a = self.url + '#issuecomment-1001'
+        rendered_a = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                      '--stage', 'repair-batch', env=owner_a).stdout
+        self.remote['comments'] = {'1001': {
+            'id': 1001, 'html_url': comment_a,
+            'issue_url': 'https://api.fixture.invalid/repos/starfleet/guard/issues/901',
+            'body': rendered_a,
+        }}
+        self.remote_path.write_text(json.dumps(self.remote))
+        first_start = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'repair-batch', '--comment-url', comment_a, '--enable', env=owner_a)
+        first_publication = json.loads(first_start.stdout)['publication']
+        self.call_source(source, 'record', '--evidence', self.packet, env=owner_a)
+        old_ready = self.invoke_owner(owner_a, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(old_ready.returncode, 0, old_ready.stderr)
+        historical_body = self.remote['comments']['1001']['body']
+
+        owner_b = dict(owner_a, CODEX_THREAD_ID='codex-successor-fixture')
+        self.call_source(source, 'rebind-owner', '--from-harness', 'codex',
+                         '--from-session', 'codex-fixture-thread', '--confirm-handoff', env=owner_b)
+        after_first_handoff = lane_runtime.read(self.repo)
+        self.assertIsNone(after_first_handoff.get('receipt'))
+        self.assertEqual(after_first_handoff['guidance_attestation_ref'], first_publication)
+        self.assertEqual(len(after_first_handoff['owner_history']), 1)
+        status = json.loads(self.call_source(source, 'status', env=owner_b).stdout)
+        self.assertEqual(status['guidance_attestation_ref'], first_publication)
+        inherited_only = self.invoke_owner(owner_b, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(inherited_only.returncode, 2)
+
+        def required_reads(session, state, generation):
+            report = self.required_reads_report(state, generation=generation)
+            report['session_id'] = session
+            self.set_pattern_buffer_report(report)
+            return report
+
+        def successor_packet(predecessor, owner_work):
+            packet_value = json.loads(self.packet.read_text())
+            packet_value['guidance_attestation'] = {
+                'version': 1, 'stage': 'successor_validation',
+                'issue_ref': 'https://fixture.invalid/starfleet/guard/issues/37',
+                'repair_history_ref': self.url + '#issuecomment-1001',
+                'prior_publication_ref': copy.deepcopy(predecessor),
+                'prerequisites_complete': True, 'gaps': [],
+                'reread': [{'kind': 'playbook', 'name': 'Current playbook',
+                            'source_ref': 'https://fixture.invalid/starfleet/guard/blob/def/playbook.md',
+                            'path': str(current_guidance),
+                            'sha256': hashlib.sha256(current_guidance.read_bytes()).hexdigest()}],
+                'reconciliation': {
+                    'inherited_work': 'Reviewed the completed work linked from the inherited publication.',
+                    'repair_history': 'Reviewed existing repair history without accepting another batch.',
+                    'scope_and_holds': 'Reconciled the existing approved scope and current human holds.',
+                    'current_owner_work': owner_work,
+                },
+                'guidance_application': 'The current guidance supports this delivery review.',
+                'approach': 'Continue the current candidate under the existing scope.',
+                'approach_reason': 'The current evidence supports the approved outcome.',
+                'evidence_refs': ['The current candidate report and PR files.'],
+                'assumptions': [], 'uncertainty': ['The fixture does not establish live GitHub delivery.'],
+                'approved_scope_ref': 'https://fixture.invalid/starfleet/guard/issues/37#approved-scope',
+                'human_holds_ref': 'No additional hold is represented in this fixture.',
+            }
+            self.packet.write_text(json.dumps(packet_value))
+
+        current_guidance = self.base / 'current-owner-guidance.md'
+        current_guidance.write_text('Synthetic current guidance reread by each successor.\n')
+        required_reads('codex-successor-fixture', 'pending', 3)
+        rereads = json.loads(self.call_source(source, 'attestation-rereads', env=owner_b).stdout)
+        successor_packet(first_publication, 'The incoming owner reviewed the current candidate and report.')
+        for entry in rereads:
+            packet_entry = {**entry, 'source_ref': 'https://fixture.invalid/guides/' + entry['name']}
+            packet_value = json.loads(self.packet.read_text())
+            packet_value['guidance_attestation']['reread'].append(packet_entry)
+            self.packet.write_text(json.dumps(packet_value))
+        pending_record = self.call_source(source, 'record', '--evidence', self.packet, env=owner_b, ok=False)
+        self.assertEqual(pending_record.returncode, 2)
+        pending_start = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--comment-url', self.url + '#issuecomment-1002',
+            env=owner_b, ok=False)
+        self.assertEqual(pending_start.returncode, 2)
+        enable_start = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--comment-url', self.url + '#issuecomment-1002',
+            '--enable', env=owner_b, ok=False)
+        self.assertEqual(enable_start.returncode, 2)
+        required_reads('codex-successor-fixture', 'current', 3)
+        missing_report_start = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--comment-url', self.url + '#issuecomment-1002',
+            env=owner_b, ok=False)
+        self.assertEqual(missing_report_start.returncode, 2)
+        self.call_source(source, 'record', '--evidence', self.packet, env=owner_b)
+
+        wrong_owner = self.call_source(source, 'attestation-render', '--evidence', self.packet,
+                                       '--stage', 'successor-validation', env=owner_a, ok=False)
+        self.assertEqual(wrong_owner.returncode, 2)
+        wrong_predecessor = json.loads(self.packet.read_text())
+        wrong_predecessor['guidance_attestation']['prior_publication_ref']['head_branch'] = 'wrong-published-branch'
+        wrong_path = self.base / 'wrong-predecessor.json'
+        wrong_path.write_text(json.dumps(wrong_predecessor))
+        wrong_link = self.call_source(source, 'attestation-render', '--evidence', wrong_path,
+                                      '--stage', 'successor-validation', env=owner_b, ok=False)
+        self.assertEqual(wrong_link.returncode, 2)
+
+        rendered_b = json.loads(self.call_source(
+            source, 'attestation-render', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--format', 'json', env=owner_b).stdout)
+        comment_b = self.url + '#issuecomment-1002'
+        self.remote['comments']['1002'] = {
+            'id': 1002, 'html_url': comment_b,
+            'issue_url': 'https://api.fixture.invalid/repos/starfleet/guard/issues/901',
+            'body': 'not the rendered current publication',
+        }
+        self.remote_path.write_text(json.dumps(self.remote))
+        wrong_body = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--comment-url', comment_b, env=owner_b, ok=False)
+        self.assertEqual(wrong_body.returncode, 2)
+        self.remote['comments']['1002']['body'] = rendered_b['body']
+        self.remote_path.write_text(json.dumps(self.remote))
+        published_b = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--comment-url', comment_b, env=owner_b)
+        publication_b = json.loads(published_b.stdout)['publication']
+        self.assertEqual(publication_b['prior_publication_ref'], first_publication)
+        self.assertEqual(lane_runtime.read(self.repo)['guidance_attestation_ref'], publication_b)
+        self.assertEqual(self.remote['comments']['1001']['body'], historical_body)
+
+        repeated = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--comment-url', comment_b, env=owner_b)
+        self.assertEqual(json.loads(repeated.stdout)['publication'], publication_b)
+        current_ready = self.invoke_owner(owner_b, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(current_ready.returncode, 0, current_ready.stderr)
+        self.remote['comment_delay'] = 3
+        self.remote_path.write_text(json.dumps(self.remote))
+        slow_comments = self.invoke_owner(owner_b, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(slow_comments.returncode, 2)
+        self.assertIn('timed out', slow_comments.stderr)
+        self.assertFalse(self.forwarded.exists())
+        self.remote.pop('comment_delay')
+        self.remote_path.write_text(json.dumps(self.remote))
+
+        self.remote['comments']['1001']['body'] = 'changed inherited publication'
+        self.remote_path.write_text(json.dumps(self.remote))
+        changed_predecessor = self.invoke_owner(owner_b, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(changed_predecessor.returncode, 2)
+        self.remote['comments']['1001']['body'] = historical_body
+        self.remote_path.write_text(json.dumps(self.remote))
+        inherited_comment = self.remote['comments'].pop('1001')
+        self.remote_path.write_text(json.dumps(self.remote))
+        missing_predecessor = self.invoke_owner(owner_b, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(missing_predecessor.returncode, 2)
+        self.remote['comments']['1001'] = inherited_comment
+        self.remote_path.write_text(json.dumps(self.remote))
+        self.remote['comments']['1002']['body'] = 'changed current publication'
+        self.remote_path.write_text(json.dumps(self.remote))
+        changed_current = self.invoke_owner(owner_b, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(changed_current.returncode, 2)
+        replacement_b_url = self.url + '#issuecomment-1004'
+        self.remote['comments']['1004'] = {
+            'id': 1004, 'html_url': replacement_b_url,
+            'issue_url': 'https://api.fixture.invalid/repos/starfleet/guard/issues/901',
+            'body': rendered_b['body'],
+        }
+        self.remote_path.write_text(json.dumps(self.remote))
+        replacement_b = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--comment-url', replacement_b_url, env=owner_b)
+        publication_b = json.loads(replacement_b.stdout)['publication']
+        self.assertEqual(publication_b['prior_publication_ref'], first_publication)
+        self.assertEqual(self.remote['comments']['1002']['body'], 'changed current publication')
+        self.assertEqual(self.invoke_owner(owner_b, 'pr', 'ready', self.url,
+                                           '--starfleet-probe').returncode, 0)
+
+        owner_c = dict(owner_a, CODEX_THREAD_ID='codex-third-fixture')
+        self.call_source(source, 'rebind-owner', '--from-harness', 'codex',
+                         '--from-session', 'codex-successor-fixture', '--confirm-handoff', env=owner_c)
+        after_second_handoff = lane_runtime.read(self.repo)
+        self.assertEqual(after_second_handoff['guidance_attestation_ref'], publication_b)
+        self.assertEqual(len(after_second_handoff['owner_history']), 2)
+        self.assertEqual(len(after_second_handoff['history']), 2)
+        successor_packet(publication_b, 'The third owner reviewed the current candidate and report.')
+        required_reads('codex-third-fixture', 'current', 4)
+        rereads_c = json.loads(self.call_source(source, 'attestation-rereads', env=owner_c).stdout)
+        for entry in rereads_c:
+            packet_value = json.loads(self.packet.read_text())
+            packet_value['guidance_attestation']['reread'].append({
+                **entry, 'source_ref': 'https://fixture.invalid/guides/' + entry['name']})
+            self.packet.write_text(json.dumps(packet_value))
+        self.call_source(source, 'record', '--evidence', self.packet, env=owner_c)
+        rendered_c = json.loads(self.call_source(
+            source, 'attestation-render', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--format', 'json', env=owner_c).stdout)
+        comment_c = self.url + '#issuecomment-1003'
+        self.remote['comments']['1003'] = {
+            'id': 1003, 'html_url': comment_c,
+            'issue_url': 'https://api.fixture.invalid/repos/starfleet/guard/issues/901',
+            'body': rendered_c['body'],
+        }
+        self.remote_path.write_text(json.dumps(self.remote))
+        published_c = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'successor-validation', '--comment-url', comment_c, env=owner_c)
+        publication_c = json.loads(published_c.stdout)['publication']
+        self.assertEqual(publication_c['prior_publication_ref'], publication_b)
+        self.assertEqual(len(lane_runtime.read(self.repo)['owner_history']), 2)
+        self.assertEqual(len(lane_runtime.read(self.repo)['history']), 2)
+        self.assertEqual(self.remote['comments']['1001']['body'], historical_body)
+        self.assertEqual(self.remote['comments']['1002']['body'], 'changed current publication')
+        self.assertEqual(self.remote['comments']['1004']['body'], rendered_b['body'])
+        self.assertFalse(self.forwarded.exists())
+        self.assertEqual(self.invoke_owner(owner_c, 'pr', 'ready', self.url,
+                                           '--starfleet-probe').returncode, 0)
+
     def test_published_guidance_attestation_requires_owner_current_packet_and_exact_remote_comment(self):
         source = self.source_checkout('published-guidance-attestation')
         owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
@@ -2460,6 +2736,127 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual((state_path.parent / 'lock').stat().st_mtime_ns, before['lock_mtime'])
         self.assertNotIn('EXISTING_FLAG', json.dumps(result))
 
+    def test_issue80_immutable_runtime_refusal_uses_existing_guidance_and_clean_source_control(self):
+        old_source = self.source_checkout('issue80-old-pin')
+        new_source = self.source_checkout('issue80-new-source')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        self.install_from_source(old_source, lane=True, env=owner_env, lane_pr_url=self.url)
+
+        runtime_plan = lane_runtime.session_store.runtime_plan(new_source)
+        lane_runtime.session_store.install_runtime(new_source, runtime_plan)
+        immutable_runtime = Path(runtime_plan['path'])
+        self.assertFalse((immutable_runtime / '.git').exists())
+        outside_git = self.base / 'outside git'
+        outside_git.mkdir()
+        before = self.fixture_snapshot()
+
+        refused = self.call_source(immutable_runtime, 'upgrade-plan', env=owner_env, ok=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(refused.stdout, '')
+        self.assertNotIn('not a git repository', refused.stderr.lower())
+        for phrase in ('immutable runtime', 'executing installer source Git revision',
+                       'product checkout has a separate Git revision',
+                       'No exact compatible source entrypoint is recorded',
+                       'verified matching clean committed newer Starfleet source checkout'):
+            self.assertIn(phrase, refused.stderr)
+
+        status_result = self.call_source(immutable_runtime, 'status', env=owner_env)
+        self.assertEqual(status_result.returncode, 0, status_result.stderr)
+        status = json.loads(status_result.stdout)
+        guidance = status['setup_guidance']
+        self.assertEqual(guidance['action'], 'upgrade')
+        self.assertIsNone(guidance['command'])
+        self.assertIsNone(status['executing_cli']['source_revision'])
+        self.assertIsNone(status['executing_cli']['working_tree_dirty'])
+        self.assertFalse(status['executing_cli']['matches_installed_pin'])
+        for phrase in ('immutable runtime', 'executing installer source Git revision',
+                       'product checkout has a separate Git revision',
+                       'No exact compatible source entrypoint is recorded',
+                       'verified matching clean committed newer Starfleet source checkout'):
+            self.assertIn(phrase, guidance['reason'])
+        self.assertNotIn(str(new_source), guidance['reason'])
+
+        coverage_result = self.call_source(immutable_runtime, 'coverage', env=owner_env)
+        self.assertEqual(coverage_result.returncode, 0, coverage_result.stderr)
+        coverage = json.loads(coverage_result.stdout)
+        self.assertEqual(coverage['setup_guidance'], guidance)
+        summary = self.call_source(immutable_runtime, 'coverage', '--summary', env=owner_env)
+        self.assertEqual(summary.returncode, 0, summary.stderr)
+        self.assertIn('Next setup: upgrade - ' + guidance['reason'], summary.stdout)
+        self.assertNotIn('\nRun: ', summary.stdout)
+
+        printed_guide = self.call_source(immutable_runtime, 'guide', '--print', env=owner_env, cwd=outside_git)
+        self.assertEqual(printed_guide.returncode, 0, printed_guide.stderr)
+        self.assertEqual(printed_guide.stdout, (immutable_runtime / 'guide.md').read_text())
+
+        clean_status_result = self.call_source(new_source, 'status', env=owner_env)
+        self.assertEqual(clean_status_result.returncode, 0, clean_status_result.stderr)
+        clean_guidance = json.loads(clean_status_result.stdout)['setup_guidance']
+        expected_argv = [sys.executable, str(new_source / 'lane.py'), '--cwd', str(self.repo), 'upgrade-plan']
+        self.assertEqual(shlex.split(clean_guidance['command']), expected_argv)
+        self.assertEqual(clean_guidance['command'], shlex.join(expected_argv))
+        clean_plan = subprocess.run(shlex.split(clean_guidance['command']), cwd=self.repo,
+                                    env=owner_env, capture_output=True, text=True)
+        self.assertEqual(clean_plan.returncode, 0, clean_plan.stderr)
+        self.assertEqual(json.loads(clean_plan.stdout)['binding_type'], 'native-owner-lane')
+        self.assertEqual(self.fixture_snapshot(), before)
+
+    def test_issue80_immutable_runtime_keeps_owner_and_pin_refusals(self):
+        source = self.source_checkout('issue80-refusal-order')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        installed = self.install_from_source(source, lane=True, env=owner_env)
+        immutable_runtime = Path(installed['seat_runtime_path'])
+
+        wrong_owner = dict(owner_env, CODEX_THREAD_ID='codex-different-owner')
+        before_owner_refusal = self.fixture_snapshot()
+        owner_result = self.call_source(immutable_runtime, 'upgrade-plan', env=wrong_owner, ok=False)
+        self.assertEqual(owner_result.returncode, 2)
+        self.assertIn('This lane belongs to another native session.', owner_result.stderr)
+        self.assertNotIn('No exact compatible source entrypoint is recorded', owner_result.stderr)
+        self.assertEqual(self.fixture_snapshot(), before_owner_refusal)
+
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        state = json.loads(state_path.read_text())
+        state['source_versions']['lane.py'] = '0' * 64
+        state_path.write_text(json.dumps(state, indent=2) + '\n')
+        before_pin_refusal = self.fixture_snapshot()
+        pin_result = self.call_source(immutable_runtime, 'upgrade-plan', env=owner_env, ok=False)
+        self.assertEqual(pin_result.returncode, 2)
+        self.assertIn('Installed source pin is changed; restore its exact files before planning a recoverable upgrade',
+                      pin_result.stderr)
+        self.assertNotIn('No exact compatible source entrypoint is recorded', pin_result.stderr)
+        self.assertEqual(self.fixture_snapshot(), before_pin_refusal)
+
+    def test_issue80_missing_and_dirty_source_refusals_are_actionable(self):
+        installed_source = self.source_checkout('issue80-installed-source')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        self.install_from_source(installed_source, lane=True, env=owner_env)
+
+        no_git_source = self.base / 'source without git'
+        shutil.copytree(APP, no_git_source, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        dirty_source = self.source_checkout('issue80-dirty-source')
+        (dirty_source / 'pending-change.txt').write_text('uncommitted source change\n')
+        before_missing_source = self.fixture_snapshot()
+        missing_result = self.call_source(no_git_source, 'upgrade-plan', env=owner_env, ok=False)
+        self.assertEqual(missing_result.returncode, 2)
+        self.assertNotIn('not a git repository', missing_result.stderr.lower())
+        self.assertIn('executing installer source Git revision', missing_result.stderr)
+        self.assertIn('product checkout has a separate Git revision', missing_result.stderr)
+        self.assertIn('No exact compatible source entrypoint is recorded', missing_result.stderr)
+
+        status_result = self.call_source(no_git_source, 'status', env=owner_env)
+        self.assertEqual(status_result.returncode, 0, status_result.stderr)
+        status = json.loads(status_result.stdout)
+        self.assertEqual(status['setup_guidance']['action'], 'upgrade')
+        self.assertIsNone(status['setup_guidance']['command'])
+        self.assertIn('No exact compatible source entrypoint is recorded', status['setup_guidance']['reason'])
+
+        dirty_result = self.call_source(dirty_source, 'upgrade-plan', env=owner_env, ok=False)
+        self.assertEqual(dirty_result.returncode, 2)
+        self.assertIn('Commit the new installer source, then review a fresh upgrade plan', dirty_result.stderr)
+        self.assertNotIn('not a git repository', dirty_result.stderr.lower())
+        self.assertEqual(self.fixture_snapshot(), before_missing_source)
+
     def test_status_separates_successor_inspector_from_intact_installed_pin(self):
         old_source = self.source_checkout('status-old-pin')
         self.install_from_source(old_source)
@@ -2480,7 +2877,7 @@ class LaneInstallTest(unittest.TestCase):
         self.assertIn('Do not use rebind-owner', value['successor_guidance'])
         self.assertEqual(value['setup_guidance']['action'], 'upgrade')
         self.assertIsNone(value['setup_guidance']['command'])
-        self.assertIn('not a clean committed Git source', value['setup_guidance']['reason'])
+        self.assertIn('No exact compatible source entrypoint is recorded', value['setup_guidance']['reason'])
         self.assertNotIn('stale', value['report_status']['reason'])
 
     def test_status_recommends_upgrade_plan_from_clean_distinct_source(self):

@@ -77,6 +77,21 @@ Do not use a workspace title or an identity copied from another session.
 Use a parent's stable, exact enrolled completion recipient only when that parent explicitly delegates it for this request.
 That delegated identity is recorded as the request's current owner and recipient; handoff later still requires an explicit `warp-drive transfer`.
 
+## Verify owner arguments for a delegated request
+
+Run `warp-drive owner-args` from the current native agent terminal to print its observed harness, session and surface, after confirming the exact tuple has one matching Hailing enrollment.
+Use `--format json` for structured output or `--format shell` for shell-quoted argument flags.
+For a delegated request, the parent can run the command in its own terminal and paste the returned flags into the existing child brief or an optional argument file.
+
+```sh
+warp-drive owner-args --format shell
+```
+
+The child then uses those exact parent-provided flags on its existing Warp request command.
+The command reads CMUX's current native caller and the local Hailing enrollment without creating Warp state, enrolling an owner or checking notification delivery.
+It requires `CMUX_AGENT_LAUNCH_KIND` and exactly one matching native session hint to agree with CMUX and Hailing, so a delegated child uses its parent's supplied flags instead of asking `owner-args` to infer the parent's identity.
+An exact configured binding does not prove that a future completion message is queued, prompted, received or read.
+
 For OpenCode, pass its exact native `ses_` session ID, including letter case, and the current CMUX surface UUID.
 Warp-drive does not convert OpenCode session IDs to UUIDs or borrow an identity from another agent.
 The source CLI accepts OpenCode reservation ownership, but an installed older Warp-drive runtime does not gain that support until separately updated.

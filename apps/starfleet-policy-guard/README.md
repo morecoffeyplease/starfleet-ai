@@ -27,7 +27,9 @@ A recorded report is a covered-delivery requirement, not proof of setup or a pre
 
 Prime Directive (Policy Guard) is the same delivery tool described by this README and its `lane.py` CLI.
 An owner can explicitly adopt its stage-specific opening and accepted repair-batch attestations for a target; older attachments remain unchanged until adoption.
-The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, the `--enable` adoption command and source/runtime upgrade requirements.
+After an authorized owner handoff, the current owner can publish a successor-validation attestation that links the exact inherited publication and reconciles current evidence.
+Successor validation requires the current owner's clean report with successful canonical verification and the current required-read receipts.
+The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, handoff ancestry, recovery, the `--enable` adoption command and source/runtime upgrade requirements.
 When Pattern Buffer is installed with a required-reads list, the owner must include current matching read receipts in the attestation; `attestation-rereads` prints the required packet entries and leaves `source_ref` for the owner to supply.
 An attestation requires `assumptions: []`; unknown required facts must be investigated or raised to the configured human on Discord, then resolved before attesting.
 The packet can record honest uncertainty about tool limits and future outcomes, but it cannot prove that the author's reasoning contains no hidden assumptions.
@@ -98,6 +100,8 @@ For current limitations and exact supported paths, use the printable guide and e
 `migrate-plan` and `migrate` record the target seat's Claude settings mode and immutable runtime pin in the migrated checkout state.
 The migration plan also records the postimage hash for the target settings file, including when the seat already owns its hooks.
 For a checkout migrated before those fields were recorded, run the reviewed `upgrade-plan` and `upgrade` flow from a clean newer source checkout.
+The planner reads Git metadata from the executing source checkout, while the product checkout supplies the installed seat state.
+See the setup guide for immutable-runtime refusals and source-selection limits.
 The plan may restore missing runtime metadata only when the checkout's immutable source path and pinned file fingerprints match the owning seat runtime.
 It may correct a stale settings mode only when that checkout records the same settings path and content hash, and the live mode matches the durable seat settings metadata.
 Review every `migration_metadata_recovery` entry and apply only its exact plan hash.
