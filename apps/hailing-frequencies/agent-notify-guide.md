@@ -128,6 +128,8 @@ agent-notify doctor
 ```
 
 Run `agent-notify doctor` to check the webhook, bot token, configured account, and required forum tags.
+`agent-notify doctor --starfleet-json` is the local read-only check used by Starfleet Doctor; it does not source this shell file, contact Discord, or write the diagnostic cache.
+It reports private credential presence and safe file permissions only, so live account, tag, and delivery checks remain unknown.
 The command caches the resolved IDs in `cache.json` with private permissions and does not create a post.
 Its success confirms the Discord configuration only, not a received reply or a running worker.
 If the configured account or forum tags change, run `agent-notify doctor` again to refresh the cache.

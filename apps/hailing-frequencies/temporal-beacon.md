@@ -85,6 +85,8 @@ Start a new agent session after registration to load the skill.
 ## Agents start here
 
 Run `temporal-beacon doctor` to check the worker and your current enrollment before promising an automatic wake.
+Starfleet Doctor uses `temporal-beacon doctor --starfleet-json`, which reads local state without acquiring locks or creating the timer database.
+A fresh Temporal Beacon heartbeat is recent worker evidence, not proof of current process liveness.
 The command identifies a stopped worker, missing enrollment, changed binding, input hold, or uncertain delivery and provides recovery guidance.
 Use the same `--state-dir` as the Hailing Frequencies worker when using an isolated pilot.
 Global options precede the subcommand.

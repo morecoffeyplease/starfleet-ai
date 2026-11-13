@@ -117,6 +117,7 @@ It reports header bytes, usable content bytes and remaining UTF-8 bytes from the
 Use the exact session ID when available so the report includes the selected session file path.
 Without `--session`, status labels its placeholder header budget and does not establish exact native-session binding.
 `status`, `session-enroll`, `enrollment-status` and `handoff-check` use the same calculation.
+`status --starfleet-json` is the aggregate doctor's bounded read-only contract and looks up enrollment without creating or acquiring a registry lock.
 Status is read-only and continues to report local budget and delivery observations without claiming that the harness received context.
 Exact-session enrollments and dispatched work keep their blocking integrity checks for missing, inactive, unreviewed, malformed or oversized required context.
 An ordinary directly managed worktree may emit its complete role view above 8192 bytes with a warning when the total Pattern Buffer output, including runtime, task and checkpoint addenda, is at most 9216 bytes and remains under the 24 KiB combined limit.

@@ -129,6 +129,11 @@ Both accept `--send` and `--only-thread THREAD`.
 One state directory allows one worker and one supervisor at a time.
 The installer starts neither process and configures no launch service.
 
+`discord-watch doctor --starfleet-json` is an internal bounded read-only interface for Starfleet Doctor.
+It accepts a schema version 1 caller object on piped stdin, avoids reading an interactive terminal, creates no state, and acquires no locks.
+It reads SQLite only in immutable read-only mode when no journal sidecars are present, and keeps credentials and raw errors out of its output.
+Its worker result uses the latest persisted heartbeat and API evidence without checking process liveness, and observed delivery remains unknown.
+
 ## Installation and verification
 
 From a Starfleet AI checkout, run:

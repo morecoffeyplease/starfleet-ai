@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import threading
 import shlex
 import signal
@@ -63,6 +64,7 @@ REMIND_AFTER = 120
 DORMANT_AFTER = 7 * 24 * 60 * 60
 ALLOWED_LAUNCH_KINDS = {"claude", "codex", "opencode"}
 ACTIVE_MESSAGE_STATES = ("pending", "awaiting_receipt", "uncertain", "stalled")
+STARFLEET_DIAGNOSTIC_LIMIT = 256 * 1024
 
 
 def require(condition, message):
@@ -2673,6 +2675,263 @@ class Watch:
         return {"stopped": True}
 
 
+def _read_starfleet_bytes(path, maximum=STARFLEET_DIAGNOSTIC_LIMIT):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("diagnostic file is unavailable") from None
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode), "diagnostic file is not regular")
+        require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) & 0o077 == 0,
+                "diagnostic file has unsafe ownership or permissions")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            value = stream.read(maximum + 1)
+        require(len(value) <= maximum, "diagnostic file exceeds its size limit")
+        return value
+    except OSError:
+        raise ValueError("diagnostic file is unreadable") from None
+    finally:
+        os.close(descriptor)
+
+
+def _read_starfleet_json(path, maximum=STARFLEET_DIAGNOSTIC_LIMIT):
+    raw = _read_starfleet_bytes(path, maximum)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        raise ValueError("diagnostic JSON is malformed") from None
+    require(isinstance(value, dict), "diagnostic JSON must be an object")
+    return value
+
+
+def read_starfleet_caller(stream):
+    raw = stream.read(16 * 1024 + 1)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, bytes) or len(raw) > 16 * 1024:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return None
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "caller"}
+            or value.get("schema_version") != 1 or not isinstance(value.get("caller"), dict)
+            or set(value["caller"]) != {"harness", "session", "workspace", "surface"}):
+        return None
+    caller = value["caller"]
+    if (caller.get("harness") not in ALLOWED_LAUNCH_KINDS
+            or any(not isinstance(caller.get(key), str) or not caller[key]
+                   for key in ("session", "workspace", "surface"))):
+        return None
+    return caller
+
+
+def _diagnostic_owner_matches(owner, caller):
+    if not isinstance(owner, dict) or caller is None:
+        return False
+    try:
+        return (owner.get("harness") == caller["harness"]
+                and hf.session_identity(owner.get("session"), caller["harness"])
+                == hf.session_identity(caller["session"], caller["harness"])
+                and hf.identity(owner.get("surface")) == hf.identity(caller["surface"])
+                and hf.identity(owner.get("workspace")) == hf.identity(caller["workspace"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def discord_watch_diagnostic_report(state_dir, hailing_state, notify_home, caller=None):
+    checks = {"configuration": "unknown", "registration": "unknown", "worker": "unknown",
+              "intended_delivery": "unknown", "observed_delivery": "unknown"}
+    state = Path(state_dir).expanduser().absolute()
+    database_path = state / "discord-watch.sqlite3"
+    hailing_directory = Path(hailing_state).expanduser().absolute()
+    hailing_path = hailing_directory / "config.json"
+    if state.is_symlink() or hailing_directory.is_symlink():
+        checks["configuration"] = "blocked"
+        return {"schema_version": 1, "checks": checks}
+
+    notify_state = "unknown"
+    try:
+        notify = hf.agent_notify_diagnostic_report(
+            notify_home, require_webhook=False, require_cached_user=True)
+        notify_state = notify.get("checks", {}).get("configuration", "unknown")
+        if notify_state not in ("ready", "missing", "blocked", "unknown"):
+            notify_state = "unknown"
+    except (AttributeError, TypeError, ValueError, OSError):
+        notify_state = "unknown"
+
+    hailing_state_status = "unknown"
+    hailing_config = None
+    try:
+        if not hailing_directory.exists():
+            hailing_state_status = "missing"
+        else:
+            info = hailing_directory.stat(follow_symlinks=False)
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) & 0o077 == 0,
+                    "Hailing Frequencies state has unsafe ownership or permissions")
+            hailing_config = _read_starfleet_json(hailing_path)
+            if hailing_config is None:
+                hailing_state_status = "missing"
+            else:
+                validator = hf.Monitor(hailing_directory, cmux=object())
+                hailing_config = validator.config(hailing_config)
+                hailing_state_status = "ready"
+    except (OSError, ValueError, KeyError, TypeError):
+        hailing_state_status = "blocked"
+
+    database_state = "unknown"
+    worker_config = None
+    owned_threads = []
+    meta = {}
+    if not state.exists():
+        database_state = "missing"
+    else:
+        try:
+            state_info = state.stat(follow_symlinks=False)
+            require(stat.S_ISDIR(state_info.st_mode) and state_info.st_uid == os.getuid()
+                    and stat.S_IMODE(state_info.st_mode) & 0o077 == 0,
+                    "Discord Watch state has unsafe ownership or permissions")
+            if database_path.is_symlink():
+                raise ValueError("Discord Watch database is a symlink")
+            if not database_path.exists():
+                database_state = "missing"
+            elif any(Path(str(database_path) + suffix).exists()
+                     or Path(str(database_path) + suffix).is_symlink()
+                     for suffix in ("-wal", "-shm", "-journal")):
+                database_state = "unknown"
+            else:
+                database_info = database_path.stat(follow_symlinks=False)
+                require(stat.S_ISREG(database_info.st_mode) and database_info.st_uid == os.getuid()
+                        and stat.S_IMODE(database_info.st_mode) & 0o077 == 0,
+                        "Discord Watch database has unsafe ownership or permissions")
+                uri = database_path.as_uri() + "?mode=ro&immutable=1"
+                with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as db:
+                    db.execute("PRAGMA query_only=ON")
+                    tables = {row[0] for row in db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'")}
+                    require({"threads", "meta", "gateway_state"}.issubset(tables),
+                            "Discord Watch schema is incomplete")
+                    columns = {table: {row[1] for row in db.execute(
+                        f"PRAGMA table_info({table})")} for table in
+                        ("threads", "meta", "gateway_state")}
+                    require({"thread_id", "owner_json", "owner_generation", "last_poll_at",
+                             "last_error_json"}.issubset(columns["threads"])
+                            and {"key", "value"}.issubset(columns["meta"])
+                            and {"condition", "recovery_state"}.issubset(columns["gateway_state"]),
+                            "Discord Watch schema requires a migration")
+                    meta_keys = ("last_worker_tick_at", "worker_sender_config", "last_api_success_at",
+                                 "last_worker_error")
+                    meta = dict(db.execute(
+                        "SELECT key,substr(value,1,4097) FROM meta WHERE key IN (" +
+                        ",".join("?" for _ in meta_keys) + ")", meta_keys))
+                    meta_sizes = dict(db.execute(
+                        "SELECT key,length(value) FROM meta WHERE key IN (" +
+                        ",".join("?" for _ in meta_keys) + ")", meta_keys))
+                    require(all(size <= 4096 for size in meta_sizes.values()),
+                            "Discord Watch metadata exceeds its diagnostic size limit")
+                    rows = db.execute(
+                        "SELECT thread_id,substr(owner_json,1,16385),length(owner_json) "
+                        "FROM threads LIMIT 257").fetchall()
+                    owner_rows_complete = len(rows) <= 256
+                    for thread_id, owner_json, owner_size in rows[:256]:
+                        require(isinstance(thread_id, str) and re.fullmatch(r"[1-9][0-9]{0,24}", thread_id)
+                                and owner_size <= 16 * 1024,
+                                "Discord Watch owner record exceeds its diagnostic limits")
+                        owner = json.loads(owner_json)
+                        if _diagnostic_owner_matches(owner, caller):
+                            owned_threads.append(thread_id)
+                    if len(rows) > 256:
+                        owner_rows_complete = False
+                    database_state = "ready" if owner_rows_complete else "unknown"
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
+            database_state = "blocked"
+
+    if database_state in ("missing", "blocked", "unknown"):
+        checks["configuration"] = database_state
+        checks["registration"] = ("unknown" if caller is None else
+                                   "missing" if database_state == "missing" else "unknown")
+        checks["worker"] = "missing" if database_state == "missing" else database_state
+        checks["intended_delivery"] = "unknown" if caller is None else (
+            "missing" if database_state == "missing" else "unknown")
+        return {"schema_version": 1, "checks": checks}
+
+    states = (database_state, notify_state, hailing_state_status)
+    checks["configuration"] = ("blocked" if "blocked" in states else
+                                "missing" if "missing" in states else
+                                "unknown" if "unknown" in states else "ready")
+    if caller is None:
+        checks["registration"] = "unknown"
+        checks["intended_delivery"] = "unknown"
+    elif hailing_state_status == "blocked":
+        checks["registration"] = "blocked"
+        checks["intended_delivery"] = "blocked"
+    elif notify_state == "blocked":
+        checks["registration"] = "blocked" if not owned_threads else "ready"
+        checks["intended_delivery"] = "blocked"
+    else:
+        exact_hailing = []
+        if hailing_config is not None:
+            for target in hailing_config.get("targets", []):
+                if _diagnostic_owner_matches(target, caller):
+                    exact_hailing.append(target)
+        exact_registration = bool(owned_threads and len(exact_hailing) == 1)
+        checks["registration"] = "ready" if exact_registration else "missing"
+        checks["intended_delivery"] = "missing" if not exact_registration else "unknown"
+
+    tick_raw = meta.get("last_worker_tick_at")
+    config_raw = meta.get("worker_sender_config")
+    worker_error = meta.get("last_worker_error")
+    try:
+        worker_tick = json.loads(tick_raw) if tick_raw is not None else None
+        parsed_worker_config = json.loads(config_raw) if config_raw is not None else None
+        if (not isinstance(worker_tick, dict) or type(worker_tick.get("at")) not in (int, float)
+                or not math.isfinite(worker_tick["at"])
+                or not isinstance(worker_tick.get("generation"), str)
+                or re.fullmatch(r"[0-9a-f]{32}", worker_tick["generation"]) is None
+                or not isinstance(parsed_worker_config, dict)
+                or parsed_worker_config.get("generation") != worker_tick["generation"]
+                or type(parsed_worker_config.get("send")) is not bool
+                or (parsed_worker_config.get("only_thread") is not None and
+                    (not isinstance(parsed_worker_config["only_thread"], str) or
+                     re.fullmatch(r"[1-9][0-9]{0,24}", parsed_worker_config["only_thread"]) is None))):
+            raise ValueError("Worker diagnostic metadata is invalid")
+        worker_config = parsed_worker_config
+        age = time.time() - worker_tick["at"]
+        api_at = float(meta.get("last_api_success_at", "nan"))
+        api_age = time.time() - api_at
+        if not math.isfinite(api_at) or age < -5 or api_age < -5:
+            raise ValueError("Worker diagnostic timestamp is invalid")
+        if age > max(60, POLL_INTERVAL * 5) or api_age > max(60, POLL_INTERVAL * 5) or worker_error:
+            checks["worker"] = "blocked"
+        else:
+            checks["worker"] = "ready"
+    except (TypeError, ValueError, OverflowError):
+        checks["worker"] = "missing" if tick_raw is None else "blocked"
+
+    if caller is not None and checks["registration"] == "ready":
+        if notify_state == "missing" or hailing_state_status == "missing":
+            checks["intended_delivery"] = "missing"
+        elif notify_state != "ready":
+            checks["intended_delivery"] = "blocked" if notify_state == "blocked" else "unknown"
+        elif worker_config is None:
+            checks["intended_delivery"] = "missing"
+        elif worker_config["send"] is not True:
+            checks["intended_delivery"] = "blocked"
+        elif (worker_config["only_thread"] is not None and
+              worker_config["only_thread"] not in owned_threads):
+            checks["intended_delivery"] = "blocked"
+        else:
+            checks["intended_delivery"] = "ready"
+    return {"schema_version": 1, "checks": checks}
+
+
 def parser():
     command = argparse.ArgumentParser(description=__doc__)
     command.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
@@ -2703,7 +2962,9 @@ def parser():
     transfer.add_argument("--from-session", required=True)
     transfer.add_argument("--session", help="Select an exact OpenCode ses_ owner when the surface is ambiguous")
     sub.add_parser("status", help="Show worker health and private queue metadata")
-    sub.add_parser("doctor", help="Check state and configuration without printing credentials")
+    doctor = sub.add_parser("doctor", help="Check state and configuration without printing credentials")
+    doctor.add_argument("--starfleet-json", action="store_true",
+                        help="emit normalized read-only setup states for Starfleet Doctor")
     for name in ("scan", "serve", "supervise"):
         child = sub.add_parser(name)
         child.add_argument("--send", action="store_true", help="Enable guarded CMUX wakes")
@@ -2719,6 +2980,15 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if args.command == "guide":
         print(Path(__file__).with_name("guide.md").read_text(encoding="utf-8"), end="")
+        return 0
+    if args.command == "doctor" and args.starfleet_json:
+        caller = None if sys.stdin.isatty() else read_starfleet_caller(sys.stdin.buffer)
+        notify_home = args.notify_home
+        if args.notify_home == DEFAULT_NOTIFY_HOME and os.environ.get("AGENT_NOTIFY_HOME"):
+            notify_home = Path(os.environ["AGENT_NOTIFY_HOME"])
+        report = discord_watch_diagnostic_report(args.state_dir, args.hailing_state,
+                                                 notify_home, caller)
+        print(json.dumps(report, separators=(",", ":")))
         return 0
     app = Watch(args.state_dir, args.hailing_state, args.notify_home, args.cmux)
     if args.command == "register":

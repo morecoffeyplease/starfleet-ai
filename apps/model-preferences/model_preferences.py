@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1256,6 +1257,91 @@ def startup_report(config, expected=None):
             "authority": "Read-only check; startup intent does not activate a profile or replace an orchestrator."}
 
 
+def read_only_diagnostic_report(app, caller=None):
+    """Return bounded setup states without entering the configuration lock."""
+    statuses = {"configuration": "unknown", "registration": "unknown", "worker": "not_applicable",
+                "intended_delivery": "not_applicable", "observed_delivery": "unknown"}
+    try:
+        config = read_only_diagnostic_json(app.config_path)
+        if config is None:
+            statuses["configuration"] = "missing"
+            active = None
+        else:
+            config.setdefault("approval_authority", {"label": None})
+            validate(config)
+            active = selection(config) if config.get("active") else None
+            statuses["configuration"] = "ready" if active is not None else "missing"
+    except (PreferenceError, OSError, ValueError, KeyError, TypeError):
+        statuses["configuration"] = "blocked"
+        active = None
+    try:
+        recipients = read_only_diagnostic_json(app.state_dir / "orchestrators.json") or {}
+        adoptions = read_only_diagnostic_json(app.state_dir / "adoptions.json") or {}
+    except (PreferenceError, OSError, ValueError, KeyError, TypeError):
+        return {"schema_version": 1, "checks": statuses}
+    if not isinstance(recipients, dict) or not isinstance(adoptions, dict):
+        statuses["registration"] = "unknown"
+        return {"schema_version": 1, "checks": statuses}
+    if not isinstance(caller, dict):
+        return {"schema_version": 1, "checks": statuses}
+    caller_fields = {key: caller.get(key) for key in ("workspace", "surface", "session", "harness")}
+    if (not all(isinstance(caller_fields[key], str) and caller_fields[key]
+                for key in caller_fields) or
+            caller_fields["harness"] not in ("claude", "codex", "muse", "opencode")):
+        return {"schema_version": 1, "checks": statuses}
+    matches = [name for name, recipient in recipients.items()
+               if same_recipient(recipient, caller_fields)]
+    statuses["registration"] = "ready" if len(matches) == 1 else "missing" if not matches else "blocked"
+    if len(matches) == 1 and active is not None:
+        record = adoptions.get(matches[0])
+        if (isinstance(record, dict) and same_recipient(record.get("recipient"), caller_fields)
+                and record.get("selection") == active["selection"]):
+            statuses["configuration"] = "ready"
+        else:
+            statuses["configuration"] = "blocked"
+    return {"schema_version": 1, "checks": statuses}
+
+
+def read_only_diagnostic_json(path, maximum=256 * 1024):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("diagnostic input is unavailable") from None
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode), "diagnostic input is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(maximum + 1)
+        require(len(raw) <= maximum, "diagnostic input exceeds its size limit")
+        value = json.loads(raw.decode("utf-8"))
+        require(isinstance(value, dict), "diagnostic input is not a JSON object")
+        return value
+    except (OSError, UnicodeError, ValueError, TypeError):
+        raise ValueError("diagnostic input is invalid") from None
+    finally:
+        os.close(descriptor)
+
+
+def read_only_diagnostic_caller(stream):
+    raw = stream.read(16 * 1024 + 1)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, bytes) or len(raw) > 16 * 1024:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return None
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "caller"}
+            or value.get("schema_version") != 1 or not isinstance(value.get("caller"), dict)
+            or set(value["caller"]) != {"harness", "session", "workspace", "surface"}):
+        return None
+    return value["caller"]
+
+
 def adoption_status(app, active, recipients):
     records = app.state("adoptions", {})
     result = {}
@@ -1300,6 +1386,9 @@ def parser():
     print_guidance.add_argument("--print", action="store_true", required=True,
                                 help="print the maintained guidance")
     sub.add_parser("list")
+    doctor = sub.add_parser("doctor", help="Read local setup without acquiring the configuration lock")
+    doctor.add_argument("--starfleet-json", action="store_true",
+                        help="read a bounded caller match from stdin and print the Starfleet diagnostic protocol")
     status = sub.add_parser("status")
     status.add_argument("--review-target")
     status.add_argument("--review-cycle")
@@ -2432,6 +2521,10 @@ def execute(args):
         return {"guidance": reviewer_guidance.REVIEWER_GUIDANCE}
     app = App(args.config_dir, args.state_dir)
     command = args.command
+    if command == "doctor":
+        caller = (read_only_diagnostic_caller(sys.stdin.buffer)
+                  if args.starfleet_json and not sys.stdin.isatty() else None)
+        return read_only_diagnostic_report(app, caller)
     if command == "preflight":
         return opencode_preflight(app, args)
     if command == "resume":

@@ -191,6 +191,8 @@ OpenCode identity-only owner commands and API admission remain separate: registr
 
 Run `python3 apps/discord-watch/verify.py` before using the worker.
 `doctor` checks local configuration without printing credentials.
+Starfleet Doctor uses the explicit `discord-watch doctor --starfleet-json` mode, which accepts a bounded schema version 1 caller object on piped stdin and does not read an interactive terminal.
+That internal inspection takes no locks, creates no state, and treats current worker heartbeat evidence separately from process liveness.
 `status` reports the last observed API scan and each message's state.
 A configured thread or a successful CMUX submit is not proof of receipt.
 Only `receive` records the local output flush, and it is not proof of comprehension.

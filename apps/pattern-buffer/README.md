@@ -173,6 +173,7 @@ Run the canonical isolated suite from the repository root.
 The compatibility suite checks the former Context Injector source entrypoint against the maintained Pattern Buffer behavior.
 If context does not appear, inspect status, validate and preview, then check the harness's own trust and hook controls.
 Validation and status report header overhead, usable content bytes and remaining UTF-8 budget for each role.
+`status --starfleet-json` is the aggregate doctor's bounded read-only contract and looks up enrollment without creating or acquiring a registry lock.
 Pass the exact session ID when available so the calculation uses the enrolled file path and identity.
 Without `--session`, status labels its placeholder header budget and does not establish exact native-session binding.
 Session enrollment and handoff checks use the same calculation before reviewed text is adopted.

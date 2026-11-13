@@ -29,6 +29,7 @@ DEFAULT_STATE = Path.home() / ".local/state/starfleet-ai/warp-drive"
 DEFAULT_HAILING_STATE = Path.home() / ".local/state/starfleet-ai/hailing-frequencies"
 HELPER_HEARTBEAT_SECONDS = 10
 HELPER_STALE_SECONDS = 30
+STARFLEET_DIAGNOSTIC_LIMIT = 256 * 1024
 SCHEDULER_INTERVAL_SECONDS = 2
 WORKTREE_IDENTITY_VERSION = 1
 NOT_PROVIDED = object()
@@ -2065,6 +2066,126 @@ def doctor_data(db):
             "delivery_receipt_tracking": "not provided; actual prompt reception requires native pilot observation"}
 
 
+def read_starfleet_caller(stream):
+    raw = stream.read(16 * 1024 + 1)
+    if not isinstance(raw, bytes) or len(raw) > 16 * 1024:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return None
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "caller"}
+            or value.get("schema_version") != 1 or not isinstance(value.get("caller"), dict)
+            or set(value["caller"]) != {"harness", "session", "workspace", "surface"}):
+        return None
+    caller = value["caller"]
+    if (caller.get("harness") not in ("claude", "codex", "muse", "opencode")
+            or any(not isinstance(caller.get(key), str) or not caller[key]
+                   for key in ("session", "workspace", "surface"))):
+        return None
+    return caller
+
+
+def _read_star_fleet_file(path, maximum=STARFLEET_DIAGNOSTIC_LIMIT):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("diagnostic file is unavailable") from None
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            value = stream.read(maximum + 1)
+        require(len(value) <= maximum, "diagnostic file exceeds its size limit")
+        return value
+    except OSError:
+        raise ValueError("diagnostic file is unreadable") from None
+    finally:
+        os.close(descriptor)
+
+
+def _starfleet_hailing_route(caller):
+    if caller is None:
+        return "unknown"
+    try:
+        raw = _read_star_fleet_file(hailing_state_dir() / "config.json")
+        if raw is None:
+            return "missing"
+        config = json.loads(raw.decode("utf-8"))
+        require(isinstance(config, dict) and config.get("version") == 1
+                and isinstance(config.get("targets"), list), "Hailing config is invalid")
+        targets, malformed = valid_hailing_targets(config)
+        owner = canonical_owner(caller["harness"], caller["session"], caller["surface"])
+        workspace = canonical_uuid(caller["workspace"], "caller workspace")
+        exact = [target for target in targets if target["harness"] == owner["harness"]
+                 and target["session"] == owner["session"] and target["surface"] == owner["surface"]
+                 and target["workspace"] == workspace]
+        return "ready" if len(exact) == 1 else "blocked" if malformed else "missing"
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError):
+        return "unknown"
+
+
+def warp_drive_diagnostic_report(state_dir, caller=None):
+    checks = {"configuration": "unknown", "registration": "not_applicable", "worker": "unknown",
+              "intended_delivery": "unknown", "observed_delivery": "unknown"}
+    directory = Path(state_dir).expanduser().absolute()
+    database_path = directory / "warp-drive.sqlite3"
+    if directory.is_symlink() or database_path.is_symlink():
+        checks["configuration"] = "blocked"
+        return {"schema_version": 1, "checks": checks}
+    if not database_path.exists():
+        checks["configuration"] = "missing"
+        return {"schema_version": 1, "checks": checks}
+    if any(Path(str(database_path) + suffix).exists() or Path(str(database_path) + suffix).is_symlink()
+           for suffix in ("-wal", "-shm", "-journal")):
+        return {"schema_version": 1, "checks": checks}
+    db = None
+    settings = {}
+    try:
+        uri = database_path.as_uri() + "?mode=ro&immutable=1"
+        db = sqlite3.connect(uri, uri=True, timeout=0.1)
+        db.execute("PRAGMA query_only=ON")
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        required_tables = {"settings", "worktrees", "reservations", "events", "host_samples", "incidents"}
+        require(required_tables.issubset(tables), "Warp-drive schema is incomplete")
+        settings_columns = {row[1] for row in db.execute("PRAGMA table_info(settings)")}
+        require({"key", "value"}.issubset(settings_columns), "Warp-drive settings schema is incomplete")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(reservations)")}
+        require({"requested_cpu_cores", "cpu_basis", "heartbeat_at", "state"}.issubset(columns),
+                "Warp-drive schema requires a migration")
+        setting_keys = ("schema_version", "notifications_enabled", "operator", "delegates",
+                        "target_cpu_fraction", "warning_heavy_limit")
+        setting_rows = db.execute(
+            "SELECT key,substr(value,1,4097),length(value) FROM settings WHERE key IN (" +
+            ",".join("?" for _ in setting_keys) + ")", setting_keys).fetchall()
+        require(all(size <= 4096 for _key, _value, size in setting_rows),
+                "Warp-drive setting exceeds the diagnostic size limit")
+        settings = {key: json.loads(value) for key, value, _size in setting_rows}
+        require(settings.get("schema_version") == 1 and
+                type(settings.get("notifications_enabled")) is bool and
+                isinstance(settings.get("operator"), str) and bool(settings["operator"]) and
+                isinstance(settings.get("delegates"), list) and
+                type(settings.get("target_cpu_fraction")) in (int, float) and
+                0 < settings["target_cpu_fraction"] <= 1 and
+                type(settings.get("warning_heavy_limit")) is int and settings["warning_heavy_limit"] >= 0,
+                "Warp-drive setup settings are incomplete")
+    except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
+        checks["configuration"] = "blocked"
+        return {"schema_version": 1, "checks": checks}
+    finally:
+        if db is not None:
+            db.close()
+    checks["configuration"] = "ready"
+    route = _starfleet_hailing_route(caller)
+    if settings["notifications_enabled"] is False:
+        checks["intended_delivery"] = "blocked"
+    else:
+        checks["intended_delivery"] = route
+    return {"schema_version": 1, "checks": checks}
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="warp-drive", description="Deterministic local CPU reservations for agent-owned work")
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE,
@@ -2154,7 +2275,9 @@ def build_parser():
     notifications.add_argument("mode", choices=("on", "off"))
     notifications.add_argument("--actor", required=True)
     config_sub.add_parser("show")
-    sub.add_parser("doctor", help="inspect local scheduler, sample and Hailing readiness")
+    doctor = sub.add_parser("doctor", help="inspect local scheduler, sample and Hailing readiness")
+    doctor.add_argument("--starfleet-json", action="store_true",
+                        help="emit normalized read-only setup states for Starfleet Doctor")
     incident = sub.add_parser("incident", help="inspect or record evidence for an exceptional condition")
     incident.add_argument("incident_id")
     incident.add_argument("--evidence")
@@ -2208,6 +2331,11 @@ def _main(argv, product_umask):
     if args.command_name == "guide":
         guide_path = Path(__file__).with_name("guide.md")
         sys.stdout.write(guide_path.read_text(encoding="utf-8"))
+        return 0
+    if args.command_name == "doctor" and args.starfleet_json:
+        caller = None if sys.stdin.isatty() else read_starfleet_caller(sys.stdin.buffer)
+        report = warp_drive_diagnostic_report(state_dir, caller)
+        print(json.dumps(report, separators=(",", ":")))
         return 0
     if args.command_name == "owner-args":
         result = verified_owner_arguments()
