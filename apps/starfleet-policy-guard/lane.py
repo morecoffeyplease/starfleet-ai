@@ -454,16 +454,19 @@ def guidance_publication_owner(publication, state, label):
     try:
         publication_pr = github.reference(publication.get('pr_url', ''), 'pull')['url']
         current_pr = github.reference(state.get('pr_url', ''), 'pull')['url']
-        comment_ref = github.comment_reference(publication.get('comment_url', ''), state['pr_url'])
     except (KeyError, TypeError, github.RecordError) as error:
-        raise ValueError(label + ' has an invalid PR or comment reference: ' + str(error)) from error
+        raise ValueError(label + ' has an invalid PR reference: ' + str(error)) from error
     if publication_pr.casefold() != current_pr.casefold():
-        raise ValueError(label + ' belongs to a different PR')
+        raise ValueError(label + ' belongs to a different PR binding')
     binding = {'branch': state.get('branch'),
                'head_branch': state.get('head_branch', state.get('branch')),
                'base_ref': state.get('base_ref')}
     if any(publication.get(key) != value for key, value in binding.items()):
-        raise ValueError(label + ' belongs to a different local or published branch mapping')
+        raise ValueError(label + ' belongs to a different branch or target binding')
+    try:
+        comment_ref = github.comment_reference(publication.get('comment_url', ''), state['pr_url'])
+    except (KeyError, TypeError, github.RecordError) as error:
+        raise ValueError(label + ' has an invalid comment reference: ' + str(error)) from error
     if publication.get('stage') not in ('opening', 'repair_batch', 'successor_validation'):
         raise ValueError(label + ' has an unsupported publication stage')
     if type(publication.get('comment_id')) is not int or publication['comment_id'] != comment_ref['comment_id']:

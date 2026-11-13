@@ -26,8 +26,11 @@ GUIDANCE_ATTESTATION_STATEMENT = '\n'.join((
     'Disclosing uncertainty does not waive a missing prerequisite.',
 ))
 SUCCESSOR_VALIDATION_STATEMENT = '\n'.join((
-    'The current native owner has reread the applicable guidance and reconciled inherited work, repair history, approved scope, human holds, and current candidate evidence.',
-    'This present review records responsibility for covered delivery. It does not claim authorship of prior work or accept a new repair batch.',
+    'The current native owner has reread applicable guidance and reconciled inherited work, existing repair history, current approved scope and human holds, and current candidate evidence.',
+    'For this current review, the current native owner confirms the inherited approach remains the simplest viable route for the approved outcome and constraints, and remains proportionate.',
+    'No claim in this current review depends on an assumption; current required reads, investigation, evidence, verification, approved scope, and authority were checked.',
+    'Any required fact that was initially unknown for this review was investigated or raised to the configured human on Discord, then resolved before this validation.',
+    'This review records current responsibility for covered delivery. It does not claim authorship of prior work or accept a new repair batch.',
     'Disclosing uncertainty does not waive a missing prerequisite.',
 ))
 

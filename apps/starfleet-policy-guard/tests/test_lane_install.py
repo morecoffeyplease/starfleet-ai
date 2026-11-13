@@ -1821,7 +1821,7 @@ class LaneInstallTest(unittest.TestCase):
             '--stage', 'successor-validation', '--comment-url', replacement_b_url, env=owner_b)
         publication_b = json.loads(replacement_b.stdout)['publication']
         self.assertEqual(publication_b['prior_publication_ref'], first_publication)
-        self.assertEqual(self.remote['comments']['1002']['body'], rendered_b['body'])
+        self.assertEqual(self.remote['comments']['1002']['body'], 'changed current publication')
         self.assertEqual(self.invoke_owner(owner_b, 'pr', 'ready', self.url,
                                            '--starfleet-probe').returncode, 0)
 

@@ -107,6 +107,7 @@ Do not include `accepted_batch_ref` on this stage.
 The renderer links the exact inherited comment and its recorded body hash, and includes the current candidate SHA from the successful report.
 This stage records current responsibility for covered delivery and creates no repair batch, round count, authorship claim, or approval transfer.
 The current owner must reread applicable guidance and reconcile completed work, current scope, holds, and candidate evidence before rendering.
+The current review explains why the inherited approach remains the simplest viable route and proportionate to the approved outcome, makes no claims based on assumptions, checks current evidence, verification, scope, and authority, and resolves any unknown required fact before attesting.
 
 Use the same evidence packet and current owner session for these commands.
 Copy the full `guidance_attestation_ref` value from the first command into `prior_publication_ref` before recording.
