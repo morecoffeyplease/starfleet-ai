@@ -2877,7 +2877,7 @@ class LaneInstallTest(unittest.TestCase):
         self.assertIn('Do not use rebind-owner', value['successor_guidance'])
         self.assertEqual(value['setup_guidance']['action'], 'upgrade')
         self.assertIsNone(value['setup_guidance']['command'])
-        self.assertIn('not a clean committed Git source', value['setup_guidance']['reason'])
+        self.assertIn('No exact compatible source entrypoint is recorded', value['setup_guidance']['reason'])
         self.assertNotIn('stale', value['report_status']['reason'])
 
     def test_status_recommends_upgrade_plan_from_clean_distinct_source(self):
