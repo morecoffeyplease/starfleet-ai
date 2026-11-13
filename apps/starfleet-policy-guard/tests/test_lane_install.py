@@ -1834,6 +1834,12 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(len(after_second_handoff['history']), 2)
         successor_packet(publication_b, 'The third owner reviewed the current candidate and report.')
         required_reads('codex-third-fixture', 'current', 4)
+        rereads_c = json.loads(self.call_source(source, 'attestation-rereads', env=owner_c).stdout)
+        for entry in rereads_c:
+            packet_value = json.loads(self.packet.read_text())
+            packet_value['guidance_attestation']['reread'].append({
+                **entry, 'source_ref': 'https://fixture.invalid/guides/' + entry['name']})
+            self.packet.write_text(json.dumps(packet_value))
         self.call_source(source, 'record', '--evidence', self.packet, env=owner_c)
         rendered_c = json.loads(self.call_source(
             source, 'attestation-render', '--evidence', self.packet,
