@@ -5,7 +5,9 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import shlex
 import shutil
+import sys
 import tempfile
 
 
@@ -21,15 +23,17 @@ def runtime_digest(source):
     return digest.hexdigest()
 
 
-def launcher_text(runtime):
-    return "#!/usr/bin/env python3\n" + (
-        LAUNCHER_MARKER + "\n"
-        "import sys\n"
-        "sys.dont_write_bytecode = True\n"
-        f"sys.path.insert(0, {str(runtime)!r})\n"
-        "from starfleet import main\n"
-        "raise SystemExit(main())\n"
-    )
+def launcher_text(runtime, interpreter=None):
+    interpreter = interpreter or sys.executable
+    return ("#!/bin/sh\n" + LAUNCHER_MARKER + "\nexec " +
+            shlex.quote(interpreter) + " " +
+            shlex.quote(str(Path(runtime) / "starfleet.py")) + ' "$@"\n')
+
+
+def ensure_supported_python(version_info=None):
+    version_info = version_info or sys.version_info
+    if tuple(version_info[:2]) < (3, 10):
+        raise RuntimeError("Starfleet Doctor requires Python 3.10 or newer")
 
 
 def ensure_directory(path, mode):
@@ -70,7 +74,9 @@ def launcher_is_owned(launcher):
 
 
 def install(prefix, source=None):
-    source = Path(source or __file__).resolve().parent
+    ensure_supported_python()
+    source = Path(source or __file__).resolve()
+    source = source if source.is_dir() else source.parent
     prefix = Path(prefix).expanduser().absolute()
     if prefix.is_symlink():
         raise ValueError(f"Refusing symlink prefix: {prefix}")
@@ -103,7 +109,7 @@ def install(prefix, source=None):
     temporary_launcher = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(launcher_text(runtime))
+            stream.write(launcher_text(runtime, sys.executable))
         os.chmod(temporary_launcher, 0o755)
         os.replace(temporary_launcher, launcher)
     finally:

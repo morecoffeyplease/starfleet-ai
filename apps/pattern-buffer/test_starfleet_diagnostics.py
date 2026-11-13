@@ -70,7 +70,21 @@ class StarfleetDiagnosticTests(unittest.TestCase):
         report = json.loads(result.stdout)
         self.assertEqual(report["checks"]["registration"], "ready")
         self.assertEqual(report["checks"]["worker"], "not_applicable")
+        self.assertEqual(report["checks"]["checkpoint"], "missing")
         self.assertNotIn(self.session, result.stdout)
+        self.assertEqual(snapshot(self.root), before)
+
+    def test_implementer_has_no_required_orchestrator_checkpoint(self):
+        source = self.base / "standing.md"
+        source.write_text("# Mission\n\nSynthetic implementer enrollment.\n", encoding="utf-8")
+        sessions.enroll(self.root, self.gitdir, "codex", self.session, source, "implementer",
+                        lambda _text, _path, _role: {"valid": True})
+        before = snapshot(self.root)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["checks"]["registration"], "ready")
+        self.assertEqual(report["checks"]["checkpoint"], "not_applicable")
         self.assertEqual(snapshot(self.root), before)
 
     def test_normal_status_behavior_does_not_require_diagnostic_protocol(self):

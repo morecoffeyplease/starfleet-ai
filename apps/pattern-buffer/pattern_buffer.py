@@ -3280,7 +3280,7 @@ def starfleet_diagnostic_report(root, gitdir, config_path, args):
         if state_path.is_symlink():
             checks["checkpoint"] = "blocked"
         elif not state_path.exists():
-            checks["checkpoint"] = "not_applicable"
+            checks["checkpoint"] = "missing"
         else:
             try:
                 _path, state = helper._load_state(sys.modules[__name__], root, gitdir,

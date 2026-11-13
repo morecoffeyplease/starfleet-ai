@@ -350,8 +350,10 @@ def inspection_environment(native_connection=False):
     environment = {key: os.environ[key] for key in allowed if key in os.environ}
     environment.setdefault("PATH", os.defpath)
     environment.setdefault("HOME", str(Path.home()))
-    if native_connection and "CMUX_SOCKET" in os.environ:
-        environment["CMUX_SOCKET"] = os.environ["CMUX_SOCKET"]
+    if native_connection:
+        for key in ("CMUX_SOCKET", "CMUX_SURFACE_ID", "CMUX_PANEL_ID", "CMUX_WORKSPACE_ID"):
+            if key in os.environ:
+                environment[key] = os.environ[key]
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONNOUSERSITE"] = "1"
     return environment
@@ -470,11 +472,13 @@ def normalize_component_protocol(adapter, stdout):
     for key in STATUS_NAMES:
         raw = raw_checks.get(key)
         if isinstance(raw, str) and raw in STATE_BY_NAME:
-            defaults[key] = STATE_BY_NAME[raw]
+            defaults[key] = (CheckState.UNKNOWN if raw == CheckState.SKIPPED.value
+                             else STATE_BY_NAME[raw])
     for key in OPTIONAL_CHECKS.get(adapter.key, ()):
         raw = raw_checks.get(key)
         if isinstance(raw, str) and raw in STATE_BY_NAME:
-            defaults[key] = STATE_BY_NAME[raw]
+            defaults[key] = (CheckState.UNKNOWN if raw == CheckState.SKIPPED.value
+                             else STATE_BY_NAME[raw])
     if not adapter.registration_required and defaults["registration"] is CheckState.UNKNOWN:
         defaults["registration"] = CheckState.NOT_APPLICABLE
     if not adapter.worker_required and defaults["worker"] is CheckState.UNKNOWN:
@@ -682,7 +686,10 @@ def tool_status(adapter, states, version, selected=True):
         checks.append(_check(name, state, evidence[name], required[name], adapter))
     for name in OPTIONAL_CHECKS.get(adapter.key, ()):
         state = states.get(name, CheckState.UNKNOWN)
-        checks.append(_check(name, state, Evidence.CONFIGURATION, False, adapter))
+        registration_state = states.get("registration", CheckState.UNKNOWN)
+        required_check = (state is not CheckState.NOT_APPLICABLE and
+                          (state is not CheckState.UNKNOWN or registration_state is CheckState.READY))
+        checks.append(_check(name, state, Evidence.CONFIGURATION, required_check, adapter))
     status = aggregate_check_states(checks)
     return {"key": adapter.key, "name": adapter.label, "status": status.value,
             "selected": selected, "runtime_version": version,

@@ -96,8 +96,8 @@ class DiscordWatchDiagnosticTests(unittest.TestCase):
             state, hailing, notify, caller = make_fixture(root)
             wrong_owner = {**caller, "session": str(uuid.uuid4()).upper()}
             wrong = discord_watch.discord_watch_diagnostic_report(state, hailing, notify, wrong_owner)
-            self.assertEqual(wrong["checks"]["registration"], "missing")
-            self.assertEqual(wrong["checks"]["intended_delivery"], "missing")
+            self.assertEqual(wrong["checks"]["registration"], "not_applicable")
+            self.assertEqual(wrong["checks"]["intended_delivery"], "not_applicable")
 
             previous_umask = os.umask(0o077)
             try:
@@ -115,6 +115,71 @@ class DiscordWatchDiagnosticTests(unittest.TestCase):
             self.assertEqual(partial["checks"]["registration"], "ready")
             self.assertEqual(partial["checks"]["worker"], "blocked")
             self.assertEqual(partial["checks"]["intended_delivery"], "blocked")
+
+    def test_empty_and_foreign_only_thread_inventories_are_not_applicable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, hailing, notify, caller = make_fixture(root)
+            app = discord_watch.Watch(state, hailing, notify)
+            previous_umask = os.umask(0o077)
+            try:
+                with contextlib.closing(app.database(create=False)) as db:
+                    db.execute("DELETE FROM threads")
+                    db.commit()
+                empty_before = snapshot_tree(root)
+                empty = discord_watch.discord_watch_diagnostic_report(state, hailing, notify, caller)
+                self.assertEqual(empty["checks"]["configuration"], "ready")
+                self.assertEqual(empty["checks"]["worker"], "ready")
+                self.assertEqual(empty["checks"]["registration"], "not_applicable")
+                self.assertEqual(empty["checks"]["intended_delivery"], "not_applicable")
+                self.assertEqual(snapshot_tree(root), empty_before)
+
+                cli = subprocess.run(
+                    [sys.executable, str(APP / "discord_watch.py"), "--state-dir", str(state),
+                     "--hailing-state", str(hailing), "--notify-home", str(notify),
+                     "doctor", "--starfleet-json"],
+                    input=json.dumps({"schema_version": 1, "caller": caller}), text=True,
+                    capture_output=True, env={"PATH": str(Path(sys.executable).parent) + os.pathsep + os.defpath,
+                                              "HOME": str(root), "PYTHONDONTWRITEBYTECODE": "1"},
+                    check=False)
+                self.assertEqual(cli.returncode, 0, cli.stderr)
+                self.assertEqual(json.loads(cli.stdout)["checks"]["registration"], "not_applicable")
+                self.assertEqual(snapshot_tree(root), empty_before)
+
+                with contextlib.closing(app.database(create=False)) as db:
+                    owner = {"harness": "codex", "session": str(uuid.uuid4()).upper(),
+                             "surface": str(uuid.uuid4()).upper(),
+                             "workspace": str(uuid.uuid4()).upper(), "started_at": time.time()}
+                    db.execute("INSERT INTO threads(thread_id,owner_json,cursor,registered_at,updated_at) "
+                               "VALUES(?,?,?,?,?)", ("123456789012345678", json.dumps(owner),
+                                                       "123456789012345678", time.time(), time.time()))
+                    db.commit()
+                foreign_before = snapshot_tree(root)
+                foreign = discord_watch.discord_watch_diagnostic_report(state, hailing, notify, caller)
+                self.assertEqual(foreign["checks"]["registration"], "not_applicable")
+                self.assertEqual(foreign["checks"]["intended_delivery"], "not_applicable")
+                self.assertEqual(snapshot_tree(root), foreign_before)
+
+                with contextlib.closing(app.database(create=False)) as db:
+                    foreign_owner = {"harness": "codex", "session": str(uuid.uuid4()).upper(),
+                                     "surface": str(uuid.uuid4()).upper(),
+                                     "workspace": str(uuid.uuid4()).upper(), "started_at": time.time()}
+                    now = time.time()
+                    db.executemany(
+                        "INSERT INTO threads(thread_id,owner_json,cursor,registered_at,updated_at) "
+                        "VALUES(?,?,?,?,?)",
+                        [(str(223456789012345600 + index), json.dumps(foreign_owner),
+                          "123456789012345678", now, now) for index in range(256)])
+                    db.commit()
+                incomplete_before = snapshot_tree(root)
+                incomplete = discord_watch.discord_watch_diagnostic_report(
+                    state, hailing, notify, caller)
+                self.assertEqual(incomplete["checks"]["configuration"], "unknown")
+                self.assertEqual(incomplete["checks"]["registration"], "unknown")
+                self.assertEqual(incomplete["checks"]["intended_delivery"], "unknown")
+                self.assertEqual(snapshot_tree(root), incomplete_before)
+            finally:
+                os.umask(previous_umask)
 
     def test_missing_malformed_and_sqlite_sidecars_do_not_change_state(self):
         with tempfile.TemporaryDirectory() as temporary:

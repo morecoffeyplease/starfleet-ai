@@ -6,6 +6,7 @@ It reads local component diagnostics and the current CMUX identity without insta
 ## Install
 
 From a source checkout, run `python3 apps/starfleet/install.py` to install into `~/.local`.
+The installer requires Python 3.10 or newer and pins the launcher to that interpreter.
 Use `python3 apps/starfleet/install.py --prefix PATH` to select another prefix.
 Add the prefix's `bin` directory to `PATH`.
 The installer stores a sealed content-addressed runtime and an owned launcher in that prefix.

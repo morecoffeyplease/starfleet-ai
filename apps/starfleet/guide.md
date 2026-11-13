@@ -6,6 +6,7 @@ Starfleet components are independent installations and do not enroll sessions or
 ## Install Starfleet Doctor
 
 From a Starfleet source checkout, run `python3 apps/starfleet/install.py`.
+The installer requires Python 3.10 or newer and pins the launcher to that interpreter.
 The installer writes a sealed content-addressed runtime and the `starfleet` launcher under `~/.local` by default.
 Use `python3 apps/starfleet/install.py --prefix PATH` to choose a different prefix.
 Add the prefix's `bin` directory to `PATH`.

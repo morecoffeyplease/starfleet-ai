@@ -2789,6 +2789,7 @@ def discord_watch_diagnostic_report(state_dir, hailing_state, notify_home, calle
     database_state = "unknown"
     worker_config = None
     owned_threads = []
+    thread_count = None
     meta = {}
     if not state.exists():
         database_state = "missing"
@@ -2840,11 +2841,18 @@ def discord_watch_diagnostic_report(state_dir, hailing_state, notify_home, calle
                         "SELECT thread_id,substr(owner_json,1,16385),length(owner_json) "
                         "FROM threads LIMIT 257").fetchall()
                     owner_rows_complete = len(rows) <= 256
+                    thread_count = len(rows)
                     for thread_id, owner_json, owner_size in rows[:256]:
                         require(isinstance(thread_id, str) and re.fullmatch(r"[1-9][0-9]{0,24}", thread_id)
                                 and owner_size <= 16 * 1024,
                                 "Discord Watch owner record exceeds its diagnostic limits")
                         owner = json.loads(owner_json)
+                        require(isinstance(owner, dict)
+                                and owner.get("harness") in ALLOWED_LAUNCH_KINDS,
+                                "Discord Watch owner record is incomplete")
+                        hf.session_identity(owner.get("session"), owner["harness"])
+                        hf.identity(owner.get("surface"))
+                        hf.identity(owner.get("workspace"))
                         if _diagnostic_owner_matches(owner, caller):
                             owned_threads.append(thread_id)
                     if len(rows) > 256:
@@ -2866,7 +2874,10 @@ def discord_watch_diagnostic_report(state_dir, hailing_state, notify_home, calle
     checks["configuration"] = ("blocked" if "blocked" in states else
                                 "missing" if "missing" in states else
                                 "unknown" if "unknown" in states else "ready")
-    if caller is None:
+    if thread_count == 0 or (caller is not None and not owned_threads):
+        checks["registration"] = "not_applicable"
+        checks["intended_delivery"] = "not_applicable"
+    elif caller is None:
         checks["registration"] = "unknown"
         checks["intended_delivery"] = "unknown"
     elif hailing_state_status == "blocked":
