@@ -386,6 +386,12 @@ python3 /path/to/installed/runtime/lane.py --cwd /worktrees/temporary-feature un
 
 Use a clean, committed newer Starfleet source checkout and run the reviewed upgrade from an active attached product checkout:
 
+`upgrade-plan` reads the executing installer source's Git revision, while the product checkout supplies the installed seat state.
+An immutable runtime has no Git-backed source checkout and cannot produce an upgrade plan.
+If `setup_guidance.reason` says the executing CLI has no clean committed source and `setup_guidance.command` is null, no exact compatible source entrypoint is recorded.
+Choose a verified matching clean committed newer Starfleet source checkout before planning.
+Policy Guard does not search local directories or fetch sources to guess compatibility.
+
 ```sh
 python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade-plan
 python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade --plan-sha256 REVIEWED_PLAN_SHA256

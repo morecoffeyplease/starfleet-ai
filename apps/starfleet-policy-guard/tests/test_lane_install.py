@@ -175,6 +175,14 @@ class LaneInstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
+    def fixture_snapshot(self):
+        return {str(path.relative_to(self.base)): (
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    path.stat().st_mode & 0o777,
+                    path.stat().st_mtime_ns)
+                for path in self.base.rglob('*')
+                if path.is_file() and '__pycache__' not in path.parts}
+
     def source_checkout(self, label, marker_file='lane.py'):
         source = self.base / ('policy guard source ' + label)
         shutil.copytree(APP, source, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
@@ -2728,6 +2736,127 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual((state_path.parent / 'lock').stat().st_mtime_ns, before['lock_mtime'])
         self.assertNotIn('EXISTING_FLAG', json.dumps(result))
 
+    def test_issue80_immutable_runtime_refusal_uses_existing_guidance_and_clean_source_control(self):
+        old_source = self.source_checkout('issue80-old-pin')
+        new_source = self.source_checkout('issue80-new-source')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        self.install_from_source(old_source, lane=True, env=owner_env, lane_pr_url=self.url)
+
+        runtime_plan = lane_runtime.session_store.runtime_plan(new_source)
+        lane_runtime.session_store.install_runtime(new_source, runtime_plan)
+        immutable_runtime = Path(runtime_plan['path'])
+        self.assertFalse((immutable_runtime / '.git').exists())
+        outside_git = self.base / 'outside git'
+        outside_git.mkdir()
+        before = self.fixture_snapshot()
+
+        refused = self.call_source(immutable_runtime, 'upgrade-plan', env=owner_env, ok=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(refused.stdout, '')
+        self.assertNotIn('not a git repository', refused.stderr.lower())
+        for phrase in ('immutable runtime', 'executing installer source Git revision',
+                       'product checkout has a separate Git revision',
+                       'No exact compatible source entrypoint is recorded',
+                       'verified matching clean committed newer Starfleet source checkout'):
+            self.assertIn(phrase, refused.stderr)
+
+        status_result = self.call_source(immutable_runtime, 'status', env=owner_env)
+        self.assertEqual(status_result.returncode, 0, status_result.stderr)
+        status = json.loads(status_result.stdout)
+        guidance = status['setup_guidance']
+        self.assertEqual(guidance['action'], 'upgrade')
+        self.assertIsNone(guidance['command'])
+        self.assertIsNone(status['executing_cli']['source_revision'])
+        self.assertIsNone(status['executing_cli']['working_tree_dirty'])
+        self.assertFalse(status['executing_cli']['matches_installed_pin'])
+        for phrase in ('immutable runtime', 'executing installer source Git revision',
+                       'product checkout has a separate Git revision',
+                       'No exact compatible source entrypoint is recorded',
+                       'verified matching clean committed newer Starfleet source checkout'):
+            self.assertIn(phrase, guidance['reason'])
+        self.assertNotIn(str(new_source), guidance['reason'])
+
+        coverage_result = self.call_source(immutable_runtime, 'coverage', env=owner_env)
+        self.assertEqual(coverage_result.returncode, 0, coverage_result.stderr)
+        coverage = json.loads(coverage_result.stdout)
+        self.assertEqual(coverage['setup_guidance'], guidance)
+        summary = self.call_source(immutable_runtime, 'coverage', '--summary', env=owner_env)
+        self.assertEqual(summary.returncode, 0, summary.stderr)
+        self.assertIn('Next setup: upgrade - ' + guidance['reason'], summary.stdout)
+        self.assertNotIn('\nRun: ', summary.stdout)
+
+        printed_guide = self.call_source(immutable_runtime, 'guide', '--print', env=owner_env, cwd=outside_git)
+        self.assertEqual(printed_guide.returncode, 0, printed_guide.stderr)
+        self.assertEqual(printed_guide.stdout, (immutable_runtime / 'guide.md').read_text())
+
+        clean_status_result = self.call_source(new_source, 'status', env=owner_env)
+        self.assertEqual(clean_status_result.returncode, 0, clean_status_result.stderr)
+        clean_guidance = json.loads(clean_status_result.stdout)['setup_guidance']
+        expected_argv = [sys.executable, str(new_source / 'lane.py'), '--cwd', str(self.repo), 'upgrade-plan']
+        self.assertEqual(shlex.split(clean_guidance['command']), expected_argv)
+        self.assertEqual(clean_guidance['command'], shlex.join(expected_argv))
+        clean_plan = subprocess.run(shlex.split(clean_guidance['command']), cwd=self.repo,
+                                    env=owner_env, capture_output=True, text=True)
+        self.assertEqual(clean_plan.returncode, 0, clean_plan.stderr)
+        self.assertEqual(json.loads(clean_plan.stdout)['binding_type'], 'native-owner-lane')
+        self.assertEqual(self.fixture_snapshot(), before)
+
+    def test_issue80_immutable_runtime_keeps_owner_and_pin_refusals(self):
+        source = self.source_checkout('issue80-refusal-order')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        installed = self.install_from_source(source, lane=True, env=owner_env)
+        immutable_runtime = Path(installed['seat_runtime_path'])
+
+        wrong_owner = dict(owner_env, CODEX_THREAD_ID='codex-different-owner')
+        before_owner_refusal = self.fixture_snapshot()
+        owner_result = self.call_source(immutable_runtime, 'upgrade-plan', env=wrong_owner, ok=False)
+        self.assertEqual(owner_result.returncode, 2)
+        self.assertIn('This lane belongs to another native session.', owner_result.stderr)
+        self.assertNotIn('No exact compatible source entrypoint is recorded', owner_result.stderr)
+        self.assertEqual(self.fixture_snapshot(), before_owner_refusal)
+
+        state_path = Path(lane_runtime.directory(self.repo)) / 'state.json'
+        state = json.loads(state_path.read_text())
+        state['source_versions']['lane.py'] = '0' * 64
+        state_path.write_text(json.dumps(state, indent=2) + '\n')
+        before_pin_refusal = self.fixture_snapshot()
+        pin_result = self.call_source(immutable_runtime, 'upgrade-plan', env=owner_env, ok=False)
+        self.assertEqual(pin_result.returncode, 2)
+        self.assertIn('Installed source pin is changed; restore its exact files before planning a recoverable upgrade',
+                      pin_result.stderr)
+        self.assertNotIn('No exact compatible source entrypoint is recorded', pin_result.stderr)
+        self.assertEqual(self.fixture_snapshot(), before_pin_refusal)
+
+    def test_issue80_missing_and_dirty_source_refusals_are_actionable(self):
+        installed_source = self.source_checkout('issue80-installed-source')
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex', CODEX_THREAD_ID='codex-fixture-thread')
+        self.install_from_source(installed_source, lane=True, env=owner_env)
+
+        no_git_source = self.base / 'source without git'
+        shutil.copytree(APP, no_git_source, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        dirty_source = self.source_checkout('issue80-dirty-source')
+        (dirty_source / 'pending-change.txt').write_text('uncommitted source change\n')
+        before_missing_source = self.fixture_snapshot()
+        missing_result = self.call_source(no_git_source, 'upgrade-plan', env=owner_env, ok=False)
+        self.assertEqual(missing_result.returncode, 2)
+        self.assertNotIn('not a git repository', missing_result.stderr.lower())
+        self.assertIn('executing installer source Git revision', missing_result.stderr)
+        self.assertIn('product checkout has a separate Git revision', missing_result.stderr)
+        self.assertIn('No exact compatible source entrypoint is recorded', missing_result.stderr)
+
+        status_result = self.call_source(no_git_source, 'status', env=owner_env)
+        self.assertEqual(status_result.returncode, 0, status_result.stderr)
+        status = json.loads(status_result.stdout)
+        self.assertEqual(status['setup_guidance']['action'], 'upgrade')
+        self.assertIsNone(status['setup_guidance']['command'])
+        self.assertIn('No exact compatible source entrypoint is recorded', status['setup_guidance']['reason'])
+
+        dirty_result = self.call_source(dirty_source, 'upgrade-plan', env=owner_env, ok=False)
+        self.assertEqual(dirty_result.returncode, 2)
+        self.assertIn('Commit the new installer source, then review a fresh upgrade plan', dirty_result.stderr)
+        self.assertNotIn('not a git repository', dirty_result.stderr.lower())
+        self.assertEqual(self.fixture_snapshot(), before_missing_source)
+
     def test_status_separates_successor_inspector_from_intact_installed_pin(self):
         old_source = self.source_checkout('status-old-pin')
         self.install_from_source(old_source)
@@ -2748,7 +2877,7 @@ class LaneInstallTest(unittest.TestCase):
         self.assertIn('Do not use rebind-owner', value['successor_guidance'])
         self.assertEqual(value['setup_guidance']['action'], 'upgrade')
         self.assertIsNone(value['setup_guidance']['command'])
-        self.assertIn('not a clean committed Git source', value['setup_guidance']['reason'])
+        self.assertIn('No exact compatible source entrypoint is recorded', value['setup_guidance']['reason'])
         self.assertNotIn('stale', value['report_status']['reason'])
 
     def test_status_recommends_upgrade_plan_from_clean_distinct_source(self):

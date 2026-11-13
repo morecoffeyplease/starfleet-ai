@@ -100,6 +100,8 @@ For current limitations and exact supported paths, use the printable guide and e
 `migrate-plan` and `migrate` record the target seat's Claude settings mode and immutable runtime pin in the migrated checkout state.
 The migration plan also records the postimage hash for the target settings file, including when the seat already owns its hooks.
 For a checkout migrated before those fields were recorded, run the reviewed `upgrade-plan` and `upgrade` flow from a clean newer source checkout.
+The planner reads Git metadata from the executing source checkout, while the product checkout supplies the installed seat state.
+See the setup guide for immutable-runtime refusals and source-selection limits.
 The plan may restore missing runtime metadata only when the checkout's immutable source path and pinned file fingerprints match the owning seat runtime.
 It may correct a stale settings mode only when that checkout records the same settings path and content hash, and the live mode matches the durable seat settings metadata.
 Review every `migration_metadata_recovery` entry and apply only its exact plan hash.
