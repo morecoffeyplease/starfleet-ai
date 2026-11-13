@@ -270,29 +270,39 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(dependency["status"], "blocked")
             self.assertIn("skipped by user instruction", dependency["summary"])
 
-    def test_public_cli_requires_policy_guard_owner_match_when_a_seat_is_enrolled(self):
+    def test_public_cli_uses_policy_guard_native_owner_context_only_when_it_matches(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bin_dir = root / "bin"
             bin_dir.mkdir()
             cmux = bin_dir / "cmux"
-            workspace, surface, _session, identity, current, selectors = self._caller_fixture()
+            workspace, surface, session, identity, current, selectors = self._caller_fixture()
             self._write_fake_cmux(cmux, {**selectors, "CMUX_SOCKET": str(root / "native.sock")},
                                   identity, current)
             provider = root / "policy_guard.py"
 
-            def write_status(lane_enrolled, owner_state=None):
+            def write_status(lane_enrolled, owner_state="matches", omit_owner=False):
                 value = {"installed_here": True, "lane_enrolled": lane_enrolled,
-                         "coverage": {"configured": True}}
-                if owner_state is not None:
+                         "attachment_state": "active-here",
+                         "managed_adapter": {"state": "intact"},
+                         "installed_source": {"integrity": "intact"},
+                         "activation": {"state": "unobserved"}}
+                if not omit_owner:
                     value["current_owner"] = {"state": owner_state}
                 expected_environment = {**selectors, "CMUX_SOCKET": str(root / "native.sock")}
                 provider.write_text(
                     f"import json,os,sys\nexpected={expected_environment!r}\n"
+                    f"value={value!r}\n"
+                    f"expected_owner={{'CMUX_AGENT_LAUNCH_KIND':'codex','CODEX_THREAD_ID':{session!r}}}\n"
                     "if any(os.environ.get(key) != item for key,item in expected.items()): sys.exit(61)\n"
-                    "if any(key in os.environ for key in ('CMUX_AGENT_LAUNCH_KIND',"
-                    "'CLAUDE_CODE_SESSION_ID','CODEX_THREAD_ID','OPENCODE_SESSION_ID')): sys.exit(62)\n"
-                    f"print(json.dumps({value!r}))\n", encoding="utf-8")
+                    "native_keys=('CMUX_AGENT_LAUNCH_KIND','CODEX_THREAD_ID','CLAUDE_CODE_SESSION_ID',"
+                    "'OPENCODE_SESSION_ID')\n"
+                    "present={key:os.environ[key] for key in native_keys if key in os.environ}\n"
+                    "if present and present != expected_owner: sys.exit(62)\n"
+                    f"owner_state=({owner_state!r} if present else "
+                    f"('unavailable' if {lane_enrolled!r} else 'legacy-per-pr-no-native-owner'))\n"
+                    "if 'current_owner' in value: value['current_owner']={'state':owner_state}\n"
+                    "print(json.dumps(value))\n", encoding="utf-8")
 
             skip = [key for key in doctor.expected_components() if key != "policy-guard"]
             command = [sys.executable, str(ROOT / "apps" / "starfleet" / "starfleet.py"),
@@ -301,22 +311,25 @@ class DoctorTests(unittest.TestCase):
                 command.extend(("--skip", key))
             environment = {"PATH": str(bin_dir), "HOME": directory,
                            "CMUX_SOCKET": str(root / "native.sock"), **selectors,
-                           "CMUX_AGENT_LAUNCH_KIND": "claude",
-                           "CLAUDE_CODE_SESSION_ID": "44444444-4444-4444-8444-444444444444",
-                           "CODEX_THREAD_ID": "55555555-5555-4555-8555-555555555555"}
+                           "CMUX_AGENT_LAUNCH_KIND": "codex",
+                           "CODEX_THREAD_ID": session,
+                           "OPENCODE_SESSION_ID": "ses_syntheticuntrusted"}
 
-            write_status(True, "matches")
+            write_status(True)
             healthy = subprocess.run(command, cwd=directory, env=environment,
                                      capture_output=True, text=True, timeout=5)
-            self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            self.assertEqual(healthy.returncode, 4, healthy.stderr)
             healthy_report = json.loads(healthy.stdout)
-            self.assertEqual(healthy_report["overall_status"], "ready")
+            self.assertEqual(healthy_report["overall_status"], "unknown")
             policy_guard = next(tool for tool in healthy_report["tools"]
                                 if tool["key"] == "policy-guard")
             registration = next(check for check in policy_guard["checks"]
                                 if check["name"] == "registration")
             self.assertEqual(registration["status"], "ready")
             self.assertTrue(registration["required"])
+            intended = next(check for check in policy_guard["checks"]
+                            if check["name"] == "intended_delivery")
+            self.assertEqual(intended["status"], "unknown")
 
             write_status(True, "mismatch")
             mismatch = subprocess.run(command, cwd=directory, env=environment,
@@ -338,7 +351,7 @@ class DoctorTests(unittest.TestCase):
             unavailable_report = json.loads(unavailable.stdout)
             self.assertEqual(unavailable_report["overall_status"], "unknown")
 
-            write_status(True)
+            write_status(True, omit_owner=True)
             absent_owner = subprocess.run(command, cwd=directory, env=environment,
                                           capture_output=True, text=True, timeout=5)
             self.assertEqual(absent_owner.returncode, 4, absent_owner.stderr)
@@ -347,7 +360,7 @@ class DoctorTests(unittest.TestCase):
             write_status(False, "legacy-per-pr-no-native-owner")
             standalone = subprocess.run(command, cwd=directory, env=environment,
                                         capture_output=True, text=True, timeout=5)
-            self.assertEqual(standalone.returncode, 0, standalone.stderr)
+            self.assertEqual(standalone.returncode, 4, standalone.stderr)
             standalone_report = json.loads(standalone.stdout)
             policy_guard = next(tool for tool in standalone_report["tools"]
                                 if tool["key"] == "policy-guard")
@@ -355,6 +368,26 @@ class DoctorTests(unittest.TestCase):
                                 if check["name"] == "registration")
             self.assertEqual(registration["status"], "not_applicable")
             self.assertFalse(registration["required"])
+
+            for conflicting in (
+                    {key: value for key, value in environment.items()
+                     if key != "CMUX_AGENT_LAUNCH_KIND"},
+                    {**environment, "CODEX_THREAD_ID": "44444444-4444-4444-8444-444444444444"},
+                    {**environment, "CMUX_AGENT_LAUNCH_KIND": "claude",
+                     "CLAUDE_CODE_SESSION_ID": "55555555-5555-4555-8555-555555555555"}):
+                write_status(True)
+                result = subprocess.run(command, cwd=directory, env=conflicting,
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 4, result.stderr)
+                result_report = json.loads(result.stdout)
+                policy_guard = next(tool for tool in result_report["tools"]
+                                    if tool["key"] == "policy-guard")
+                configuration = next(check for check in policy_guard["checks"]
+                                     if check["name"] == "configuration")
+                self.assertEqual(configuration["status"], "ready")
+                registration = next(check for check in policy_guard["checks"]
+                                    if check["name"] == "registration")
+                self.assertEqual(registration["status"], "unknown")
 
     def test_invalid_oversized_and_slow_subprocess_output_is_suppressed(self):
         invalid = doctor.run_bounded(

@@ -264,12 +264,29 @@ def _read_process_output(stream, remaining):
         return b""
 
 
-def run_bounded(argv, cwd, stdin_bytes, maximum, timeout, native_connection=False):
+def run_bounded(argv, cwd, stdin_bytes, maximum, timeout, native_connection=False,
+                policy_guard_identity=None):
+    environment = inspection_environment(native_connection=native_connection)
+    if policy_guard_identity is not None:
+        allowed_identity_keys = {"CMUX_AGENT_LAUNCH_KIND", "CODEX_THREAD_ID",
+                                 "CLAUDE_CODE_SESSION_ID"}
+        if (not native_connection or not isinstance(policy_guard_identity, dict)
+                or not set(policy_guard_identity).issubset(allowed_identity_keys)):
+            return "unavailable", b"", 127
+        selected = policy_guard_identity.get("CMUX_AGENT_LAUNCH_KIND")
+        expected_session_key = {"codex": "CODEX_THREAD_ID",
+                                "claude": "CLAUDE_CODE_SESSION_ID"}.get(selected)
+        if (expected_session_key is None or set(policy_guard_identity) !=
+                {"CMUX_AGENT_LAUNCH_KIND", expected_session_key}
+                or not isinstance(policy_guard_identity[expected_session_key], str)
+                or not policy_guard_identity[expected_session_key]):
+            return "unavailable", b"", 127
+        environment.update(policy_guard_identity)
     try:
         process = subprocess.Popen(
             argv,
             cwd=cwd,
-            env=inspection_environment(native_connection=native_connection),
+            env=environment,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -537,8 +554,10 @@ def policy_guard_status(adapter, argv_prefix, cwd, caller):
     argv = [*argv_prefix, "--cwd", str(cwd), "status"]
     if caller.state is CheckState.READY:
         argv.extend(("--session-id", caller.session))
+    native_identity = policy_guard_native_identity(caller)
     result, output, _ = run_bounded(argv, cwd, None, MAX_COMPONENT_OUTPUT, MAX_COMPONENT_SECONDS,
-                                    native_connection=caller.state is CheckState.READY)
+                                    native_connection=caller.state is CheckState.READY,
+                                    policy_guard_identity=native_identity)
     if result != "ready":
         return statuses
     try:
@@ -566,9 +585,25 @@ def policy_guard_status(adapter, argv_prefix, cwd, caller):
         statuses["registration"] = CheckState.BLOCKED
     else:
         statuses["registration"] = CheckState.UNKNOWN
-    statuses["intended_delivery"] = CheckState.READY if value.get("coverage", {}).get("configured") else CheckState.UNKNOWN
+    # Policy Guard status exposes installation and activation, not a delivery-configuration check.
+    statuses["intended_delivery"] = CheckState.UNKNOWN
     statuses["observed_delivery"] = CheckState.UNKNOWN
     return statuses
+
+
+def policy_guard_native_identity(caller):
+    if caller.state is not CheckState.READY or caller.harness not in ("codex", "claude"):
+        return None
+    if os.environ.get("CMUX_AGENT_LAUNCH_KIND") != caller.harness:
+        return None
+    if caller.harness == "codex":
+        session_key, other_session_key = "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"
+    else:
+        session_key, other_session_key = "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"
+    session = os.environ.get(session_key)
+    if session != caller.session or os.environ.get(other_session_key):
+        return None
+    return {"CMUX_AGENT_LAUNCH_KIND": caller.harness, session_key: session}
 
 
 def inspect_adapter(adapter, caller, cwd, prior_results, policy_guard_cli=None):
