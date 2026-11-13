@@ -502,7 +502,7 @@ def review_scope(config, cwd, base, facts):
 
 def review_summary(plan):
     """Bound terminal output only; full scope and content hashing remain unchanged."""
-    result = dict(plan)
+    result = {key: value for key, value in plan.items() if key != "selection_snapshot"}
     for key in ("paths", "counted_files", "tracked_paths", "untracked_paths"):
         if key not in plan:
             result[key] = None
@@ -523,6 +523,240 @@ def review_summary(plan):
     result["path_classification"] = "recorded" if "untracked_paths" in plan else "unavailable_in_legacy_plan"
     result["scope_note"] = "All tracked and untracked paths remain in scope; previews do not exclude inputs or weaken approval invalidation."
     result["details"] = f"model-preferences review-inspect {plan['id']} --full"
+    return result
+
+
+def review_selection_snapshot(config, plan):
+    saved = plan.get("selection_snapshot")
+    if isinstance(saved, dict) and saved.get("selection") == plan.get("selection"):
+        return saved, "saved_snapshot"
+    try:
+        active = selection(config)
+    except PreferenceError:
+        return None, "unknown"
+    if active["selection"] == plan.get("selection"):
+        return active, "current_selection"
+    return None, "unknown"
+
+
+def review_approval_decisions(app, plan):
+    directory = app.state_dir / "approvals"
+    if not directory.is_dir():
+        return [], "available"
+    decisions = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            approval = read(path)
+        except (OSError, ValueError, TypeError, PreferenceError):
+            return decisions, "unknown"
+        required = {"id", "scope", "selection", "authority", "authorization", "at", "role"}
+        if not isinstance(approval, dict) or not required.issubset(approval):
+            return decisions, "unknown"
+        if (approval.get("scope") == plan.get("scope")
+                and approval.get("selection") == plan.get("selection")
+                and approval.get("role") in ("advanced_review", "standard_review")):
+            decisions.append({"id": approval.get("id", path.stem),
+                              "review_role": approval["role"],
+                              "authority": approval.get("authority"),
+                              "recorded_at": approval.get("at")})
+    return decisions, "available"
+
+
+def review_cycle_slots(app, plan):
+    if plan.get("role") != "standard_review" or not plan.get("review_target") or not plan.get("review_cycle"):
+        return None, "not_applicable"
+    try:
+        target = load_target(app, plan["review_target"])
+        cycle = cycle_for_target(target, plan["review_cycle"])
+        require(any(item.get("id") == plan.get("id") for item in cycle_plan_refs(cycle)),
+                "Review plan is not a member of the saved review cycle.")
+        require(cycle.get("selection") == plan.get("selection"),
+                "Review plan selection differs from the saved review cycle.")
+    except (OSError, PreferenceError, ValueError, KeyError, TypeError):
+        return None, "unknown"
+    if (cycle.get("current_plan", {}).get("id") != plan.get("id")
+            or cycle.get("current_plan", {}).get("scope") != plan.get("scope")):
+        return cycle, "stale"
+    return cycle, "saved_cycle"
+
+
+def review_freshness(config, plan):
+    try:
+        active = selection(config)
+    except PreferenceError:
+        selection_status = "unknown"
+    else:
+        selection_status = "current" if active["selection"] == plan.get("selection") else "stale"
+    try:
+        current = review_scope(config, plan["root"], plan["base"], plan["facts"])
+    except (OSError, PreferenceError, ValueError, KeyError, TypeError):
+        scope_status = "unknown"
+    else:
+        scope_status = "current" if current["scope"] == plan.get("scope") else "stale"
+    if "stale" in (selection_status, scope_status):
+        status = "stale"
+    elif "unknown" in (selection_status, scope_status):
+        status = "unknown"
+    else:
+        status = "current"
+    return {"status": status, "selection": selection_status, "scope": scope_status}
+
+
+def review_guidance(app, config, plan):
+    freshness = review_freshness(config, plan)
+    saved_selection, selection_source = review_selection_snapshot(config, plan)
+    authority = None
+    authority_status = "unknown"
+    fresh_review_authorization_required = False
+    if saved_selection is not None:
+        authority = saved_selection.get("approval_authority", {}).get("label")
+        authority_status = "configured" if isinstance(authority, str) and authority.strip() else "unset"
+        if authority_status == "unset":
+            authority = None
+        fresh_review_authorization_required = saved_selection.get("profile") in ("Codex-Qwen", "Qwen-only")
+
+    cycle, cycle_status = review_cycle_slots(app, plan)
+    if cycle_status == "stale":
+        freshness["status"] = "stale"
+
+    classification_role = plan.get("role")
+    requires_approval = classification_role == "advanced_review"
+    decisions, decisions_status = review_approval_decisions(app, plan)
+    advanced_approval = next((item for item in decisions if item["review_role"] == "advanced_review"), None)
+    standard_instead = next((item for item in decisions if item["review_role"] == "standard_review"), None)
+    if freshness["status"] == "stale":
+        approval_status = "not_required" if not requires_approval else "stale"
+    elif decisions_status == "unknown":
+        approval_status = "unknown" if requires_approval else "not_required"
+    elif freshness["status"] == "unknown":
+        approval_status = "unknown" if requires_approval else "not_required"
+    elif not requires_approval:
+        approval_status = "not_required"
+    elif standard_instead and advanced_approval:
+        approval_status = "multiple_decisions"
+    elif standard_instead:
+        approval_status = "standard_instead"
+    elif advanced_approval:
+        approval_status = "approved"
+    else:
+        approval_status = "missing"
+
+    dispatch_role = (None if (freshness["status"] == "current" and standard_instead and advanced_approval)
+                     else "standard_review" if (freshness["status"] == "current" and standard_instead)
+                     else classification_role)
+    reviewer_choices = []
+
+    def describe_choice(slot, choice):
+        return {"slot": slot, "harness": choice.get("harness"), "provider": choice.get("harness"),
+                "provider_id": choice.get("provider_id"), "family": choice.get("family"),
+                "model": choice.get("model"), "effort": choice.get("effort")}
+
+    if cycle is not None:
+        for item in cycle["slots"]:
+            reviewer_choices.append(describe_choice(item["number"], item["choice"]))
+    elif saved_selection is not None and dispatch_role in ROLES and dispatch_role.endswith("_review"):
+        for slot, choice in enumerate(saved_selection.get("roles", {}).get(dispatch_role, []), 1):
+            reviewer_choices.append(describe_choice(slot, choice))
+
+    if classification_role == "advanced_review" and freshness["status"] == "current":
+        if approval_status == "multiple_decisions":
+            option_roles = ["advanced_review", "standard_review"]
+        elif dispatch_role:
+            option_roles = [dispatch_role]
+        else:
+            option_roles = ["advanced_review"]
+    else:
+        option_roles = [dispatch_role] if dispatch_role else []
+    review_options = []
+    if saved_selection is not None:
+        for role in option_roles:
+            if role == dispatch_role and cycle is not None:
+                choices = reviewer_choices
+            else:
+                choices = [describe_choice(slot, choice) for slot, choice in
+                           enumerate(saved_selection.get("roles", {}).get(role, []), 1)]
+            review_options.append({"role": role, "slots": choices})
+
+    prefix = (f"model-preferences --config-dir {shlex.quote(str(app.config_dir))} "
+              f"--state-dir {shlex.quote(str(app.state_dir))}")
+    plan_id = plan.get("id", "<plan-id>")
+    if freshness["status"] != "current":
+        next_action = "Create a fresh review plan for the current worktree scope and active selection before dispatch; do not reuse a decision from this plan."
+        command = None
+        next_role = None
+    elif cycle_status == "unknown":
+        next_action = "The saved review cycle could not be verified. Inspect its target and cycle records before dispatch."
+        command = None
+        next_role = None
+    elif requires_approval and authority_status == "unset":
+        next_action = ("No human approval authority is configured in this plan's saved selection. Configure the actual authority, "
+                       "then create a fresh plan because changing authority changes the selection.")
+        command = f'{prefix} authority-set "<human approval authority label>" --orchestrators future-only'
+        next_role = None
+    elif requires_approval and approval_status == "missing":
+        next_action = (f'Ask the configured authority "{authority}" to decide on this exact plan and scope. '
+                       "If approved, record that explicit decision; the configured label does not authenticate a person.")
+        command = f'{prefix} approve-review {plan_id} --authorization "<recorded explicit decision>"'
+        next_role = None
+    elif requires_approval and approval_status == "approved":
+        next_action = f"Use saved approval {advanced_approval['id']} to dispatch the advanced reviewers in the configured slots."
+        next_role = "advanced_review"
+        command = (f"{prefix} dispatch --role advanced_review --slot <slot> --cwd "
+                   f"{shlex.quote(str(plan.get('root', '<worktree>')))} --task-file <review-brief> "
+                   f"--review-plan {plan_id} --approval {advanced_approval['id']}")
+    elif requires_approval and approval_status == "standard_instead":
+        next_action = (f"The saved authority decision selects standard review. Use approval {standard_instead['id']} "
+                       "to dispatch the standard reviewers in the configured slots.")
+        next_role = "standard_review"
+        command = (f"{prefix} dispatch --role standard_review --slot <slot> --cwd "
+                   f"{shlex.quote(str(plan.get('root', '<worktree>')))} --task-file <review-brief> "
+                   f"--review-plan {plan_id} --approval {standard_instead['id']}")
+    elif requires_approval and approval_status == "multiple_decisions":
+        next_action = (f"Both approval decisions are recorded: advanced review ({advanced_approval['id']}) and standard instead "
+                       f"({standard_instead['id']}). Choose either supported review role and pass its matching approval.")
+        next_role = None
+        command = None
+    elif requires_approval and approval_status == "unknown":
+        next_action = "Approval records could not be fully read. Resolve the approval state before dispatch."
+        next_role = None
+        command = None
+    elif not requires_approval:
+        next_action = "Approval is not required for this standard review plan. Dispatch the configured standard reviewer slots."
+        next_role = "standard_review"
+        command = (f"{prefix} dispatch --role standard_review --slot <slot> --cwd "
+                   f"{shlex.quote(str(plan.get('root', '<worktree>')))} --task-file <review-brief> "
+                   f"--review-plan {plan_id}")
+        if plan.get("review_target") and plan.get("review_cycle"):
+            command += (f" --review-target {shlex.quote(plan['review_target'])}"
+                        f" --review-cycle {shlex.quote(plan['review_cycle'])}")
+    else:
+        next_action = "Approval status could not be established. Inspect the saved plan and approval state before dispatch."
+        next_role = None
+        command = None
+
+    if fresh_review_authorization_required:
+        next_action += " Include a fresh --review-authorization value on each review launch."
+        if command and " dispatch " in command:
+            command += ' --review-authorization "<fresh operator authorization>"'
+
+    return {"plan_status": freshness["status"], "selection_status": freshness["selection"],
+            "scope_status": freshness["scope"], "selection_source": selection_source,
+            "classification_role": classification_role, "review_role": next_role or dispatch_role,
+            "review_slots": reviewer_choices, "review_options": review_options,
+            "approval_required": requires_approval, "approval_status": approval_status,
+            "approval_authority": {"status": authority_status, "label": authority},
+            "fresh_review_authorization_required": fresh_review_authorization_required,
+            "approval_records_status": decisions_status, "review_cycle_status": cycle_status,
+            "approval_decisions": decisions, "next_action": next_action,
+            "next_action_command": command}
+
+
+def review_output(app, config, plan, full=False, saved_snapshot=False):
+    result = dict(plan) if full else review_summary(plan)
+    result.pop("selection_snapshot", None)
+    result["review_guidance"] = review_guidance(app, config, plan)
+    if saved_snapshot:
+        result["saved_snapshot"] = True
     return result
 
 
@@ -2316,9 +2550,9 @@ def execute(args):
             return {"removed": args.name}
         elif command == "review-plan":
             plan = review_scope(config, args.cwd, args.base, read(args.facts))
-            plan.update(selection=selection(config)["selection"], id=uuid.uuid4().hex)
-            has_cycle_context = bool(args.target or args.cycle_key or args.previous_cycle)
             active = selection(config)
+            plan.update(selection=active["selection"], selection_snapshot=active, id=uuid.uuid4().hex)
+            has_cycle_context = bool(args.target or args.cycle_key or args.previous_cycle)
             light_standard = ("standard_review_policy" in active and plan["role"] == "standard_review")
             if light_standard:
                 require(args.target and args.cycle_key,
@@ -2328,11 +2562,11 @@ def execute(args):
                 require(not has_cycle_context,
                         "Target cycle options apply only to standard reviews under claude-codex-light.")
                 app.save_state(f"reviews/{plan['id']}", plan)
-            return plan if args.full else review_summary(plan)
+            return review_output(app, config, plan, full=args.full)
         elif command == "review-inspect":
             plan = app.state(f"reviews/{safe_id(args.plan)}", None)
             require(plan, "Unknown review plan.")
-            return {**(plan if args.full else review_summary(plan)), "saved_snapshot": True}
+            return review_output(app, config, plan, full=args.full, saved_snapshot=True)
         elif command == "approve-review":
             plan = app.state(f"reviews/{safe_id(args.plan)}", None)
             require(plan and plan["role"] == "advanced_review", "Advanced review plan required.")

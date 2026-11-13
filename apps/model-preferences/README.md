@@ -127,6 +127,15 @@ The refresh keeps that cycle's frozen slot set and requires each slot to complet
 The command holds while a linked launch is active or uncertain.
 Use a new cycle key and predecessor after a completed cycle for an intentional repeat review.
 
+`review-plan` and `review-inspect` include a `review_guidance` object alongside the existing plan fields.
+It shows whether the saved selection and scope are current, the saved approval authority when known, whether approval is required, matching approval decisions, and each configured reviewer slot's provider, model and effort.
+For an advanced plan that needs approval, ask the configured authority to decide on that exact plan and scope before recording the decision with `approve-review`.
+The output includes the scoped command prefix and the next supported action, including when the authority is unset or the plan is stale.
+Inspection only reads the plan, current configuration, worktree and existing approval records; it does not create approvals or launch reviewers.
+For `Codex-Qwen` and `Qwen-only`, the dispatch template also retains the required fresh `--review-authorization` value for each review launch.
+Legacy plans can identify their saved authority and reviewer choices only while their selection digest still matches the active selection.
+When a plan is stale, its current configured authority is never presented as the plan's saved authority.
+
 Repeat a dispatch to inspect or reuse the saved slot launch.
 Pass `--retry-failed` only after the exact slot's recorded launch exits with a nonzero code.
 The tool does not retry a launch whose state is missing, active, failed without an observed exit code, or uncertain.
