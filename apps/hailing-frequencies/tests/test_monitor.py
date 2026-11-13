@@ -573,6 +573,8 @@ class MonitorTests(unittest.TestCase):
             staged_guide = staging / "guide.md"
             staged_agent_notify = staging / "agent-notify"
             staged_agent_notify_guide = staging / "agent-notify-guide.md"
+            staged_discord_cleanup = staging / "discord_cleanup.py"
+            staged_discord_cleanup_guide = staging / "discord-cleanup.md"
             staged_opencode_adapter = staging / "opencode_adapter.py"
             staged_script.write_bytes(b"immutable runtime script")
             staged_service.write_bytes(b"immutable runtime service")
@@ -581,6 +583,8 @@ class MonitorTests(unittest.TestCase):
             staged_guide.write_bytes((source_app / "guide.md").read_bytes())
             staged_agent_notify.write_bytes((source_app / "agent-notify").read_bytes())
             staged_agent_notify_guide.write_bytes((source_app / "agent-notify-guide.md").read_bytes())
+            staged_discord_cleanup.write_bytes((source_app / "discord_cleanup.py").read_bytes())
+            staged_discord_cleanup_guide.write_bytes((source_app / "discord-cleanup.md").read_bytes())
             staged_opencode_adapter.write_bytes(
                 (source_app.parent / "opencode-adapter" / "opencode_adapter.py").read_bytes())
             skill_source = source_app / "skills/temporal-beacon/SKILL.md"
@@ -589,6 +593,8 @@ class MonitorTests(unittest.TestCase):
                        "temporal_beacon.py": staged_temporal.read_bytes(), "guide.md": staged_guide.read_bytes(),
                        "agent-notify": staged_agent_notify.read_bytes(),
                        "agent-notify-guide.md": staged_agent_notify_guide.read_bytes(),
+                       "discord_cleanup.py": staged_discord_cleanup.read_bytes(),
+                       "discord-cleanup.md": staged_discord_cleanup_guide.read_bytes(),
                        "opencode_adapter.py": staged_opencode_adapter.read_bytes(),
                        "skills/temporal-beacon/SKILL.md": skill_source.read_bytes(),
                        "skills/agent-notify/SKILL.md": agent_notify_skill_source.read_bytes()}
