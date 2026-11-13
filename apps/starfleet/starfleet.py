@@ -136,7 +136,7 @@ ADAPTERS = (
             registration_required=False, worker_required=True,
             guide_command="warp-drive guide --print"),
     Adapter("policy-guard", "Starfleet Policy Guard", None, (), mode="policy-guard",
-            registration_required=False, guide_command="starfleet guide --print"),
+            registration_required=True, guide_command="starfleet guide --print"),
     Adapter("starfleet-markup", "Starfleet Markup", "starfleet-markup", ("claude-config",), mode="static-command",
             registration_required=False, worker_required=False, guide_command="starfleet-markup guide --print"),
     Adapter("replicator", "Replicator", "replicator", (), mode="passive",
@@ -530,13 +530,15 @@ def pattern_buffer_status(adapter, executable, cwd, caller):
 
 def policy_guard_status(adapter, argv_prefix, cwd, caller):
     statuses = no_evidence_states(adapter)
+    statuses["registration"] = CheckState.UNKNOWN
     if not argv_prefix:
         statuses["configuration"] = CheckState.UNKNOWN
         return statuses
     argv = [*argv_prefix, "--cwd", str(cwd), "status"]
     if caller.state is CheckState.READY:
         argv.extend(("--session-id", caller.session))
-    result, output, _ = run_bounded(argv, cwd, None, MAX_COMPONENT_OUTPUT, MAX_COMPONENT_SECONDS)
+    result, output, _ = run_bounded(argv, cwd, None, MAX_COMPONENT_OUTPUT, MAX_COMPONENT_SECONDS,
+                                    native_connection=caller.state is CheckState.READY)
     if result != "ready":
         return statuses
     try:
@@ -553,9 +555,15 @@ def policy_guard_status(adapter, argv_prefix, cwd, caller):
     elif installed is False:
         statuses["configuration"] = CheckState.BLOCKED
     owner = value.get("current_owner")
-    if caller.state is CheckState.READY and isinstance(owner, dict):
-        statuses["registration"] = (CheckState.READY if owner.get("state") == "matches"
-                                     else CheckState.BLOCKED)
+    owner_state = owner.get("state") if isinstance(owner, dict) else None
+    if value.get("lane_enrolled") is False and owner_state == "legacy-per-pr-no-native-owner":
+        statuses["registration"] = CheckState.NOT_APPLICABLE
+    elif caller.state is not CheckState.READY:
+        statuses["registration"] = CheckState.UNKNOWN
+    elif owner_state == "matches":
+        statuses["registration"] = CheckState.READY
+    elif owner_state in ("mismatch", "unrecognized"):
+        statuses["registration"] = CheckState.BLOCKED
     else:
         statuses["registration"] = CheckState.UNKNOWN
     statuses["intended_delivery"] = CheckState.READY if value.get("coverage", {}).get("configured") else CheckState.UNKNOWN
@@ -683,7 +691,10 @@ def tool_status(adapter, states, version, selected=True):
             state = CheckState.NOT_APPLICABLE
         if name == "intended_delivery" and not adapter.delivery_required and state is CheckState.UNKNOWN:
             state = CheckState.NOT_APPLICABLE
-        checks.append(_check(name, state, evidence[name], required[name], adapter))
+        check_required = required[name]
+        if adapter.key == "policy-guard" and name == "registration":
+            check_required = state is not CheckState.NOT_APPLICABLE
+        checks.append(_check(name, state, evidence[name], check_required, adapter))
     for name in OPTIONAL_CHECKS.get(adapter.key, ()):
         state = states.get(name, CheckState.UNKNOWN)
         registration_state = states.get("registration", CheckState.UNKNOWN)

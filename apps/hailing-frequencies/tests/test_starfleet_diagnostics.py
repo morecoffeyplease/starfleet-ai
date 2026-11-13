@@ -117,6 +117,35 @@ class StarfleetDiagnosticTests(unittest.TestCase):
         self.assertNotIn(token, rendered)
         self.assertEqual(snapshot(self.root), before)
 
+    def test_agent_notify_public_cli_accepts_unquoted_and_single_quoted_literals(self):
+        config_home = self.root / "agent-notify-quoted"
+        config_home.mkdir(mode=0o700)
+        env_file = config_home / "env"
+        webhook = "https://discord.com/api/webhooks/123456789012345678/secret-webhook-token"
+        token = "012345678901234567890123"
+        command = ["bash", str(ROOT / "agent-notify"), "doctor", "--starfleet-json"]
+        environment = {"PATH": str(Path(sys.executable).parent) + os.pathsep + os.defpath,
+                       "HOME": str(self.root), "AGENT_NOTIFY_HOME": str(config_home),
+                       "PYTHONDONTWRITEBYTECODE": "1"}
+        for webhook_value, token_value in ((webhook, token),
+                                           (f"'{webhook}'", f"'{token}'")):
+            user_id = "" if webhook_value == webhook else "''"
+            env_file.write_text(
+                f"DISCORD_WEBHOOK_URL={webhook_value}\n"
+                f"DISCORD_BOT_TOKEN={token_value}\n"
+                f"DISCORD_USER_ID={user_id}\n", encoding="utf-8")
+            env_file.chmod(0o600)
+            before = snapshot(self.root)
+            result = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
+                                    env=environment, check=False, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["checks"]["configuration"], "ready")
+            self.assertEqual(report["checks"]["intended_delivery"], "unknown")
+            self.assertNotIn(webhook, result.stdout + result.stderr)
+            self.assertNotIn(token, result.stdout + result.stderr)
+            self.assertEqual(snapshot(self.root), before)
+
     def test_agent_notify_discord_watch_config_check_accepts_bot_only_setup_and_cached_user(self):
         config_home = self.root / "agent-notify-bot-only"
         config_home.mkdir(mode=0o700)

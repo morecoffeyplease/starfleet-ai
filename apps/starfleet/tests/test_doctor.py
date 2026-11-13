@@ -270,6 +270,92 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(dependency["status"], "blocked")
             self.assertIn("skipped by user instruction", dependency["summary"])
 
+    def test_public_cli_requires_policy_guard_owner_match_when_a_seat_is_enrolled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            cmux = bin_dir / "cmux"
+            workspace, surface, _session, identity, current, selectors = self._caller_fixture()
+            self._write_fake_cmux(cmux, {**selectors, "CMUX_SOCKET": str(root / "native.sock")},
+                                  identity, current)
+            provider = root / "policy_guard.py"
+
+            def write_status(lane_enrolled, owner_state=None):
+                value = {"installed_here": True, "lane_enrolled": lane_enrolled,
+                         "coverage": {"configured": True}}
+                if owner_state is not None:
+                    value["current_owner"] = {"state": owner_state}
+                expected_environment = {**selectors, "CMUX_SOCKET": str(root / "native.sock")}
+                provider.write_text(
+                    f"import json,os,sys\nexpected={expected_environment!r}\n"
+                    "if any(os.environ.get(key) != item for key,item in expected.items()): sys.exit(61)\n"
+                    "if any(key in os.environ for key in ('CMUX_AGENT_LAUNCH_KIND',"
+                    "'CLAUDE_CODE_SESSION_ID','CODEX_THREAD_ID','OPENCODE_SESSION_ID')): sys.exit(62)\n"
+                    f"print(json.dumps({value!r}))\n", encoding="utf-8")
+
+            skip = [key for key in doctor.expected_components() if key != "policy-guard"]
+            command = [sys.executable, str(ROOT / "apps" / "starfleet" / "starfleet.py"),
+                       "doctor", "--cwd", directory, "--json", "--policy-guard-cli", str(provider)]
+            for key in skip:
+                command.extend(("--skip", key))
+            environment = {"PATH": str(bin_dir), "HOME": directory,
+                           "CMUX_SOCKET": str(root / "native.sock"), **selectors,
+                           "CMUX_AGENT_LAUNCH_KIND": "claude",
+                           "CLAUDE_CODE_SESSION_ID": "44444444-4444-4444-8444-444444444444",
+                           "CODEX_THREAD_ID": "55555555-5555-4555-8555-555555555555"}
+
+            write_status(True, "matches")
+            healthy = subprocess.run(command, cwd=directory, env=environment,
+                                     capture_output=True, text=True, timeout=5)
+            self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            healthy_report = json.loads(healthy.stdout)
+            self.assertEqual(healthy_report["overall_status"], "ready")
+            policy_guard = next(tool for tool in healthy_report["tools"]
+                                if tool["key"] == "policy-guard")
+            registration = next(check for check in policy_guard["checks"]
+                                if check["name"] == "registration")
+            self.assertEqual(registration["status"], "ready")
+            self.assertTrue(registration["required"])
+
+            write_status(True, "mismatch")
+            mismatch = subprocess.run(command, cwd=directory, env=environment,
+                                      capture_output=True, text=True, timeout=5)
+            self.assertEqual(mismatch.returncode, 3, mismatch.stderr)
+            mismatch_report = json.loads(mismatch.stdout)
+            self.assertEqual(mismatch_report["overall_status"], "blocked")
+            policy_guard = next(tool for tool in mismatch_report["tools"]
+                                if tool["key"] == "policy-guard")
+            registration = next(check for check in policy_guard["checks"]
+                                if check["name"] == "registration")
+            self.assertEqual(registration["status"], "blocked")
+            self.assertTrue(registration["required"])
+
+            write_status(True, "unavailable")
+            unavailable = subprocess.run(command, cwd=directory, env=environment,
+                                         capture_output=True, text=True, timeout=5)
+            self.assertEqual(unavailable.returncode, 4, unavailable.stderr)
+            unavailable_report = json.loads(unavailable.stdout)
+            self.assertEqual(unavailable_report["overall_status"], "unknown")
+
+            write_status(True)
+            absent_owner = subprocess.run(command, cwd=directory, env=environment,
+                                          capture_output=True, text=True, timeout=5)
+            self.assertEqual(absent_owner.returncode, 4, absent_owner.stderr)
+            self.assertEqual(json.loads(absent_owner.stdout)["overall_status"], "unknown")
+
+            write_status(False, "legacy-per-pr-no-native-owner")
+            standalone = subprocess.run(command, cwd=directory, env=environment,
+                                        capture_output=True, text=True, timeout=5)
+            self.assertEqual(standalone.returncode, 0, standalone.stderr)
+            standalone_report = json.loads(standalone.stdout)
+            policy_guard = next(tool for tool in standalone_report["tools"]
+                                if tool["key"] == "policy-guard")
+            registration = next(check for check in policy_guard["checks"]
+                                if check["name"] == "registration")
+            self.assertEqual(registration["status"], "not_applicable")
+            self.assertFalse(registration["required"])
+
     def test_invalid_oversized_and_slow_subprocess_output_is_suppressed(self):
         invalid = doctor.run_bounded(
             [sys.executable, "-c", "import os; os.write(1, b'\\xff')"], None, None, 128, 2)

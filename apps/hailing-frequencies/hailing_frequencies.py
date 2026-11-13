@@ -1460,6 +1460,52 @@ def _match_scan_target(scan, session):
         if isinstance(targets, list) else None
 
 
+def _parse_static_shell_literal(raw):
+    require(isinstance(raw, str) and not any(ord(character) < 32 or ord(character) == 127
+                                             for character in raw),
+            "Agent Notify setting is not a supported literal")
+    value = []
+    quote = None
+    index = 0
+    while index < len(raw):
+        character = raw[index]
+        if quote == "'":
+            if character == "'":
+                quote = None
+            else:
+                value.append(character)
+        elif quote == '"':
+            if character == '"':
+                quote = None
+            elif character == "\\":
+                index += 1
+                require(index < len(raw), "Agent Notify setting has an incomplete escape")
+                escaped = raw[index]
+                if escaped in ("$", "`", '"', "\\"):
+                    value.append(escaped)
+                else:
+                    value.extend(("\\", escaped))
+            elif character in ("$", "`"):
+                raise ValueError("Agent Notify setting contains unsupported shell expansion")
+            else:
+                value.append(character)
+        elif character in ("'", '"'):
+            quote = character
+        elif character == "\\":
+            index += 1
+            require(index < len(raw), "Agent Notify setting has an incomplete escape")
+            value.append(raw[index])
+        elif character in ("$", "`", ";", "|", "&", "<", ">", "(", ")"):
+            raise ValueError("Agent Notify setting contains unsupported shell syntax")
+        elif character.isspace():
+            raise ValueError("Agent Notify setting is not one static shell word")
+        else:
+            value.append(character)
+        index += 1
+    require(quote is None, "Agent Notify setting is not a supported literal")
+    return "".join(value)
+
+
 def agent_notify_diagnostic_report(notify_home=None, *, require_webhook=True,
                                    require_cached_user=False):
     directory = Path(notify_home or os.environ.get(
@@ -1491,11 +1537,8 @@ def agent_notify_diagnostic_report(notify_home=None, *, require_webhook=True,
                     match = re.fullmatch(r"(DISCORD_WEBHOOK_URL|DISCORD_BOT_TOKEN|DISCORD_USER_ID)=(.*)", line)
                     require(match is not None, "Agent Notify configuration contains an unsupported line")
                     key, value = match.groups()
-                    if value in ("''", '""'):
-                        value = ""
+                    value = _parse_static_shell_literal(value)
                     require(key not in values, "Agent Notify configuration has a duplicate setting")
-                    require(not any(char in value for char in "`$;|&<>"),
-                            "Agent Notify configuration is malformed")
                     if key != "DISCORD_USER_ID":
                         require(bool(value), "Agent Notify required configuration is empty")
                     values[key] = value
