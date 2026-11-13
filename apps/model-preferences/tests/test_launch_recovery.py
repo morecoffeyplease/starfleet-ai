@@ -1,6 +1,7 @@
 """Exact-owner reconciliation for interrupted Codex launches."""
 import contextlib
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -222,14 +224,99 @@ class LaunchRecoveryTest(unittest.TestCase):
             with self.stopped_owner(launch, identity):
                 self.reconcile(launch, disposition="abandoned", key=key)
 
+    def test_existing_unresolved_continuations_hold_inspection_and_reconciliation(self):
+        launch, identity = self.launch()
+        before = self.app.state(f"launches/{launch['id']}", None)
+        for status, expected in (("starting", "unresolved"), ("uncertain", "unresolved"),
+                                 ("exited", "unknown")):
+            continuation = {"launch": launch["id"], "session": launch["native_session"],
+                            "status": status, "id": uuid.uuid4().hex}
+            self.app.save_state(f"continuations/{launch['native_session']}", continuation)
+            with self.subTest(status=status), self.stopped_owner(launch, identity):
+                inspected = self.call("launch-inspect", launch["id"])
+                self.assertEqual(inspected["evidence"]["continuation"], expected)
+                self.assertFalse(inspected["stopped_state_proven"])
+                self.assertFalse(inspected["abandonment_ready"])
+                self.assertEqual(inspected["next_commands"], [])
+                for disposition in ("interrupted", "abandoned"):
+                    with self.assertRaisesRegex(mp.PreferenceError, "continuation is unresolved"):
+                        self.reconcile(launch, disposition=disposition)
+            self.assertEqual(self.app.state(f"launches/{launch['id']}", None), before)
+
+    def test_inspection_does_not_create_a_session_lock_file(self):
+        launch, identity = self.launch()
+        lock_path = self.state_dir / "resume-locks" / f"{launch['native_session']}.lock"
+        self.assertFalse(lock_path.exists())
+        with self.stopped_owner(launch, identity):
+            inspected = self.call("launch-inspect", launch["id"])
+        self.assertEqual(inspected["evidence"]["resume_lock"], "available")
+        self.assertFalse(lock_path.exists())
+
+    def test_resume_holding_session_lock_blocks_reconcile_until_terminal_attempt(self):
+        launch, identity = self.launch()
+        with self.stopped_owner(launch, identity):
+            self.reconcile(launch)
+        followup = self.root / "follow-up.txt"
+        followup.write_text("Continue while the owner holds the existing session lock.\n")
+        entered = threading.Event()
+        release = threading.Event()
+        outcome = {}
+
+        def stream(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("resume fixture was not released")
+            return subprocess.CompletedProcess([], 0)
+
+        def resume():
+            try:
+                outcome["result"] = self.call("resume", launch["id"], "--task-file", str(followup))
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        with self.stopped_owner(launch, identity), patch.object(mp, "stream_codex", side_effect=stream):
+            worker = threading.Thread(target=resume)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5), "resume did not reach the held native call")
+                inspected = self.call("launch-inspect", launch["id"])
+                self.assertEqual(inspected["evidence"]["continuation"], "unresolved")
+                self.assertEqual(inspected["evidence"]["resume_lock"], "in_flight")
+                self.assertFalse(inspected["stopped_state_proven"])
+                with self.assertRaisesRegex(mp.PreferenceError, "continuation in flight"):
+                    self.reconcile(launch, disposition="abandoned")
+            finally:
+                release.set()
+                worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), "resume did not finish after release")
+        self.assertNotIn("error", outcome, outcome.get("error"))
+        self.assertEqual(outcome["result"]["exit_code"], 0)
+        continuation = self.app.state(f"continuations/{launch['native_session']}", None)
+        self.assertEqual(continuation["status"], "exited")
+        with self.stopped_owner(launch, identity):
+            result = self.reconcile(launch, disposition="abandoned")
+        self.assertEqual(result["status"], "abandoned")
+
     def test_concurrent_same_request_key_records_one_history_entry(self):
         launch, identity = self.launch()
         key = str(uuid.uuid4())
         def invoke():
-            return self.reconcile(launch, key=key)
+            try:
+                return ("result", self.reconcile(launch, key=key))
+            except mp.PreferenceError as exc:
+                return ("error", str(exc))
         with self.stopped_owner(launch, identity), concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda _: invoke(), range(2)))
-        self.assertEqual([result["status"] for result in results], ["interrupted", "interrupted"])
+        successes = [value for kind, value in results if kind == "result"]
+        errors = [value for kind, value in results if kind == "error"]
+        self.assertGreaterEqual(len(successes), 1)
+        self.assertLessEqual(len(errors), 1)
+        if errors:
+            self.assertIn("continuation in flight", errors[0])
+        self.assertEqual([result["status"] for result in successes], ["interrupted"] * len(successes))
+        with self.stopped_owner(launch, identity):
+            retry = self.reconcile(launch, key=key)
+        self.assertTrue(retry["reused"])
         saved = self.app.state(f"launches/{launch['id']}", None)
         self.assertEqual(len(saved["recovery"]["history"]), 1)
 

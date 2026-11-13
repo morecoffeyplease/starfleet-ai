@@ -3265,6 +3265,62 @@ def native_binding_observation(app, launch):
     return "verified" if binding == {"launch": launch.get("id")} and claims.get(launch.get("id")) == key else "mismatch"
 
 
+def continuation_observation(app, launch):
+    session = launch.get("native_session")
+    if not isinstance(session, str):
+        return "unknown"
+    path = app.state_dir / "continuations" / f"{session}.json"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "none"
+    except OSError:
+        return "unknown"
+    if not stat.S_ISREG(info.st_mode):
+        return "unknown"
+    try:
+        if info.st_size > 65536:
+            return "unknown"
+        continuation = app.state(f"continuations/{session}", None)
+    except (PreferenceError, OSError, ValueError, TypeError):
+        return "unknown"
+    if (not isinstance(continuation, dict) or continuation.get("launch") != launch.get("id")
+            or continuation.get("session") != session):
+        return "unknown"
+    if (continuation.get("status") == "exited"
+            and type(continuation.get("exit_code")) is int
+            and isinstance(continuation.get("finished_at"), str)
+            and continuation["finished_at"]):
+        return "exited"
+    if continuation.get("status") in ("starting", "uncertain"):
+        return "unresolved"
+    return "unknown"
+
+
+def resume_lock_observation(app, session):
+    if not isinstance(session, str):
+        return "unknown"
+    path = app.state_dir / "resume-locks" / f"{session}.lock"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return "available"
+    except OSError:
+        return "unknown"
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "in_flight"
+        except OSError:
+            return "unknown"
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return "available"
+    finally:
+        os.close(descriptor)
+
+
 def launch_recovery_observation(app, launch):
     provenance = launch.get("recovery_provenance")
     if not isinstance(provenance, dict) or provenance.get("version") != 1:
@@ -3277,6 +3333,7 @@ def launch_recovery_observation(app, launch):
         "native_binding": native_binding_observation(app, launch),
         "native_session": observe_native_session(app, launch.get("native_session")),
         "pattern_buffer_task": pattern_task.get("status"),
+        "continuation": continuation_observation(app, launch),
         "_pattern_buffer_task": pattern_task,
     }
 
@@ -3322,9 +3379,12 @@ def launch_inspection(app, launch):
     task = observation["_pattern_buffer_task"]
     process_stopped = (observation["dispatcher_process"] == "stopped"
                        and observation["child_process"] == "stopped")
+    resume_lock = resume_lock_observation(app, launch.get("native_session"))
     stop_proof = (observation["owner"] == "matched" and process_stopped
                   and observation["native_session"] == "ended"
-                  and observation["native_binding"] == "verified")
+                  and observation["native_binding"] == "verified"
+                  and observation["continuation"] in ("none", "exited")
+                  and resume_lock == "available")
     next_commands = []
     if stop_proof:
         if task_status in ("pending_unbound", "active_exact") and task.get("task_id"):
@@ -3356,6 +3416,7 @@ def launch_inspection(app, launch):
         elif status == "abandoned":
             next_commands = []
     evidence = {key: value for key, value in observation.items() if not key.startswith("_")}
+    evidence["resume_lock"] = resume_lock
     return {
         "launch": launch["id"],
         "status": status,
@@ -3405,6 +3466,7 @@ def launch_recovery_history(launch):
 
 def launch_reconcile(app, launch_id, disposition, request_key):
     launch_id = safe_id(launch_id)
+    require(disposition in ("interrupted", "abandoned"), "Unknown launch disposition.")
     try:
         canonical_key = str(uuid.UUID(request_key))
     except (ValueError, TypeError, AttributeError) as exc:
@@ -3412,6 +3474,34 @@ def launch_reconcile(app, launch_id, disposition, request_key):
     require(canonical_key == request_key, "Reconciliation request key must be a canonical UUID.")
     initial = app.state(f"launches/{launch_id}", None)
     require(isinstance(initial, dict), "Unknown launch.")
+    session = initial.get("native_session")
+    try:
+        require(isinstance(session, str) and str(uuid.UUID(session)) == session,
+                "Launch has no exact native session; no state changed.")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PreferenceError("Launch has no exact native session; no state changed.") from exc
+    lock_path = app.state_dir / "resume-locks" / f"{session}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as session_lock:
+        try:
+            fcntl.flock(session_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PreferenceError(
+                "This native session has a continuation in flight; inspect and retry reconciliation.") from exc
+        try:
+            latest = app.state(f"launches/{launch_id}", None)
+            require(latest == initial,
+                    "Launch changed before reconciliation; inspect again before retrying.")
+            continuation = continuation_observation(app, latest)
+            require(continuation in ("none", "exited"),
+                    "A continuation is unresolved or ambiguous; inspect it before reconciling.")
+            return launch_reconcile_with_session_lock(
+                app, launch_id, disposition, canonical_key, initial, continuation)
+        finally:
+            fcntl.flock(session_lock.fileno(), fcntl.LOCK_UN)
+
+
+def launch_reconcile_with_session_lock(app, launch_id, disposition, canonical_key, initial, continuation):
     history = launch_recovery_history(initial)
     prior = next((item for item in history if isinstance(item, dict)
                   and item.get("request_key") == canonical_key), None)
@@ -3423,8 +3513,9 @@ def launch_reconcile(app, launch_id, disposition, request_key):
         return {"launch": launch_id, "status": initial.get("status"),
                 "disposition": disposition, "request_key": canonical_key, "reused": True,
                 "native_exit_code": "unknown"}
-    require(disposition in ("interrupted", "abandoned"), "Unknown launch disposition.")
     observation = launch_recovery_observation(app, initial)
+    require(observation["continuation"] == continuation,
+            "Continuation state changed during observation; inspect before reconciling.")
     require(observation["owner"] == "matched",
             "Current caller is not the exact recorded launch owner; no state changed.")
     require(observation["dispatcher_process"] == "stopped"
@@ -3464,6 +3555,8 @@ def launch_reconcile(app, launch_id, disposition, request_key):
         latest = app.state(f"launches/{launch_id}", None)
         require(isinstance(latest, dict), "Launch record disappeared during reconciliation; no state changed.")
         latest_history = launch_recovery_history(latest)
+        require(continuation_observation(app, latest) == continuation,
+                "Continuation state changed before reconciliation; no state changed.")
         repeated = next((item for item in latest_history if isinstance(item, dict)
                          and item.get("request_key") == canonical_key), None)
         if repeated is not None:
