@@ -49,6 +49,7 @@ OPENCODE_DEFAULT_DELIVERY_POLICY = "native_empty_composer"
 OPENCODE_API_SIDECHANNEL_DELIVERY_POLICY = "api_sidechannel"
 OPENCODE_HTTP_TIMEOUT = 5
 OPENCODE_RESPONSE_LIMIT = 128 * 1024
+STARFLEET_DIAGNOSTIC_LIMIT = 256 * 1024
 
 
 class LockBusyError(ValueError):
@@ -571,8 +572,9 @@ class Monitor:
             finally:
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
-    def config(self):
-        value = json.loads((self.directory / "config.json").read_text())
+    def config(self, value=None):
+        if value is None:
+            value = json.loads((self.directory / "config.json").read_text())
         require(value.get("version") == 1, "Unsupported configuration version")
         for key in ("remind_after", "escalate_after", "cooldown", "interval"):
             require(type(value.get(key)) in (int, float) and math.isfinite(value[key]) and value[key] > 0,
@@ -1287,6 +1289,288 @@ def serve_iteration(app, send=False, only_sessions=None):
     return report
 
 
+def _read_diagnostic_bytes(path, maximum=STARFLEET_DIAGNOSTIC_LIMIT):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("diagnostic file is unavailable") from None
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode), "diagnostic file is not regular")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            value = stream.read(maximum + 1)
+        require(len(value) <= maximum, "diagnostic file exceeds its size limit")
+        return value
+    except OSError:
+        raise ValueError("diagnostic file is unreadable") from None
+    finally:
+        os.close(descriptor)
+
+
+def _read_diagnostic_json(path, maximum=STARFLEET_DIAGNOSTIC_LIMIT):
+    raw = _read_diagnostic_bytes(path, maximum)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        raise ValueError("diagnostic JSON is malformed") from None
+    require(isinstance(value, dict), "diagnostic JSON must be an object")
+    return value
+
+
+def read_starfleet_caller(stream):
+    raw = stream.read(16 * 1024 + 1)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, bytes) or len(raw) > 16 * 1024:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return None
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "caller"}
+            or value.get("schema_version") != 1 or not isinstance(value.get("caller"), dict)
+            or set(value["caller"]) != {"harness", "session", "workspace", "surface"}):
+        return None
+    caller = value["caller"]
+    if (caller.get("harness") not in ("claude", "codex", "muse", "opencode")
+            or any(not isinstance(caller.get(key), str) or not caller[key]
+                   for key in ("session", "workspace", "surface"))):
+        return None
+    return caller
+
+
+def _worker_heartbeat(directory, config, name="last-scan.json", error_name="last-error.json"):
+    try:
+        scan = _read_diagnostic_json(directory / name)
+        if scan is None:
+            return "missing", None
+        heartbeat = scan.get("completed_at", scan.get("at"))
+        require(type(heartbeat) in (int, float) and math.isfinite(heartbeat),
+                "invalid heartbeat timestamp")
+        age = time.time() - heartbeat
+        threshold = max(120, config["interval"] * 4)
+        require(math.isfinite(threshold), "invalid heartbeat threshold")
+        require(0 <= age <= threshold, "worker heartbeat is stale")
+        target_errors = scan.get("target_errors", [])
+        require(isinstance(target_errors, list) and not target_errors, "worker target coverage is incomplete")
+        require(scan.get("coverage_complete", True) is True, "worker coverage is incomplete")
+        error = _read_diagnostic_json(directory / error_name)
+        if error is not None:
+            error_at = error.get("at")
+            require(type(error_at) in (int, float) and math.isfinite(error_at), "invalid worker error time")
+            require(error_at < heartbeat, "latest worker scan reports an error")
+        return "ready", scan
+    except (OSError, ValueError, KeyError, TypeError):
+        return "blocked", None
+
+
+def _match_diagnostic_target(config, caller):
+    if not isinstance(caller, dict):
+        return None
+    try:
+        session = session_identity(caller["session"], caller["harness"])
+        workspace = identity(caller["workspace"])
+        surface = identity(caller["surface"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    matches = [target for target in config.get("targets", [])
+               if target.get("harness") == caller["harness"] and target.get("session") == session
+               and target.get("workspace") == workspace and target.get("surface") == surface]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _common_diagnostic_report(config_state, registration_state, worker_state,
+                              delivery_state, observed_state="unknown"):
+    return {"schema_version": 1, "checks": {
+        "configuration": config_state, "registration": registration_state,
+        "worker": worker_state, "intended_delivery": delivery_state,
+        "observed_delivery": observed_state,
+    }}
+
+
+def hailing_diagnostic_report(app, caller):
+    config_path = app.directory / "config.json"
+    if app.directory.is_symlink():
+        return _common_diagnostic_report("blocked", "unknown", "unknown", "unknown")
+    try:
+        raw = _read_diagnostic_json(config_path)
+        if raw is None:
+            return _common_diagnostic_report("missing", "missing" if caller else "unknown",
+                                             "missing", "missing" if caller else "unknown")
+        config = app.config(raw)
+    except (OSError, ValueError, KeyError, TypeError):
+        return _common_diagnostic_report("blocked", "unknown", "unknown", "unknown")
+    target = _match_diagnostic_target(config, caller)
+    registration = "unknown" if caller is None else "ready" if target else "missing"
+    worker, scan = _worker_heartbeat(app.directory, config)
+    delivery = "unknown"
+    if caller is not None:
+        if target is None:
+            delivery = "missing"
+        elif scan is not None and worker == "ready":
+            scope = scan.get("sending_sessions")
+            target_rows = scan.get("targets")
+            row = next((item for item in target_rows if isinstance(item, dict)
+                        and item.get("session") == session_identity(caller["session"], caller["harness"])),
+                       None) if isinstance(target_rows, list) else None
+            if (scan.get("mode") == "send" and (scope is None or target["session"] in scope)
+                    and isinstance(row, dict) and row.get("sending_enabled") is True):
+                delivery = "ready"
+            else:
+                delivery = "blocked"
+    return _common_diagnostic_report("ready", registration, worker, delivery)
+
+
+def temporal_diagnostic_report(app, caller):
+    report = hailing_diagnostic_report(app, caller)
+    checks = report["checks"]
+    if checks["configuration"] != "ready":
+        return report
+    try:
+        config = app.config(_read_diagnostic_json(app.directory / "config.json"))
+        worker, scan = _worker_heartbeat(app.directory, config, "timer-last-scan.json",
+                                         "timer-last-error.json")
+        checks["worker"] = worker
+        if caller is not None and checks["registration"] == "ready":
+            target = _match_diagnostic_target(config, caller)
+            hailing_scan_state, hailing_scan = _worker_heartbeat(app.directory, config)
+            if hailing_scan_state == "ready" and isinstance(hailing_scan, dict):
+                scope = hailing_scan.get("sending_sessions")
+                checks["intended_delivery"] = (
+                    "ready" if hailing_scan.get("mode") == "send" and
+                    target is not None and (scope is None or target["session"] in scope) and
+                    isinstance(_match_scan_target(hailing_scan, target["session"]), dict) else "blocked")
+            else:
+                checks["intended_delivery"] = "unknown"
+    except (OSError, ValueError, KeyError, TypeError):
+        checks["worker"] = "blocked"
+        checks["intended_delivery"] = "unknown"
+    return report
+
+
+def _match_scan_target(scan, session):
+    targets = scan.get("targets")
+    return next((item for item in targets if isinstance(item, dict)
+                 and item.get("session") == session and item.get("sending_enabled") is True), None) \
+        if isinstance(targets, list) else None
+
+
+def _parse_static_shell_literal(raw):
+    require(isinstance(raw, str) and not any(ord(character) < 32 or ord(character) == 127
+                                             for character in raw),
+            "Agent Notify setting is not a supported literal")
+    value = []
+    quote = None
+    index = 0
+    while index < len(raw):
+        character = raw[index]
+        if quote == "'":
+            if character == "'":
+                quote = None
+            else:
+                value.append(character)
+        elif quote == '"':
+            if character == '"':
+                quote = None
+            elif character == "\\":
+                index += 1
+                require(index < len(raw), "Agent Notify setting has an incomplete escape")
+                escaped = raw[index]
+                if escaped in ("$", "`", '"', "\\"):
+                    value.append(escaped)
+                else:
+                    value.extend(("\\", escaped))
+            elif character in ("$", "`"):
+                raise ValueError("Agent Notify setting contains unsupported shell expansion")
+            else:
+                value.append(character)
+        elif character in ("'", '"'):
+            quote = character
+        elif character == "\\":
+            index += 1
+            require(index < len(raw), "Agent Notify setting has an incomplete escape")
+            value.append(raw[index])
+        elif character in ("$", "`", ";", "|", "&", "<", ">", "(", ")"):
+            raise ValueError("Agent Notify setting contains unsupported shell syntax")
+        elif character.isspace():
+            raise ValueError("Agent Notify setting is not one static shell word")
+        else:
+            value.append(character)
+        index += 1
+    require(quote is None, "Agent Notify setting is not a supported literal")
+    return "".join(value)
+
+
+def agent_notify_diagnostic_report(notify_home=None, *, require_webhook=True,
+                                   require_cached_user=False):
+    directory = Path(notify_home or os.environ.get(
+        "AGENT_NOTIFY_HOME", Path.home() / ".config/agent-notify")).expanduser()
+    path = directory / "env"
+    config = "unknown"
+    try:
+        if directory.is_symlink():
+            config = "blocked"
+        elif not directory.exists():
+            config = "missing"
+        elif not directory.is_dir() or stat.S_IMODE(directory.stat().st_mode) & 0o077:
+            config = "blocked"
+        else:
+            raw = _read_diagnostic_bytes(path, 16 * 1024)
+            if raw is None:
+                config = "missing"
+            else:
+                info = path.stat(follow_symlinks=False)
+                require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                        and stat.S_IMODE(info.st_mode) & 0o077 == 0,
+                        "Agent Notify credentials have unsafe ownership or permissions")
+                text = raw.decode("utf-8")
+                values = {}
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    match = re.fullmatch(r"(DISCORD_WEBHOOK_URL|DISCORD_BOT_TOKEN|DISCORD_USER_ID)=(.*)", line)
+                    require(match is not None, "Agent Notify configuration contains an unsupported line")
+                    key, value = match.groups()
+                    value = _parse_static_shell_literal(value)
+                    require(key not in values, "Agent Notify configuration has a duplicate setting")
+                    if key != "DISCORD_USER_ID":
+                        require(bool(value), "Agent Notify required configuration is empty")
+                    values[key] = value
+                webhook = values.get("DISCORD_WEBHOOK_URL", "")
+                parsed = urllib.parse.urlsplit(webhook)
+                valid_webhook = (not require_webhook or (
+                    parsed.scheme == "https" and parsed.netloc == "discord.com"
+                    and parsed.path.startswith("/api/webhooks/") and not parsed.query
+                    and not parsed.fragment))
+                token = values.get("DISCORD_BOT_TOKEN", "")
+                valid_token = bool(re.fullmatch(r"[A-Za-z0-9._-]{20,}", token))
+                user = values.get("DISCORD_USER_ID", "")
+                if not user and require_cached_user:
+                    cache_path = directory / "cache.json"
+                    cache = _read_diagnostic_json(cache_path, 16 * 1024)
+                    if cache is not None:
+                        cache_info = cache_path.stat(follow_symlinks=False)
+                        require(stat.S_ISREG(cache_info.st_mode) and cache_info.st_uid == os.getuid()
+                                and stat.S_IMODE(cache_info.st_mode) & 0o077 == 0,
+                                "Agent Notify cache has unsafe ownership or permissions")
+                        user = str(cache.get("user", ""))
+                valid_user = (bool(re.fullmatch(r"[0-9]{16,22}", user))
+                              if require_cached_user else
+                              ("DISCORD_USER_ID" not in values or not user or
+                               bool(re.fullmatch(r"[0-9]{16,22}", user))))
+                config = "ready" if valid_webhook and valid_token and valid_user else "missing"
+    except (OSError, ValueError, UnicodeError, TypeError):
+        config = "blocked"
+    delivery = "unknown" if config == "ready" else config
+    return _common_diagnostic_report(config, "not_applicable", "not_applicable", delivery)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
@@ -1318,6 +1602,11 @@ def parser():
         command.add_argument("--send", action="store_true", help="Enable guarded prompt submission; default observe only")
         command.add_argument("--only-session", action="append", help="Limit sends to this enrolled UUID; repeat for canaries")
     sub.add_parser("status")
+    doctor = sub.add_parser("doctor", help="Read local setup and existing worker heartbeat without a lock")
+    doctor.add_argument("--starfleet-json", action="store_true",
+                        help="emit normalized read-only setup states for Starfleet Doctor")
+    notify_diagnostic = sub.add_parser("agent-notify-diagnostic", help=argparse.SUPPRESS)
+    notify_diagnostic.add_argument("--starfleet-json", action="store_true", required=True)
     sub.add_parser("health")
     watcher = sub.add_parser("health-watch")
     watcher.add_argument("--no-notify", action="store_true")
@@ -1368,7 +1657,9 @@ def parser():
     cancel.add_argument("timer_id")
     temporal_sub.add_parser("receive", help="Output the current continuation and record its receipt")
     temporal_sub.choices["receive"].add_argument("--timer-id")
-    temporal_sub.add_parser("doctor", help="Diagnose timer worker and delivery state")
+    temporal_doctor = temporal_sub.add_parser("doctor", help="Diagnose timer worker and delivery state")
+    temporal_doctor.add_argument("--starfleet-json", action="store_true",
+                                 help="emit normalized read-only setup states for Starfleet Doctor")
     return p
 
 
@@ -1389,6 +1680,12 @@ def main(argv=None):
         import discord_cleanup
         return discord_cleanup.main(args)
     app = Monitor(args.state_dir, Cmux(args.cmux))
+    if args.command == "agent-notify-diagnostic":
+        return agent_notify_diagnostic_report()
+    if args.command == "doctor":
+        caller = (read_starfleet_caller(getattr(sys.stdin, "buffer", sys.stdin))
+                  if args.starfleet_json and not sys.stdin.isatty() else None)
+        return hailing_diagnostic_report(app, caller)
     if args.command == "attention-once":
         stream = getattr(sys.stdin, "buffer", sys.stdin)
         try:
@@ -1454,6 +1751,10 @@ def main(argv=None):
         from temporal_beacon import TemporalBeacon
         beacon = TemporalBeacon(app)
         if args.temporal_command == "doctor":
+            if args.starfleet_json:
+                caller = (None if sys.stdin.isatty() else
+                          read_starfleet_caller(getattr(sys.stdin, "buffer", sys.stdin)))
+                return temporal_diagnostic_report(app, caller)
             return beacon.doctor()
         if args.temporal_command == "set":
             return beacon.set(args.after, args.at, args.every, args.until, args.message,

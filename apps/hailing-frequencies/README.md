@@ -7,6 +7,8 @@ An explicit experimental `api_sidechannel` policy queues OpenCode attention whil
 OpenCode's supported TUI plugin API does not expose composer draft contents, so this opt-in does not infer or claim that the composer is empty.
 It is a local Python 3 standard-library CLI, with an observe-only default, opt-in supervised monitor, and independent health alerts.
 The monitor does not own messages, mark another agent's messages read, poll Discord, install harness hooks, change models, or grant task authority.
+`hailing-frequencies doctor --starfleet-json` and `temporal-beacon doctor --starfleet-json` are bounded read-only contracts for Starfleet Doctor; they inspect local configuration and heartbeat files without locks, database creation, or worker startup.
+Fresh heartbeat evidence does not independently prove that a worker process is alive now.
 
 Temporal Beacon adds durable agent wake timers to this same worker.
 Read the [Temporal Beacon guide](temporal-beacon.md) for `--after`, `--at`, `--every`, time-based `--until`, receipt, installation, and diagnosis, or load its [agent skill](skills/temporal-beacon/SKILL.md).
@@ -15,6 +17,8 @@ Timer delivery uses the existing enrolled-session guards and opt-in send scope; 
 The Hailing installer also installs the `agent-notify` Discord conversation command, its [setup guide](agent-notify-guide.md), and its [agent skill](skills/agent-notify/SKILL.md).
 Print its setup instructions with `agent-notify guide --print` before creating Discord configuration or a worker.
 Agent Notify keeps its existing private configuration and thread routing state, and registers posts with the existing Discord Watch worker when available.
+`agent-notify doctor --starfleet-json` inspects private file permissions and credential presence locally without sourcing the shell configuration, calling Discord, or writing its cache.
+The local check cannot verify a live Discord webhook, token, account, or forum tags, so intended delivery remains unknown.
 A separate `discord-cleanup` command previews and deletes selected archived, Closed threads from the configured Agent Notify forum.
 Print its [cleanup guide](discord-cleanup.md) with `hailing-frequencies discord-cleanup guide --print`.
 

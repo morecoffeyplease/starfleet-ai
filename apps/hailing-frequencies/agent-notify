@@ -43,6 +43,12 @@ if [[ "${1:-}" == "guide" ]]; then
   exit 64
 fi
 
+# Starfleet Doctor inspects local configuration without sourcing executable shell content.
+if [[ "${1:-}" == "doctor" && "${2:-}" == "--starfleet-json" && $# -eq 2 ]]; then
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  exec python3 "$script_dir/hailing_frequencies.py" agent-notify-diagnostic --starfleet-json
+fi
+
 CONF_DIR="${AGENT_NOTIFY_HOME:-$HOME/.config/agent-notify}"
 ENV_FILE="$CONF_DIR/env"
 CACHE="$CONF_DIR/cache.json"

@@ -11,6 +11,7 @@ The repository does not promise publication to npm, PyPI, Homebrew, or another p
 
 | Component | What it does |
 | --- | --- |
+| [Starfleet Doctor](apps/starfleet/README.md) | Checks the maintained tool inventory without changing configuration, ownership, or worker state. |
 | [Hailing Frequencies](apps/hailing-frequencies/README.md) | Watches explicitly enrolled CMUX sessions and submits guarded attention prompts. |
 | [Agent Notify](apps/hailing-frequencies/agent-notify-guide.md) | Opens one Discord forum post per conversation and can register the thread for its exact enrolled owner. |
 | [Replicator](apps/replicator/README.md) | Prints the maintained guide for an explicitly requested orchestrator handoff. |
@@ -61,6 +62,7 @@ Use the following checklist with the linked component instructions.
 
 | Tool | Orchestrator setup and registration |
 | --- | --- |
+| [Starfleet Doctor](apps/starfleet/README.md) | Install the read-only aggregate checker and verify that `starfleet guide --print` works outside the checkout. |
 | [Hailing Frequencies](apps/hailing-frequencies/guide.md) | Enroll the exact native session and surface, then verify the existing worker and intended send coverage. |
 | [Temporal Beacon](apps/hailing-frequencies/temporal-beacon.md) | Verify the installed command, register its packaged skill and check its shared Hailing enrollment and worker; no second daemon or test timer is needed. |
 | [Agent Notify](apps/hailing-frequencies/agent-notify-guide.md) | Verify the command and configured Discord route, and register its packaged skill; keep credentials private. |
@@ -74,6 +76,7 @@ Use the following checklist with the linked component instructions.
 | [Replicator](apps/replicator/guide.md) | Install or verify the runtime and read the handoff guide; setup alone does not start a handoff or replace an agent. |
 
 The Context Injector compatibility command belongs to the Pattern Buffer installation, not a second mission or worker.
+The Starfleet Doctor inventory and read-only adapter tests are maintained in [apps/starfleet](apps/starfleet/README.md).
 Some tools register an owned resource when it exists, rather than registering the session globally.
 Do not create fake PRs, reviews, conversations, jobs or timers to manufacture an enrollment receipt.
 Reuse shared commands, hooks and workers, and preserve other agents, shared model profiles, human holds and machine-wide service policy.

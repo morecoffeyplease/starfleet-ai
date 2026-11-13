@@ -19,9 +19,12 @@ PYTHON_CHECKS = (
     ("Context Injector compatibility", ("-m", "unittest", "discover", "-s", "apps/context-injector", "-p", "test_*.py", "-v")),
     ("Discord Watch", ("apps/discord-watch/verify.py",)),
     ("Hailing Frequencies", ("apps/hailing-frequencies/verify.py",)),
+    ("Model Preferences", ("apps/model-preferences/verify.py",)),
     ("Pattern Buffer", ("-m", "unittest", "discover", "-s", "apps/pattern-buffer", "-p", "test_*.py", "-v")),
     ("Replicator", ("apps/replicator/verify.py",)),
     ("Starfleet Policy Guard", ("apps/starfleet-policy-guard/verify.py",)),
+    ("Starfleet Doctor", ("-m", "unittest", "discover", "-s", "apps/starfleet/tests", "-p", "test_*.py", "-v")),
+    ("Warp-drive Starfleet diagnostics", ("-m", "unittest", "discover", "-s", "apps/warp-drive", "-p", "test_starfleet_diagnostics.py", "-v")),
     ("Warp-drive", ("apps/warp-drive/verify.py",)),
 )
 

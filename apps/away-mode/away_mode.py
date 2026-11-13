@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -711,6 +712,71 @@ def render(state, report, details=False):
     return "\n".join(lines) + "\n"
 
 
+def read_diagnostic_caller(stream):
+    raw = stream.read(16 * 1024 + 1)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, bytes) or len(raw) > 16 * 1024:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return None
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "caller"}
+            or value.get("schema_version") != 1 or not isinstance(value.get("caller"), dict)
+            or set(value["caller"]) != {"harness", "session", "workspace", "surface"}):
+        return None
+    caller = value["caller"]
+    if (caller.get("harness") not in ("claude", "codex", "muse", "opencode")
+            or any(not isinstance(caller.get(key), str) or not caller[key]
+                   for key in ("session", "workspace", "surface"))):
+        return None
+    return caller
+
+
+def read_only_diagnostic_report(state_dir, caller=None):
+    checks = {"configuration": "unknown", "registration": "unknown", "worker": "not_applicable",
+              "intended_delivery": "not_applicable", "observed_delivery": "unknown"}
+    path = Path(state_dir).expanduser().absolute() / "state.json"
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        checks["configuration"] = "missing"
+        checks["registration"] = "missing" if caller is not None else "unknown"
+        return {"schema_version": 1, "checks": checks}
+    except OSError:
+        checks["configuration"] = "blocked"
+        return {"schema_version": 1, "checks": checks}
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode), "Away Mode diagnostic state is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(16 * 1024 * 1024 + 1)
+        require(len(raw) <= 16 * 1024 * 1024, "Away Mode diagnostic state exceeds its size limit")
+        state = json.loads(raw.decode("utf-8"))
+        require(isinstance(state, dict) and state.get("schema_version") == 1
+                and isinstance(state.get("lanes"), dict) and isinstance(state.get("presence"), dict)
+                and state["presence"].get("mode") in ("away", "back")
+                and (state["presence"].get("transition") is None or
+                     isinstance(state["presence"].get("transition"), str)),
+                "Away Mode diagnostic state is invalid")
+    except (Error, OSError, UnicodeError, ValueError, TypeError):
+        checks["configuration"] = "blocked"
+        return {"schema_version": 1, "checks": checks}
+    finally:
+        os.close(descriptor)
+    checks["configuration"] = "ready"
+    if caller is not None:
+        matches = [recipient for recipient in state["lanes"].values()
+                   if isinstance(recipient, dict)
+                   and all(str(recipient.get(key, "")).casefold() == str(caller.get(caller_key, "")).casefold()
+                           for key, caller_key in (("harness", "harness"), ("session", "session"),
+                                                   ("workspace", "workspace"), ("surface", "surface")))]
+        checks["registration"] = "ready" if len(matches) == 1 else "missing" if not matches else "blocked"
+    return {"schema_version": 1, "checks": checks}
+
+
 def parser():
     home = Path.home()
     preference_defaults = mp.parser().parse_args(["status"])
@@ -737,6 +803,9 @@ def parser():
     s = sub.add_parser("unenroll"); s.add_argument("name")
     s = sub.add_parser("track-worktree"); s.add_argument("path")
     sub.add_parser("status")
+    doctor = sub.add_parser("doctor", help="Read local setup without acquiring the Away Mode lock")
+    doctor.add_argument("--starfleet-json", action="store_true",
+                        help="emit normalized read-only setup states for Starfleet Doctor")
     sub.add_parser("context")
     sub.add_parser("opencode-context", help="Read presence context from the exact current native OpenCode lane.")
     g = sub.add_parser("guide")
@@ -782,8 +851,12 @@ def parser():
 
 
 def execute(args, app=None):
-    app = app or App(args.state_dir)
     command = args.command
+    if command == "doctor":
+        caller = (read_diagnostic_caller(sys.stdin.buffer)
+                  if args.starfleet_json and not sys.stdin.isatty() else None)
+        return read_only_diagnostic_report(Path(args.state_dir), caller)
+    app = app or App(args.state_dir)
     if command == "guide":
         return Path(__file__).with_name("guide.md").read_text()
     if command == "notification-context":

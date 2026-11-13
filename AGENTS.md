@@ -53,6 +53,7 @@ Diagnostics must inspect installation, configuration, applicable registration an
 Distinguish configured state from observed delivery and name unknown or blocked checks with an actionable next step.
 Respect the user's selected tool set: report an explicitly skipped tool as skipped by user instruction, exclude it from completeness failures and explain any unavailable dependent capability without enabling it.
 When a maintained aggregate setup checker exists, add the new tool to its checklist and verification in the same PR.
+The maintained Starfleet Doctor adapter table and no-write fixtures live in `apps/starfleet` and its focused check is part of `scripts/verify.py`.
 Ship a maintained `<tool> guide --print` entry point with the installed runtime.
 Guide printing must work outside Git and before configuration or enrollment, without credentials, state creation, locks, service startup or other writes.
 Test diagnostic outcomes with synthetic state and verify installed guide printing without the source checkout.

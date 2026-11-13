@@ -3201,6 +3201,109 @@ def compaction_settings(args):
                       "note": "Saved configuration only. Existing sessions may retain earlier environment values; restart/resume and verify the actual session before relying on it. No session was changed or restarted."}, indent=2))
 
 
+def starfleet_diagnostic_report(root, gitdir, config_path, args):
+    checks = {"configuration": "unknown", "registration": "unknown", "worker": "not_applicable",
+              "intended_delivery": "unknown", "observed_delivery": "unknown", "checkpoint": "unknown"}
+    config = {}
+    source = root / ".context-injector" / "context.md"
+    if not config_path.exists() and not config_path.is_symlink():
+        checks["configuration"] = "missing"
+    else:
+        try:
+            config, source = load(root, gitdir)
+            checks["configuration"] = "ready" if enabled(config) else "blocked"
+        except (OSError, ValueError, TypeError, UnicodeError, subprocess.SubprocessError):
+            checks["configuration"] = "blocked"
+
+    exact_session = args.session != "validation"
+    if exact_session:
+        try:
+            task_precedes = opencode_task_assignment_precedes_enrollment(gitdir, args.harness, args.session)
+            binding = session_binding_readonly(root, gitdir, args.harness, args.session,
+                                               getattr(args, "agent", ""))
+            if binding is None:
+                checks["registration"] = "not_applicable" if task_precedes else "missing"
+            elif binding.state == "active":
+                checks["registration"] = "ready"
+            else:
+                checks["registration"] = "blocked"
+        except (OSError, ValueError, TypeError, UnicodeError):
+            binding = None
+            checks["registration"] = "blocked"
+    else:
+        binding = None
+        task_precedes = False
+
+    if checks["configuration"] == "ready" and exact_session and binding is not None:
+        try:
+            budgets = current_context_budgets(root, gitdir, args.harness, args.session,
+                                              getattr(args, "agent", ""),
+                                              binding=binding)
+            if not budgets.get("ok"):
+                checks["configuration"] = "blocked"
+        except (OSError, ValueError, TypeError, UnicodeError, subprocess.SubprocessError):
+            checks["configuration"] = "unknown"
+
+    if args.harness in ("claude", "codex"):
+        try:
+            data = read_settings(settings_path(args.harness, args.settings))
+            hooks = data.get("hooks", {})
+            by_event = {
+                event: [handler for group in hooks.get(event, []) for handler in group["hooks"]
+                        if owned(handler, args.harness)]
+                for event in ("SessionStart", "PreToolUse", "PostToolUse", "PreCompact", "UserPromptSubmit")
+            }
+            required_events = ("SessionStart", "PreToolUse", "PostToolUse")
+            counts_valid = all(len(by_event[event]) == 1 for event in required_events)
+            checkpoint_present = bool(by_event["PreCompact"] or by_event["UserPromptSubmit"] or any(
+                "--required-reads-only" not in handler.get("command", "")
+                for handler in by_event["PostToolUse"]))
+            if checkpoint_present:
+                counts_valid = counts_valid and len(by_event["PreCompact"]) == 1 and len(
+                    by_event["UserPromptSubmit"]) == 1 and any(
+                        "--required-reads-only" not in handler.get("command", "")
+                        for handler in by_event["PostToolUse"])
+            duplicate = any(len(by_event[event]) > 1 for event in by_event)
+            checks["intended_delivery"] = ("blocked" if duplicate else "ready" if counts_valid else "missing")
+        except (OSError, ValueError, TypeError, UnicodeError):
+            checks["intended_delivery"] = "unknown"
+    elif args.harness == "opencode":
+        checks["intended_delivery"] = "unknown"
+
+    if not exact_session or binding is None:
+        checks["checkpoint"] = "unknown" if not exact_session else "not_applicable"
+    elif binding.role != "orchestrator":
+        checks["checkpoint"] = "not_applicable"
+    else:
+        helper = checkpoints()
+        state_path = helper._state_path(gitdir, args.harness, args.session)
+        if state_path.is_symlink():
+            checks["checkpoint"] = "blocked"
+        elif not state_path.exists():
+            checks["checkpoint"] = "missing"
+        else:
+            try:
+                _path, state = helper._load_state(sys.modules[__name__], root, gitdir,
+                                                  args.harness, args.session)
+                report = helper._report(sys.modules[__name__], root, gitdir,
+                                        args.harness, args.session, state)
+                note, warning = helper._read_note(state, sys.modules[__name__])
+                recovery = report.get("recovery", {})
+                recovery_ready = (not recovery.get("required") or
+                                  recovery.get("freshness") == "current" and
+                                  isinstance(recovery.get("receipt"), dict) and
+                                  recovery["receipt"].get("current_generation") is True and
+                                  recovery["receipt"].get("latest_checkpoint_matches_read") is True and
+                                  len(recovery.get("received_parts", [])) == recovery.get("part_count"))
+                valid = (note is not None and warning is None and state.get("enabled") is True
+                         and report.get("revision_mismatch") is not True and recovery_ready)
+                checks["checkpoint"] = "ready" if valid else "blocked"
+            except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+                checks["checkpoint"] = "blocked"
+
+    return {"schema_version": 1, "checks": checks}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cwd", default=os.getcwd(), help="worktree or a directory inside it")
@@ -3249,6 +3352,8 @@ def main():
     status.add_argument("--session", help="report the exact session's selected standing context")
     status.add_argument("--settings", help="inspect an explicit settings JSON file")
     status.add_argument("--runtime-dir", help="inspect the OpenCode plugin in an explicit runtime directory")
+    status.add_argument("--starfleet-json", action="store_true",
+                        help="emit normalized read-only setup states for Starfleet Doctor")
     required_reads = sub.add_parser(
         "required-reads", help="manage and inspect owner-reviewed required reads",
         description="Register the owner-reviewed documents that gate tool use for each session role.",
@@ -3466,6 +3571,10 @@ def main():
             return 0
         root, gitdir = checkout(args.cwd)
         config_path = gitdir / "context-injector" / "config.json"
+        if args.command == "status" and args.starfleet_json:
+            report = starfleet_diagnostic_report(root, gitdir, config_path, args)
+            print(json.dumps(report, separators=(",", ":")))
+            return 0
         if args.command == "required-reads":
             required_reads_command(root, gitdir, args)
             return 0

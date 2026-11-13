@@ -21,6 +21,7 @@ Missing or mismatched identity fails closed; generic `context` remains available
 The default state is private and lives outside the repository.
 Pass `--state-dir` to every source CLI command during an isolated trial.
 The printable guide works without state, credentials or enrollment and describes setup, authority limits and verification.
+`away-mode doctor --starfleet-json` is the aggregate doctor's bounded read-only contract; it reads local state without taking the Away Mode lock or discovering other worktrees.
 Run `python3 apps/away-mode/verify.py` for the component's canonical verification command.
 
 ## Configure and record presence
