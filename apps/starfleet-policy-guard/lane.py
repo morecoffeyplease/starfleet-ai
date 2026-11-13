@@ -8,6 +8,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -439,6 +440,107 @@ def captured_gh(state):
     return path
 
 
+def guidance_owner_key(owner, label):
+    if (not isinstance(owner, dict) or owner.get('harness') not in ('claude', 'codex') or
+            not isinstance(owner.get('session_id'), str) or not owner['session_id'].strip()):
+        raise ValueError(label + ' has no valid Claude or Codex native owner')
+    return {'harness': owner['harness'], 'session_id': owner['session_id']}
+
+
+def guidance_publication_owner(publication, state, label):
+    if (not isinstance(publication, dict) or type(publication.get('version')) is not int or
+            publication['version'] != 1):
+        raise ValueError(label + ' is missing or malformed')
+    try:
+        publication_pr = github.reference(publication.get('pr_url', ''), 'pull')['url']
+        current_pr = github.reference(state.get('pr_url', ''), 'pull')['url']
+    except (KeyError, TypeError, github.RecordError) as error:
+        raise ValueError(label + ' has an invalid PR reference: ' + str(error)) from error
+    if publication_pr.casefold() != current_pr.casefold():
+        raise ValueError(label + ' belongs to a different PR binding')
+    binding = {'branch': state.get('branch'),
+               'head_branch': state.get('head_branch', state.get('branch')),
+               'base_ref': state.get('base_ref')}
+    if any(publication.get(key) != value for key, value in binding.items()):
+        raise ValueError(label + ' belongs to a different branch or target binding')
+    try:
+        comment_ref = github.comment_reference(publication.get('comment_url', ''), state['pr_url'])
+    except (KeyError, TypeError, github.RecordError) as error:
+        raise ValueError(label + ' has an invalid comment reference: ' + str(error)) from error
+    if publication.get('stage') not in ('opening', 'repair_batch', 'successor_validation'):
+        raise ValueError(label + ' has an unsupported publication stage')
+    if type(publication.get('comment_id')) is not int or publication['comment_id'] != comment_ref['comment_id']:
+        raise ValueError(label + ' comment ID does not match its exact comment URL')
+    for key in ('body_sha256', 'attestation_sha256'):
+        if (not isinstance(publication.get(key), str) or
+                not re.fullmatch(r'[0-9a-f]{64}', publication[key])):
+            raise ValueError(label + ' has an invalid ' + key)
+    return guidance_owner_key(publication.get('owner'), label)
+
+
+def guidance_handoff_path(state, previous_owner, current_owner):
+    if previous_owner == current_owner:
+        raise ValueError('Successor validation requires a handoff from a different native owner')
+    history = state.get('owner_history')
+    if not isinstance(history, list) or not history:
+        raise ValueError('Successor validation requires the supported owner handoff history')
+    expected = current_owner
+    path = []
+    for transition in reversed(history):
+        if not isinstance(transition, dict):
+            raise ValueError('Owner handoff history is malformed; preserve it and inspect the lane')
+        source = guidance_owner_key(transition.get('from'), 'Owner handoff history')
+        target = guidance_owner_key(transition.get('to'), 'Owner handoff history')
+        at = transition.get('at')
+        valid_time = type(at) is int or (type(at) is float and math.isfinite(at))
+        if (source == target or not valid_time or
+                transition.get('authority') !=
+                'caller explicitly confirms an authorized handoff; not independently authenticated'):
+            raise ValueError('Owner handoff history is malformed; preserve it and inspect the lane')
+        if target != expected:
+            raise ValueError('Owner handoff history does not lead to the current native owner')
+        path.append(transition)
+        expected = source
+        if expected == previous_owner:
+            return list(reversed(path))
+    raise ValueError('No supported owner handoff path connects the inherited publication to the current owner')
+
+
+def successor_predecessor(state, packet):
+    if state.get('attestation_required') is not True:
+        raise ValueError('Successor validation is available only for an already adopted target; it cannot enable adoption')
+    current_owner = guidance_owner_key(state.get('lane_owner'), 'Current lane owner')
+    current_publication = state.get('guidance_attestation_ref')
+    current_publication_owner = guidance_publication_owner(
+        current_publication, state, 'Current or inherited guidance publication')
+    record = packet.get('guidance_attestation') if isinstance(packet, dict) else None
+    prior = record.get('prior_publication_ref') if isinstance(record, dict) else None
+    same_owner_publication = None
+    if current_publication_owner == current_owner:
+        if current_publication.get('stage') != 'successor_validation':
+            raise ValueError('Successor validation must link an inherited publication from a different native owner')
+        expected_prior = current_publication.get('prior_publication_ref')
+        if not isinstance(expected_prior, dict) or prior != expected_prior:
+            raise ValueError('Repeated successor validation must retain the exact inherited publication and cannot reference itself')
+        same_owner_publication = current_publication
+        prior = expected_prior
+    elif prior != current_publication:
+        raise ValueError('Successor packet must link the exact currently inherited publication')
+    prior_owner = guidance_publication_owner(prior, state, 'Inherited guidance publication')
+    guidance_handoff_path(state, prior_owner, current_owner)
+    return prior, same_owner_publication
+
+
+def check_guidance_publication_comment(publication, state, executable, label, *, timeout=5):
+    remote = github.read_comment(publication['comment_url'], state['pr_url'], executable, timeout=timeout)
+    if remote['reference']['comment_id'] != publication.get('comment_id'):
+        raise ValueError(label + ' comment ID does not match its exact publication reference')
+    digest = hashlib.sha256(remote['body'].encode()).hexdigest()
+    if digest != publication.get('body_sha256'):
+        raise ValueError(label + ' comment body changed or no longer matches its exact publication reference')
+    return remote
+
+
 def require_guidance_attestation(state, cwd, *, local_inspection=False):
     published = state.get('guidance_attestation_ref')
     if (not isinstance(published, dict) or type(published.get('version')) is not int or
@@ -448,14 +550,9 @@ def require_guidance_attestation(state, cwd, *, local_inspection=False):
             'This target requires a published guidance attestation. Before the final start check, print the local '
             'guide with ' + guide_command + ' and reread its "Published guidance attestations" section. Then run '
             'attestation-start-check from its owner session.')
-    if published.get('pr_url', '').casefold() != state['pr_url'].casefold():
-        raise ValueError('Published guidance attestation belongs to a different PR binding')
-    binding = {'branch': state['branch'], 'head_branch': state.get('head_branch', state['branch']),
-               'base_ref': state['base_ref']}
-    if any(published.get(key) != value for key, value in binding.items()):
-        raise ValueError('Published guidance attestation belongs to a different branch or target binding')
-    owner = {key: state['lane_owner'][key] for key in ('harness', 'session_id')}
-    if published.get('owner') != owner:
+    published_owner = guidance_publication_owner(published, state, 'Published guidance attestation')
+    owner = guidance_owner_key(state.get('lane_owner'), 'Current lane owner')
+    if published_owner != owner:
         raise ValueError('Published guidance attestation belongs to a previous native owner; the current owner must validate its own publication')
     receipt = state.get('receipt')
     packet_path = receipt.get('packet_path') if isinstance(receipt, dict) else None
@@ -463,6 +560,11 @@ def require_guidance_attestation(state, cwd, *, local_inspection=False):
         raise ValueError('Guidance attestation requires the current report packet path; record the report before covered delivery')
     packet, path = attestation_packet(packet_path, state)
     report = receipt.get('report') if isinstance(receipt.get('report'), dict) else None
+    prior = None
+    if published.get('stage') == 'successor_validation':
+        prior, _same_owner_publication = successor_predecessor(state, packet)
+        if published.get('prior_publication_ref') != prior:
+            raise ValueError('Successor publication no longer links the exact inherited publication in its current packet')
     rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
                                                     published.get('stage'), report=report,
                                                     receipt_context=published.get('required_reads'))
@@ -472,7 +574,18 @@ def require_guidance_attestation(state, cwd, *, local_inspection=False):
     if local_inspection:
         return
     executable = captured_gh(state)
-    remote = github.read_comment(published.get('comment_url', ''), state['pr_url'], executable, timeout=5)
+    comment_deadline = time.monotonic() + 5
+    if prior is not None:
+        predecessor_timeout = comment_deadline - time.monotonic()
+        if predecessor_timeout <= 0:
+            raise ValueError('Combined inherited and current guidance comment read budget expired; current publication is unverified')
+        check_guidance_publication_comment(prior, state, executable, 'Inherited guidance',
+                                           timeout=predecessor_timeout)
+    current_timeout = comment_deadline - time.monotonic()
+    if current_timeout <= 0:
+        raise ValueError('Combined inherited and current guidance comment read budget expired; current publication is unverified')
+    remote = github.read_comment(published.get('comment_url', ''), state['pr_url'], executable,
+                                timeout=current_timeout)
     if remote['reference']['comment_id'] != published.get('comment_id'):
         raise ValueError('Published guidance comment ID does not match its per-PR reference')
     if remote['body'] != rendered['body']:
@@ -482,13 +595,18 @@ def require_guidance_attestation(state, cwd, *, local_inspection=False):
 def attestation_render(args):
     state = attestation_owner_state(read(args.cwd), args.cwd)
     packet, path = attestation_packet(args.evidence, state)
+    stage = args.stage.replace('-', '_')
     report = None
-    if args.stage == 'opening':
+    if stage in ('opening', 'successor_validation'):
         report = delivery.report(args.cwd, state['base_ref'], state['pr_url'], path)
+        if report['snapshot']['base_ref'] != state['base_ref']:
+            label = 'Successor validation' if stage == 'successor_validation' else 'Opening attestation'
+            raise ValueError(label + ' report must match the current PG target binding')
+    if stage == 'successor_validation':
+        successor_predecessor(state, packet)
     owner = state['lane_owner']
     receipt_report = delivery.required_reads_status(state['root'], owner['harness'], owner['session_id'])
     receipt_context = delivery.require_required_read_receipts(receipt_report, packet, path.parent)
-    stage = args.stage.replace('-', '_')
     rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
                                                     stage, report=report, receipt_context=receipt_context)
     if args.format == 'json':
@@ -511,25 +629,36 @@ def attestation_start_check(args):
     adopted_now = False
     with locked(args.cwd) as state:
         attestation_owner_state(state, args.cwd)
+        stage = args.stage.replace('-', '_')
         if 'attestation_required' in state and state.get('attestation_required') is not True:
             raise ValueError('Malformed attestation adoption state; there is no disable or fallback mode')
-        if state.get('attestation_required') is True and args.enable:
+        if stage == 'successor_validation':
+            if args.enable:
+                raise ValueError('Successor validation cannot adopt or enable an attestation-required target')
+            if state.get('attestation_required') is not True:
+                raise ValueError('Successor validation is available only after the owner has adopted attestation requirements')
+        elif state.get('attestation_required') is True and args.enable:
             raise ValueError('This owner lane is already adopted; omit --enable when binding another PR')
-        if 'attestation_required' not in state and not args.enable:
+        if stage != 'successor_validation' and 'attestation_required' not in state and not args.enable:
             raise ValueError('This legacy target is unchanged; first owner-coordinated adoption requires --enable')
         packet, path = attestation_packet(args.evidence, state)
-        delivery.guidance_attestation(packet, path.parent, state['pr_url'], args.stage.replace('-', '_'))
+        delivery.guidance_attestation(packet, path.parent, state['pr_url'], stage)
+        prior_publication = None
+        same_owner_publication = None
+        if stage == 'successor_validation':
+            prior_publication, same_owner_publication = successor_predecessor(state, packet)
         owner = state['lane_owner']
         receipt_report = delivery.required_reads_status(state['root'], owner['harness'], owner['session_id'])
         receipt_context = delivery.require_required_read_receipts(receipt_report, packet, path.parent)
         report = None
-        if args.stage == 'opening':
+        if stage in ('opening', 'successor_validation'):
             report = delivery_runs.check(state.get('receipt'), args.cwd, state['pr_url'])
             if report['snapshot']['base_ref'] != state['base_ref']:
-                raise ValueError('Opening attestation report must match the current PG target binding')
+                label = 'Successor validation' if stage == 'successor_validation' else 'Opening attestation'
+                raise ValueError(label + ' report must match the current PG target binding')
             if not delivery.opening_report_ready(report):
-                raise ValueError('Opening attestation requires a current clean PG report with successful canonical verification')
-        stage = args.stage.replace('-', '_')
+                label = 'Successor validation' if stage == 'successor_validation' else 'Opening attestation'
+                raise ValueError(label + ' requires a current clean PG report with successful canonical verification')
         rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
                                                         stage, report=report, receipt_context=receipt_context)
         executable = captured_gh(state)
@@ -537,10 +666,29 @@ def attestation_start_check(args):
                                              state.get('head_branch'), executable=executable)
         if report is not None:
             github.check_published_snapshot(pr_ref, remote_pr_record, report['snapshot'], executable=executable)
+        if prior_publication is not None:
+            check_guidance_publication_comment(prior_publication, state, executable, 'Inherited guidance')
         remote_comment = github.read_comment(args.comment_url, state['pr_url'], executable)
         if remote_comment['body'] != rendered['body']:
             raise ValueError('Published comment body does not match the exact current rendered attestation')
         comment_ref = remote_comment['reference']
+        if prior_publication is not None and comment_ref['url'] == prior_publication['comment_url']:
+            raise ValueError('Successor validation must use a new comment and preserve the inherited publication')
+        if (same_owner_publication and comment_ref['url'] == same_owner_publication.get('comment_url') and
+                (rendered['body_sha256'] != same_owner_publication.get('body_sha256') or
+                 rendered['attestation_sha256'] != same_owner_publication.get('attestation_sha256'))):
+            raise ValueError('A changed successor validation must use a new comment and preserve the existing publication')
+        if same_owner_publication and comment_ref['url'] == same_owner_publication.get('comment_url'):
+            previous_reads = same_owner_publication.get('required_reads')
+            current_reads = rendered.get('required_reads')
+            if previous_reads is None and current_reads is None:
+                pass
+            elif (isinstance(previous_reads, dict) and isinstance(current_reads, dict) and
+                  all(previous_reads.get(key) == current_reads.get(key)
+                      for key in ('list_sha256', 'generation', 'entries'))):
+                rendered['required_reads'] = copy.deepcopy(previous_reads)
+            else:
+                raise ValueError('Successor required-read context changed; publish a new comment and preserve the existing publication')
         publication = {
             'version': 1,
             'pr_url': pr_ref['url'],
@@ -554,6 +702,8 @@ def attestation_start_check(args):
             'body_sha256': rendered['body_sha256'],
             'attestation_sha256': rendered['attestation_sha256'],
         }
+        if prior_publication is not None:
+            publication['prior_publication_ref'] = copy.deepcopy(prior_publication)
         if 'required_reads' in rendered:
             publication['required_reads'] = rendered['required_reads']
         if 'attestation_required' not in state:
@@ -2959,6 +3109,7 @@ def status(cwd, session_id=None, state=None, native_context=None):
             'source_revision': (state or {}).get('source_revision'),
             'report_status': {'state': receipt_status, 'reason': receipt_reason,
                               'notice': 'No network freshness check, readiness approval or merge authority.'},
+            'guidance_attestation_ref': (state or {}).get('guidance_attestation_ref'),
             'receipt': (state or {}).get('receipt'), 'history': (state or {}).get('history', []),
             'retired_attachments': retired_attachments,
             'enrollment_help': None if configured else enrollment_help(cwd)}
@@ -4417,10 +4568,10 @@ def build_parser():
     p.add_argument('--policy', type=Path, default=delivery.POLICY)
     p.add_argument('--format', choices=('json', 'text'), default='text')
     p = sub.add_parser(
-        'attestation-render', help='render a current opening or accepted repair-batch attestation without writes',
+        'attestation-render', help='render a current opening, repair-batch, or successor-validation attestation without writes',
         epilog='Example: lane.py --cwd /worktree attestation-render --evidence /private/delivery-evidence.json --stage repair-batch')
     p.add_argument('--evidence', type=Path, required=True)
-    p.add_argument('--stage', choices=('opening', 'repair-batch'), required=True)
+    p.add_argument('--stage', choices=('opening', 'repair-batch', 'successor-validation'), required=True)
     p.add_argument('--format', choices=('markdown', 'json'), default='markdown')
     sub.add_parser(
         'attestation-rereads',
@@ -4431,7 +4582,7 @@ def build_parser():
         'attestation-start-check', help='validate one exact published attestation comment and bind it to this PR',
         epilog='Example: lane.py --cwd /worktree attestation-start-check --evidence /private/delivery-evidence.json --stage repair-batch --comment-url https://github.com/OWNER/REPO/pull/123#issuecomment-ID')
     p.add_argument('--evidence', type=Path, required=True)
-    p.add_argument('--stage', choices=('opening', 'repair-batch'), required=True)
+    p.add_argument('--stage', choices=('opening', 'repair-batch', 'successor-validation'), required=True)
     p.add_argument('--comment-url', required=True)
     p.add_argument('--enable', action='store_true', help='Explicitly adopt attestation-required behavior for this owner lane')
     p = sub.add_parser('init-evidence', help='Create a PR-bound evidence starter outside Git worktrees; never run checks')

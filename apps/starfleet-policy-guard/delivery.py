@@ -25,6 +25,14 @@ GUIDANCE_ATTESTATION_STATEMENT = '\n'.join((
     'Any required fact that was initially unknown was investigated or raised to the configured human on Discord, then resolved before I attested.',
     'Disclosing uncertainty does not waive a missing prerequisite.',
 ))
+SUCCESSOR_VALIDATION_STATEMENT = '\n'.join((
+    'The current native owner has reread applicable guidance and reconciled inherited work, existing repair history, current approved scope and human holds, and current candidate evidence.',
+    'For this current review, the current native owner confirms the inherited approach remains the simplest viable route for the approved outcome and constraints, and remains proportionate.',
+    'No claim in this current review depends on an assumption; current required reads, investigation, evidence, verification, approved scope, and authority were checked.',
+    'Any required fact that was initially unknown for this review was investigated or raised to the configured human on Discord, then resolved before this validation.',
+    'This review records current responsibility for covered delivery. It does not claim authorship of prior work or accept a new repair batch.',
+    'Disclosing uncertainty does not waive a missing prerequisite.',
+))
 
 
 class Gaps:
@@ -297,8 +305,8 @@ def guidance_attestation(packet, directory, pr_url, stage=None):
     record = packet.get('guidance_attestation')
     if not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1:
         raise ValueError('Evidence packet needs a version 1 guidance_attestation object')
-    if record.get('stage') not in ('opening', 'repair_batch') or (stage and record['stage'] != stage):
-        raise ValueError('Guidance attestation must identify the requested opening or repair_batch stage')
+    if record.get('stage') not in ('opening', 'repair_batch', 'successor_validation') or (stage and record['stage'] != stage):
+        raise ValueError('Guidance attestation must identify the requested opening, repair_batch, or successor_validation stage')
     issue_ref = text(record, 'issue_ref')
     issue = github.reference(issue_ref, 'issues')
     pull = github.reference(pr_url, 'pull')
@@ -307,6 +315,35 @@ def guidance_attestation(packet, directory, pr_url, stage=None):
     if record['stage'] == 'repair_batch':
         text(record, 'accepted_batch_ref')
         text(record, 'repair_history_ref')
+    elif record['stage'] == 'successor_validation':
+        if 'accepted_batch_ref' in record:
+            raise ValueError('A successor validation cannot accept or create a repair batch')
+        text(record, 'repair_history_ref')
+        prior = record.get('prior_publication_ref')
+        if not isinstance(prior, dict) or type(prior.get('version')) is not int or prior['version'] != 1:
+            raise ValueError('Successor validation must link the exact inherited publication reference')
+        for key in ('pr_url', 'branch', 'head_branch', 'base_ref', 'comment_url', 'stage'):
+            text(prior, key)
+        owner = prior.get('owner')
+        if (not isinstance(owner, dict) or owner.get('harness') not in ('claude', 'codex') or
+                not isinstance(owner.get('session_id'), str) or not owner['session_id'].strip()):
+            raise ValueError('Inherited publication reference has no valid native owner')
+        if type(prior.get('comment_id')) is not int or prior['comment_id'] < 1:
+            raise ValueError('Inherited publication reference has no valid comment ID')
+        for key in ('body_sha256', 'attestation_sha256'):
+            if not isinstance(prior.get(key), str) or not re.fullmatch(r'[0-9a-f]{64}', prior[key]):
+                raise ValueError('Inherited publication reference has an invalid ' + key)
+        if prior['stage'] not in ('opening', 'repair_batch', 'successor_validation'):
+            raise ValueError('Inherited publication reference has an unsupported stage')
+        try:
+            github.comment_reference(prior['comment_url'], pr_url)
+        except github.RecordError as error:
+            raise ValueError('Inherited publication comment must belong to this PR: ' + str(error)) from error
+        reconciliation = record.get('reconciliation')
+        if not isinstance(reconciliation, dict):
+            raise ValueError('Successor validation requires a reconciliation object')
+        for key in ('inherited_work', 'repair_history', 'scope_and_holds', 'current_owner_work'):
+            text(reconciliation, key)
     elif record.get('accepted_batch_ref'):
         raise ValueError('An opening attestation cannot claim an accepted repair batch')
     if record.get('prerequisites_complete') is not True:
@@ -340,8 +377,9 @@ def guidance_attestation(packet, directory, pr_url, stage=None):
 def render_guidance_attestation(packet, directory, pr_url, stage, report=None, receipt_context=None):
     """Render the approved stage ordering and return digests for the exact body."""
     record = guidance_attestation(packet, directory, pr_url, stage)
-    if stage == 'opening' and not opening_report_ready(report):
-        raise ValueError('Opening attestation requires a current clean report with successful canonical verification')
+    if stage in ('opening', 'successor_validation') and not opening_report_ready(report):
+        label = 'Successor validation' if stage == 'successor_validation' else 'Opening attestation'
+        raise ValueError(label + ' requires a current clean report with successful canonical verification')
     if receipt_context is not None:
         if (not isinstance(receipt_context, dict) or
                 not isinstance(receipt_context.get('list_sha256'), str) or
@@ -369,7 +407,7 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None, r
             '## Completed evidence',
             lines(record['evidence_refs']),
         ]
-    else:
+    elif stage == 'repair_batch':
         sections = [
             '# Accepted repair-batch attestation',
             GUIDANCE_ATTESTATION_STATEMENT,
@@ -380,6 +418,30 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None, r
             '## Approach',
             record['approach'] + '\n\nReason: ' + record['approach_reason'],
             'Guidance application: ' + record['guidance_application'],
+        ]
+    else:
+        prior = record['prior_publication_ref']
+        reconciliation = record['reconciliation']
+        sections = [
+            '# Successor validation',
+            SUCCESSOR_VALIDATION_STATEMENT,
+            issue_line,
+            'Inherited publication: ' + prior['comment_url'],
+            'Inherited publication body SHA-256: ' + prior['body_sha256'],
+            'Inherited publication attestation SHA-256: ' + prior['attestation_sha256'],
+            'Current candidate: ' + report['snapshot']['head'],
+            'Current report: clean candidate with successful canonical verification.',
+            '## Inherited-work reconciliation',
+            'Inherited work: ' + reconciliation['inherited_work'],
+            'Existing repair history: ' + record['repair_history_ref'],
+            'Repair history review: ' + reconciliation['repair_history'],
+            'Scope and holds review: ' + reconciliation['scope_and_holds'],
+            'Current owner work: ' + reconciliation['current_owner_work'],
+            '## Current review',
+            'Guidance application: ' + record['guidance_application'],
+            record['approach'] + '\n\nReason: ' + record['approach_reason'],
+            '## Current candidate evidence',
+            lines(record['evidence_refs']),
         ]
     source_lines = []
     matched_receipts = set()
@@ -407,7 +469,7 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None, r
     if stage == 'repair_batch':
         sections.insert(sections.index('## Scope and holds') + 1,
                         'Existing repair history: ' + record['repair_history_ref'])
-    else:
+    elif stage == 'opening':
         sections.extend([
             '## Opening attestation',
             'Guidance application: ' + record['guidance_application'],
