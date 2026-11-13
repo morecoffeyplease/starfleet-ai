@@ -214,6 +214,26 @@ def source_is_immutable_runtime(runtime=None):
         return False
 
 
+def upgrade_source_guidance_reason(immutable_runtime=False):
+    if immutable_runtime:
+        return ('This CLI is an immutable runtime, and upgrade-plan reads the executing installer source Git revision. '
+                'The product checkout has a separate Git revision that cannot supply it. '
+                'No exact compatible source entrypoint is recorded. Choose a verified matching clean committed newer '
+                'Starfleet source checkout before planning. Status and coverage show the existing owner and source diagnostics.')
+    return ('upgrade-plan reads the executing installer source Git revision, and the product checkout has a separate '
+            'Git revision that cannot supply it. No exact compatible source entrypoint is recorded. Choose a verified '
+            'matching clean committed newer Starfleet source checkout before planning. Status and coverage show the '
+            'existing owner and source diagnostics.')
+
+
+def require_intact_upgrade_source_pin(state):
+    old_pin = source_pin_status(state)
+    if old_pin['integrity'] != 'intact':
+        raise ValueError('Installed source pin is ' + old_pin['integrity'] +
+                         '; restore its exact files before planning a recoverable upgrade')
+    return old_pin
+
+
 def upgrade_journal_path(cwd):
     found = session_store.lookup_checkout(root(cwd))
     if found:
@@ -1960,14 +1980,23 @@ def build_upgrade_plan(cwd):
         raise ValueError('No active installation state to upgrade')
     state = json.loads(state_file['text'])
     product, seat = validate_upgrade_scope(state, product)
-    if delivery.value(APP, 'status', '--porcelain'):
+    if source_is_immutable_runtime():
+        require_intact_upgrade_source_pin(state)
+        raise ValueError(upgrade_source_guidance_reason(immutable_runtime=True))
+    try:
+        source_dirty = delivery.value(APP, 'status', '--porcelain')
+    except ValueError:
+        require_intact_upgrade_source_pin(state)
+        raise ValueError(upgrade_source_guidance_reason()) from None
+    if source_dirty:
         raise ValueError('Commit the new installer source, then review a fresh upgrade plan')
-    new_revision = delivery.value(APP, 'rev-parse', 'HEAD')
+    try:
+        new_revision = delivery.value(APP, 'rev-parse', 'HEAD')
+    except ValueError:
+        require_intact_upgrade_source_pin(state)
+        raise ValueError(upgrade_source_guidance_reason()) from None
     new_versions = source_versions(state.get('lane_owner', {}).get('harness'))
-    old_pin = source_pin_status(state)
-    if old_pin['integrity'] != 'intact':
-        raise ValueError('Installed source pin is ' + old_pin['integrity'] +
-                         '; restore its exact files before planning a recoverable upgrade')
+    old_pin = require_intact_upgrade_source_pin(state)
     runtime_plan = session_store.runtime_plan(APP) if state.get('seat_id') else None
     seat_manifest_before = None
     selected_runtime_missing = False
@@ -2941,6 +2970,8 @@ def setup_guidance(cwd, state, detail):
                 return guidance('upgrade', 'The installed source pin is intact and this CLI is a different clean committed source. OpenCode identity is scoped to its native plugin context, so status does not recommend a plain-shell upgrade command.')
             command = shlex.join([sys.executable, str(SELF), '--cwd', product_root, 'upgrade-plan'])
             return guidance('upgrade', 'The installed source pin is intact and this CLI is a different clean committed source. Review an upgrade plan; upgrade remains optional and report freshness is a separate delivery concern.', command)
+        if current_cli['source_revision'] is None:
+            return guidance('upgrade', upgrade_source_guidance_reason(source_is_immutable_runtime()))
         return guidance('upgrade', 'The installed source pin is intact, but this CLI is not a clean committed Git source that can create an upgrade plan. Use a clean Starfleet source checkout before planning.')
 
     if owner and not state.get('pr_url') and not state.get('pr_bindings'):
