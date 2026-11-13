@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -62,6 +63,47 @@ def verify_runtime(runtime, source):
             raise ValueError("Existing Starfleet Doctor runtime does not match its content address")
 
 
+def _directory_identity(path):
+    info = Path(path).lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("Refusing to remove an installer path that is not a directory")
+    return info.st_dev, info.st_ino
+
+
+def _remove_owned_directory(path, identity):
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+        raise RuntimeError("Refusing to remove a directory no longer owned by this installation")
+
+    path.chmod(0o700)
+    for child in path.rglob("*"):
+        child_info = child.lstat()
+        if stat.S_ISDIR(child_info.st_mode):
+            child.chmod(0o700)
+        elif stat.S_ISREG(child_info.st_mode):
+            child.chmod(0o600)
+
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+        raise RuntimeError("Refusing to remove a directory no longer owned by this installation")
+    shutil.rmtree(path)
+
+
+def _seal_published_runtime(runtime, source, identity):
+    info = runtime.lstat()
+    if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+        raise RuntimeError("Published Starfleet Doctor runtime changed before sealing")
+    os.chmod(runtime, 0o555)
+    info = runtime.lstat()
+    if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+        raise RuntimeError("Published Starfleet Doctor runtime changed while sealing")
+    verify_runtime(runtime, source)
+
+
 def launcher_is_owned(launcher):
     if launcher.is_symlink():
         return False
@@ -94,16 +136,26 @@ def install(prefix, source=None):
         verify_runtime(runtime, source)
     else:
         temporary = Path(tempfile.mkdtemp(prefix=".starfleet-", dir=runtime_root))
+        temporary_identity = _directory_identity(temporary)
         try:
             for name in FILES:
                 shutil.copyfile(source / name, temporary / name)
                 os.chmod(temporary / name, 0o444)
-            os.chmod(temporary, 0o555)
             os.replace(temporary, runtime)
+            runtime_identity = temporary_identity
+            try:
+                _seal_published_runtime(runtime, source, runtime_identity)
+            except BaseException as seal_error:
+                try:
+                    _remove_owned_directory(runtime, runtime_identity)
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"Could not seal new runtime {runtime}: {seal_error}; "
+                        f"cleanup also failed: {cleanup_error}"
+                    ) from seal_error
+                raise
         finally:
-            if temporary.exists():
-                os.chmod(temporary, 0o700)
-                shutil.rmtree(temporary)
+            _remove_owned_directory(temporary, temporary_identity)
     verify_runtime(runtime, source)
     descriptor, temporary_name = tempfile.mkstemp(prefix=".starfleet-", dir=bin_dir)
     temporary_launcher = Path(temporary_name)

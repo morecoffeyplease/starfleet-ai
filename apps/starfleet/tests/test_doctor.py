@@ -72,6 +72,18 @@ class DoctorTests(unittest.TestCase):
                      "CMUX_WORKSPACE_ID": workspace}
         return workspace, surface, session, identity, current, selectors
 
+    @staticmethod
+    def _installer_cli_environment(directory, sitecustomize):
+        hooks = Path(directory) / "python-hooks"
+        hooks.mkdir()
+        (hooks / "sitecustomize.py").write_text(sitecustomize, encoding="utf-8")
+        environment = os.environ.copy()
+        existing_pythonpath = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = str(hooks) + (
+            os.pathsep + existing_pythonpath if existing_pythonpath else "")
+        environment["HOME"] = str(directory)
+        return environment
+
     def test_caller_requires_one_exact_fresh_current_agent_on_the_surface(self):
         workspace = "11111111-1111-4111-8111-111111111111"
         surface = "22222222-2222-4222-8222-222222222222"
@@ -484,6 +496,127 @@ class DoctorTests(unittest.TestCase):
             self.assertTrue(owned_launcher.is_file())
             with self.assertRaisesRegex(RuntimeError, "Python 3.10"):
                 installer.ensure_supported_python((3, 9, 18))
+
+    def test_installer_cli_publishes_writable_runtime_before_sealing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prefix = root / "prefix"
+            loaded = root / "contract-loaded"
+            rejected = root / "sealed-directory-rename-rejected"
+            sitecustomize = (
+                "import os, stat\nfrom pathlib import Path\n"
+                f"Path({str(loaded)!r}).write_text('loaded', encoding='utf-8')\n"
+                "_real_replace = os.replace\n"
+                "def _guarded_replace(source, destination, *args, **kwargs):\n"
+                "    info = os.lstat(source)\n"
+                "    if stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o555:\n"
+                f"        Path({str(rejected)!r}).write_text('rejected', encoding='utf-8')\n"
+                "        raise OSError('injected contract rejects sealed-directory rename')\n"
+                "    return _real_replace(source, destination, *args, **kwargs)\n"
+                "os.replace = _guarded_replace\n")
+            environment = self._installer_cli_environment(root, sitecustomize)
+            command = [sys.executable, str(ROOT / "apps" / "starfleet" / "install.py"),
+                       "--prefix", str(prefix)]
+            result = subprocess.run(command, cwd=root, env=environment,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(loaded.is_file())
+            self.assertFalse(rejected.exists())
+
+            source = ROOT / "apps" / "starfleet"
+            digest = installer.runtime_digest(source)
+            runtime = prefix / "share" / "starfleet-ai" / "starfleet" / digest
+            launcher = prefix / "bin" / "starfleet"
+            self.assertEqual(runtime.stat().st_mode & 0o777, 0o555)
+            for name in installer.FILES:
+                installed = runtime / name
+                self.assertEqual(installed.stat().st_mode & 0o777, 0o444)
+                self.assertEqual(installed.read_bytes(), (source / name).read_bytes())
+            self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
+            self.assertIn(installer.LAUNCHER_MARKER, launcher.read_text(encoding="utf-8"))
+            self.assertFalse(list(runtime.parent.glob(".starfleet-*")))
+
+    def test_installer_cli_seal_failure_rolls_back_runtime_and_preserves_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prefix = root / "prefix"
+            bin_dir = prefix / "bin"
+            bin_dir.mkdir(parents=True)
+            launcher = bin_dir / "starfleet"
+            original_launcher = ("#!/bin/sh\n" + installer.LAUNCHER_MARKER +
+                                "\nexec /synthetic/previous-starfleet\n")
+            launcher.write_text(original_launcher, encoding="utf-8")
+            launcher.chmod(0o755)
+            launcher_mode = launcher.stat().st_mode & 0o777
+
+            source = ROOT / "apps" / "starfleet"
+            digest = installer.runtime_digest(source)
+            runtime_root = prefix / "share" / "starfleet-ai" / "starfleet"
+            runtime = runtime_root / digest
+            seal_attempted = root / "seal-attempted"
+            sitecustomize = (
+                "import os\nfrom pathlib import Path\n"
+                "_real_chmod = os.chmod\n"
+                "def _fail_runtime_seal(path, mode, *args, **kwargs):\n"
+                f"    if Path(path) == Path({str(runtime)!r}) and mode == 0o555:\n"
+                f"        Path({str(seal_attempted)!r}).write_text('attempted', encoding='utf-8')\n"
+                "        raise OSError('injected runtime seal failure')\n"
+                "    return _real_chmod(path, mode, *args, **kwargs)\n"
+                "os.chmod = _fail_runtime_seal\n")
+            environment = self._installer_cli_environment(root, sitecustomize)
+            command = [sys.executable, str(ROOT / "apps" / "starfleet" / "install.py"),
+                       "--prefix", str(prefix)]
+            result = subprocess.run(command, cwd=root, env=environment,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(seal_attempted.is_file())
+            self.assertFalse(runtime.exists())
+            self.assertFalse(list(runtime_root.glob(".starfleet-*")))
+            self.assertEqual(launcher.read_text(encoding="utf-8"), original_launcher)
+            self.assertEqual(launcher.stat().st_mode & 0o777, launcher_mode)
+            self.assertEqual([path.name for path in bin_dir.iterdir()], ["starfleet"])
+
+    def test_installer_cleanup_preserves_a_replaced_runtime_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prefix = root / "prefix"
+            bin_dir = prefix / "bin"
+            bin_dir.mkdir(parents=True)
+            launcher = bin_dir / "starfleet"
+            original_launcher = ("#!/bin/sh\n" + installer.LAUNCHER_MARKER +
+                                "\nexec /synthetic/previous-starfleet\n")
+            launcher.write_text(original_launcher, encoding="utf-8")
+            launcher.chmod(0o755)
+
+            source = ROOT / "apps" / "starfleet"
+            digest = installer.runtime_digest(source)
+            runtime_root = prefix / "share" / "starfleet-ai" / "starfleet"
+            runtime = runtime_root / digest
+            displaced = root / "displaced-installer-runtime"
+            replacement = root / "replacement-created"
+            sitecustomize = (
+                "import os\nfrom pathlib import Path\n"
+                "_real_chmod = os.chmod\n_real_replace = os.replace\n"
+                "def _replace_runtime_before_seal(path, mode, *args, **kwargs):\n"
+                f"    if Path(path) == Path({str(runtime)!r}) and mode == 0o555:\n"
+                f"        _real_replace(path, {str(displaced)!r})\n"
+                "        Path(path).mkdir()\n"
+                f"        (Path(path) / 'unrelated.txt').write_text('preserve', encoding='utf-8')\n"
+                f"        Path({str(replacement)!r}).write_text('replaced', encoding='utf-8')\n"
+                "        raise OSError('injected runtime replacement before seal')\n"
+                "    return _real_chmod(path, mode, *args, **kwargs)\n"
+                "os.chmod = _replace_runtime_before_seal\n")
+            environment = self._installer_cli_environment(root, sitecustomize)
+            command = [sys.executable, str(ROOT / "apps" / "starfleet" / "install.py"),
+                       "--prefix", str(prefix)]
+            result = subprocess.run(command, cwd=root, env=environment,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(replacement.is_file())
+            self.assertTrue(displaced.is_dir())
+            self.assertEqual((runtime / "unrelated.txt").read_text(encoding="utf-8"), "preserve")
+            self.assertEqual(launcher.read_text(encoding="utf-8"), original_launcher)
+            self.assertFalse(list(bin_dir.glob(".starfleet-*")))
 
     def test_doctor_cli_is_read_only_for_an_all_skipped_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
