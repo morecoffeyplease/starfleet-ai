@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import stat
@@ -2584,6 +2585,190 @@ def request_object(key, owner, path, command):
             "repo": str(path), "command": command}
 
 
+def test_owner_args_cli(temp):
+    state = temp / "owner-args-state"
+    hailing_dir = temp / "owner-args-hailing"
+    hailing_dir.mkdir()
+    config_path = hailing_dir / "config.json"
+    fixture_path = temp / "owner-args-cmux.json"
+    workspace = uuid_text()
+    surface = uuid_text()
+    session = "ses_MixedCase42"
+    owner = {"harness": "opencode", "session": session, "surface": surface}
+    target = {**owner, "workspace": workspace, "label": "private-fixture-label",
+              "started_at": 1.0, "cutoff": 0.0}
+    config = {"version": 1, "targets": [target], "remind_after": 60,
+              "escalate_after": 120, "cooldown": 30, "interval": 10}
+    current_item = {"placement": {"kind": "local"}, "lifecycle": "running",
+                    "freshness": {"state": "current"},
+                    "projections": [{"workspace_id": workspace.lower(), "panel_id": surface.lower()}],
+                    "agents": [{"session_id": session, "kind": "opencode", "state": "working"}]}
+    fixture = {"identify": {"caller": {"surface_type": "terminal",
+                                         "workspace_id": workspace.lower(),
+                                         "surface_id": surface.lower()}},
+               "current": {"truncated": False,
+                           "owner_availability": {"agent_sessions": "available"},
+                           "items": [current_item]}}
+    cmux = temp / "fake-cmux"
+    cmux.write_text("#!/usr/bin/env python3\n"
+                    "import json, os, sys\n"
+                    "fixture = json.load(open(os.environ['CMUX_FIXTURE'], encoding='utf-8'))\n"
+                    "print(json.dumps(fixture['identify' if sys.argv[-1] == 'identify' else 'current']))\n",
+                    encoding="utf-8")
+    cmux.chmod(0o755)
+    base_env = {"WARP_DRIVE_CMUX": str(cmux),
+                "WARP_DRIVE_HAILING_STATE": str(hailing_dir),
+                "CMUX_FIXTURE": str(fixture_path)}
+
+    def run(fmt=None, ok=True, extra_env=None, write_config=True):
+        if write_config:
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+        fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+        before_config = ((config_path.stat().st_mtime_ns, config_path.read_bytes())
+                         if config_path.exists() else None)
+        before_fixture = (fixture_path.stat().st_mtime_ns, fixture_path.read_bytes())
+        args = ["owner-args"] + (["--format", fmt] if fmt else [])
+        result = run_cli(state, *args, env={**base_env, **(extra_env or {})}, ok=ok)
+        after_config = ((config_path.stat().st_mtime_ns, config_path.read_bytes())
+                        if config_path.exists() else None)
+        check(after_config == before_config and
+              (fixture_path.stat().st_mtime_ns, fixture_path.read_bytes()) == before_fixture and
+              not state.exists(),
+              "owner-args modified synthetic identity state or created Warp state")
+        return result
+
+    unchanged_config = json.dumps(config).encode()
+    human = run()
+    check(human.returncode == 0 and owner["session"] in human.stdout and
+          "one exact Hailing enrollment" in human.stdout and
+          "Completion delivery is not verified" in human.stdout,
+          "owner-args did not print human-readable verified current owner output")
+    json_result = parse_json(run("json"))
+    check(json_result["status"] == "verified" and json_result["owner"] == owner and
+          json_result["verification"]["completion_delivery"] == "not verified" and
+          "private-fixture-label" not in json.dumps(json_result),
+          "owner-args JSON exposed enrollment labels or omitted verification status")
+    shell_result = run("shell")
+    expected = ["--harness", owner["harness"], "--session", owner["session"],
+                "--surface", owner["surface"]]
+    check(shlex.split(shell_result.stdout) == expected,
+          "owner-args shell output did not preserve exact safely quoted argument boundaries")
+    poisoned_env = {"CMUX_AGENT_LAUNCH_KIND": "claude", "OPENCODE_SESSION_ID": "ses_wrong",
+                    "CMUX_SURFACE_ID": uuid_text()}
+    check(parse_json(run("json", extra_env=poisoned_env))["owner"] == owner,
+          "owner-args trusted conflicting environment identity over CMUX identify/current")
+    check(not state.exists() and config_path.read_bytes() == unchanged_config,
+          "owner-args created Warp state or modified Hailing enrollment")
+
+    for harness in ("claude", "codex"):
+        native_session = uuid_text()
+        native_owner = {"harness": harness, "session": native_session, "surface": surface}
+        config["targets"] = [{**native_owner, "workspace": workspace, "label": "private-fixture-label",
+                              "started_at": 1.0, "cutoff": 0.0}]
+        fixture["current"]["items"] = [{**current_item,
+            "agents": [{"session_id": native_session, "kind": harness, "state": "idle"}]}]
+        native_result = parse_json(run("json"))
+        check(native_result["owner"] == native_owner,
+              f"owner-args did not verify the current {harness} caller")
+
+    config["targets"] = [target]
+    fixture["current"]["items"] = [current_item]
+    fixture["current"]["items"][0]["agents"][0]["session_id"] = session
+    fixture["current"]["items"][0]["agents"][0]["kind"] = "opencode"
+
+    config_path.unlink()
+    missing = run(ok=False, write_config=False)
+    check(missing.returncode == 2 and "Hailing enrollment config is missing" in missing.stderr and
+          "hailing-frequencies guide --print" in missing.stderr,
+          "owner-args did not refuse absent enrollment with actionable guidance")
+
+    wrong_surface = uuid_text()
+    config["targets"] = [{**target, "surface": wrong_surface}]
+    mismatch = run(ok=False)
+    check(mismatch.returncode == 2 and "no exact Hailing enrollment" in mismatch.stderr,
+          "owner-args accepted a Hailing tuple that mismatched the current caller")
+
+    config["targets"] = [{**target, "workspace": uuid_text()}]
+    wrong_workspace = run(ok=False)
+    check(wrong_workspace.returncode == 2 and "Hailing workspace differs from CMUX" in wrong_workspace.stderr,
+          "owner-args accepted an enrollment from a different current workspace")
+
+    config["targets"] = [target]
+    config["targets"].append(dict(target))
+    duplicate_enrollment = run(ok=False)
+    check(duplicate_enrollment.returncode == 2 and "multiple matching Hailing enrollments" in duplicate_enrollment.stderr,
+          "owner-args accepted duplicate exact Hailing enrollments")
+
+    config["targets"] = [target]
+    fixture["current"]["items"] = [current_item, dict(current_item)]
+    ambiguous = run(ok=False)
+    check(ambiguous.returncode == 2 and "one unambiguous caller surface" in ambiguous.stderr,
+          "owner-args accepted an ambiguous native surface")
+
+    fixture["current"]["items"] = [current_item]
+    fixture["current"]["items"][0]["agents"].append(
+        {"session_id": uuid_text(), "kind": "codex", "state": "working"})
+    ambiguous_agents = run(ok=False)
+    check(ambiguous_agents.returncode == 2 and "one unambiguous active native owner" in ambiguous_agents.stderr,
+          "owner-args accepted an ambiguous active agent array")
+
+    fixture["current"]["items"][0]["agents"] = [{"session_id": session, "kind": "opencode", "state": "ended"}]
+    ended = run(ok=False)
+    check(ended.returncode == 2 and "one unambiguous active native owner" in ended.stderr,
+          "owner-args accepted an ended native owner")
+
+    fixture["current"]["items"][0]["agents"] = [{"session_id": session, "kind": "opencode", "state": "working"}]
+    fixture["current"]["truncated"] = True
+    truncated = run(ok=False)
+    check(truncated.returncode == 2 and "inventory is truncated" in truncated.stderr,
+          "owner-args accepted a truncated CMUX inventory")
+
+    fixture["current"]["truncated"] = False
+    fixture["current"].pop("owner_availability")
+    unavailable = run(ok=False)
+    check(unavailable.returncode == 2 and "does not expose agent identities" in unavailable.stderr,
+          "owner-args accepted a CMUX inventory without owner availability")
+
+    fixture["current"]["owner_availability"] = {"agent_sessions": "available"}
+    fixture["current"]["items"][0]["freshness"]["state"] = "stale"
+    stale = run(ok=False)
+    check(stale.returncode == 2 and "stale or inactive" in stale.stderr,
+          "owner-args accepted a stale native caller")
+
+    no_cmux = run(ok=False, extra_env={"WARP_DRIVE_CMUX": str(temp / "missing-cmux"),
+                                       "CMUX_AGENT_LAUNCH_KIND": "opencode",
+                                       "OPENCODE_SESSION_ID": session,
+                                       "CMUX_SURFACE_ID": surface})
+    check(no_cmux.returncode == 2 and "CMUX identify failed" in no_cmux.stderr,
+          "owner-args trusted environment identity when native CMUX was unavailable")
+
+    fixture["current"]["items"][0]["freshness"]["state"] = "current"
+    fixture["current"]["items"][0]["agents"][0]["session_id"] = "ses_$(touch owner-args-injected)"
+    injection = run("shell", ok=False)
+    check(injection.returncode == 2 and "session identity is invalid" in injection.stderr and
+          not (temp / "owner-args-injected").exists() and not state.exists(),
+          "owner-args emitted unsafe shell arguments for an invalid native session")
+
+    fixture["current"]["items"] = [current_item]
+    fixture["current"]["items"][0]["agents"][0]["session_id"] = session
+    share, bin_dir, installed_state = temp / "owner-args-installed-share", temp / "owner-args-installed-bin", temp / "owner-args-installed-state"
+    installed = subprocess.run([sys.executable, str(ROOT / "install.py"), "--share-dir", str(share),
+                                "--bin-dir", str(bin_dir)], text=True, capture_output=True)
+    check(installed.returncode == 0,
+          f"owner-args installer smoke failed:\n{installed.stdout}\n{installed.stderr}")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    installed_env = os.environ.copy()
+    installed_env.update(base_env)
+    installed_result = subprocess.run([str(bin_dir / "warp-drive"), "--state-dir", str(installed_state),
+                                       "owner-args", "--format", "json"], cwd=temp,
+                                      env=installed_env, text=True, capture_output=True)
+    installed_json = json.loads(installed_result.stdout) if installed_result.returncode == 0 else {}
+    check(installed_result.returncode == 0 and installed_json.get("owner") == owner and
+          not installed_state.exists(),
+          f"installed owner-args failed outside the source checkout:\n{installed_result.stdout}\n{installed_result.stderr}")
+
+
 def test_new_recipient_enrollment_guard(temp):
     state = temp / "recipient-guard-state"
     hailing_dir = temp / "recipient-guard-hailing"
@@ -3528,6 +3713,7 @@ def main():
             test_warning_reserved_claims_and_inherited_multiples(temp)
             test_scheduler_refreshes_policy_version(temp)
             test_explicit_cpu_estimates(temp)
+            test_owner_args_cli(temp)
             test_new_recipient_enrollment_guard(temp)
             test_missed_turn_ordering(temp)
             test_scheduler_startup_pacing_and_escape_limit(temp)
