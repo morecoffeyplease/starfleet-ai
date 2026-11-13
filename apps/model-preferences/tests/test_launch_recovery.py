@@ -274,7 +274,9 @@ class LaunchRecoveryTest(unittest.TestCase):
             except BaseException as exc:
                 outcome["error"] = exc
 
-        with self.stopped_owner(launch, identity), patch.object(mp, "stream_codex", side_effect=stream):
+        with self.stopped_owner(launch, identity), \
+                patch.object(mp.shutil, "which", return_value="codex"), \
+                patch.object(mp, "stream_codex", side_effect=stream):
             worker = threading.Thread(target=resume)
             worker.start()
             try:
@@ -360,7 +362,9 @@ class LaunchRecoveryTest(unittest.TestCase):
                 return {"session_id": launch["native_session"], "owner": task_owner,
                         "brief_sha256": current_task["brief_sha256"]}
             self.fail("Unexpected Pattern Buffer command")
-        with self.stopped_owner(launch, identity), patch.object(mp.App, "run_json", side_effect=pattern_buffer), \
+        with self.stopped_owner(launch, identity), \
+                patch.object(mp.shutil, "which", return_value="codex"), \
+                patch.object(mp.App, "run_json", side_effect=pattern_buffer), \
                 patch.object(mp, "stream_codex", return_value=subprocess.CompletedProcess([], 0)) as child:
             result = self.call("resume", launch["id"], "--task-file", str(followup))
         self.assertEqual(result["exit_code"], 0)

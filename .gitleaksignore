@@ -1,2 +1,4 @@
 # Verified synthetic Discord Watch fixture ID; this exception is scoped to its one historical finding.
 265dcde429be50d3491a1499de4ee77cb62b13d1:apps/discord-watch/tests/test_starfleet_diagnostics.py:discord-client-id:53
+# The same verified synthetic fixture in its squashed main commit.
+bab08efb717073266344c6e43f9b55e39618cbf9:apps/discord-watch/tests/test_starfleet_diagnostics.py:discord-client-id:53
