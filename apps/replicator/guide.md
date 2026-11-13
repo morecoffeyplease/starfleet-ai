@@ -69,9 +69,12 @@ Replicator does not activate or change a Model Preferences profile.
 replicator successor configure --seat SEAT --worktree /absolute/path/to/worktree \
   --family codex-luna --effort xhigh
 replicator successor show --seat SEAT --worktree /absolute/path/to/worktree
+replicator successor show --seat SEAT --worktree /absolute/path/to/worktree --json
 replicator successor cancel INTENT_ID
 ```
 
+Show prints a concise human-readable summary by default and accepts `--json` for automation.
+The summary labels the configured family, model, effort, and Model Preferences provenance separately from unknown native generation, predecessor settings, effective permissions, and readiness.
 Pass `--mp-config-dir` and `--mp-state-dir` to configure or show when the existing Model Preferences installation uses explicit paths.
 Repeating the same configured request for the same seat and worktree returns the existing intent.
 Cancel the current intent before configuring a different choice for that scope.
@@ -88,6 +91,7 @@ replicator doctor --starfleet-json
 ```
 
 The diagnostic is read-only and reports the configured state separately from observed delivery.
+The `checks` object maps each check name directly to its string status.
 With no intent file, configuration is `ready`, registration, worker, and intended delivery are `not_applicable`, and observed delivery is `unknown`.
 
 ## Inspect the actual checkout and tools

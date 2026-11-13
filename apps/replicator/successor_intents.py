@@ -90,6 +90,10 @@ def _validate_store(value):
                 if set(choice) != {"kind"}:
                     raise IntentError("Successor intent state is malformed.")
             elif kind == "model_preferences_candidate":
+                if set(choice) != {
+                        "kind", "snapshot", "active_profile", "active_selection_digest",
+                        "candidate_matches_active_orchestrator", "candidate_digest", "provenance"}:
+                    raise IntentError("Successor intent state is malformed.")
                 snapshot = choice.get("snapshot")
                 provenance = choice.get("provenance")
                 candidate_digest = choice.get("candidate_digest")
@@ -102,6 +106,18 @@ def _validate_store(value):
                         or provenance.get("kind") != "configured_model_family"
                         or not isinstance(candidate_digest, str) or len(candidate_digest) != 64
                         or any(character not in "0123456789abcdef" for character in candidate_digest)):
+                    raise IntentError("Successor intent state is malformed.")
+                active_profile = choice.get("active_profile")
+                active_selection_digest = choice.get("active_selection_digest")
+                matches_active = choice.get("candidate_matches_active_orchestrator")
+                if (active_profile is not None and (not isinstance(active_profile, str) or not active_profile)
+                        or active_selection_digest is not None
+                        and (not isinstance(active_selection_digest, str) or len(active_selection_digest) != 64
+                             or any(character not in "0123456789abcdef" for character in active_selection_digest))
+                        or (active_profile is None) != (active_selection_digest is None)
+                        or matches_active is not None and type(matches_active) is not bool
+                        or (active_profile is None) != (matches_active is None)
+                        or matches_active is False and candidate_digest == active_selection_digest):
                     raise IntentError("Successor intent state is malformed.")
             else:
                 raise IntentError("Successor intent state is malformed.")
@@ -337,4 +353,4 @@ def doctor_report(state_dir):
     }
     if any(state not in DOCTOR_STATES for state in checks.values()):
         raise IntentError("Doctor state is invalid.")
-    return {"schema_version": 1, "checks": {name: {"status": state} for name, state in checks.items()}}
+    return {"schema_version": 1, "checks": checks}

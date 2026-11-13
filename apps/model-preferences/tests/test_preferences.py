@@ -608,6 +608,7 @@ class PreferencesTest(unittest.TestCase):
         active = mp.selection(self.app.config())
         self.assertEqual(report["protocol"], "starfleet.model-preferences.successor-choice/v1")
         self.assertEqual(report["seat"]["harness"], "codex")
+        self.assertEqual(report["active_profile"], "Codex-only")
         self.assertEqual(report["choice"], {"role": "orchestrator", "family": "codex-astra",
                                              "harness": "codex", "model": "gpt-6-astra", "effort": "xhigh"})
         self.assertEqual(report["active_selection_digest"], active["selection"])
@@ -628,6 +629,7 @@ class PreferencesTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
+        self.assertIsNone(report["active_profile"])
         self.assertIsNone(report["active_selection_digest"])
         self.assertIsNone(report["candidate_matches_active_orchestrator"])
         self.assertEqual(report["choice"]["model"], "gpt-6-luna")

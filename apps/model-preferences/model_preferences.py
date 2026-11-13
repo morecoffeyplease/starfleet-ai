@@ -1612,7 +1612,8 @@ def resolve_successor_choice(app, config, args):
             "Orchestrator seat registration uses an unsupported harness.")
     seat = {"name": args.seat, "harness": recipient["harness"],
             "session_id": recipient["session"], "workspace_id": workspace, "panel_id": surface}
-    active = selection(config) if config.get("active") else None
+    active_profile = config.get("active")
+    active = selection(config) if active_profile else None
     candidate = None
     candidate_digest = None
     matches_active = None
@@ -1646,6 +1647,7 @@ def resolve_successor_choice(app, config, args):
         "protocol": "starfleet.model-preferences.successor-choice/v1",
         "seat": seat,
         "choice": candidate,
+        "active_profile": active_profile,
         "active_selection_digest": active["selection"] if active else None,
         "candidate_matches_active_orchestrator": matches_active,
         "candidate_digest": candidate_digest,

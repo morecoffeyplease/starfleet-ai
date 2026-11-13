@@ -57,9 +57,12 @@ Pass both options to snapshot one existing Model Preferences family and supporte
 replicator successor configure --seat SEAT --worktree /absolute/path/to/worktree \
   --family codex-luna --effort xhigh
 replicator successor show --seat SEAT --worktree /absolute/path/to/worktree
+replicator successor show --seat SEAT --worktree /absolute/path/to/worktree --json
 replicator successor cancel INTENT_ID
 ```
 
+Show prints a concise human-readable summary by default and accepts `--json` for automation.
+An explicit candidate summary separates its configured family, model, effort, active profile, active selection digest, and candidate digest from unknown native generation, predecessor settings, permissions, and readiness.
 The configure and show commands accept `--mp-config-dir` and `--mp-state-dir` when the existing Model Preferences installation uses explicit paths.
 The command resolves the seat and candidate through Model Preferences, which accepts only a configured family and supported effort for the registered harness.
 Replicator stores the candidate and its separate provenance digest in a private state directory, and repeating the same configured request for the same seat and worktree is idempotent.
@@ -77,7 +80,8 @@ replicator doctor --starfleet-json
 ```
 
 The diagnostic performs no writes, locks, native queries, or credential reads.
-With no intent file, `configuration` is `ready`, registration, worker, and intended delivery are `not_applicable`, and observed delivery is `unknown`.
+The `checks` object maps each check name directly to its string status.
+With no intent file, configuration is `ready`, registration, worker, and intended delivery are `not_applicable`, and observed delivery is `unknown`.
 Valid diagnostic output exits successfully even when an individual check is blocked or unknown.
 
 ## Install the local launcher

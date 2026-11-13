@@ -466,6 +466,14 @@ def model_preferences_successor_choice(args):
     if (not isinstance(result, dict) or result.get("schema_version") != 1
             or result.get("protocol") != "starfleet.model-preferences.successor-choice/v1"):
         raise successor_intents.IntentError("Model Preferences returned an unsupported successor resolution.")
+    active_profile = result.get("active_profile")
+    active_selection_digest = result.get("active_selection_digest")
+    if (active_profile is not None and (not isinstance(active_profile, str) or not active_profile)
+            or (active_profile is None) != (active_selection_digest is None)
+            or active_selection_digest is not None
+            and (not isinstance(active_selection_digest, str) or len(active_selection_digest) != 64
+                 or any(character not in "0123456789abcdef" for character in active_selection_digest))):
+        raise successor_intents.IntentError("Model Preferences returned invalid profile provenance.")
     seat = result.get("seat")
     if (not isinstance(seat, dict) or seat.get("name") != args.seat
             or not all(isinstance(seat.get(key), str) and seat[key]
@@ -473,11 +481,15 @@ def model_preferences_successor_choice(args):
         raise successor_intents.IntentError("Model Preferences did not return one complete configured seat.")
     choice = result.get("choice")
     if family is None:
-        if choice is not None:
+        if choice is not None or result.get("candidate_matches_active_orchestrator") is not None:
             raise successor_intents.IntentError("Model Preferences returned an unexpected model choice.")
     elif (not isinstance(choice, dict) or choice.get("family") != family
           or choice.get("effort") != effort or choice.get("harness") != seat["harness"]):
         raise successor_intents.IntentError("The configured choice is unsupported for this exact seat and harness.")
+    elif ((active_profile is None) != (result.get("candidate_matches_active_orchestrator") is None)
+          or result.get("candidate_matches_active_orchestrator") is not None
+          and type(result["candidate_matches_active_orchestrator"]) is not bool):
+        raise successor_intents.IntentError("Model Preferences returned invalid candidate comparison provenance.")
     return result
 
 
@@ -492,6 +504,7 @@ def successor_scope(args):
         choice = {
             "kind": "model_preferences_candidate",
             "snapshot": resolved["choice"],
+            "active_profile": resolved["active_profile"],
             "active_selection_digest": resolved.get("active_selection_digest"),
             "candidate_matches_active_orchestrator": resolved.get("candidate_matches_active_orchestrator"),
             "candidate_digest": resolved.get("candidate_digest"),
@@ -514,6 +527,41 @@ def successor_show(args):
         raise successor_intents.IntentError("Do not pass a model choice to successor show.")
     scope, _ = successor_scope(args)
     return successor_intents.show_intent(args.state_dir, scope)
+
+
+def print_successor_intent(report):
+    intent = report.get("intent")
+    if intent is None:
+        print("No successor intent is configured for this seat and worktree.")
+        return
+    scope = intent["scope"]
+    seat = scope["seat"]
+    worktree = scope["worktree"]
+    choice = intent["choice"]
+    print(f"Successor intent: {intent['state']} ({intent['policy']})")
+    print(f"Intent ID: {intent['id']}")
+    print(f"Seat: {seat['name']} ({seat['harness']})")
+    print(f"Configured session identity: {seat['session_id']}")
+    print(f"Worktree: {worktree['root']}")
+    if choice["kind"] == "preserve_observed_predecessor":
+        print("Configured choice: preserve the predecessor's observed model and effort")
+    else:
+        snapshot = choice["snapshot"]
+        provenance = choice["provenance"]
+        print(f"Configured choice: {snapshot['family']} ({snapshot['model']}) at {snapshot['effort']}")
+        print("Model Preferences provenance:")
+        print(f"  Active profile: {choice['active_profile'] or 'none'}")
+        print(f"  Active selection digest: {choice['active_selection_digest'] or 'none'}")
+        print(f"  Candidate digest: {choice['candidate_digest']}")
+        matches = choice["candidate_matches_active_orchestrator"]
+        print(f"  Matches active orchestrator: {matches if matches is not None else 'not compared'}")
+        print(f"  Configured family source: {provenance.get('family_source') or 'unavailable'}")
+    print("Native observations:")
+    print(f"  Native generation: {intent['native_generation']['status']}")
+    print(f"  Predecessor model: {intent['observations']['predecessor_model']['status']}")
+    print(f"  Predecessor effort: {intent['observations']['predecessor_effort']['status']}")
+    print(f"  Effective permissions: {intent['observations']['effective_permissions']['status']}")
+    print(f"  Readiness: {intent['readiness']['status']}")
 
 
 def build_parser():
@@ -540,6 +588,7 @@ def build_parser():
     show.add_argument("--worktree", required=True)
     show.add_argument("--mp-config-dir")
     show.add_argument("--mp-state-dir")
+    show.add_argument("--json", action="store_true", help="print the intent as JSON")
     cancel = successor_commands.add_parser("cancel", help="cancel a configured intent by its exact ID")
     cancel.add_argument("intent_id")
     doctor = commands.add_parser("doctor", help="inspect Replicator configuration without writes or native queries")
@@ -576,8 +625,8 @@ def main(argv=None):
         if args.starfleet_json:
             print(json.dumps(report, indent=2))
         else:
-            for name, check in report["checks"].items():
-                print(f"{name}: {check['status']}")
+            for name, state in report["checks"].items():
+                print(f"{name}: {state}")
         return 0
     if args.command == "successor":
         try:
@@ -585,6 +634,9 @@ def main(argv=None):
                 result = successor_configure(args)
             elif args.successor_command == "show":
                 result = successor_show(args)
+                if not args.json:
+                    print_successor_intent(result)
+                    return 0
             else:
                 result = successor_intents.cancel_intent(args.state_dir, args.intent_id)
             print(json.dumps(result, indent=2))

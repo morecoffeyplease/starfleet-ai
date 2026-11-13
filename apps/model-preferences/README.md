@@ -52,8 +52,9 @@ The resolver does not change or activate a shared profile, query a provider cata
 model-preferences resolve-successor --seat SEAT --family codex-luna --effort xhigh
 ```
 
-The result retains the active selection digest when an active profile exists and carries a separate candidate provenance digest for the explicit choice.
+The result includes the active profile name, the active selection digest when a profile exists, and a separate candidate provenance digest for the explicit choice.
 The active selection digest keeps its existing meaning and does not authenticate a candidate that differs from the active orchestrator role.
+Replicator stores the active profile name and digest alongside its immutable candidate snapshot as separate provenance fields.
 Without `--family` and `--effort`, the result identifies the registered seat only.
 Replicator uses that registration to scope the preserve-observed request while keeping predecessor model, effort, native generation, and effective permissions unknown until exact-session observations are available.
 

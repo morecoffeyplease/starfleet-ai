@@ -506,6 +506,7 @@ class ReplicatorCliTests(unittest.TestCase):
             "role": "orchestrator", "family": "codex-luna", "harness": "codex",
             "model": "gpt-6-luna", "effort": "xhigh",
         })
+        self.assertEqual(first["choice"]["active_profile"], "Codex-only")
         self.assertFalse(first["choice"]["candidate_matches_active_orchestrator"])
         self.assertNotEqual(first["choice"]["candidate_digest"], first["choice"]["active_selection_digest"])
         self.assertEqual(first["native_generation"], {"status": "unknown", "value": None, "evidence": None})
@@ -522,16 +523,58 @@ class ReplicatorCliTests(unittest.TestCase):
         self.assertEqual(second["id"], first["id"])
         self.assertTrue(second["reused"])
 
-        config["profiles"]["Codex-only"]["orchestrator"] = {"model": "codex-astra", "effort": "high"}
-        config_path.write_text(json.dumps(config), encoding="utf-8")
-        shown = self.run_successor(installation, environment, intent_state,
+        human = self.run_successor(installation, environment, intent_state,
                                    "successor", *self.successor_scope_args(
                                        "show", repo, config_dir, mp_state_dir))
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn("Configured choice: codex-luna (gpt-6-luna) at xhigh", human.stdout)
+        self.assertIn("Active profile: Codex-only", human.stdout)
+        self.assertIn(f"Active selection digest: {first['choice']['active_selection_digest']}", human.stdout)
+        self.assertIn(f"Candidate digest: {first['choice']['candidate_digest']}", human.stdout)
+        self.assertIn("Native generation: unknown", human.stdout)
+        self.assertIn("Predecessor model: unknown", human.stdout)
+        self.assertIn("Predecessor effort: unknown", human.stdout)
+        self.assertIn("Effective permissions: unknown", human.stdout)
+        self.assertIn("Readiness: unknown", human.stdout)
+
+        config["active"] = "Claude-Codex"
+        config["activation"] = "changed-activation"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        changed_profile = subprocess.run(
+            ["model-preferences", "--config-dir", str(config_dir), "--state-dir", str(mp_state_dir),
+             "resolve-successor", "--seat", "lane"],
+            env=environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(changed_profile.returncode, 0, changed_profile.stderr)
+        current_profile = json.loads(changed_profile.stdout)
+        self.assertEqual(current_profile["active_profile"], "Claude-Codex")
+        self.assertNotEqual(current_profile["active_selection_digest"],
+                            first["choice"]["active_selection_digest"])
+        shown = self.run_successor(installation, environment, intent_state,
+                                   "successor", *self.successor_scope_args(
+                                       "show", repo, config_dir, mp_state_dir), "--json")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         stored = json.loads(shown.stdout)["intent"]
         self.assertEqual(stored["id"], first["id"])
         self.assertEqual(stored["choice"], first["choice"])
+        self.assertEqual(stored["choice"]["active_profile"], "Codex-only")
+        self.assertEqual(stored["choice"]["active_selection_digest"],
+                         first["choice"]["active_selection_digest"])
         self.assertEqual(stored["native_generation"]["status"], "unknown")
+
+        config["active"] = None
+        config["activation"] = None
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        no_profile_state = self.root / "replicator-state-no-profile"
+        no_profile = self.run_successor(
+            installation, environment, no_profile_state, "successor",
+            *self.successor_scope_args("configure", repo, config_dir, mp_state_dir),
+            "--family", "codex-luna", "--effort", "xhigh",
+        )
+        self.assertEqual(no_profile.returncode, 0, no_profile.stderr)
+        no_profile_choice = json.loads(no_profile.stdout)["choice"]
+        self.assertIsNone(no_profile_choice["active_profile"])
+        self.assertIsNone(no_profile_choice["active_selection_digest"])
 
     def test_successor_preserve_default_is_unknown_and_scope_mismatch_does_not_bind(self):
         installation = self.install_copy()
@@ -554,7 +597,7 @@ class ReplicatorCliTests(unittest.TestCase):
 
         wrong_worktree = self.run_successor(
             installation, environment, intent_state, "successor",
-            *self.successor_scope_args("show", other_repo, config_dir, mp_state_dir),
+            *self.successor_scope_args("show", other_repo, config_dir, mp_state_dir), "--json",
         )
         self.assertEqual(wrong_worktree.returncode, 0, wrong_worktree.stderr)
         self.assertIsNone(json.loads(wrong_worktree.stdout)["intent"])
@@ -620,15 +663,19 @@ class ReplicatorCliTests(unittest.TestCase):
                                     "doctor", "--starfleet-json")
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
-        self.assertEqual(report["schema_version"], 1)
-        self.assertEqual(set(report["checks"]), {
-            "configuration", "registration", "worker", "intended_delivery", "observed_delivery",
-        })
-        self.assertEqual(report["checks"]["configuration"]["status"], "ready")
-        for name in ("registration", "worker", "intended_delivery"):
-            self.assertEqual(report["checks"][name]["status"], "not_applicable")
-        self.assertEqual(report["checks"]["observed_delivery"]["status"], "unknown")
+        expected = {"schema_version": 1, "checks": {
+            "configuration": "ready", "registration": "not_applicable", "worker": "not_applicable",
+            "intended_delivery": "not_applicable", "observed_delivery": "unknown",
+        }}
+        self.assertEqual(report, expected)
+        self.assertTrue(all(type(state) is str for state in report["checks"].values()))
         self.assertNotIn(str(state_dir), result.stdout)
+        self.assertEqual(before, self.tree_snapshot())
+
+        human_doctor = self.run_successor(installation, self.environment, state_dir, "doctor")
+        self.assertEqual(human_doctor.returncode, 0, human_doctor.stderr)
+        self.assertIn("configuration: ready", human_doctor.stdout)
+        self.assertIn("observed_delivery: unknown", human_doctor.stdout)
         self.assertEqual(before, self.tree_snapshot())
 
         guide = self.run_process([installation["command"], "guide", "--print"])
@@ -643,7 +690,7 @@ class ReplicatorCliTests(unittest.TestCase):
                                      "doctor", "--starfleet-json")
         self.assertEqual(invalid.returncode, 0, invalid.stderr)
         invalid_report = json.loads(invalid.stdout)
-        self.assertEqual(invalid_report["checks"]["configuration"]["status"], "unknown")
+        self.assertEqual(invalid_report["checks"]["configuration"], "unknown")
         self.assertNotIn("invalid", invalid.stdout)
 
     def test_successor_has_no_persistent_mode_or_generation_claim(self):
