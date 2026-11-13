@@ -9,7 +9,8 @@ import tempfile
 root = Path(__file__).resolve().parent
 with tempfile.TemporaryDirectory(prefix="hailing-frequencies-compile-") as temporary:
     sources = [root / name for name in
-               ("hailing_frequencies.py", "install.py", "service.py", "temporal_beacon.py", "verify.py")]
+               ("hailing_frequencies.py", "install.py", "service.py", "temporal_beacon.py",
+                "discord_cleanup.py", "verify.py")]
     sources.append(root.parent / "opencode-adapter" / "opencode_adapter.py")
     for index, source in enumerate(sources):
         py_compile.compile(str(source), cfile=str(Path(temporary) / f"{index}-{source.name}c"), doraise=True)
