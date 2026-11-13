@@ -1574,8 +1574,32 @@ def discover_native_owner():
     return owner, workspace
 
 
+def require_native_runtime_owner(owner):
+    session_env = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
+                   "opencode": "OPENCODE_SESSION_ID"}
+    help_text = ("Run from the actual native agent session, or use the exact owner tuple "
+                 "explicitly supplied by the parent for delegated work.")
+    launch_kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().lower()
+    require(launch_kind in session_env and launch_kind == owner["harness"],
+            f"CMUX runtime harness does not match its current native owner. {help_text}")
+    hints = [(name, value.strip()) for name in session_env.values()
+             if (value := os.environ.get(name, "")).strip()]
+    require(len(hints) == 1,
+            f"Exactly one native session hint is required to distinguish this caller from an inherited CMUX surface. {help_text}")
+    expected_name = session_env[launch_kind]
+    require(hints[0][0] == expected_name,
+            f"A session hint for another harness is present. {help_text}")
+    try:
+        hinted_session = canonical_session(launch_kind, hints[0][1])
+    except WarpError as exc:
+        raise WarpError(f"The current native session hint is invalid for {launch_kind}. {help_text}") from exc
+    require(hinted_session == owner["session"],
+            f"The native session hint does not match the current CMUX owner. {help_text}")
+
+
 def verified_owner_arguments():
     owner, workspace = discover_native_owner()
+    require_native_runtime_owner(owner)
     snapshot = read_hailing_enrollment_snapshot()
     if snapshot["problem"]:
         raise WarpError(f"{snapshot['problem']}. Follow `hailing-frequencies guide --print` and enroll the actual current owner.")

@@ -2618,7 +2618,20 @@ def test_owner_args_cli(temp):
     cmux.chmod(0o755)
     base_env = {"WARP_DRIVE_CMUX": str(cmux),
                 "WARP_DRIVE_HAILING_STATE": str(hailing_dir),
-                "CMUX_FIXTURE": str(fixture_path)}
+                "CMUX_FIXTURE": str(fixture_path),
+                "CMUX_AGENT_LAUNCH_KIND": "", "CLAUDE_CODE_SESSION_ID": "",
+                "CODEX_THREAD_ID": "", "OPENCODE_SESSION_ID": ""}
+
+    def runtime_hints():
+        agents = [agent for item in fixture["current"]["items"]
+                  for agent in item.get("agents", [])
+                  if isinstance(agent, dict) and agent.get("state") != "ended"]
+        if len(agents) != 1 or agents[0].get("kind") not in ("claude", "codex", "opencode"):
+            return {}
+        harness = agents[0]["kind"]
+        session_name = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
+                        "opencode": "OPENCODE_SESSION_ID"}[harness]
+        return {"CMUX_AGENT_LAUNCH_KIND": harness, session_name: agents[0].get("session_id", "")}
 
     def run(fmt=None, ok=True, extra_env=None, write_config=True):
         if write_config:
@@ -2628,7 +2641,8 @@ def test_owner_args_cli(temp):
                          if config_path.exists() else None)
         before_fixture = (fixture_path.stat().st_mtime_ns, fixture_path.read_bytes())
         args = ["owner-args"] + (["--format", fmt] if fmt else [])
-        result = run_cli(state, *args, env={**base_env, **(extra_env or {})}, ok=ok)
+        result = run_cli(state, *args,
+                         env={**base_env, **runtime_hints(), **(extra_env or {})}, ok=ok)
         after_config = ((config_path.stat().st_mtime_ns, config_path.read_bytes())
                         if config_path.exists() else None)
         check(after_config == before_config and
@@ -2655,8 +2669,15 @@ def test_owner_args_cli(temp):
           "owner-args shell output did not preserve exact safely quoted argument boundaries")
     poisoned_env = {"CMUX_AGENT_LAUNCH_KIND": "claude", "OPENCODE_SESSION_ID": "ses_wrong",
                     "CMUX_SURFACE_ID": uuid_text()}
-    check(parse_json(run("json", extra_env=poisoned_env))["owner"] == owner,
-          "owner-args trusted conflicting environment identity over CMUX identify/current")
+    poisoned = run("json", ok=False, extra_env=poisoned_env)
+    check(poisoned.returncode == 2 and "runtime harness does not match" in poisoned.stderr,
+          "owner-args accepted environment hints that conflict with CMUX identify/current")
+    absent_hint = run("json", ok=False, extra_env={"OPENCODE_SESSION_ID": ""})
+    check(absent_hint.returncode == 2 and "Exactly one native session hint" in absent_hint.stderr,
+          "owner-args accepted a caller with no native session hint")
+    malformed_hint = run("json", ok=False, extra_env={"OPENCODE_SESSION_ID": "not-a-session"})
+    check(malformed_hint.returncode == 2 and "session hint is invalid" in malformed_hint.stderr,
+          "owner-args accepted a malformed native session hint")
     check(not state.exists() and config_path.read_bytes() == unchanged_config,
           "owner-args created Warp state or modified Hailing enrollment")
 
@@ -2670,6 +2691,33 @@ def test_owner_args_cli(temp):
         native_result = parse_json(run("json"))
         check(native_result["owner"] == native_owner,
               f"owner-args did not verify the current {harness} caller")
+
+    parent_codex_session = uuid_text()
+    child_codex_session = uuid_text()
+    codex_parent = {"harness": "codex", "session": parent_codex_session, "surface": surface}
+    config["targets"] = [{**codex_parent, "workspace": workspace, "label": "private-fixture-label",
+                          "started_at": 1.0, "cutoff": 0.0}]
+    fixture["current"]["items"] = [{**current_item,
+        "agents": [{"session_id": parent_codex_session, "kind": "codex", "state": "working"}]}]
+    same_harness_child = run("json", ok=False,
+                             extra_env={"CMUX_AGENT_LAUNCH_KIND": "codex",
+                                        "CODEX_THREAD_ID": child_codex_session})
+    check(same_harness_child.returncode == 2 and "does not match the current CMUX owner" in same_harness_child.stderr,
+          "owner-args accepted a headless same-harness child session on its parent's surface")
+
+    parent_claude_session = uuid_text()
+    child_codex_session = uuid_text()
+    claude_parent = {"harness": "claude", "session": parent_claude_session, "surface": surface}
+    config["targets"] = [{**claude_parent, "workspace": workspace, "label": "private-fixture-label",
+                          "started_at": 1.0, "cutoff": 0.0}]
+    fixture["current"]["items"] = [{**current_item,
+        "agents": [{"session_id": parent_claude_session, "kind": "claude", "state": "working"}]}]
+    cross_harness_child = run("json", ok=False,
+                              extra_env={"CMUX_AGENT_LAUNCH_KIND": "claude",
+                                         "CLAUDE_CODE_SESSION_ID": parent_claude_session,
+                                         "CODEX_THREAD_ID": child_codex_session})
+    check(cross_harness_child.returncode == 2 and "Exactly one native session hint" in cross_harness_child.stderr,
+          "owner-args accepted a cross-harness child alongside its inherited parent identity")
 
     config["targets"] = [target]
     fixture["current"]["items"] = [current_item]
@@ -2760,6 +2808,7 @@ def test_owner_args_cli(temp):
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
     installed_env = os.environ.copy()
     installed_env.update(base_env)
+    installed_env.update(runtime_hints())
     installed_result = subprocess.run([str(bin_dir / "warp-drive"), "--state-dir", str(installed_state),
                                        "owner-args", "--format", "json"], cwd=temp,
                                       env=installed_env, text=True, capture_output=True)

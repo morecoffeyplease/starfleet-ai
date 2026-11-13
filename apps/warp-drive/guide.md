@@ -88,8 +88,8 @@ warp-drive owner-args --format shell
 ```
 
 The child then uses those exact parent-provided flags on its existing Warp request command.
-A child must not use `owner-args` to borrow its parent's identity implicitly.
 The command reads CMUX's current native caller and the local Hailing enrollment without creating Warp state, enrolling an owner or checking notification delivery.
+It requires `CMUX_AGENT_LAUNCH_KIND` and exactly one matching native session hint to agree with CMUX and Hailing, so a delegated child uses its parent's supplied flags instead of asking `owner-args` to infer the parent's identity.
 An exact configured binding does not prove that a future completion message is queued, prompted, received or read.
 
 For OpenCode, pass its exact native `ses_` session ID, including letter case, and the current CMUX surface UUID.
