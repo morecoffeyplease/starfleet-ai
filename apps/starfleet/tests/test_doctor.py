@@ -126,14 +126,16 @@ class DoctorTests(unittest.TestCase):
         states["worker"] = doctor.CheckState.READY
         states["intended_delivery"] = doctor.CheckState.READY
         states["checkpoint"] = doctor.CheckState.MISSING
-        orchestrator = doctor.tool_status(adapter, states, "fixture")
+        with patch.object(doctor.shutil, "which", return_value="/synthetic/pattern-buffer"):
+            orchestrator = doctor.tool_status(adapter, states, "fixture")
         checkpoint = next(check for check in orchestrator["checks"]
                           if check["name"] == "checkpoint")
         self.assertTrue(checkpoint["required"])
         self.assertEqual(orchestrator["status"], "missing")
 
         states["checkpoint"] = doctor.CheckState.NOT_APPLICABLE
-        implementer = doctor.tool_status(adapter, states, "fixture")
+        with patch.object(doctor.shutil, "which", return_value="/synthetic/pattern-buffer"):
+            implementer = doctor.tool_status(adapter, states, "fixture")
         checkpoint = next(check for check in implementer["checks"]
                           if check["name"] == "checkpoint")
         self.assertFalse(checkpoint["required"])
@@ -141,10 +143,20 @@ class DoctorTests(unittest.TestCase):
 
         states["registration"] = doctor.CheckState.UNKNOWN
         states["checkpoint"] = doctor.CheckState.UNKNOWN
-        unresolved = doctor.tool_status(adapter, states, "fixture")
+        with patch.object(doctor.shutil, "which", return_value="/synthetic/pattern-buffer"):
+            unresolved = doctor.tool_status(adapter, states, "fixture")
         checkpoint = next(check for check in unresolved["checks"]
                           if check["name"] == "checkpoint")
         self.assertFalse(checkpoint["required"])
+
+        states["registration"] = doctor.CheckState.READY
+        states["checkpoint"] = doctor.CheckState.NOT_APPLICABLE
+        with patch.object(doctor.shutil, "which", return_value=None):
+            missing_runtime = doctor.tool_status(adapter, states, "fixture")
+        runtime = next(check for check in missing_runtime["checks"]
+                       if check["name"] == "runtime")
+        self.assertEqual(runtime["status"], "missing")
+        self.assertEqual(missing_runtime["status"], "missing")
 
     def test_native_observation_gets_terminal_selectors_but_uses_current_snapshot_owner(self):
         with tempfile.TemporaryDirectory() as directory:
