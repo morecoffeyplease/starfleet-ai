@@ -594,6 +594,70 @@ class PreferencesTest(unittest.TestCase):
             "harness": "opencode", "provider_id": "trial-local", "slug": "qwen3.6:35b",
             "efforts": ["max"], "source": "exact provider model"})
 
+    def test_resolve_successor_choice_is_read_only_and_distinguishes_candidate_provenance(self):
+        self.app.save_state("orchestrators", {"lane": {**self.recipient, "harness": "codex"}})
+        self.activate("Codex-only")
+        before_config = {p.relative_to(self.config_dir): p.read_bytes() for p in self.config_dir.rglob("*") if p.is_file()}
+        before_state = {p.relative_to(self.state_dir): p.read_bytes() for p in self.state_dir.rglob("*") if p.is_file()}
+
+        result = self.run_cli(dict(os.environ), "resolve-successor", "--seat", "lane",
+                              "--family", "codex-astra", "--effort", "xhigh")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        active = mp.selection(self.app.config())
+        self.assertEqual(report["protocol"], "starfleet.model-preferences.successor-choice/v1")
+        self.assertEqual(report["seat"]["harness"], "codex")
+        self.assertEqual(report["choice"], {"role": "orchestrator", "family": "codex-astra",
+                                             "harness": "codex", "model": "gpt-6-astra", "effort": "xhigh"})
+        self.assertEqual(report["active_selection_digest"], active["selection"])
+        self.assertFalse(report["candidate_matches_active_orchestrator"])
+        self.assertEqual(report["provenance"], {"kind": "configured_model_family",
+                                                "family_source": "opt-in example; current availability is not checked"})
+        self.assertNotEqual(report["candidate_digest"], active["selection"])
+        self.assertEqual({p.relative_to(self.config_dir): p.read_bytes() for p in self.config_dir.rglob("*") if p.is_file()},
+                         before_config)
+        self.assertEqual({p.relative_to(self.state_dir): p.read_bytes() for p in self.state_dir.rglob("*") if p.is_file()},
+                         before_state)
+
+    def test_resolve_successor_choice_supports_configured_candidate_without_active_profile(self):
+        self.app.save_state("orchestrators", {"lane": {**self.recipient, "harness": "codex"}})
+
+        result = self.run_cli(dict(os.environ), "resolve-successor", "--seat", "lane",
+                              "--family", "codex-luna", "--effort", "xhigh")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIsNone(report["active_selection_digest"])
+        self.assertIsNone(report["candidate_matches_active_orchestrator"])
+        self.assertEqual(report["choice"]["model"], "gpt-6-luna")
+
+    def test_resolve_successor_choice_rejects_unconfigured_families_efforts_and_seats(self):
+        self.app.save_state("orchestrators", {"lane": {**self.recipient, "harness": "codex"}})
+        cases = (
+            ("other-lane", "codex-luna", "xhigh", "Unknown orchestrator seat"),
+            ("lane", "not-configured", "xhigh", "Unknown configured model family"),
+            ("lane", "codex-luna", "unlisted", "Unsupported effort"),
+            ("lane", "claude-opus", "high", "registered seat's existing harness"),
+        )
+        for seat, family, effort, expected in cases:
+            with self.subTest(seat=seat, family=family, effort=effort):
+                result = self.run_cli(dict(os.environ), "resolve-successor", "--seat", seat,
+                                      "--family", family, "--effort", effort)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected, result.stderr)
+
+    def test_resolve_successor_choice_without_override_returns_registration_only(self):
+        self.app.save_state("orchestrators", {"lane": {**self.recipient, "harness": "codex"}})
+
+        result = self.run_cli(dict(os.environ), "resolve-successor", "--seat", "lane")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIsNone(report["choice"])
+        self.assertIsNone(report["candidate_digest"])
+        self.assertEqual(report["provenance"]["kind"], "seat_registration_only")
+
     def test_single_reviewer_defaults_resolve_without_a_slot_and_reject_slot_two(self):
         for profile, standard, advanced in (("Codex-only", "gpt-6.1-sol", "gpt-6-astra"),
                                             ("Codex-Muse", "gpt-6.1-sol", "gpt-6-astra"),

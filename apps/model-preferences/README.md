@@ -42,6 +42,21 @@ When an activation or model update changes active launch choices, select future-
 The command never changes running sessions or starts a handoff by itself.
 Use startup --expect-profile NAME to compare a session's stated intent with the saved active selection without activating it.
 
+## Resolve a Replicator successor choice
+
+Replicator uses a read-only resolver to select an existing configured model family and supported effort for one registered orchestrator seat.
+The optional candidate must use the seat's registered harness.
+The resolver does not change or activate a shared profile, query a provider catalog, or establish native runtime settings.
+
+```sh
+model-preferences resolve-successor --seat SEAT --family codex-luna --effort xhigh
+```
+
+The result retains the active selection digest when an active profile exists and carries a separate candidate provenance digest for the explicit choice.
+The active selection digest keeps its existing meaning and does not authenticate a candidate that differs from the active orchestrator role.
+Without `--family` and `--effort`, the result identifies the registered seat only.
+Replicator uses that registration to scope the preserve-observed request while keeping predecessor model, effort, native generation, and effective permissions unknown until exact-session observations are available.
+
 ## Human approval authority
 
 No human approval authority is assigned by default.

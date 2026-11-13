@@ -1,7 +1,7 @@
 # Hand off an orchestrator session
 
 Use this guide when an authorized user explicitly requests a manual handoff for an exact orchestrator session.
-The `replicator` command only prints this guide and does not perform a handoff.
+The `guide --print` command prints this guide, and the current successor commands configure or inspect intent without performing a handoff.
 Treat the checklist as the existing handoff procedure, not as a new approval step.
 
 ## Prerequisites and existing installations
@@ -57,6 +57,38 @@ An unavailable or ambiguous CMUX observation remains `unknown` and does not iden
 If a context read fails, keep dependent handoff work blocked and repeat the same read after access recovers.
 Successful stat or mode checks do not prove that file bytes are readable.
 Git errors can follow unreadable metadata, so do not repair permissions or Git metadata from an error alone.
+
+## Configure one-shot successor intent
+
+Use Replicator to record a one-shot intent for the exact Model Preferences seat and canonical Git worktree before a separately authorized handoff.
+Omit the model options to request preservation of the predecessor's observed model and effort, or pass both `--family` and `--effort` to snapshot a configured Model Preferences candidate.
+The candidate must use the registered seat's existing harness and a supported effort for its configured family.
+Replicator does not activate or change a Model Preferences profile.
+
+```sh
+replicator successor configure --seat SEAT --worktree /absolute/path/to/worktree \
+  --family codex-luna --effort xhigh
+replicator successor show --seat SEAT --worktree /absolute/path/to/worktree
+replicator successor cancel INTENT_ID
+```
+
+Pass `--mp-config-dir` and `--mp-state-dir` to configure or show when the existing Model Preferences installation uses explicit paths.
+Repeating the same configured request for the same seat and worktree returns the existing intent.
+Cancel the current intent before configuring a different choice for that scope.
+Only one-shot intents are supported, and persistent defaults are unsupported.
+The preserve-observed request records the intended policy while predecessor model and effort remain `unknown` until an exact-session observation exists.
+The current CMUX snapshot does not expose a supported native generation, model, effort, or effective-permission observation.
+Replicator therefore leaves generation, predecessor settings, effective permissions, and readiness `unknown` and does not claim native binding or parity.
+These configuration commands do not launch a successor, transfer custody, close the predecessor, or consume an intent.
+
+Run the passive diagnostic outside Git or before configuring an intent:
+
+```sh
+replicator doctor --starfleet-json
+```
+
+The diagnostic is read-only and reports the configured state separately from observed delivery.
+With no intent file, configuration is `ready`, registration, worker, and intended delivery are `not_applicable`, and observed delivery is `unknown`.
 
 ## Inspect the actual checkout and tools
 

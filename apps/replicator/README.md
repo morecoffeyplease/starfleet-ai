@@ -1,7 +1,7 @@
 # Replicator
 
-Replicator packages a maintained guide and read-only preflight for an explicitly requested manual handoff between orchestrator sessions.
-The guide describes the handoff procedure, and preflight reports only the caller, worktree, and explicit input checks it can observe.
+Replicator packages a maintained guide, read-only preflight, and one-shot successor intent configuration for an explicitly requested manual handoff between orchestrator sessions.
+The guide describes the handoff procedure, preflight reports only the caller, worktree, and explicit input checks it can observe, and successor intent records a frozen choice for a configured seat and worktree.
 Replicator does not start agents, workers, timers, or an automatic handoff trigger.
 
 ## Print the guide
@@ -46,6 +46,39 @@ An unknown status means the required evidence is missing or ambiguous.
 Keep the predecessor while a required handoff check remains blocked or unknown.
 The current CMUX snapshot provides caller identity and state, but no model, effort, or effective permission fields.
 Preflight reports those settings as `unknown` until an exact-session native control provides evidence.
+
+## Configure a one-shot successor intent
+
+Configure the exact registered Model Preferences seat and Git worktree before a separately authorized handoff.
+Omit `--family` and `--effort` to record a request to preserve the predecessor's observed model and effort.
+Pass both options to snapshot one existing Model Preferences family and supported effort without activating or changing a shared profile.
+
+```sh
+replicator successor configure --seat SEAT --worktree /absolute/path/to/worktree \
+  --family codex-luna --effort xhigh
+replicator successor show --seat SEAT --worktree /absolute/path/to/worktree
+replicator successor cancel INTENT_ID
+```
+
+The configure and show commands accept `--mp-config-dir` and `--mp-state-dir` when the existing Model Preferences installation uses explicit paths.
+The command resolves the seat and candidate through Model Preferences, which accepts only a configured family and supported effort for the registered harness.
+Replicator stores the candidate and its separate provenance digest in a private state directory, and repeating the same configured request for the same seat and worktree is idempotent.
+A different configured request for that scope requires cancelling the current intent first.
+This interface supports one-shot intents only, and persistent defaults are unsupported.
+The default preserve-observed request does not infer a predecessor model or effort from the saved profile, argv, or environment.
+The stored native generation, predecessor model and effort, effective permissions, and readiness remain `unknown` until supported exact-session observations exist.
+The current CMUX snapshot provides no supported native generation, model, effort, or effective-permission observation, so configuration does not bind a generation or establish runtime parity or readiness.
+Configuration does not launch a successor, transfer custody, close a predecessor, or consume an intent.
+
+Run the passive configuration diagnostic outside a Git checkout:
+
+```sh
+replicator doctor --starfleet-json
+```
+
+The diagnostic performs no writes, locks, native queries, or credential reads.
+With no intent file, `configuration` is `ready`, registration, worker, and intended delivery are `not_applicable`, and observed delivery is `unknown`.
+Valid diagnostic output exits successfully even when an individual check is blocked or unknown.
 
 ## Install the local launcher
 

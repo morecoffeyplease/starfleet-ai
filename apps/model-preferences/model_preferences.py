@@ -1537,6 +1537,10 @@ def parser():
             s.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for guarded preflight.")
             s.add_argument("--pattern-buffer", "--context-injector", dest="context_injector", help="Pattern Buffer script; --context-injector is a compatibility alias."); s.add_argument("--owner-worktree")
             s.add_argument("--receipt-file", help="Forward a unique Pattern Buffer dispatch snapshot path; requires its script and owner worktree.")
+    successor_choice = sub.add_parser("resolve-successor", help="resolve a configured successor choice without writes")
+    successor_choice.add_argument("--seat", required=True)
+    successor_choice.add_argument("--family")
+    successor_choice.add_argument("--effort")
     resume = sub.add_parser("resume", help="Continue a guarded OpenCode session or an exited, verified Codex launch.")
     resume.add_argument("launch"); resume.add_argument("--task-file", required=True)
     resume.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for a guarded continuation.")
@@ -1588,6 +1592,65 @@ def resolve(snapshot, role, slot):
     else:
         require(slot is None, "--slot applies only to reviewer groups.")
     return {"profile": snapshot["profile"], "selection": snapshot["selection"], "role": role, **choice}
+
+
+def resolve_successor_choice(app, config, args):
+    require(bool(args.seat.strip()), "Seat name must be nonempty.")
+    require((args.family is None) == (args.effort is None),
+            "Pass both --family and --effort to resolve an explicit successor choice.")
+    recipient = app.state("orchestrators", {}).get(args.seat)
+    require(isinstance(recipient, dict), "Unknown orchestrator seat.")
+    require(all(isinstance(recipient.get(key), str) and recipient[key]
+                for key in ("workspace", "surface", "session", "harness")),
+            "Orchestrator seat registration is incomplete.")
+    try:
+        workspace = str(uuid.UUID(recipient["workspace"]))
+        surface = str(uuid.UUID(recipient["surface"]))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PreferenceError("Orchestrator seat registration has invalid workspace or surface identity.") from exc
+    require(recipient["harness"] in ("claude", "codex", "muse"),
+            "Orchestrator seat registration uses an unsupported harness.")
+    seat = {"name": args.seat, "harness": recipient["harness"],
+            "session_id": recipient["session"], "workspace_id": workspace, "panel_id": surface}
+    active = selection(config) if config.get("active") else None
+    candidate = None
+    candidate_digest = None
+    matches_active = None
+    provenance = {"kind": "seat_registration_only", "family_source": None}
+    if args.family is not None:
+        model = config["models"].get(args.family)
+        require(isinstance(model, dict), "Unknown configured model family.")
+        require(args.effort in model["efforts"], "Unsupported effort for configured model family.")
+        require(model["harness"] == recipient["harness"],
+                "Successor choices must use the registered seat's existing harness.")
+        candidate = {"role": "orchestrator", "family": args.family,
+                     "harness": model["harness"], "model": model["slug"], "effort": args.effort}
+        if model["harness"] == "opencode":
+            candidate["provider_id"] = model["provider_id"]
+        active_choice = resolve(active, "orchestrator", None) if active else None
+        matches_active = (all(
+            active_choice.get(key) == candidate.get(key)
+            for key in ("family", "harness", "model", "effort", "provider_id"))
+            if active_choice else None)
+        family_source = model.get("source") if isinstance(model.get("source"), str) else None
+        provenance = {"kind": "configured_model_family", "family_source": family_source}
+        candidate_digest = digest({
+            "protocol": "starfleet.model-preferences.successor-choice/v1",
+            "seat": seat,
+            "candidate": candidate,
+            "family_source": family_source,
+            "active_selection_digest": active["selection"] if active else None,
+        })
+    return {
+        "schema_version": 1,
+        "protocol": "starfleet.model-preferences.successor-choice/v1",
+        "seat": seat,
+        "choice": candidate,
+        "active_selection_digest": active["selection"] if active else None,
+        "candidate_matches_active_orchestrator": matches_active,
+        "candidate_digest": candidate_digest,
+        "provenance": provenance,
+    }
 
 
 def preflight_remediation(code, details=None):
@@ -3997,7 +4060,11 @@ def main():
         if args.command == "review-guidance":
             sys.stdout.write(reviewer_guidance.REVIEWER_GUIDANCE)
             return 0
-        result = execute(args)
+        if args.command == "resolve-successor":
+            app = App(args.config_dir, args.state_dir)
+            result = resolve_successor_choice(app, app.config(), args)
+        else:
+            result = execute(args)
         print(json.dumps(result, indent=2))
         if result.get("exit_code"):
             return result["exit_code"] if result["exit_code"] > 0 else 1

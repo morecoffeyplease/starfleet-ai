@@ -10,7 +10,7 @@ import shlex
 import sys
 
 MARKER = "# starfleet-replicator:v1"
-SOURCE_NAMES = ("replicator.py", "guide.md", "README.md")
+SOURCE_NAMES = ("replicator.py", "successor_intents.py", "guide.md", "README.md")
 
 
 def require(condition, message):

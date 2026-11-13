@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 
+import successor_intents
+
 
 STATUSES = ("ready", "blocked", "unknown", "skipped")
 ACTIVE_CMUX_STATES = ("working", "idle")
@@ -18,6 +20,7 @@ MAX_COMMAND_OUTPUT = 2 * 1024 * 1024
 MAX_INPUT_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 5
 TOOL_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")
+MAX_MODEL_PREFERENCES_OUTPUT = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -411,14 +414,136 @@ def preflight_report(context_files=(), guidance_files=(), skipped_tools=(), envi
     return build_report(checks, caller)
 
 
+def canonical_worktree_identity(value):
+    try:
+        worktree = Path(value).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise successor_intents.IntentError("Worktree is unavailable or cannot be resolved.") from exc
+    if not worktree.is_dir():
+        raise successor_intents.IntentError("Worktree must be an existing Git worktree root.")
+    git = shutil.which("git")
+    if git is None:
+        raise successor_intents.IntentError("The read-only Git command is unavailable.")
+    status, root_text = git_value(git, worktree, "rev-parse", "--show-toplevel")
+    if status != "ready":
+        raise successor_intents.IntentError("The exact Git worktree root could not be confirmed.")
+    try:
+        root = resolve_path(root_text)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise successor_intents.IntentError("The Git worktree root could not be resolved.") from exc
+    if root != worktree:
+        raise successor_intents.IntentError("Pass the exact Git worktree root, not a nested path.")
+    status, directories = git_directories(git, root)
+    if status != "ready" or directories is None:
+        raise successor_intents.IntentError("The exact Git worktree metadata could not be confirmed.")
+    git_dir, common_dir = directories
+    return {"root": str(root), "git_dir": str(git_dir), "common_dir": str(common_dir)}
+
+
+def model_preferences_successor_choice(args):
+    executable = shutil.which("model-preferences")
+    if executable is None:
+        raise successor_intents.IntentError("The configured Model Preferences command is unavailable.")
+    family = getattr(args, "family", None)
+    effort = getattr(args, "effort", None)
+    argv = [executable]
+    if args.mp_config_dir:
+        argv.extend(("--config-dir", args.mp_config_dir))
+    if args.mp_state_dir:
+        argv.extend(("--state-dir", args.mp_state_dir))
+    argv.extend(("resolve-successor", "--seat", args.seat))
+    if family is not None:
+        argv.extend(("--family", family, "--effort", effort))
+    status, output = run_bounded(argv)
+    if status != "ready" or output is None:
+        raise successor_intents.IntentError("Model Preferences could not resolve this successor scope and choice.")
+    if len(output.encode("utf-8", "replace")) > MAX_MODEL_PREFERENCES_OUTPUT:
+        raise successor_intents.IntentError("Model Preferences returned an oversized successor resolution.")
+    try:
+        result = json.loads(output)
+    except (TypeError, ValueError) as exc:
+        raise successor_intents.IntentError("Model Preferences returned an unreadable successor resolution.") from exc
+    if (not isinstance(result, dict) or result.get("schema_version") != 1
+            or result.get("protocol") != "starfleet.model-preferences.successor-choice/v1"):
+        raise successor_intents.IntentError("Model Preferences returned an unsupported successor resolution.")
+    seat = result.get("seat")
+    if (not isinstance(seat, dict) or seat.get("name") != args.seat
+            or not all(isinstance(seat.get(key), str) and seat[key]
+                       for key in ("harness", "session_id", "workspace_id", "panel_id"))):
+        raise successor_intents.IntentError("Model Preferences did not return one complete configured seat.")
+    choice = result.get("choice")
+    if family is None:
+        if choice is not None:
+            raise successor_intents.IntentError("Model Preferences returned an unexpected model choice.")
+    elif (not isinstance(choice, dict) or choice.get("family") != family
+          or choice.get("effort") != effort or choice.get("harness") != seat["harness"]):
+        raise successor_intents.IntentError("The configured choice is unsupported for this exact seat and harness.")
+    return result
+
+
+def successor_scope(args):
+    resolved = model_preferences_successor_choice(args)
+    worktree = canonical_worktree_identity(args.worktree)
+    scope = {"seat": resolved["seat"], "worktree": worktree}
+    family = getattr(args, "family", None)
+    if family is None:
+        choice = {"kind": "preserve_observed_predecessor"}
+    else:
+        choice = {
+            "kind": "model_preferences_candidate",
+            "snapshot": resolved["choice"],
+            "active_selection_digest": resolved.get("active_selection_digest"),
+            "candidate_matches_active_orchestrator": resolved.get("candidate_matches_active_orchestrator"),
+            "candidate_digest": resolved.get("candidate_digest"),
+            "provenance": resolved.get("provenance"),
+        }
+        if not isinstance(choice["candidate_digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", choice["candidate_digest"]):
+            raise successor_intents.IntentError("Model Preferences did not provide candidate provenance evidence.")
+    return scope, choice
+
+
+def successor_configure(args):
+    if (args.family is None) != (args.effort is None):
+        raise successor_intents.IntentError("Pass both --family and --effort for an explicit model choice.")
+    scope, choice = successor_scope(args)
+    return successor_intents.configure_intent(args.state_dir, scope, choice)
+
+
+def successor_show(args):
+    if getattr(args, "family", None) is not None or getattr(args, "effort", None) is not None:
+        raise successor_intents.IntentError("Do not pass a model choice to successor show.")
+    scope, _ = successor_scope(args)
+    return successor_intents.show_intent(args.state_dir, scope)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="replicator",
-        description="Print the handoff guide or a read-only operational readiness report.",
+        description="Configure one-shot successor intent, print the handoff guide, or inspect readiness.",
     )
+    default_state_dir = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "starfleet-ai/replicator"
+    parser.add_argument("--state-dir", default=str(default_state_dir), help="private Replicator state directory")
     commands = parser.add_subparsers(dest="command", required=True)
     guide = commands.add_parser("guide", help="print the maintained handoff guide")
     guide.add_argument("--print", dest="print_guide", action="store_true", required=True)
+    successor = commands.add_parser("successor", help="configure and inspect one-shot successor intent")
+    successor_commands = successor.add_subparsers(dest="successor_command", required=True)
+    configure = successor_commands.add_parser("configure", help="configure intent without launching a successor")
+    configure.add_argument("--seat", required=True)
+    configure.add_argument("--worktree", required=True)
+    configure.add_argument("--family", help="existing Model Preferences model family for an explicit one-shot choice")
+    configure.add_argument("--effort", help="supported effort for --family")
+    configure.add_argument("--mp-config-dir")
+    configure.add_argument("--mp-state-dir")
+    show = successor_commands.add_parser("show", help="inspect intent for the exact seat and worktree")
+    show.add_argument("--seat", required=True)
+    show.add_argument("--worktree", required=True)
+    show.add_argument("--mp-config-dir")
+    show.add_argument("--mp-state-dir")
+    cancel = successor_commands.add_parser("cancel", help="cancel a configured intent by its exact ID")
+    cancel.add_argument("intent_id")
+    doctor = commands.add_parser("doctor", help="inspect Replicator configuration without writes or native queries")
+    doctor.add_argument("--starfleet-json", action="store_true", help="print the agreed structured diagnostic protocol")
     preflight = commands.add_parser("preflight", help="inspect the current caller and worktree without writes")
     preflight.add_argument("--context-file", action="append", default=[], metavar="PATH")
     preflight.add_argument("--guidance-file", action="append", default=[], metavar="PATH")
@@ -446,6 +571,27 @@ def main(argv=None):
     if args.command == "guide" and args.print_guide:
         sys.stdout.buffer.write(Path(__file__).with_name("guide.md").read_bytes())
         return 0
+    if args.command == "doctor":
+        report = successor_intents.doctor_report(args.state_dir)
+        if args.starfleet_json:
+            print(json.dumps(report, indent=2))
+        else:
+            for name, check in report["checks"].items():
+                print(f"{name}: {check['status']}")
+        return 0
+    if args.command == "successor":
+        try:
+            if args.successor_command == "configure":
+                result = successor_configure(args)
+            elif args.successor_command == "show":
+                result = successor_show(args)
+            else:
+                result = successor_intents.cancel_intent(args.state_dir, args.intent_id)
+            print(json.dumps(result, indent=2))
+            return 0
+        except (OSError, ValueError) as exc:
+            print(f"replicator: {exc}", file=sys.stderr)
+            return 1
     if args.command == "preflight":
         try:
             report = preflight_report(args.context_file, args.guidance_file, args.skip_tool)
