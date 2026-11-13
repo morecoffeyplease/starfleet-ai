@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import copy
 import datetime as dt
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -444,6 +445,78 @@ class App(CmuxTransport):
                 self.save_state("notification", saved)
                 return saved
         return {"superseded": True, "selection": snapshot["selection"], "attempts": results}
+
+
+def process_birth_identity(pid):
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                                text=True, capture_output=True, timeout=2,
+                                env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    birth = result.stdout.strip()
+    return birth or None
+
+
+def process_record(pid):
+    birth = process_birth_identity(pid)
+    return {"pid": pid, "birth": birth, "status": "observed" if birth else "unavailable"}
+
+
+def observe_process(record):
+    if (not isinstance(record, dict) or isinstance(record.get("pid"), bool)
+            or not isinstance(record.get("pid"), int) or record["pid"] <= 0
+            or not isinstance(record.get("birth"), str) or not record["birth"]):
+        return "unknown"
+    pid = record["pid"]
+    try:
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                                text=True, capture_output=True, timeout=2,
+                                env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if result.returncode == 0 and result.stdout.strip():
+        return "live" if result.stdout.strip() == record["birth"] else "pid_reused"
+    if result.returncode != 1 or result.stdout.strip() or result.stderr.strip():
+        return "unknown"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "stopped"
+    except PermissionError:
+        return "unknown"
+    except OSError as exc:
+        return "stopped" if exc.errno == errno.ESRCH else "unknown"
+    return "unknown"
+
+
+def capture_dispatch_owner(app):
+    try:
+        caller = app.caller()
+    except (PreferenceError, OSError, ValueError, TypeError, KeyError, AttributeError,
+            subprocess.SubprocessError):
+        return {"status": "unavailable"}
+    identity = {key: caller.get(key) for key in ("harness", "session", "workspace", "surface")}
+    if (not isinstance(identity["harness"], str) or identity["harness"] not in ("claude", "codex", "muse")
+            or not isinstance(identity["session"], str) or not identity["session"]
+            or not all(isinstance(identity[key], str) and identity[key] for key in ("workspace", "surface"))):
+        return {"status": "unavailable"}
+    return {"status": "verified", "identity": identity}
+
+
+def optional_dispatch_owner(app, args):
+    try:
+        config = app.config()
+        choice = resolve(selection(config), args.role, args.slot)
+    except (PreferenceError, OSError, ValueError, TypeError, KeyError):
+        return None
+    if choice.get("harness") != "codex":
+        return None
+    return capture_dispatch_owner(app)
 
 
 def argv_for(choice, prompt, cwd, interactive=False):
@@ -1470,6 +1543,13 @@ def parser():
     resume.add_argument("--review-plan"); resume.add_argument("--approval")
     resume.add_argument("--review-target"); resume.add_argument("--review-cycle")
     resume.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review continuation.")
+    launch_inspect = sub.add_parser("launch-inspect", help="Read-only inspection of an exact recorded launch and its recovery evidence.")
+    launch_inspect.add_argument("launch")
+    launch_reconcile = sub.add_parser("launch-reconcile", help="Record an owner-authorized interrupted or abandoned launch disposition.")
+    launch_reconcile.add_argument("launch")
+    launch_reconcile.add_argument("--disposition", choices=("interrupted", "abandoned"), required=True)
+    launch_reconcile.add_argument("--request-key", required=True,
+                                  help="Unique canonical UUID retained with the reconciliation history for idempotent retry.")
     review = sub.add_parser("review-plan"); review.add_argument("--cwd", required=True)
     review.add_argument("--base", required=True); review.add_argument("--facts", required=True)
     review.add_argument("--target"); review.add_argument("--cycle-key"); review.add_argument("--previous-cycle")
@@ -2521,6 +2601,7 @@ def execute(args):
         return {"guidance": reviewer_guidance.REVIEWER_GUIDANCE}
     app = App(args.config_dir, args.state_dir)
     command = args.command
+    dispatch_owner = optional_dispatch_owner(app, args) if command == "dispatch" else None
     if command == "doctor":
         caller = (read_only_diagnostic_caller(sys.stdin.buffer)
                   if args.starfleet_json and not sys.stdin.isatty() else None)
@@ -2529,6 +2610,10 @@ def execute(args):
         return opencode_preflight(app, args)
     if command == "resume":
         return resume_launch(app, args)
+    if command == "launch-inspect":
+        return launch_inspect(app, args.launch)
+    if command == "launch-reconcile":
+        return launch_reconcile(app, args.launch, args.disposition, args.request_key)
     if command == "examples":
         return example_config()
     with locked(app.config_dir):
@@ -2831,6 +2916,14 @@ def execute(args):
                 launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
                           "context_injector": adapter, "slot": args.slot,
                           "task_digest": task_digest, "status": "starting"}
+                if choice["harness"] == "codex":
+                    launch["recovery_provenance"] = {
+                        "version": 1,
+                        "owner": dispatch_owner or {"status": "unavailable"},
+                        "dispatcher": process_record(os.getpid()),
+                        "child": None,
+                    }
+                    launch["pattern_buffer_task"] = {"status": "none" if adapter is None else "awaiting_receipt"}
                 if review_cycle:
                     launch["review_cycle"] = review_cycle
                 if choice["profile"] in ("Codex-Qwen", "Qwen-only") and choice["role"].endswith("_review"):
@@ -2854,14 +2947,32 @@ def execute(args):
         env.pop("STARFLEET_CONTEXT_DISPATCH", None)
         if choice["harness"] == "codex":
             argv.insert(argv.index("exec") + 1, "--json")
-            completed = stream_codex(app, launch, argv, env, cwd)
+            completed = stream_codex(app, launch, argv, env, cwd,
+                                     on_spawn=lambda pid: record_dispatch_child(app, launch["id"], pid))
         else:
             completed = subprocess.run(argv, cwd=cwd, env=env)
         launch = app.state(f"launches/{launch['id']}", launch)
         launch.update(status="exited", exit_code=completed.returncode, finished_at=now())
     except OSError as exc:
-        launch.update(status="failed", error=str(exc)); app.save_state(f"launches/{launch['id']}", launch)
+        with locked(app.config_dir):
+            latest = app.state(f"launches/{launch['id']}", launch)
+            provenance = latest.get("recovery_provenance")
+            child = provenance.get("child") if isinstance(provenance, dict) else None
+            if isinstance(child, dict) and isinstance(child.get("pid"), int):
+                latest.update(status="uncertain", error_code="dispatch_observation_failed", uncertain_since=now())
+            else:
+                latest.update(status="failed", error=str(exc))
+            app.save_state(f"launches/{launch['id']}", latest)
+        if latest.get("status") == "uncertain":
+            raise PreferenceError("Dispatch observation failed after process start; inspect the exact launch before retrying.") from None
         raise PreferenceError(str(exc)) from exc
+    except BaseException:
+        if launch.get("choice", {}).get("harness") == "codex":
+            with locked(app.config_dir):
+                latest = app.state(f"launches/{launch['id']}", launch)
+                latest.update(status="uncertain", error_code="dispatch_interrupted", uncertain_since=now())
+                app.save_state(f"launches/{launch['id']}", latest)
+        raise
     with locked(app.config_dir):
         app.save_state(f"launches/{launch['id']}", launch)
     return {"launch": launch["id"], "exit_code": completed.returncode}
@@ -2921,14 +3032,79 @@ def bind_native(app, launch_id, session):
         app.save_state("claims", claims)
         app.save_state(f"bindings/{key}", {"launch": launch_id})
         launch["native_session"] = session
+        pattern_task = launch.get("pattern_buffer_task")
+        if (launch.get("choice", {}).get("harness") == "codex"
+                and (not isinstance(pattern_task, dict)
+                     or pattern_task.get("status") in ("awaiting_receipt", "unavailable"))):
+            launch["pattern_buffer_task"] = capture_pattern_buffer_link(launch)
         app.save_state(f"launches/{launch_id}", launch)
 
 
-def stream_codex(app, launch, argv, env, cwd, prompt=None, expected=None):
+def capture_pattern_buffer_link(launch):
+    adapter = launch.get("context_injector")
+    if adapter is None:
+        return {"status": "none"}
+    if not isinstance(adapter, dict):
+        return {"status": "unavailable"}
+    try:
+        raw, receipt = read_pattern_buffer_receipt(launch)
+        task_id = safe_id(receipt.get("task_id"))
+    except (OSError, ValueError, TypeError, KeyError, PreferenceError):
+        return {"status": "unavailable"}
+    if (not isinstance(receipt, dict) or receipt.get("receipt_type") != "immutable_dispatch_snapshot"
+            or receipt.get("harness") != "codex" or receipt.get("status") != "pending"
+            or receipt.get("session_id") is not None or receipt.get("worktree") != launch.get("cwd")
+            or receipt.get("owner_worktree") != adapter.get("owner_worktree")
+            or receipt.get("brief_sha256") != launch.get("task_digest")):
+        return {"status": "unavailable"}
+    return {"status": "linked", "task_id": task_id,
+            "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+            "initial_brief_sha256": receipt["brief_sha256"]}
+
+
+def read_pattern_buffer_receipt(launch):
+    adapter = launch.get("context_injector")
+    if not isinstance(adapter, dict) or not isinstance(adapter.get("receipt"), str):
+        raise PreferenceError("Pattern Buffer receipt is unavailable.")
+    path = Path(adapter["receipt"])
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode) and info.st_size <= 65536,
+                "Pattern Buffer receipt is not a bounded regular file.")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(65537)
+        require(len(raw) <= 65536, "Pattern Buffer receipt exceeds its inspection limit.")
+        receipt = json.loads(raw.decode("utf-8"))
+    finally:
+        os.close(descriptor)
+    require(isinstance(receipt, dict), "Pattern Buffer receipt is not an object.")
+    return raw, receipt
+
+
+def record_dispatch_child(app, launch_id, pid):
+    child = process_record(pid)
+    with locked(app.config_dir):
+        launch = app.state(f"launches/{launch_id}", None)
+        require(launch is not None, "Launch record disappeared while the dispatch process started.")
+        provenance = launch.get("recovery_provenance")
+        require(isinstance(provenance, dict) and provenance.get("version") == 1,
+                "Dispatch process provenance is unavailable.")
+        previous = provenance.get("child")
+        require(previous is None or previous.get("pid") == pid,
+                "A different dispatch child is already recorded.")
+        provenance["child"] = child
+        app.save_state(f"launches/{launch_id}", launch)
+
+
+def stream_codex(app, launch, argv, env, cwd, prompt=None, expected=None, on_spawn=None):
     """Forward JSONL output and bind only the explicit native thread.started event."""
     seen = None
     with subprocess.Popen(argv, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
                           stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL) as process:
+        if on_spawn:
+            on_spawn(process.pid)
         if prompt is not None:
             process.stdin.write(prompt)
             process.stdin.close()
@@ -2980,6 +3156,331 @@ def injector_task(app, launch, session):
     expected_owner = None if adapter["owner_worktree"] == launch["cwd"] else task["owner"]
     require(status.get("context_owner") == expected_owner, "Pattern Buffer current owner changed; nothing resumed.")
     return cli, task_id, task
+
+
+def launch_owner_observation(app, launch):
+    provenance = launch.get("recovery_provenance")
+    owner = provenance.get("owner") if isinstance(provenance, dict) else None
+    if not isinstance(owner, dict) or owner.get("status") != "verified" or not isinstance(owner.get("identity"), dict):
+        return "unavailable"
+    current = capture_dispatch_owner(app)
+    if current.get("status") != "verified":
+        return "unknown"
+    return "matched" if same_recipient(owner["identity"], current["identity"]) else "wrong_owner"
+
+
+def observe_native_session(app, session):
+    if not isinstance(session, str):
+        return "unbound"
+    try:
+        if str(uuid.UUID(session)) != session:
+            return "unknown"
+        current = app.current()
+    except (PreferenceError, OSError, ValueError, TypeError, KeyError, AttributeError,
+            subprocess.SubprocessError):
+        return "unknown"
+    if (not isinstance(current, dict) or current.get("truncated") is not False
+            or not isinstance(current.get("items"), list)):
+        return "incomplete"
+    matches = []
+    for item in current["items"]:
+        if not isinstance(item, dict) or not isinstance(item.get("agents", []), list):
+            return "unknown"
+        for agent in item.get("agents", []):
+            if (isinstance(agent, dict) and agent.get("kind") == "codex"
+                    and agent.get("session_id") == session):
+                matches.append((item, agent))
+    if not matches:
+        return "missing"
+    if len(matches) != 1:
+        return "ambiguous"
+    item, agent = matches[0]
+    freshness = item.get("freshness")
+    if not isinstance(freshness, dict) or freshness.get("state") != "current":
+        return "stale"
+    if item.get("lifecycle") == "ended" and agent.get("state") == "ended":
+        return "ended"
+    if (item.get("lifecycle") == "running"
+            and agent.get("state") in ("working", "idle", "needs_input")):
+        return "live"
+    return "unknown"
+
+
+def linked_pattern_buffer_task(app, launch):
+    link = launch.get("pattern_buffer_task")
+    if not isinstance(link, dict):
+        return {"status": "unavailable"}
+    if link.get("status") == "none":
+        return {"status": "none"}
+    if link.get("status") != "linked":
+        return {"status": "unavailable"}
+    adapter = launch.get("context_injector")
+    if not isinstance(adapter, dict):
+        return {"status": "mismatch"}
+    try:
+        raw, receipt = read_pattern_buffer_receipt(launch)
+        task_id = safe_id(link.get("task_id"))
+        require(hashlib.sha256(raw).hexdigest() == link.get("receipt_sha256")
+                and receipt.get("task_id") == task_id
+                and receipt.get("worktree") == launch.get("cwd")
+                and receipt.get("harness") == "codex"
+                and receipt.get("owner_worktree") == adapter.get("owner_worktree")
+                and receipt.get("brief_sha256") == link.get("initial_brief_sha256")
+                and link.get("initial_brief_sha256") == launch.get("task_digest"),
+                "Pattern Buffer task receipt no longer matches the recorded launch.")
+        cli = [sys.executable, adapter["script"], "--cwd", launch["cwd"]]
+        task = app.run_json([*cli, "task-status", "--task-id", task_id])
+    except (PreferenceError, OSError, ValueError, TypeError, KeyError, AttributeError,
+            subprocess.SubprocessError):
+        return {"status": "unavailable"}
+    owner = task.get("owner") if isinstance(task, dict) else None
+    if (not isinstance(task, dict) or task.get("task_id") != task_id
+            or task.get("root") != launch.get("cwd") or task.get("harness") != "codex"
+            or not isinstance(owner, dict) or owner.get("root") != adapter.get("owner_worktree")):
+        return {"status": "mismatch"}
+    status = task.get("status")
+    session = task.get("session_id")
+    native = launch.get("native_session")
+    if status == "pending" and session is None:
+        return {"status": "pending_unbound", "task_id": task_id}
+    if status == "active" and session == native and isinstance(native, str):
+        return {"status": "active_exact", "task_id": task_id}
+    if status == "finished" and session in (None, native):
+        return {"status": "finished", "task_id": task_id}
+    return {"status": "mismatch"}
+
+
+def native_binding_observation(app, launch):
+    session = launch.get("native_session")
+    if not isinstance(session, str):
+        return "unbound"
+    key = digest({"harness": "codex", "session": session})
+    try:
+        binding = app.state(f"bindings/{key}", None)
+        claims = app.state("claims", {})
+    except (PreferenceError, OSError, ValueError, TypeError):
+        return "unknown"
+    if not isinstance(claims, dict):
+        return "unknown"
+    return "verified" if binding == {"launch": launch.get("id")} and claims.get(launch.get("id")) == key else "mismatch"
+
+
+def launch_recovery_observation(app, launch):
+    provenance = launch.get("recovery_provenance")
+    if not isinstance(provenance, dict) or provenance.get("version") != 1:
+        provenance = {}
+    pattern_task = linked_pattern_buffer_task(app, launch)
+    return {
+        "owner": launch_owner_observation(app, launch),
+        "dispatcher_process": observe_process(provenance.get("dispatcher")),
+        "child_process": observe_process(provenance.get("child")),
+        "native_binding": native_binding_observation(app, launch),
+        "native_session": observe_native_session(app, launch.get("native_session")),
+        "pattern_buffer_task": pattern_task.get("status"),
+        "_pattern_buffer_task": pattern_task,
+    }
+
+
+def require_recovered_launch_ready(launch, observation):
+    history = launch_recovery_history(launch)
+    require(launch.get("status") == "interrupted" and history
+            and history[-1].get("disposition") == "interrupted",
+            "Launch has no completed interrupted reconciliation; nothing resumed.")
+    require(observation.get("owner") == "matched",
+            "Current caller is not the exact recorded launch owner; nothing resumed.")
+    require(observation.get("dispatcher_process") == "stopped"
+            and observation.get("child_process") == "stopped",
+            "Original dispatch process stop is no longer proven; nothing resumed.")
+    require(observation.get("native_session") == "ended",
+            "Fresh exact native-session ended evidence is unavailable; nothing resumed.")
+    require(observation.get("native_binding") == "verified",
+            "Native launch binding is incomplete or ambiguous; nothing resumed.")
+    task_status = observation.get("pattern_buffer_task")
+    require(task_status in ("none", "active_exact"),
+            "Pattern Buffer task is not active on the exact native session; nothing resumed.")
+
+
+def model_preferences_command(app, *args):
+    return shlex.join([sys.executable, str(Path(__file__).resolve()),
+                       "--config-dir", str(app.config_dir.resolve()),
+                       "--state-dir", str(app.state_dir.resolve()), *args])
+
+
+def pattern_buffer_task_commands(launch, task_id, action):
+    adapter = launch["context_injector"]
+    prefix = [sys.executable, adapter["script"], "--cwd", launch["cwd"]]
+    if action == "finish":
+        return [shlex.join([*prefix, "finish-task", "--task-id", task_id]),
+                shlex.join([*prefix, "task-status", "--task-id", task_id])]
+    return []
+
+
+def launch_inspection(app, launch):
+    observation = launch_recovery_observation(app, launch)
+    status = launch.get("status")
+    task_status = observation["pattern_buffer_task"]
+    task = observation["_pattern_buffer_task"]
+    process_stopped = (observation["dispatcher_process"] == "stopped"
+                       and observation["child_process"] == "stopped")
+    stop_proof = (observation["owner"] == "matched" and process_stopped
+                  and observation["native_session"] == "ended"
+                  and observation["native_binding"] == "verified")
+    next_commands = []
+    if stop_proof:
+        if task_status in ("pending_unbound", "active_exact") and task.get("task_id"):
+            next_commands.extend(pattern_buffer_task_commands(launch, task["task_id"], "finish"))
+        if status in ("starting", "uncertain"):
+            if task_status in ("none", "active_exact"):
+                request_key = str(uuid.uuid4())
+                next_commands.append(model_preferences_command(
+                    app, "launch-reconcile", launch["id"], "--disposition", "interrupted",
+                    "--request-key", request_key))
+                if task_status == "none":
+                    next_commands.append(model_preferences_command(
+                        app, "launch-reconcile", launch["id"], "--disposition", "abandoned",
+                        "--request-key", str(uuid.uuid4())))
+            elif task_status == "finished":
+                next_commands.append(model_preferences_command(
+                    app, "launch-reconcile", launch["id"], "--disposition", "abandoned",
+                    "--request-key", str(uuid.uuid4())))
+        elif status == "interrupted":
+            if task_status in ("none", "active_exact"):
+                next_commands.append(model_preferences_command(
+                    app, "resume", launch["id"], "--task-file", "/absolute/path/to/follow-up.md"))
+                if task_status == "active_exact":
+                    next_commands.extend(pattern_buffer_task_commands(launch, task["task_id"], "finish"))
+            elif task_status == "finished":
+                next_commands.append(model_preferences_command(
+                    app, "launch-reconcile", launch["id"], "--disposition", "abandoned",
+                    "--request-key", str(uuid.uuid4())))
+        elif status == "abandoned":
+            next_commands = []
+    evidence = {key: value for key, value in observation.items() if not key.startswith("_")}
+    return {
+        "launch": launch["id"],
+        "status": status,
+        "native_session_bound": isinstance(launch.get("native_session"), str),
+        "native_exit_code": "unknown" if launch.get("exit_code") is None else launch.get("exit_code"),
+        "evidence": evidence,
+        "stopped_state_proven": stop_proof,
+        "continuation_ready": (stop_proof and task_status in ("none", "active_exact")
+                               and status in ("starting", "uncertain", "interrupted")),
+        "abandonment_ready": (stop_proof and task_status in ("none", "finished")
+                              and status in ("starting", "uncertain", "interrupted")),
+        "next_commands": next_commands,
+    }
+
+
+def launch_inspect(app, launch_id):
+    launch_id = safe_id(launch_id)
+    launch = app.state(f"launches/{launch_id}", None)
+    require(isinstance(launch, dict), "Unknown launch.")
+    return launch_inspection(app, launch)
+
+
+def launch_recovery_history(launch):
+    recovery = launch.get("recovery")
+    if recovery is None:
+        return []
+    require(isinstance(recovery, dict) and recovery.get("version") == 1
+            and isinstance(recovery.get("history"), list),
+            "Launch reconciliation history is invalid; inspect the state before retrying.")
+    history = recovery["history"]
+    require(len(history) <= 32, "Launch reconciliation history exceeds its inspection limit.")
+    keys = []
+    for entry in history:
+        require(isinstance(entry, dict) and entry.get("disposition") in ("interrupted", "abandoned")
+                and isinstance(entry.get("request_key"), str)
+                and entry.get("native_exit_code") == "unknown",
+                "Launch reconciliation history is invalid; inspect the state before retrying.")
+        try:
+            require(str(uuid.UUID(entry["request_key"])) == entry["request_key"],
+                    "Launch reconciliation history has an invalid request key.")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise PreferenceError("Launch reconciliation history has an invalid request key.") from exc
+        keys.append(entry["request_key"])
+    require(len(keys) == len(set(keys)), "Launch reconciliation history has duplicate request keys.")
+    return history
+
+
+def launch_reconcile(app, launch_id, disposition, request_key):
+    launch_id = safe_id(launch_id)
+    try:
+        canonical_key = str(uuid.UUID(request_key))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PreferenceError("Reconciliation request key must be a canonical UUID.") from exc
+    require(canonical_key == request_key, "Reconciliation request key must be a canonical UUID.")
+    initial = app.state(f"launches/{launch_id}", None)
+    require(isinstance(initial, dict), "Unknown launch.")
+    history = launch_recovery_history(initial)
+    prior = next((item for item in history if isinstance(item, dict)
+                  and item.get("request_key") == canonical_key), None)
+    if prior is not None:
+        require(prior.get("disposition") == disposition,
+                "This reconciliation request key already names a different disposition.")
+        require(launch_owner_observation(app, initial) == "matched",
+                "Only the exact recorded launch owner can repeat reconciliation.")
+        return {"launch": launch_id, "status": initial.get("status"),
+                "disposition": disposition, "request_key": canonical_key, "reused": True,
+                "native_exit_code": "unknown"}
+    require(disposition in ("interrupted", "abandoned"), "Unknown launch disposition.")
+    observation = launch_recovery_observation(app, initial)
+    require(observation["owner"] == "matched",
+            "Current caller is not the exact recorded launch owner; no state changed.")
+    require(observation["dispatcher_process"] == "stopped"
+            and observation["child_process"] == "stopped",
+            "Dispatch process stop is not proven; no state changed.")
+    require(observation["native_session"] == "ended",
+            "A fresh exact native-session ended observation is unavailable; no state changed.")
+    require(observation["native_binding"] == "verified",
+            "Native launch binding is incomplete or ambiguous; no state changed.")
+    task = observation["_pattern_buffer_task"]
+    task_status = task.get("status")
+    require(task_status in ("none", "pending_unbound", "active_exact", "finished"),
+            "Linked Pattern Buffer task state is unavailable or ambiguous; no state changed.")
+    if disposition == "interrupted":
+        require(initial.get("status") in ("starting", "uncertain"),
+                "Only a starting or uncertain launch can be reconciled as interrupted.")
+        require(not history, "Launch already has a reconciliation history; inspect before another disposition.")
+        require(task_status in ("none", "active_exact"),
+                "Only an unowned launch or an active task bound to the exact native session can continue.")
+    else:
+        require(initial.get("status") in ("starting", "uncertain", "interrupted"),
+                "Only an unresolved launch can be reconciled as abandoned.")
+        if initial.get("status") == "starting" or initial.get("status") == "uncertain":
+            require(not history, "Launch already has a reconciliation history; inspect before another disposition.")
+        else:
+            require(bool(history) and history[-1].get("disposition") == "interrupted",
+                    "Only a reconciled interrupted launch can be abandoned later.")
+        require(task_status in ("none", "finished"),
+                "Finish the linked Pattern Buffer task with its supported owner command, then inspect it before abandonment.")
+    entry = {"request_key": canonical_key, "disposition": disposition, "observed_at": now(),
+             "owner": observation["owner"], "dispatcher_process": observation["dispatcher_process"],
+             "child_process": observation["child_process"], "native_session": observation["native_session"],
+             "native_binding": observation["native_binding"],
+             "pattern_buffer_task": task_status, "native_exit_code": "unknown"}
+    require(len(history) < 32, "Launch reconciliation history is full; preserve it for owner review.")
+    with locked(app.config_dir):
+        latest = app.state(f"launches/{launch_id}", None)
+        require(isinstance(latest, dict), "Launch record disappeared during reconciliation; no state changed.")
+        latest_history = launch_recovery_history(latest)
+        repeated = next((item for item in latest_history if isinstance(item, dict)
+                         and item.get("request_key") == canonical_key), None)
+        if repeated is not None:
+            require(repeated.get("disposition") == disposition,
+                    "This reconciliation request key already names a different disposition.")
+            require(observation["owner"] == "matched",
+                    "Only the exact recorded launch owner can repeat reconciliation.")
+            return {"launch": launch_id, "status": latest.get("status"),
+                    "disposition": disposition, "request_key": canonical_key, "reused": True,
+                    "native_exit_code": "unknown"}
+        require(latest == initial, "Launch changed during observation; inspect again before reconciling.")
+        require(latest_history == history, "Launch reconciliation history changed; inspect again before reconciling.")
+        latest["status"] = disposition
+        latest["recovery"] = {"version": 1, "history": [*history, entry]}
+        app.save_state(f"launches/{launch_id}", latest)
+    return {"launch": launch_id, "status": disposition, "disposition": disposition,
+            "request_key": canonical_key, "reused": False, "native_exit_code": "unknown"}
 
 
 def resume_opencode_launch(app, args, brief):
@@ -3148,6 +3649,7 @@ def resume_launch(app, args):
             raise PreferenceError("Invalid native session ID.") from exc
         binding = app.state(f"bindings/{digest({'harness': 'codex', 'session': session})}", None)
         require(binding and binding.get("launch") == launch_id, "Native session has no matching launch binding; nothing resumed.")
+        launch_snapshot = copy.deepcopy(launch)
     lock_path = app.state_dir / "resume-locks" / f"{session}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a") as stream:
@@ -3155,10 +3657,20 @@ def resume_launch(app, args):
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise PreferenceError("This native session already has a continuation in flight.") from exc
+        recovered = launch_snapshot.get("status") == "interrupted"
+        recovery_observation = None
+        if recovered:
+            recovery_observation = launch_recovery_observation(app, launch_snapshot)
+            require_recovered_launch_ready(launch_snapshot, recovery_observation)
         with locked(app.config_dir):
             config = app.config()
             launch = app.state(f"launches/{launch_id}", None)
-            require(launch["status"] == "exited", "Original launch has not exited; nothing resumed.")
+            if recovered:
+                require(launch == launch_snapshot,
+                        "Interrupted launch changed during owner and stopped-state checks; inspect before retrying.")
+                require_recovered_launch_ready(launch, recovery_observation)
+            else:
+                require(launch["status"] == "exited", "Original launch has not exited; nothing resumed.")
             choice = launch["choice"]
             membership = launch.get("review_cycle")
             if membership:
@@ -3195,6 +3707,12 @@ def resume_launch(app, args):
             app.save_state(f"continuations/{session}", attempt)
             app.save_state(f"attempts/{attempt['id']}", attempt)
         try:
+            if recovered:
+                latest = app.state(f"launches/{launch_id}", None)
+                require(latest == launch_snapshot,
+                        "Interrupted launch changed before continuation; inspect before retrying.")
+                recovery_observation = launch_recovery_observation(app, latest)
+                require_recovered_launch_ready(latest, recovery_observation)
             if task:
                 cli, task_id, original_task = task
                 with tempfile.NamedTemporaryFile(prefix="mp-resume-brief-", mode="wb") as snapshot:
@@ -3203,6 +3721,12 @@ def resume_launch(app, args):
                 require(updated.get("session_id") == session and updated.get("owner") == original_task["owner"]
                         and updated.get("brief_sha256") == attempt["task_digest"], "Pattern Buffer update could not be verified; inspect the attempt.")
                 attempt["context_injector_task"] = task_id
+            if recovered:
+                latest = app.state(f"launches/{launch_id}", None)
+                require(latest == launch_snapshot,
+                        "Interrupted launch changed before native continuation; inspect before retrying.")
+                recovery_observation = launch_recovery_observation(app, latest)
+                require_recovered_launch_ready(latest, recovery_observation)
             prompt = reviewer_guidance.compose_reviewer_prompt(choice["role"], brief.decode())
             prompt = DELEGATION + " Use the current researcher role for authorized research.\n\n" + prompt
             env = dict(os.environ, STARFLEET_MODEL_LAUNCH=launch_id)
