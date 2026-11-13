@@ -1498,6 +1498,132 @@ def observed_sender_surface():
         return None
 
 
+def cmux_json(args, action):
+    executable = cmux_executable()
+    require(executable, "CMUX is unavailable. Run `warp-drive owner-args` from a current native CMUX terminal.")
+    try:
+        result = subprocess.run([executable, "--json", *args], capture_output=True,
+                                text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WarpError(f"CMUX {action} failed. Run `warp-drive owner-args` from a current native CMUX terminal.") from exc
+    require(result.returncode == 0,
+            f"CMUX {action} failed. Run `warp-drive owner-args` from a current native CMUX terminal.")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WarpError(f"CMUX {action} returned invalid JSON; retry from a current native terminal.") from exc
+    require(isinstance(value, dict), f"CMUX {action} returned an invalid response; retry from a current native terminal.")
+    return value
+
+
+def discover_native_owner():
+    caller_packet = cmux_json(["--id-format", "uuids", "identify"], "identify")
+    caller = caller_packet.get("caller")
+    require(isinstance(caller, dict) and caller.get("surface_type") == "terminal",
+            "CMUX did not identify this as a terminal. Run from the current native agent terminal.")
+    try:
+        workspace = canonical_uuid(caller.get("workspace_id"), "CMUX caller workspace")
+        surface = canonical_uuid(caller.get("surface_id"), "CMUX caller surface")
+    except WarpError as exc:
+        raise WarpError("CMUX could not identify this terminal's workspace and surface UUIDs.") from exc
+
+    current = cmux_json(["current", "--limit", "200"], "current")
+    require(current.get("truncated") is False,
+            "CMUX current inventory is truncated. Retry after the complete native inventory is available.")
+    availability = current.get("owner_availability")
+    require(isinstance(availability, dict) and availability.get("agent_sessions") == "available",
+            "CMUX current inventory does not expose agent identities. Retry when native owner inventory is available.")
+    items = current.get("items")
+    require(isinstance(items, list), "CMUX current inventory has no item list; retry from the current native terminal.")
+
+    matches = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        projections = item.get("projections")
+        if not isinstance(projections, list):
+            continue
+        if any(isinstance(projection, dict) and
+               isinstance(projection.get("workspace_id"), str) and
+               isinstance(projection.get("panel_id"), str) and
+               projection["workspace_id"].upper() == workspace and
+               projection["panel_id"].upper() == surface
+               for projection in projections):
+            matches.append(item)
+    require(len(matches) == 1,
+            "CMUX does not show one unambiguous caller surface. Run from the intended native agent terminal and retry.")
+    item = matches[0]
+    require(isinstance(item.get("placement"), dict) and item["placement"].get("kind") == "local",
+            "CMUX caller surface is not a current local terminal. Retry from the intended native terminal.")
+    require(item.get("lifecycle") == "running" and
+            isinstance(item.get("freshness"), dict) and item["freshness"].get("state") == "current",
+            "CMUX caller surface is stale or inactive. Retry from the current native agent terminal.")
+    agents = item.get("agents")
+    require(isinstance(agents, list), "CMUX caller surface has no agent inventory; retry when it is available.")
+    active = [agent for agent in agents
+              if isinstance(agent, dict) and agent.get("state") != "ended"]
+    require(len(active) == 1 and active[0].get("state") in ("working", "idle", "needs_input"),
+            "CMUX caller needs one unambiguous active native owner. Run from the intended native agent terminal and retry.")
+    harness = active[0].get("kind")
+    require(harness in ("claude", "codex", "opencode"),
+            "CMUX caller harness is unsupported by Warp-drive. Use an enrolled Claude, Codex, or OpenCode terminal.")
+    try:
+        owner = canonical_owner(harness, active[0].get("session_id"), surface)
+    except WarpError as exc:
+        raise WarpError("CMUX caller session identity is invalid for Warp-drive. Retry from the current native terminal.") from exc
+    return owner, workspace
+
+
+def require_native_runtime_owner(owner):
+    session_env = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
+                   "opencode": "OPENCODE_SESSION_ID"}
+    help_text = ("Run from the actual native agent session, or use the exact owner tuple "
+                 "explicitly supplied by the parent for delegated work.")
+    launch_kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().lower()
+    require(launch_kind in session_env and launch_kind == owner["harness"],
+            f"CMUX runtime harness does not match its current native owner. {help_text}")
+    hints = [(name, value.strip()) for name in session_env.values()
+             if (value := os.environ.get(name, "")).strip()]
+    require(len(hints) == 1,
+            f"Exactly one native session hint is required to distinguish this caller from an inherited CMUX surface. {help_text}")
+    expected_name = session_env[launch_kind]
+    require(hints[0][0] == expected_name,
+            f"A session hint for another harness is present. {help_text}")
+    try:
+        hinted_session = canonical_session(launch_kind, hints[0][1])
+    except WarpError as exc:
+        raise WarpError(f"The current native session hint is invalid for {launch_kind}. {help_text}") from exc
+    require(hinted_session == owner["session"],
+            f"The native session hint does not match the current CMUX owner. {help_text}")
+
+
+def verified_owner_arguments():
+    owner, workspace = discover_native_owner()
+    require_native_runtime_owner(owner)
+    snapshot = read_hailing_enrollment_snapshot()
+    if snapshot["problem"]:
+        raise WarpError(f"{snapshot['problem']}. Follow `hailing-frequencies guide --print` and enroll the actual current owner.")
+    require(not snapshot["malformed"],
+            "Hailing enrollment contains malformed targets. Inspect it with the Hailing guide before retrying.")
+    matches = [target for target in snapshot["targets"]
+               if target["harness"] == owner["harness"] and
+               target["session"] == owner["session"] and
+               target["surface"] == owner["surface"]]
+    require(matches,
+            "The current CMUX owner has no exact Hailing enrollment. Follow `hailing-frequencies guide --print` and enroll this actual owner; Warp-drive does not enroll it.")
+    require(len(matches) == 1,
+            "The current owner has multiple matching Hailing enrollments. Resolve the duplicate enrollment before retrying.")
+    require(matches[0]["workspace"].upper() == workspace,
+            "The current owner's Hailing workspace differs from CMUX. Follow the Hailing guide to inspect its exact current binding.")
+    arguments = ["--harness", owner["harness"], "--session", owner["session"],
+                 "--surface", owner["surface"]]
+    return {"status": "verified", "owner": owner, "arguments": arguments,
+            "shell_arguments": shlex.join(arguments),
+            "verification": {"native_caller": "current CMUX terminal",
+                             "hailing_enrollment": "exact match",
+                             "completion_delivery": "not verified"}}
+
+
 def deliver_completion_wake(db, state_dir, row, target, cmux, sender_surface):
     """Commit one send intent, call CMUX without a write lock, then record its outcome."""
     request_id = row["id"]
@@ -1948,6 +2074,9 @@ def build_parser():
     sub.add_parser("init", help="initialize private local state")
     guide = sub.add_parser("guide", help="print the agent guide without opening state")
     guide.add_argument("--print", dest="print_guide", action="store_true", required=True)
+    owner_args = sub.add_parser("owner-args",
+                                help="print arguments for the current native owner with an exact Hailing enrollment")
+    owner_args.add_argument("--format", choices=("human", "json", "shell"), default="human")
     submit = sub.add_parser("submit", help="create or reuse one stable request for a CPU phase")
     _add_request_args(submit)
     run = sub.add_parser("run", help="submit and attach a CPU phase; use status or inspect for current wait diagnostics",
@@ -2079,6 +2208,21 @@ def _main(argv, product_umask):
     if args.command_name == "guide":
         guide_path = Path(__file__).with_name("guide.md")
         sys.stdout.write(guide_path.read_text(encoding="utf-8"))
+        return 0
+    if args.command_name == "owner-args":
+        result = verified_owner_arguments()
+        if args.format == "json":
+            print(json.dumps(result, indent=2))
+        elif args.format == "shell":
+            print(result["shell_arguments"])
+        else:
+            owner = result["owner"]
+            print("Verified current native owner with one exact Hailing enrollment:")
+            print(f"  harness: {owner['harness']}")
+            print(f"  session: {owner['session']}")
+            print(f"  surface: {owner['surface']}")
+            print(f"  arguments: {result['shell_arguments']}")
+            print("Completion delivery is not verified by this check.")
         return 0
     if args.command_name == "init":
         with contextlib.closing(connect(state_dir)) as db:

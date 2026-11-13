@@ -96,13 +96,14 @@ The core CLI includes:
 
 - `init`, `submit`, `batch`, `run`, `attach`, and `scheduler`.
 - `status`, `inspect`, `cancel`, `delay`, and `transfer`.
-- `order`, `boost`, `config`, `doctor`, `incident`, `reconcile`, and `guide --print`.
+- `owner-args`, `order`, `boost`, `config`, `doctor`, `incident`, `reconcile`, and `guide --print`.
 
 Submit one meaningful CPU phase per reservation and report how many CPU workers can run simultaneously during that phase.
 Do not sum worker counts across serial phases; within one checkout, make only one CPU-intensive request eligible at a time when commands share generated files, caches or a database, and enable each dependent phase after its predecessor finishes.
 Independent requests and batches may run concurrently across checkouts when their shared inputs are safe.
 Use your own observed harness, session and surface by default; use a parent's stable, exact enrolled recipient only when that parent explicitly delegates it for this request.
 Naming a delegated parent identity records that request's owner and completion recipient, and any later ownership handoff still requires an explicit `warp-drive transfer`.
+Use `warp-drive owner-args` in the current native terminal to print its verified tuple for an existing delegated brief; see the [agent guide](guide.md#verify-owner-arguments-for-a-delegated-request).
 
 Run the sending scheduler explicitly in a dedicated native CMUX terminal with `warp-drive scheduler --send`.
 Its `CMUX_SURFACE_ID` must identify that terminal and differ from enrolled recipient surfaces.
