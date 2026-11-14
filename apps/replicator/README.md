@@ -1,6 +1,6 @@
 # Replicator
 
-Replicator packages a maintained guide, read-only preflight, one-shot successor intent configuration, a versioned handoff freeze, and a scoped Codex predecessor settings observation for an explicitly requested manual handoff between orchestrator sessions.
+Replicator packages a maintained guide, read-only preflight, one-shot successor intent configuration, a versioned handoff freeze, and scoped Codex predecessor settings and access observations for an explicitly requested manual handoff between orchestrator sessions.
 The guide describes the handoff procedure, preflight reports only the caller, worktree, and explicit input checks it can observe, and successor intent records a frozen choice for a configured seat and worktree.
 Replicator does not start agents, workers, timers, or an automatic handoff trigger.
 
@@ -125,6 +125,27 @@ It does not support other Codex versions or other harnesses.
 The settings describe one observed turn and do not prove historical continuity, future settings, effective file or Git access, network access, or native trust.
 Effective permissions remain `unknown`, so readiness stays `blocked`.
 This command records settings only and does not launch a successor, transfer custody, close a predecessor, or consume the intent.
+
+## Observe scoped predecessor access
+
+Run the exact-owner access observation after recording the Codex predecessor snapshot:
+
+```sh
+replicator handoff observe-access HANDOFF_ID \
+  --context-file /path/to/required-context.md \
+  --guidance-file /path/to/AGENTS.md --json
+```
+
+The command records actual bounded byte reads and canonical Git metadata reads separately.
+It stores file lengths and digests, not file contents, and reports omitted path classes as `unknown`.
+Optional `--probe-write` creates and removes unique owner-only files in the frozen worktree, Git directory, and common directory.
+Optional `--probe-origin` runs bounded `git ls-remote --refs origin` with stdin closed and does not disclose the remote URL or output.
+Uncertain probe cleanup remains attached to the exact operation for same-request reconciliation.
+An existing filename collision is preserved and remains blocked when ownership cannot be proven.
+An identical request in the same observed native turn reuses its existing evidence; use `--retry` after completion to record a fresh attempt.
+Local access checks do not establish effective permissions or native trust, and failed network checks remain `unknown`.
+Handoff inspection exposes phase-specific launch and transfer readiness; successor parity is a transfer requirement.
+This observation command never launches a successor, transfers custody, closes the predecessor, or consumes the intent.
 
 Run the passive configuration diagnostic outside a Git checkout:
 

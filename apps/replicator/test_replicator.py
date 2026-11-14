@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
 SOURCE_NAMES = (
-    "replicator.py", "successor_intents.py", "handoff_engine.py", "native_observer.py",
+    "replicator.py", "successor_intents.py", "handoff_engine.py", "native_observer.py", "access_observer.py",
     "install.py", "guide.md", "README.md",
 )
 MODEL_PREFERENCES_SCRIPT = ROOT.parents[0] / "model-preferences" / "model_preferences.py"
@@ -769,7 +769,11 @@ class ReplicatorCliTests(unittest.TestCase):
         show_json = self.run_successor(installation, no_mp_environment, intent_state,
                                        "handoff", "show", frozen["id"], "--json")
         self.assertEqual(show_json.returncode, 0, show_json.stderr)
-        self.assertEqual(json.loads(show_json.stdout)["handoff"], frozen)
+        shown_handoff = json.loads(show_json.stdout)["handoff"]
+        expected_handoff = {**frozen, "phase_readiness": handoff_engine.phase_readiness(frozen)}
+        self.assertEqual(shown_handoff, expected_handoff)
+        self.assertNotIn("successor_binding", shown_handoff["phase_readiness"]["launch"]["checks"])
+        self.assertEqual(shown_handoff["phase_readiness"]["transfer"]["status"], "blocked")
         before_reconcile = self.tree_snapshot()
         local_store_bytes = (intent_state / "successor-intents.json").read_bytes()
         reconciled = self.run_successor(installation, no_mp_environment, intent_state,
@@ -780,6 +784,7 @@ class ReplicatorCliTests(unittest.TestCase):
         self.assertFalse(reconciliation["native_queries_performed"])
         self.assertFalse(reconciliation["writes_performed"])
         self.assertIn("native_generation_unavailable", reconciliation["blockers"])
+        self.assertEqual(reconciliation["phase_readiness"]["transfer"]["status"], "blocked")
         self.assertEqual(before_reconcile, self.tree_snapshot())
         self.assertEqual(local_store_bytes, (intent_state / "successor-intents.json").read_bytes())
         self.assertFalse(side_effect_marker.exists())

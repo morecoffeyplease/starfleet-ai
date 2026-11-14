@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 
+import access_observer
 import successor_intents
 import handoff_engine
 import native_observer
@@ -114,11 +115,12 @@ def input_check(name, paths, option):
     )
 
 
-def run_bounded(argv, cwd=None):
+def run_bounded(argv, cwd=None, *, closed_stdin=False):
     try:
         result = subprocess.run(
             argv,
             cwd=cwd,
+            stdin=subprocess.DEVNULL if closed_stdin else None,
             capture_output=True,
             text=True,
             timeout=COMMAND_TIMEOUT_SECONDS,
@@ -596,6 +598,67 @@ def handoff_observe_predecessor(args):
     return handoff_engine.record_predecessor_observation(args.state_dir, args.handoff_id, snapshot)
 
 
+def handoff_observe_access(args):
+    handoff = handoff_engine.show_handoff(args.state_dir, args.handoff_id)["handoff"]
+    request = access_observer.normalize_request(
+        args.context_file, args.guidance_file, probe_write=args.probe_write, probe_origin=args.probe_origin,
+    )
+    access_state = handoff["access_observations"]
+    pending = None
+    if access_state.get("pending") is not None:
+        pending = next(item for item in access_state["predecessor"]
+                       if item["id"] == access_state["pending"])
+        if pending["request_digest"] != access_observer.request_digest(request):
+            raise handoff_engine.HandoffError(
+                "An access probe has incomplete cleanup; repeat its exact request to reconcile it."
+            )
+    native_cwd, caller, identity_check = caller_identity(os.environ)
+    if identity_check.status != "ready" or caller is None or native_cwd is None:
+        raise native_observer.NativeObservationError(identity_check.source)
+    seat = handoff["scope"]["seat"]
+    expected_caller = {
+        "harness": seat["harness"],
+        "session_id": seat["session_id"],
+        "panel_id": seat["panel_id"],
+        "workspace_id": seat["workspace_id"],
+    }
+    if caller != expected_caller:
+        raise native_observer.NativeObservationError("The live caller does not match this frozen predecessor seat.")
+    worktree = canonical_worktree_identity(native_cwd)
+    if worktree != handoff["scope"]["worktree"]:
+        raise native_observer.NativeObservationError("The live caller worktree does not match this frozen handoff.")
+    snapshot = native_observer.observe_codex_predecessor(
+        handoff["scope"], caller, worktree, home=Path.home(), environment=os.environ, runner=run_bounded,
+    )
+    if not args.retry and pending is None:
+        existing = handoff_engine.existing_access_observation(
+            args.state_dir, args.handoff_id, snapshot, request,
+        )
+        if existing is not None:
+            return existing
+    if pending is not None:
+        inputs = {name: pending["checks"][name] for name in ("context_access", "guidance_access")}
+        git_check = pending["checks"]["git_metadata_access"]
+        origin_check = pending["checks"]["git_origin_access"]
+    else:
+        inputs = access_observer.read_inputs(request)
+        try:
+            git_identity = canonical_worktree_identity(handoff["scope"]["worktree"]["root"])
+        except (OSError, ValueError):
+            git_identity = None
+        git_check = access_observer.git_metadata_check(git_identity, handoff["scope"]["worktree"])
+        origin_check = access_observer.git_origin_check(
+            request, handoff["scope"]["worktree"]["root"],
+            lambda argv, *, closed_stdin=False: run_bounded(argv, cwd=handoff["scope"]["worktree"]["root"],
+                                                             closed_stdin=closed_stdin),
+        )
+    return handoff_engine.record_access_observation(
+        args.state_dir, args.handoff_id, snapshot, request, inputs, git_check, origin_check,
+        worktree, observed_at=snapshot["observed_at"], identity_resolver=canonical_worktree_identity,
+        retry=args.retry,
+    )
+
+
 def print_handoff_summary(result):
     handoff = result["handoff"]
     seat = handoff["scope"]["seat"]
@@ -629,7 +692,26 @@ def print_handoff_summary(result):
     print(f"Effective permissions: {handoff['observations']['effective_permissions']['status']}")
     print(f"Readiness: {handoff['readiness']['status']} ({handoff['readiness']['reason']})")
     print(f"Launch: {handoff['launch']['status']}")
+    phases = handoff.get("phase_readiness", handoff_engine.phase_readiness(handoff))
+    print(f"Launch readiness: {phases['launch']['status']}")
+    print(f"Transfer readiness: {phases['transfer']['status']}")
     print("No native launch, transfer, or predecessor close was performed.")
+
+
+def print_access_summary(result):
+    observation = result["observation"]
+    checks = observation["checks"]
+    print(f"Access observation: {observation['state']}")
+    print(f"Observation ID: {observation['id']}")
+    for name in ("owner_binding", "native_settings_match", "context_access", "guidance_access",
+                 "git_metadata_access", "write_access", "git_origin_access", "native_trust",
+                 "effective_permissions"):
+        print(f"{name.replace('_', ' ').capitalize()}: {checks[name]['status']}")
+    print(f"Probe cleanup: {observation['cleanup']['status']}")
+    phases = handoff_engine.phase_readiness(result["handoff"])
+    print(f"Launch readiness: {phases['launch']['status']}")
+    print(f"Transfer readiness: {phases['transfer']['status']}")
+    print("No successor launch, custody transfer, or predecessor close was performed.")
 
 
 def handoff_show(args):
@@ -731,6 +813,18 @@ def build_parser():
     )
     observe.add_argument("handoff_id")
     observe.add_argument("--json", action="store_true", help="print the persisted observation as JSON")
+    access = handoff_commands.add_parser(
+        "observe-access", help="record bounded access evidence from the exact Codex predecessor",
+    )
+    access.add_argument("handoff_id")
+    access.add_argument("--context-file", action="append", default=[], metavar="PATH")
+    access.add_argument("--guidance-file", action="append", default=[], metavar="PATH")
+    access.add_argument("--probe-write", action="store_true",
+                        help="write, read, and remove unique probes in the frozen worktree and Git metadata dirs")
+    access.add_argument("--probe-origin", action="store_true",
+                        help="run bounded git ls-remote --refs origin with stdin closed")
+    access.add_argument("--retry", action="store_true", help="record a fresh observation after a completed attempt")
+    access.add_argument("--json", action="store_true", help="print the persisted access observation as JSON")
     doctor = commands.add_parser("doctor", help="inspect Replicator configuration without writes or native queries")
     doctor.add_argument("--starfleet-json", action="store_true", help="print the agreed structured diagnostic protocol")
     preflight = commands.add_parser("preflight", help="inspect the current caller and worktree without writes")
@@ -802,6 +896,12 @@ def main(argv=None):
                 if not args.json:
                     print_handoff_summary(result)
                     print(f"Observation reused: {str(result['reused']).lower()}")
+                    return 0
+            elif args.handoff_command == "observe-access":
+                result = handoff_observe_access(args)
+                if not args.json:
+                    print_access_summary(result)
+                    print(f"Observation reused or reconciled: {str(result['reused']).lower()}")
                     return 0
             else:
                 result = handoff_reconcile(args)

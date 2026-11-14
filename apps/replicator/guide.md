@@ -137,6 +137,54 @@ The settings describe the observed turn and do not prove historical continuity, 
 Effective permissions remain `unknown`, so readiness stays `blocked`.
 Observation records settings only and does not launch a successor, transfer custody, close a predecessor, or consume the intent.
 
+## Observe scoped access from the predecessor
+
+Run access observation from the same exact Codex predecessor and frozen worktree after recording its settings snapshot.
+Pass only context and guidance paths that this handoff requires:
+
+```sh
+replicator handoff observe-access HANDOFF_ID \
+  --context-file /path/to/required-context.md \
+  --guidance-file /path/to/AGENTS.md --json
+```
+
+The command revalidates the frozen seat, worktree, hook generation, process identity, rollout source, and observed settings.
+It reads bounded actual bytes from each supplied file and records byte counts and digests without storing file contents.
+It runs bounded Git identity reads against the frozen checkout and keeps their result separate from file access.
+An omitted path class remains `unknown` because no bytes were read for it.
+An access observation never changes the frozen predecessor snapshot or configured successor choice.
+
+Add `--probe-write` only when an explicit write check is needed:
+
+```sh
+replicator handoff observe-access HANDOFF_ID --probe-write --json
+```
+
+This option exclusively creates owner-only probe files in the canonical worktree, Git directory, and common directory.
+It writes and reads its own bounded marker, then removes only that exact file after rechecking the canonical Git identity.
+The command never changes Git refs, the index, Git config, permissions, or existing files.
+If cleanup cannot be verified, the operation and exact probe identity remain pending.
+Repeat the same command with the same paths and options to reconcile that operation before requesting a new one.
+If an existing filename collision prevents proving ownership, Replicator preserves that file and leaves cleanup blocked for review.
+An identical request in the same observed native turn reuses its existing byte and probe evidence.
+Use `--retry` after a completed observation to read the requested paths and record a fresh attempt.
+
+Add `--probe-origin` for one bounded `git ls-remote --refs origin` check with stdin closed:
+
+```sh
+replicator handoff observe-access HANDOFF_ID --probe-origin --json
+```
+
+The check uses only the frozen checkout's configured `origin` and does not print its URL or remote output.
+A failed command stays `unknown` because authentication, transport, and remote failures do not establish a permission denial.
+Network access and native trust remain separately unknown unless their own supported evidence is available.
+Scoped local reads and temporary write probes do not prove complete effective permissions or native trust.
+
+The handoff status includes `phase_readiness.launch` and `phase_readiness.transfer` assessments.
+Launch assessment uses the frozen intent and predecessor observations without requiring a successor observation.
+Transfer remains blocked until a successor has an exact native binding, matching settings and applicable access, verified receiving, and accepted custody.
+This access unit does not observe a successor or perform a launch, transfer, predecessor close, or intent consumption.
+
 Run the passive diagnostic outside Git or before configuring an intent:
 
 ```sh

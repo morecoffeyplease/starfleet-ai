@@ -11,7 +11,7 @@ import sys
 
 MARKER = "# starfleet-replicator:v1"
 SOURCE_NAMES = (
-    "replicator.py", "successor_intents.py", "handoff_engine.py", "native_observer.py",
+    "replicator.py", "successor_intents.py", "handoff_engine.py", "native_observer.py", "access_observer.py",
     "guide.md", "README.md",
 )
 

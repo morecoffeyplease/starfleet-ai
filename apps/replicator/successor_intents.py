@@ -14,6 +14,8 @@ import time
 import uuid
 from datetime import datetime
 
+import access_observer
+
 
 STORE_NAME = "successor-intents.json"
 LOCK_NAME = ".successor-intents.lock"
@@ -378,6 +380,11 @@ def _validate_store(value):
                 or handoff.get("intent_digest") != digest(snapshot)):
             raise IntentError("Successor handoff snapshot is malformed.")
         _validate_native_predecessor_snapshot(handoff)
+        if "access_observations" in handoff:
+            try:
+                access_observer.validate_access_history(handoff["access_observations"], handoff)
+            except access_observer.AccessObservationError as exc:
+                raise IntentError("Successor handoff scoped access evidence is malformed.") from exc
         if (handoff.get("permission_requirement") != {
                     "kind": "match_predecessor_effective", "status": "unknown"}
                 or handoff.get("launch") != {"status": "not_started"}
