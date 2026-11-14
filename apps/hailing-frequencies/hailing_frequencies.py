@@ -624,8 +624,37 @@ class Monitor:
         db.execute("CREATE TABLE IF NOT EXISTS batches (token TEXT PRIMARY KEY, session TEXT, at REAL, outcome TEXT, detail TEXT)")
         db.execute("CREATE TABLE IF NOT EXISTS acknowledgements (session TEXT, message TEXT, at REAL, evidence TEXT, PRIMARY KEY(session,message))")
         db.execute("CREATE TABLE IF NOT EXISTS attention_intents (session TEXT, started_at REAL, event_key TEXT, body_sha256 TEXT, outcome TEXT, attempted INTEGER, at REAL, detail TEXT, PRIMARY KEY(session,started_at,event_key))")
+        db.execute("CREATE TABLE IF NOT EXISTS custody_adoption_operations (operation_id TEXT PRIMARY KEY, plan_json TEXT NOT NULL, plan_digest TEXT NOT NULL, approval_reference TEXT NOT NULL, state TEXT NOT NULL, accepted_owner_json TEXT, accepted_at REAL, apply_started_at REAL, last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL)")
+        db.execute("CREATE TABLE IF NOT EXISTS custody_adoption_holds (operation_id TEXT NOT NULL, resource_kind TEXT NOT NULL, resource_id TEXT NOT NULL, plan_digest TEXT NOT NULL, PRIMARY KEY(operation_id,resource_kind,resource_id))")
+        db.execute("CREATE TABLE IF NOT EXISTS custody_adoption_events (operation_id TEXT NOT NULL, resource_kind TEXT NOT NULL, resource_id TEXT NOT NULL, plan_digest TEXT NOT NULL, old_owner_digest TEXT NOT NULL, new_owner_digest TEXT NOT NULL, before_digest TEXT NOT NULL, after_preserved_digest TEXT NOT NULL, committed_at REAL NOT NULL, PRIMARY KEY(operation_id,resource_kind,resource_id))")
         db.commit()
         return db
+
+    def custody_adoption_hold(self, resource_kind, resource_id):
+        """Return an active explicit-adoption hold without creating local state."""
+        path = self.directory / "receipts.sqlite3"
+        if not path.is_file() or path.is_symlink():
+            return None
+        try:
+            uri = path.resolve().as_uri() + "?mode=ro"
+            with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1)) as db:
+                table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                                   ("custody_adoption_holds",)).fetchone()
+                if table is None:
+                    return None
+                rows = db.execute(
+                    "SELECT h.operation_id,h.plan_digest,o.plan_digest,o.state "
+                    "FROM custody_adoption_holds h LEFT JOIN custody_adoption_operations o "
+                    "ON o.operation_id=h.operation_id WHERE h.resource_kind=? AND h.resource_id=?",
+                    (resource_kind, str(resource_id))).fetchall()
+            for operation_id, hold_digest, plan_digest, state in rows:
+                if plan_digest != hold_digest or state != "complete":
+                    return {"operation_id": operation_id, "state": state or "missing",
+                            "resource_kind": resource_kind}
+            return None
+        except (OSError, sqlite3.Error):
+            return {"operation_id": "unknown", "state": "unavailable",
+                    "resource_kind": resource_kind}
 
     def prior_attention_intent(self, target, event_key):
         path = self.directory / "receipts.sqlite3"
@@ -719,6 +748,8 @@ class Monitor:
         target = next((item for item in config["targets"] if item["session"] == session), None)
         if target is None:
             return self.attention_result("unavailable", False, "Session is not enrolled", event_key)
+        if self.custody_adoption_hold("hailing_session", target["session"]):
+            return self.attention_result("held", False, "Session is held by an explicit custody adoption", event_key)
         if not surface_id:
             return self.attention_result("unavailable", False, "CMUX_SURFACE_ID is required", event_key)
         try:
@@ -960,6 +991,8 @@ class Monitor:
         normalized_ids = [identity(message_id) for message_id in message_ids]
         require(len(set(normalized_ids)) == len(normalized_ids), "Duplicate message IDs are not allowed")
         target = self.enrolled_target(session_id, surface_id)
+        require(not self.custody_adoption_hold("hailing_session", target["session"]),
+                "Session is held by an explicit custody adoption")
         self._inbox_binding(target)
         rows = self.cmux.messages(target)
         require(len(rows) < SCAN_LIMIT, "Inbox scan saturated; no messages output or acknowledged")
@@ -974,6 +1007,8 @@ class Monitor:
 
         current_target = self.enrolled_target(session_id, surface_id)
         require(current_target == target, "Enrollment changed; no messages acknowledged")
+        require(not self.custody_adoption_hold("hailing_session", target["session"]),
+                "Session is held by an explicit custody adoption")
         self._inbox_binding(current_target)
         current_rows = self.cmux.messages(current_target)
         require(len(current_rows) < SCAN_LIMIT, "Inbox scan saturated; no messages acknowledged")
@@ -1078,6 +1113,8 @@ class Monitor:
         target = next((item for item in config["targets"] if item["session"] == session), None)
         require(target is not None, "Session is not enrolled")
         require(surface == target["surface"], "CMUX_SURFACE_ID does not match the enrolled surface")
+        require(not self.custody_adoption_hold("hailing_session", target["session"]),
+                "Session is held by an explicit custody adoption")
         self.cmux.binding(target)
         rows = self.cmux.messages(target)
         require(len(rows) < SCAN_LIMIT, "Inbox scan saturated; no acknowledgment recorded")
@@ -1158,6 +1195,12 @@ class Monitor:
         initial_errors_by_session = {}
         target_errors = []
         for target in config["targets"]:
+            if self.custody_adoption_hold("hailing_session", target["session"]):
+                error = {"label": target["label"], "session": target["session"],
+                         "stage": "custody_adoption", "error": "Exact owner is held by an explicit custody adoption"}
+                initial_errors_by_session[target["session"]] = error
+                target_errors.append(error)
+                continue
             try:
                 rows = self.target_messages(target)
             except TargetInboxError as exc:
@@ -1789,6 +1832,8 @@ def main(argv=None):
                                          for mid in args.message]}
         if args.command == "enroll":
             surface, session = identity(args.surface), identity(args.session)
+            require(not app.custody_adoption_hold("hailing_session", session),
+                    "Session is held by an explicit custody adoption")
             store = json.loads((app.cmux.hook_directory / (args.harness + "-hook-sessions.json")).read_text())
             record = next((v for k, v in store["sessions"].items() if k.upper() == session), {})
             target = {"surface": surface, "workspace": identity(record["workspaceId"]), "session": session,
@@ -1810,6 +1855,8 @@ def main(argv=None):
             return app.enroll_opencode(args.manifest, args.label, args.include_existing)
         if args.command == "unenroll":
             session = session_identity(args.session)
+            require(not app.custody_adoption_hold("hailing_session", session),
+                    "Session is held by an explicit custody adoption")
             config["targets"] = [t for t in config["targets"] if t["session"] != session]
             if config.get("coordinator") == session:
                 config["coordinator"] = None

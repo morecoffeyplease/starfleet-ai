@@ -101,6 +101,22 @@ class TemporalBeacon:
         );
         CREATE INDEX IF NOT EXISTS timer_occurrences_current
           ON timer_occurrences(timer_id,sequence DESC);
+        CREATE TABLE IF NOT EXISTS custody_adoption_operations (
+          operation_id TEXT PRIMARY KEY, plan_json TEXT NOT NULL, plan_digest TEXT NOT NULL,
+          approval_reference TEXT NOT NULL, state TEXT NOT NULL, accepted_owner_json TEXT,
+          accepted_at REAL, apply_started_at REAL, last_error TEXT,
+          created_at REAL NOT NULL, updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS custody_adoption_holds (
+          operation_id TEXT NOT NULL, resource_kind TEXT NOT NULL, resource_id TEXT NOT NULL,
+          plan_digest TEXT NOT NULL, PRIMARY KEY(operation_id,resource_kind,resource_id)
+        );
+        CREATE TABLE IF NOT EXISTS custody_adoption_events (
+          operation_id TEXT NOT NULL, resource_kind TEXT NOT NULL, resource_id TEXT NOT NULL,
+          plan_digest TEXT NOT NULL, old_owner_digest TEXT NOT NULL, new_owner_digest TEXT NOT NULL,
+          before_digest TEXT NOT NULL, after_preserved_digest TEXT NOT NULL,
+          committed_at REAL NOT NULL, PRIMARY KEY(operation_id,resource_kind,resource_id)
+        );
         """)
         columns = {row[1] for row in db.execute("PRAGMA table_info(timers)")}
         if "schedule_spec" not in columns:
@@ -343,6 +359,8 @@ class TemporalBeacon:
                 target["started_at"], worktree, continuation.strip(), schedule, interval, due, deadline,
                 request_id, replacement_key, schedule_spec)
         with self.locked(), contextlib.closing(self.database()) as db:
+            if self.app.custody_adoption_hold("hailing_session", target["session"]):
+                raise ValueError("Session is held by an explicit custody adoption")
             db.execute("BEGIN IMMEDIATE")
             if request_id:
                 existing = db.execute("SELECT * FROM timers WHERE request_id=?", (request_id,)).fetchone()
@@ -392,6 +410,8 @@ class TemporalBeacon:
             db.execute("BEGIN IMMEDIATE")
             timer = self._timer(db, timer_id)
             require(timer["owner_key"] == owner_key, "Timer belongs to another exact owner")
+            require(not self.app.custody_adoption_hold("temporal_timer", timer_id),
+                    "Timer is held by an explicit custody adoption")
             if timer["status"] == "active":
                 db.execute("UPDATE timers SET status='canceled',updated_at=? WHERE id=? AND status='active'", (now, timer_id))
                 db.execute("UPDATE timer_occurrences SET status='canceled' WHERE timer_id=? AND status IN ('pending','held')", (timer_id,))
@@ -414,6 +434,8 @@ class TemporalBeacon:
             occurrence = self._occurrence_dict(row[:9])
             timer_status, stored_owner, until_at, interval, due_at, worktree = row[9:]
             require(stored_owner == owner_key, "Timer owner changed")
+            require(not self.app.custody_adoption_hold("temporal_timer", occurrence["timer_id"]),
+                    "Timer is held by an explicit custody adoption")
             require(timer_status == "active", "Timer is canceled, expired, or no longer current; its continuation cannot be retrieved")
             self.binding(target, worktree)
             payload = {"timer_id": occurrence["timer_id"], "occurrence_id": occurrence["id"],
@@ -464,6 +486,11 @@ class TemporalBeacon:
                     db.commit()
                     continue
                 timer = self._timer_dict(current)
+                if self.app.custody_adoption_hold("temporal_timer", timer["id"]):
+                    results.append({"timer_id": timer["id"], "status": "custody_adoption_hold",
+                                    "would_submit": False})
+                    db.commit()
+                    continue
                 prior = db.execute("SELECT id,status FROM timer_occurrences WHERE timer_id=? ORDER BY sequence DESC LIMIT 1", (timer["id"],)).fetchone()
                 if prior and prior[1] in ("submitted", "uncertain"):
                     db.commit()

@@ -158,6 +158,17 @@ The service persists an attempt before writing input.
 If submission times out or the process crashes during delivery, it preserves an uncertain attempt rather than automatically replaying a possibly delivered message.
 Inspect uncertain delivery before deciding how to recover.
 
+## Explicit current-generation custody adoption
+
+An operator-approved adoption can assign an enumerated existing timer to the verified current generation when the old native generation is unavailable.
+The operation is implemented by `discord-watch custody-adoption` and is documented in the [Discord Watch guide](../discord-watch/guide.md#explicit-current-generation-custody-adoption).
+It records distinct old and current identities and never claims historical process continuity.
+The current exact owner must independently accept the immutable plan through the existing native binding guard.
+An active partial adoption holds only its selected timers, including timers that become due while held.
+Timer IDs, request IDs, cadence, continuation, next due time, deadline, status, and occurrence history remain unchanged by the owner mapping.
+An uncertain or submitted occurrence is never reset or replayed as part of adoption.
+Do not cancel or recreate a held timer to work around an incomplete operation.
+
 ## Service operation and recovery
 
 Use the existing Hailing Frequencies installation, initialization, enrollment, and `supervise --send` workflow in the [agent guide](README.md).
