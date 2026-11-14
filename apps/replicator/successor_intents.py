@@ -5,6 +5,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -15,11 +16,14 @@ import uuid
 
 STORE_NAME = "successor-intents.json"
 LOCK_NAME = ".successor-intents.lock"
-STORE_SCHEMA_VERSION = 1
+STORE_SCHEMA_VERSION = 2
+INTENT_SCHEMA_VERSION = 1
 INTENT_PROTOCOL = "starfleet.replicator.successor-intent/v1"
+HANDOFF_PROTOCOL = "starfleet.replicator.handoff/v1"
 MAX_STORE_BYTES = 1024 * 1024
 MAX_TOTAL_INTENTS = 256
 MAX_INTENTS_PER_SCOPE = 32
+MAX_TOTAL_HANDOFFS = 256
 LOCK_TIMEOUT_SECONDS = 5
 DOCTOR_STATES = {"ready", "missing", "blocked", "unknown", "not_applicable", "skipped"}
 
@@ -29,7 +33,7 @@ class IntentError(ValueError):
 
 
 def empty_store():
-    return {"schema_version": STORE_SCHEMA_VERSION, "scopes": {}}
+    return {"schema_version": STORE_SCHEMA_VERSION, "scopes": {}, "handoffs": {}}
 
 
 def canonical_json(value):
@@ -41,19 +45,26 @@ def digest(value):
 
 
 def _validate_store(value):
-    if not isinstance(value, dict) or value.get("schema_version") != STORE_SCHEMA_VERSION:
+    if (not isinstance(value, dict)
+            or value.get("schema_version") not in (1, STORE_SCHEMA_VERSION)):
         raise IntentError("Successor intent state has an unsupported format.")
     scopes = value.get("scopes")
     if not isinstance(scopes, dict):
         raise IntentError("Successor intent state is malformed.")
+    handoffs = value.get("handoffs", {})
+    if not isinstance(handoffs, dict):
+        raise IntentError("Successor handoff state is malformed.")
+    value["schema_version"] = STORE_SCHEMA_VERSION
+    value["handoffs"] = handoffs
     total = 0
+    intents = {}
     for key, records in scopes.items():
         if not isinstance(key, str) or len(key) != 64 or not isinstance(records, list):
             raise IntentError("Successor intent state is malformed.")
         if len(records) > MAX_INTENTS_PER_SCOPE:
             raise IntentError("Successor intent state exceeds its record limit.")
         for record in records:
-            if (not isinstance(record, dict) or record.get("schema_version") != STORE_SCHEMA_VERSION
+            if (not isinstance(record, dict) or record.get("schema_version") != INTENT_SCHEMA_VERSION
                     or record.get("protocol") != INTENT_PROTOCOL
                     or not isinstance(record.get("id"), str)
                     or len(record["id"]) != 32
@@ -61,6 +72,11 @@ def _validate_store(value):
                 raise IntentError("Successor intent state is malformed.")
             if any(character not in "0123456789abcdef" for character in record["id"]):
                 raise IntentError("Successor intent state is malformed.")
+            if "handoff_id" in record:
+                handoff_id = record["handoff_id"]
+                if (not isinstance(handoff_id, str) or len(handoff_id) != 32
+                        or any(character not in "0123456789abcdef" for character in handoff_id)):
+                    raise IntentError("Successor intent handoff link is malformed.")
             scope = record.get("scope")
             choice = record.get("choice")
             request_digest = record.get("request_digest")
@@ -136,9 +152,80 @@ def _validate_store(value):
                     or record.get("custody_acceptance") != {"status": "not_applicable"}
                     or record.get("predecessor_cleanup") != {"status": "not_applicable"}):
                 raise IntentError("Successor intent state is malformed.")
+            intents[record["id"]] = record
         total += len(records)
     if total > MAX_TOTAL_INTENTS:
         raise IntentError("Successor intent state exceeds its record limit.")
+    if len(handoffs) > MAX_TOTAL_HANDOFFS:
+        raise IntentError("Successor handoff state exceeds its record limit.")
+    linked_intents = set()
+    handoff_generations = set()
+    for handoff_id, handoff in handoffs.items():
+        if (not isinstance(handoff_id, str) or len(handoff_id) != 32
+                or any(character not in "0123456789abcdef" for character in handoff_id)
+                or not isinstance(handoff, dict)
+                or handoff.get("schema_version") != 1
+                or handoff.get("protocol") != HANDOFF_PROTOCOL
+                or handoff.get("id") != handoff_id
+                or not isinstance(handoff.get("handoff_generation"), str)
+                or len(handoff["handoff_generation"]) != 32
+                or any(character not in "0123456789abcdef" for character in handoff["handoff_generation"])
+                or handoff["handoff_generation"] == handoff_id
+                or handoff.get("state") != "frozen"):
+            raise IntentError("Successor handoff state is malformed.")
+        if handoff["handoff_generation"] in handoff_generations:
+            raise IntentError("Successor handoff generation is duplicated.")
+        handoff_generations.add(handoff["handoff_generation"])
+        intent_id = handoff.get("intent_id")
+        if (not isinstance(intent_id, str) or len(intent_id) != 32
+                or any(character not in "0123456789abcdef" for character in intent_id)):
+            raise IntentError("Successor handoff link is malformed.")
+        intent = intents.get(intent_id)
+        if (intent is None or intent.get("state") != "configured"
+                or intent.get("handoff_id") != handoff_id
+                or intent_id in linked_intents):
+            raise IntentError("Successor handoff link is malformed.")
+        linked_intents.add(intent_id)
+        snapshot = handoff.get("intent_snapshot")
+        if (not isinstance(snapshot, dict) or snapshot.get("id") != intent_id
+                or snapshot.get("scope") != intent.get("scope")
+                or snapshot.get("choice") != intent.get("choice")
+                or handoff.get("scope") != intent.get("scope")
+                or handoff.get("choice") != intent.get("choice")
+                or handoff.get("intent_digest") != digest(snapshot)):
+            raise IntentError("Successor handoff snapshot is malformed.")
+        if (handoff.get("native_generation") != {
+                "status": "unknown", "value": None, "evidence": None}
+                or handoff.get("native_predecessor_binding") != {
+                    "status": "unknown", "hook_generation": None, "evidence": None}
+                or handoff.get("native_successor_binding") != {
+                    "status": "unknown", "hook_generation": None, "evidence": None}):
+            raise IntentError("Successor handoff native binding is malformed.")
+        unknown_observation = {"status": "unknown", "value": None, "evidence": None}
+        observations = handoff.get("observations")
+        expected_observations = {
+            "predecessor_model", "predecessor_effort", "successor_model", "successor_effort",
+            "effective_permissions",
+        }
+        if (not isinstance(observations, dict) or set(observations) != expected_observations
+                or any(observations.get(name) != unknown_observation for name in expected_observations)
+                or handoff.get("permission_requirement") != {
+                    "kind": "match_predecessor_effective", "status": "unknown"}
+                or handoff.get("readiness") != {
+                    "status": "blocked", "reason": "native_observations_unavailable"}
+                or handoff.get("launch") != {"status": "not_started"}
+                or handoff.get("transfer") != {"status": "not_applicable"}
+                or handoff.get("predecessor_cleanup") != {"status": "not_applicable"}):
+            raise IntentError("Successor handoff readiness is malformed.")
+        frozen_at = handoff.get("frozen_at")
+        if type(frozen_at) not in (int, float) or not math.isfinite(frozen_at) or frozen_at < 0:
+            raise IntentError("Successor handoff timestamp is malformed.")
+    for intent_id, intent in intents.items():
+        handoff_id = intent.get("handoff_id")
+        if handoff_id is not None:
+            handoff = handoffs.get(handoff_id)
+            if handoff is None or handoff.get("intent_id") != intent_id:
+                raise IntentError("Successor intent handoff link is malformed.")
     return value
 
 
@@ -225,6 +312,7 @@ def mutation_lock(state_dir):
 
 
 def write_store(root, value):
+    _validate_store(value)
     data = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
     if len(data) > MAX_STORE_BYTES:
         raise IntentError("Successor intent state exceeds its size limit.")
@@ -254,22 +342,47 @@ def _request_digest(scope, choice):
     return digest({"protocol": INTENT_PROTOCOL, "policy": "once", "scope": scope, "choice": choice})
 
 
+def intent_lifecycle_state(store, record):
+    if record["state"] == "cancelled":
+        return "cancelled"
+    handoff_id = record.get("handoff_id")
+    if handoff_id is None:
+        return "configured"
+    handoff = store["handoffs"].get(handoff_id)
+    if handoff is None:
+        raise IntentError("Successor intent handoff link is unavailable.")
+    if handoff["state"] == "transferred":
+        return "consumed"
+    return "frozen"
+
+
+def public_intent(store, record):
+    result = {**record, "lifecycle_state": intent_lifecycle_state(store, record)}
+    handoff_id = record.get("handoff_id")
+    if handoff_id is not None:
+        handoff = store["handoffs"].get(handoff_id)
+        result["handoff"] = ({"id": handoff_id, "protocol": handoff["protocol"],
+                              "state": handoff["state"]} if handoff else None)
+    return result
+
+
 def configure_intent(state_dir, scope, choice):
     key = scope_key(scope)
     request_digest = _request_digest(scope, choice)
     with mutation_lock(state_dir) as root:
         store = read_store(root)
         records = store["scopes"].setdefault(key, [])
-        active = next((record for record in reversed(records) if record["state"] == "configured"), None)
+        active = next((record for record in reversed(records)
+                       if intent_lifecycle_state(store, record) in ("configured", "frozen")), None)
         if active:
             if active["request_digest"] == request_digest:
-                return {**active, "reused": True}
-            raise IntentError("A different successor intent is already configured for this exact scope; cancel it first.")
+                return {**public_intent(store, active), "reused": True}
+            raise IntentError("A different successor intent is already configured or frozen for this exact scope; cancel it first.")
         total = sum(len(items) for items in store["scopes"].values())
         if total >= MAX_TOTAL_INTENTS or len(records) >= MAX_INTENTS_PER_SCOPE:
             raise IntentError("Successor intent state reached its record limit.")
         intent = {
-            "schema_version": STORE_SCHEMA_VERSION,
+            "schema_version": INTENT_SCHEMA_VERSION,
             "protocol": INTENT_PROTOCOL,
             "id": uuid.uuid4().hex,
             "scope": scope,
@@ -290,15 +403,16 @@ def configure_intent(state_dir, scope, choice):
         }
         records.append(intent)
         write_store(root, store)
-        return {**intent, "reused": False}
+        return {**public_intent(store, intent), "reused": False}
 
 
 def show_intent(state_dir, scope):
     key = scope_key(scope)
-    records = read_store(state_dir)["scopes"].get(key, [])
+    store = read_store(state_dir)
+    records = store["scopes"].get(key, [])
     if not records:
         return {"schema_version": STORE_SCHEMA_VERSION, "intent": None}
-    return {"schema_version": STORE_SCHEMA_VERSION, "intent": records[-1]}
+    return {"schema_version": STORE_SCHEMA_VERSION, "intent": public_intent(store, records[-1])}
 
 
 def _find_intent(store, intent_id):
@@ -312,26 +426,18 @@ def _find_intent(store, intent_id):
 def cancel_intent(state_dir, intent_id):
     if len(intent_id) != 32 or any(character not in "0123456789abcdef" for character in intent_id):
         raise IntentError("Invalid successor intent ID.")
-    store = read_store(state_dir)
-    _, _, current = _find_intent(store, intent_id)
-    if current is None:
-        raise IntentError("Unknown successor intent.")
-    if current["state"] == "cancelled":
-        return current
-    if current["state"] != "configured":
-        raise IntentError("Only a configured successor intent can be cancelled.")
     with mutation_lock(state_dir) as root:
         store = read_store(root)
         key, index, current = _find_intent(store, intent_id)
         if current is None:
             raise IntentError("Unknown successor intent.")
         if current["state"] == "cancelled":
-            return current
-        if current["state"] != "configured":
-            raise IntentError("Only a configured successor intent can be cancelled.")
+            return public_intent(store, current)
+        if intent_lifecycle_state(store, current) != "configured":
+            raise IntentError("Only a configured successor intent can be cancelled before it is frozen.")
         store["scopes"][key][index] = {**current, "state": "cancelled"}
         write_store(root, store)
-        return store["scopes"][key][index]
+        return public_intent(store, store["scopes"][key][index])
 
 
 def doctor_report(state_dir):

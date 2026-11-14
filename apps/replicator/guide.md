@@ -84,6 +84,31 @@ The current CMUX snapshot does not expose a supported native generation, model, 
 Replicator therefore leaves generation, predecessor settings, effective permissions, and readiness `unknown` and does not claim native binding or parity.
 These configuration commands do not launch a successor, transfer custody, close the predecessor, or consume an intent.
 
+## Freeze and inspect a versioned handoff
+
+Freeze a configured intent only after its exact registered seat and canonical worktree still match.
+For an explicit candidate, Replicator re-resolves the same family and effort through Model Preferences and refuses if the configured choice or seat changed.
+For preserve-observed, Replicator revalidates the registered seat but keeps predecessor model and effort `unknown`.
+
+```sh
+replicator handoff freeze INTENT_ID --worktree /absolute/path/to/worktree \
+  --mp-config-dir /path/to/model-preferences/config \
+  --mp-state-dir /path/to/model-preferences/state
+replicator handoff show HANDOFF_ID
+replicator handoff show HANDOFF_ID --json
+replicator handoff reconcile HANDOFF_ID
+replicator handoff reconcile HANDOFF_ID --json
+```
+
+Freeze stores one immutable `starfleet.replicator.handoff/v1` record and its one-to-one intent link in the same atomic private state-file replacement.
+Repeating freeze returns the same handoff ID and application handoff generation without creating another record.
+The application generation is not a native hook or process generation, and the native binding stays `unknown` until a supported exact-session observation exists.
+Show reports configured choice and provenance separately from unknown native model, effort, permissions, and readiness.
+Reconcile reads local state only and performs no native queries or writes.
+The frozen handoff is blocked on unavailable native observations.
+The freeze-only interface does not launch a successor, transfer custody, close a predecessor, or claim delivery.
+Cancel is available only before freeze.
+
 Run the passive diagnostic outside Git or before configuring an intent:
 
 ```sh

@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 import successor_intents
+import handoff_engine
 
 
 STATUSES = ("ready", "blocked", "unknown", "skipped")
@@ -529,6 +530,89 @@ def successor_show(args):
     return successor_intents.show_intent(args.state_dir, scope)
 
 
+def handoff_freeze(args):
+    store = successor_intents.read_store(args.state_dir)
+    _key, _index, intent = successor_intents._find_intent(store, args.intent_id)
+    if intent is None:
+        raise handoff_engine.HandoffError("Unknown successor intent.")
+    worktree = canonical_worktree_identity(args.worktree)
+    if worktree != intent["scope"]["worktree"]:
+        raise handoff_engine.HandoffError("The canonical worktree does not match this exact successor intent.")
+    existing = handoff_engine.existing_handoff_for_intent(args.state_dir, args.intent_id)
+    if existing is not None:
+        return {"handoff": existing, "reused": True}
+
+    choice = intent["choice"]
+    expected_choice = None
+    family = None
+    effort = None
+    if choice["kind"] == "model_preferences_candidate":
+        expected_choice = choice["snapshot"]
+        family = expected_choice["family"]
+        effort = expected_choice["effort"]
+    resolve_args = argparse.Namespace(
+        seat=intent["scope"]["seat"]["name"],
+        family=family,
+        effort=effort,
+        mp_config_dir=args.mp_config_dir,
+        mp_state_dir=args.mp_state_dir,
+    )
+    resolved = model_preferences_successor_choice(resolve_args)
+    if resolved["seat"] != intent["scope"]["seat"]:
+        raise handoff_engine.HandoffError("The registered Model Preferences seat changed; no handoff was frozen.")
+    revalidated_scope = {"seat": resolved["seat"], "worktree": worktree}
+    revalidated_choice = resolved["choice"] if expected_choice is not None else None
+    return handoff_engine.freeze_handoff(
+        args.state_dir, args.intent_id, revalidated_scope, revalidated_choice,
+    )
+
+
+def print_handoff_summary(result):
+    handoff = result["handoff"]
+    seat = handoff["scope"]["seat"]
+    choice = handoff["choice"]
+    print(f"Handoff: {handoff['state']}")
+    print(f"Handoff ID: {handoff['id']}")
+    print(f"Handoff generation: {handoff['handoff_generation']}")
+    print(f"Intent ID: {handoff['intent_id']}")
+    print(f"Seat: {seat['name']} ({seat['harness']})")
+    if choice["kind"] == "preserve_observed_predecessor":
+        print("Configured choice: preserve the predecessor's observed model and effort")
+    else:
+        snapshot = choice["snapshot"]
+        print(f"Configured choice: {snapshot['family']} ({snapshot['model']}) at {snapshot['effort']}")
+        print(f"Model Preferences profile: {choice['active_profile'] or 'none'}")
+        print(f"Active selection digest: {choice['active_selection_digest'] or 'none'}")
+        print(f"Candidate digest: {choice['candidate_digest']}")
+    print(f"Native hook generation: {handoff['native_generation']['status']}")
+    print(f"Observed predecessor model: {handoff['observations']['predecessor_model']['status']}")
+    print(f"Observed predecessor effort: {handoff['observations']['predecessor_effort']['status']}")
+    print(f"Observed successor model: {handoff['observations']['successor_model']['status']}")
+    print(f"Observed successor effort: {handoff['observations']['successor_effort']['status']}")
+    print(f"Effective permissions: {handoff['observations']['effective_permissions']['status']}")
+    print(f"Readiness: {handoff['readiness']['status']} ({handoff['readiness']['reason']})")
+    print(f"Launch: {handoff['launch']['status']}")
+    print("No native launch, transfer, or predecessor close was performed.")
+
+
+def handoff_show(args):
+    return handoff_engine.show_handoff(args.state_dir, args.handoff_id)
+
+
+def handoff_reconcile(args):
+    return handoff_engine.reconcile_handoff(args.state_dir, args.handoff_id)
+
+
+def print_handoff_reconciliation(result):
+    print_handoff_summary({"handoff": result["handoff"]})
+    reconciliation = result["reconciliation"]
+    print(f"Reconciliation: {reconciliation['status']}")
+    print(f"Native queries performed: {str(reconciliation['native_queries_performed']).lower()}")
+    print(f"Writes performed: {str(reconciliation['writes_performed']).lower()}")
+    for blocker in reconciliation["blockers"]:
+        print(f"Blocked: {blocker}")
+
+
 def print_successor_intent(report):
     intent = report.get("intent")
     if intent is None:
@@ -591,6 +675,20 @@ def build_parser():
     show.add_argument("--json", action="store_true", help="print the intent as JSON")
     cancel = successor_commands.add_parser("cancel", help="cancel a configured intent by its exact ID")
     cancel.add_argument("intent_id")
+    handoff = commands.add_parser("handoff", help="freeze and inspect versioned handoffs without native actions")
+    handoff_commands = handoff.add_subparsers(dest="handoff_command", required=True)
+    freeze = handoff_commands.add_parser("freeze", help="freeze one configured intent without launching a successor")
+    freeze.add_argument("intent_id")
+    freeze.add_argument("--worktree", required=True, help="exact canonical Git worktree for this intent")
+    freeze.add_argument("--mp-config-dir")
+    freeze.add_argument("--mp-state-dir")
+    freeze.add_argument("--json", action="store_true", help="print the frozen handoff as JSON")
+    show_handoff_parser = handoff_commands.add_parser("show", help="inspect a frozen handoff without native queries")
+    show_handoff_parser.add_argument("handoff_id")
+    show_handoff_parser.add_argument("--json", action="store_true", help="print the handoff as JSON")
+    reconcile = handoff_commands.add_parser("reconcile", help="read local handoff state without native queries or writes")
+    reconcile.add_argument("handoff_id")
+    reconcile.add_argument("--json", action="store_true", help="print the reconciliation as JSON")
     doctor = commands.add_parser("doctor", help="inspect Replicator configuration without writes or native queries")
     doctor.add_argument("--starfleet-json", action="store_true", help="print the agreed structured diagnostic protocol")
     preflight = commands.add_parser("preflight", help="inspect the current caller and worktree without writes")
@@ -639,6 +737,29 @@ def main(argv=None):
                     return 0
             else:
                 result = successor_intents.cancel_intent(args.state_dir, args.intent_id)
+            print(json.dumps(result, indent=2))
+            return 0
+        except (OSError, ValueError) as exc:
+            print(f"replicator: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "handoff":
+        try:
+            if args.handoff_command == "freeze":
+                result = handoff_freeze(args)
+                if not args.json:
+                    print_handoff_summary(result)
+                    print(f"Existing handoff reused: {str(result['reused']).lower()}")
+                    return 0
+            elif args.handoff_command == "show":
+                result = handoff_show(args)
+                if not args.json:
+                    print_handoff_summary({"handoff": result["handoff"]})
+                    return 0
+            else:
+                result = handoff_reconcile(args)
+                if not args.json:
+                    print_handoff_reconciliation(result)
+                    return 0
             print(json.dumps(result, indent=2))
             return 0
         except (OSError, ValueError) as exc:

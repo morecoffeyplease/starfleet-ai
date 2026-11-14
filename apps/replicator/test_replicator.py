@@ -11,11 +11,12 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent
-SOURCE_NAMES = ("replicator.py", "successor_intents.py", "install.py", "guide.md", "README.md")
+SOURCE_NAMES = ("replicator.py", "successor_intents.py", "handoff_engine.py", "install.py", "guide.md", "README.md")
 MODEL_PREFERENCES_SCRIPT = ROOT.parents[0] / "model-preferences" / "model_preferences.py"
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
 import replicator
+import handoff_engine
 
 
 class ReplicatorCliTests(unittest.TestCase):
@@ -653,10 +654,286 @@ class ReplicatorCliTests(unittest.TestCase):
         self.assertEqual(replacement.returncode, 0, replacement.stderr)
         self.assertNotEqual(json.loads(replacement.stdout)["id"], first["id"])
 
+    def test_handoff_freeze_is_versioned_atomic_idempotent_and_read_only_on_reconcile(self):
+        installation = self.install_copy()
+        config_dir, mp_state_dir, environment = self.model_preferences_fixture()
+        repo = self.init_repo(self.root / "handoff-worktree")
+        config_path = config_dir / "profiles.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["active"] = "Codex-only"
+        config["activation"] = "handoff-fixture"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        intent_state = self.root / "handoff-state"
+        configured = self.run_successor(
+            installation, environment, intent_state, "successor",
+            *self.successor_scope_args("configure", repo, config_dir, mp_state_dir),
+            "--family", "codex-luna", "--effort", "xhigh",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        intent = json.loads(configured.stdout)
+        saved_choice = intent["choice"]
+
+        config["active"] = "Claude-Codex"
+        config["activation"] = "changed-after-snapshot"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        legacy_store = json.loads((intent_state / "successor-intents.json").read_text(encoding="utf-8"))
+        legacy_store["schema_version"] = 1
+        legacy_store.pop("handoffs")
+        (intent_state / "successor-intents.json").write_text(json.dumps(legacy_store), encoding="utf-8")
+        (intent_state / "successor-intents.json").chmod(0o600)
+
+        trap_dir = self.root / "handoff-traps"
+        trap_dir.mkdir()
+        side_effect_marker = self.root / "native-side-effect.txt"
+        for name in ("cmux", "claude", "codex", "opencode", "pattern-buffer", "warp-drive",
+                     "hailing-frequencies", "temporal-beacon", "discord-watch"):
+            trap = trap_dir / name
+            trap.write_text(
+                "#!" + sys.executable + "\n"
+                "from pathlib import Path\n"
+                f"Path({str(side_effect_marker)!r}).write_text('unexpected native action', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            trap.chmod(0o755)
+        guarded_environment = dict(environment)
+        guarded_environment["PATH"] = str(trap_dir) + os.pathsep + environment["PATH"]
+        freeze_args = ("handoff", "freeze", intent["id"], "--worktree", str(repo),
+                       "--mp-config-dir", str(config_dir), "--mp-state-dir", str(mp_state_dir), "--json")
+        frozen_result = self.run_successor(
+            installation, guarded_environment, intent_state, *freeze_args,
+        )
+        self.assertEqual(frozen_result.returncode, 0, frozen_result.stderr)
+        frozen_response = json.loads(frozen_result.stdout)
+        self.assertFalse(frozen_response["reused"])
+        frozen = frozen_response["handoff"]
+        self.assertEqual(frozen["schema_version"], 1)
+        self.assertEqual(frozen["protocol"], "starfleet.replicator.handoff/v1")
+        self.assertEqual(frozen["state"], "frozen")
+        self.assertEqual(frozen["choice"], saved_choice)
+        self.assertEqual(frozen["intent_snapshot"]["id"], intent["id"])
+        self.assertEqual(frozen["handoff_generation"], frozen["handoff_generation"].lower())
+        self.assertEqual(len(frozen["handoff_generation"]), 32)
+        self.assertNotEqual(frozen["handoff_generation"], frozen["id"])
+        self.assertNotEqual(frozen["handoff_generation"], intent["scope"]["seat"]["session_id"])
+        self.assertEqual(frozen["native_generation"], {"status": "unknown", "value": None, "evidence": None})
+        self.assertEqual(frozen["native_predecessor_binding"], {
+            "status": "unknown", "hook_generation": None, "evidence": None,
+        })
+        self.assertEqual(frozen["native_successor_binding"], {
+            "status": "unknown", "hook_generation": None, "evidence": None,
+        })
+        self.assertEqual(frozen["readiness"], {
+            "status": "blocked", "reason": "native_observations_unavailable",
+        })
+        self.assertEqual(frozen["launch"], {"status": "not_started"})
+        self.assertEqual(frozen["transfer"], {"status": "not_applicable"})
+        self.assertEqual(frozen["predecessor_cleanup"], {"status": "not_applicable"})
+        self.assertEqual(frozen["observations"]["predecessor_model"]["status"], "unknown")
+        self.assertEqual(frozen["observations"]["predecessor_effort"]["status"], "unknown")
+        self.assertEqual(frozen["observations"]["successor_model"]["status"], "unknown")
+        self.assertEqual(frozen["observations"]["successor_effort"]["status"], "unknown")
+        self.assertEqual(frozen["observations"]["effective_permissions"]["status"], "unknown")
+        self.assertFalse(side_effect_marker.exists())
+
+        saved_store = json.loads((intent_state / "successor-intents.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_store["schema_version"], 2)
+        self.assertEqual(set(saved_store["handoffs"]), {frozen["id"]})
+        saved_intent = saved_store["scopes"][next(iter(saved_store["scopes"]))][0]
+        self.assertEqual(saved_intent["id"], intent["id"])
+        self.assertEqual(saved_intent["handoff_id"], frozen["id"])
+        self.assertEqual(saved_intent["choice"], saved_choice)
+        self.assertEqual(saved_intent["state"], "configured")
+
+        git_parent = str(Path(shutil.which("git")).parent)
+        no_mp_environment = dict(guarded_environment)
+        no_mp_environment["PATH"] = str(trap_dir) + os.pathsep + git_parent
+        reused = self.run_successor(installation, no_mp_environment, intent_state, *freeze_args)
+        self.assertEqual(reused.returncode, 0, reused.stderr)
+        reused_response = json.loads(reused.stdout)
+        self.assertTrue(reused_response["reused"])
+        self.assertEqual(reused_response["handoff"]["id"], frozen["id"])
+        self.assertEqual(reused_response["handoff"]["handoff_generation"], frozen["handoff_generation"])
+        self.assertFalse(side_effect_marker.exists())
+
+        show_human = self.run_successor(installation, no_mp_environment, intent_state,
+                                        "handoff", "show", frozen["id"])
+        self.assertEqual(show_human.returncode, 0, show_human.stderr)
+        self.assertIn("Configured choice: codex-luna (gpt-6-luna) at xhigh", show_human.stdout)
+        self.assertIn("Candidate digest:", show_human.stdout)
+        self.assertIn("Native hook generation: unknown", show_human.stdout)
+        self.assertIn("Effective permissions: unknown", show_human.stdout)
+        self.assertIn("Readiness: blocked (native_observations_unavailable)", show_human.stdout)
+        show_json = self.run_successor(installation, no_mp_environment, intent_state,
+                                       "handoff", "show", frozen["id"], "--json")
+        self.assertEqual(show_json.returncode, 0, show_json.stderr)
+        self.assertEqual(json.loads(show_json.stdout)["handoff"], frozen)
+        before_reconcile = self.tree_snapshot()
+        local_store_bytes = (intent_state / "successor-intents.json").read_bytes()
+        reconciled = self.run_successor(installation, no_mp_environment, intent_state,
+                                        "handoff", "reconcile", frozen["id"], "--json")
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        reconciliation = json.loads(reconciled.stdout)["reconciliation"]
+        self.assertEqual(reconciliation["status"], "blocked")
+        self.assertFalse(reconciliation["native_queries_performed"])
+        self.assertFalse(reconciliation["writes_performed"])
+        self.assertIn("native_generation_unavailable", reconciliation["blockers"])
+        self.assertEqual(before_reconcile, self.tree_snapshot())
+        self.assertEqual(local_store_bytes, (intent_state / "successor-intents.json").read_bytes())
+        self.assertFalse(side_effect_marker.exists())
+
+        cancelled = self.run_successor(installation, no_mp_environment, intent_state,
+                                       "successor", "cancel", intent["id"])
+        self.assertEqual(cancelled.returncode, 1)
+        self.assertIn("Only a configured successor intent can be cancelled", cancelled.stderr)
+        changed = self.run_successor(
+            installation, guarded_environment, intent_state, "successor",
+            *self.successor_scope_args("configure", repo, config_dir, mp_state_dir),
+            "--family", "codex-astra", "--effort", "xhigh",
+        )
+        self.assertEqual(changed.returncode, 1)
+        self.assertIn("already configured or frozen", changed.stderr)
+        same_choice_new_provenance = self.run_successor(
+            installation, guarded_environment, intent_state, "successor",
+            *self.successor_scope_args("configure", repo, config_dir, mp_state_dir),
+            "--family", "codex-luna", "--effort", "xhigh",
+        )
+        self.assertEqual(same_choice_new_provenance.returncode, 1)
+        self.assertIn("already configured or frozen", same_choice_new_provenance.stderr)
+        after_reconfigure = json.loads((intent_state / "successor-intents.json").read_text(encoding="utf-8"))
+        saved_after_reconfigure = after_reconfigure["scopes"][next(iter(after_reconfigure["scopes"]))][0]
+        self.assertEqual(saved_after_reconfigure["choice"], saved_choice)
+        self.assertEqual(saved_after_reconfigure["choice"]["active_profile"], "Codex-only")
+        self.assertEqual(after_reconfigure["handoffs"][frozen["id"]], frozen)
+        unsupported = self.run_successor(installation, no_mp_environment, intent_state,
+                                         "handoff", "launch", frozen["id"])
+        self.assertNotEqual(unsupported.returncode, 0)
+        self.assertFalse(side_effect_marker.exists())
+
+    def test_handoff_freeze_rejects_wrong_scope_and_changed_configured_candidate(self):
+        installation = self.install_copy()
+        config_dir, mp_state_dir, environment = self.model_preferences_fixture()
+        repo = self.init_repo(self.root / "handoff-exact-worktree")
+        other_repo = self.init_repo(self.root / "handoff-wrong-worktree")
+        intent_state = self.root / "handoff-reject-state"
+        configured = self.run_successor(
+            installation, environment, intent_state, "successor",
+            *self.successor_scope_args("configure", repo, config_dir, mp_state_dir),
+            "--family", "codex-luna", "--effort", "xhigh",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        intent = json.loads(configured.stdout)
+        wrong_worktree = self.run_successor(
+            installation, environment, intent_state, "handoff", "freeze", intent["id"],
+            "--worktree", str(other_repo), "--mp-config-dir", str(config_dir),
+            "--mp-state-dir", str(mp_state_dir), "--json",
+        )
+        self.assertEqual(wrong_worktree.returncode, 1)
+        self.assertIn("canonical worktree does not match", wrong_worktree.stderr)
+
+        config_path = config_dir / "profiles.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["models"]["codex-luna"]["slug"] = "changed-configured-model"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        changed_candidate = self.run_successor(
+            installation, environment, intent_state, "handoff", "freeze", intent["id"],
+            "--worktree", str(repo), "--mp-config-dir", str(config_dir),
+            "--mp-state-dir", str(mp_state_dir), "--json",
+        )
+        self.assertEqual(changed_candidate.returncode, 1)
+        self.assertIn("configured candidate changed", changed_candidate.stderr)
+        store = json.loads((intent_state / "successor-intents.json").read_text(encoding="utf-8"))
+        self.assertEqual(store["handoffs"], {})
+        record = store["scopes"][next(iter(store["scopes"]))][0]
+        self.assertNotIn("handoff_id", record)
+        self.assertEqual(record["choice"]["snapshot"]["model"], "gpt-6-luna")
+
+        config["models"]["codex-luna"]["slug"] = "gpt-6-luna"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        seat_path = mp_state_dir / "orchestrators.json"
+        registered_seats = json.loads(seat_path.read_text(encoding="utf-8"))
+        registered_seats["lane"]["session"] = "changed-fixture-session"
+        seat_path.write_text(json.dumps(registered_seats), encoding="utf-8")
+        seat_path.chmod(0o600)
+        wrong_seat = self.run_successor(
+            installation, environment, intent_state, "handoff", "freeze", intent["id"],
+            "--worktree", str(repo), "--mp-config-dir", str(config_dir),
+            "--mp-state-dir", str(mp_state_dir), "--json",
+        )
+        self.assertEqual(wrong_seat.returncode, 1)
+        self.assertIn("registered Model Preferences seat changed", wrong_seat.stderr)
+        unchanged = json.loads((intent_state / "successor-intents.json").read_text(encoding="utf-8"))
+        self.assertEqual(unchanged["handoffs"], {})
+
+    def test_preserve_observed_freeze_stays_blocked_and_reducers_are_idempotent(self):
+        installation = self.install_copy()
+        config_dir, mp_state_dir, environment = self.model_preferences_fixture()
+        repo = self.init_repo(self.root / "handoff-preserve-worktree")
+        intent_state = self.root / "handoff-preserve-state"
+        configured = self.run_successor(
+            installation, environment, intent_state, "successor",
+            *self.successor_scope_args("configure", repo, config_dir, mp_state_dir),
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        intent = json.loads(configured.stdout)
+        frozen_result = self.run_successor(
+            installation, environment, intent_state, "handoff", "freeze", intent["id"],
+            "--worktree", str(repo), "--mp-config-dir", str(config_dir),
+            "--mp-state-dir", str(mp_state_dir), "--json",
+        )
+        self.assertEqual(frozen_result.returncode, 0, frozen_result.stderr)
+        frozen = json.loads(frozen_result.stdout)["handoff"]
+        self.assertEqual(frozen["choice"], {"kind": "preserve_observed_predecessor"})
+        self.assertEqual(frozen["observations"]["predecessor_model"]["value"], None)
+        self.assertEqual(frozen["observations"]["predecessor_effort"]["value"], None)
+        self.assertEqual(frozen["readiness"]["status"], "blocked")
+        self.assertEqual(frozen["native_generation"]["status"], "unknown")
+
+        with self.assertRaises(handoff_engine.HandoffError):
+            handoff_engine._begin_opening(frozen)
+        synthetic_ready = {**frozen, "readiness": {"status": "ready"}}
+        opening, attempt_allowed = handoff_engine._begin_opening(synthetic_ready)
+        self.assertTrue(attempt_allowed)
+        same_opening, retry_allowed = handoff_engine._begin_opening(opening)
+        self.assertFalse(retry_allowed)
+        self.assertEqual(same_opening, opening)
+        uncertain = handoff_engine._mark_opening_uncertain(opening)
+        self.assertEqual(uncertain["state"], "opening_unconfirmed")
+        self.assertEqual(handoff_engine._mark_opening_uncertain(uncertain), uncertain)
+        same_uncertain, uncertain_retry = handoff_engine._begin_opening(uncertain)
+        self.assertFalse(uncertain_retry)
+        self.assertEqual(same_uncertain, uncertain)
+
+        synthetic_intent = {"id": "intent", "lifecycle_state": "frozen"}
+        synthetic_handoff = {
+            "id": "handoff", "intent_id": "intent", "intent_digest": "snapshot-digest",
+            "state": "transfer_prepared",
+        }
+        receipt = handoff_engine._ConfirmedTransferReceipt(
+            "handoff", "intent", "snapshot-digest", "receipt-1",
+        )
+        consumed_intent, transferred, duplicate = handoff_engine._consume_confirmed_transfer(
+            synthetic_intent, synthetic_handoff, receipt,
+        )
+        self.assertFalse(duplicate)
+        self.assertEqual(consumed_intent["lifecycle_state"], "consumed")
+        self.assertEqual(transferred["state"], "transferred")
+        replay_intent, replay_handoff, duplicate = handoff_engine._consume_confirmed_transfer(
+            consumed_intent, transferred, receipt,
+        )
+        self.assertTrue(duplicate)
+        self.assertEqual(replay_intent, consumed_intent)
+        self.assertEqual(replay_handoff, transferred)
+        wrong_receipt = handoff_engine._ConfirmedTransferReceipt(
+            "handoff", "intent", "snapshot-digest", "receipt-2",
+        )
+        with self.assertRaises(handoff_engine.HandoffError):
+            handoff_engine._consume_confirmed_transfer(consumed_intent, transferred, wrong_receipt)
+
     def test_successor_doctor_is_read_only_outside_git_and_installed_module_is_packaged(self):
         installation = self.install_copy()
         runtime = Path(installation["runtime"])
         self.assertTrue((runtime / "successor_intents.py").is_file())
+        self.assertTrue((runtime / "handoff_engine.py").is_file())
         state_dir = self.root / "missing-state"
         before = self.tree_snapshot()
         result = self.run_successor(installation, self.environment, state_dir,

@@ -1,6 +1,6 @@
 # Replicator
 
-Replicator packages a maintained guide, read-only preflight, and one-shot successor intent configuration for an explicitly requested manual handoff between orchestrator sessions.
+Replicator packages a maintained guide, read-only preflight, one-shot successor intent configuration, and a versioned handoff freeze for an explicitly requested manual handoff between orchestrator sessions.
 The guide describes the handoff procedure, preflight reports only the caller, worktree, and explicit input checks it can observe, and successor intent records a frozen choice for a configured seat and worktree.
 Replicator does not start agents, workers, timers, or an automatic handoff trigger.
 
@@ -72,6 +72,32 @@ The default preserve-observed request does not infer a predecessor model or effo
 The stored native generation, predecessor model and effort, effective permissions, and readiness remain `unknown` until supported exact-session observations exist.
 The current CMUX snapshot provides no supported native generation, model, effort, or effective-permission observation, so configuration does not bind a generation or establish runtime parity or readiness.
 Configuration does not launch a successor, transfer custody, close a predecessor, or consume an intent.
+
+## Freeze and inspect a versioned handoff
+
+Freeze a configured intent once its exact registered seat and canonical worktree still match.
+For an explicit choice, Replicator re-resolves the same configured family and effort through Model Preferences without activating a profile.
+The candidate must remain unchanged and supported for the exact registered harness.
+For preserve-observed, Replicator revalidates the seat only and does not infer a predecessor model or effort.
+
+```sh
+replicator handoff freeze INTENT_ID --worktree /absolute/path/to/worktree \
+  --mp-config-dir /path/to/model-preferences/config \
+  --mp-state-dir /path/to/model-preferences/state
+replicator handoff show HANDOFF_ID
+replicator handoff show HANDOFF_ID --json
+replicator handoff reconcile HANDOFF_ID
+replicator handoff reconcile HANDOFF_ID --json
+```
+
+Freeze stores one immutable `starfleet.replicator.handoff/v1` record and links it to the one-shot intent in the same atomic state-file replacement.
+Repeating freeze for that intent returns the same handoff ID and handoff generation.
+The application-owned handoff generation is distinct from native hook generation, which remains `unknown` because no supported exact-session generation observation is available.
+Show separates configured Model Preferences choice and provenance from native observations and readiness.
+Reconcile reads only the private local state, performs no native queries or writes, and reports the current native-observation blockers.
+The frozen record leaves native model, effort, effective permissions, native bindings, readiness, transfer, and predecessor cleanup unknown, blocked, or not applicable as appropriate.
+Cancel refuses a frozen intent, and another candidate cannot replace it.
+This freeze-only slice has no launch, ready, transfer, or close command and does not establish native parity, custody, or delivery.
 
 Run the passive configuration diagnostic outside a Git checkout:
 
