@@ -38,6 +38,10 @@ _reviewer_guidance_spec = importlib.util.spec_from_file_location(
     "model_preferences_reviewer_guidance", _reviewer_guidance_path)
 reviewer_guidance = importlib.util.module_from_spec(_reviewer_guidance_spec)
 _reviewer_guidance_spec.loader.exec_module(reviewer_guidance)
+_handoff_adapter_path = Path(__file__).resolve().with_name("handoff_adapter.py")
+_handoff_adapter_spec = importlib.util.spec_from_file_location("model_preferences_handoff_adapter", _handoff_adapter_path)
+handoff_adapter = importlib.util.module_from_spec(_handoff_adapter_spec)
+_handoff_adapter_spec.loader.exec_module(handoff_adapter)
 
 
 def now():
@@ -1568,8 +1572,10 @@ def parser():
     hook_config = sub.add_parser("hook-config"); hook_config.add_argument("--harness", choices=("claude", "codex"), required=True)
     hs = sub.add_parser("handoff-start"); hs.add_argument("name"); hs.add_argument("--brief", required=True)
     hs.add_argument("--roadmap", required=True); hs.add_argument("--cwd", required=True)
+    hs.add_argument("--replicator-state-dir", help="Replicator's private state directory when not using its default.")
     for name in ("handoff-ready", "handoff-transfer", "handoff-close", "handoff-approve-close"):
         s = sub.add_parser(name); s.add_argument("handoff")
+        s.add_argument("--replicator-state-dir", help="Replicator's private state directory when not using its default.")
         if name == "handoff-ready":
             s.add_argument("--remaining-questions", required=True)
         if name == "handoff-transfer":
@@ -2681,6 +2687,11 @@ def execute(args):
         return launch_reconcile(app, args.launch, args.disposition, args.request_key)
     if command == "examples":
         return example_config()
+    if command == "handoff-start":
+        return handoff_adapter.start(app, args)
+    if command in ("handoff-ready", "handoff-transfer", "handoff-close", "handoff-approve-close"):
+        handoff_adapter.route_transition(app, args.handoff,
+                                         replicator_state_dir=args.replicator_state_dir)
     with locked(app.config_dir):
         if command == "init":
             require(not app.config_path.exists(), "Configuration exists; init will not overwrite it.")

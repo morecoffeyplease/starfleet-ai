@@ -58,6 +58,37 @@ Replicator stores the active profile name and digest alongside its immutable can
 Without `--family` and `--effort`, the result identifies the registered seat only.
 Replicator uses that registration to scope the preserve-observed request while keeping predecessor model, effort, native generation, and effective permissions unknown until exact-session observations are available.
 
+## Replicator-backed handoff commands
+
+Install Replicator separately and put its installed command directory on `PATH` before using `model-preferences handoff-start`.
+The Model Preferences installer packages its delegation adapter but does not install Replicator or create a Replicator intent.
+Configure the exact one-shot successor intent through Replicator before starting the Model Preferences handoff command.
+Omit model options to request preservation of the predecessor's observed model and effort, or choose an existing same-harness family and supported effort explicitly.
+
+```sh
+python3 apps/replicator/install.py \
+  --runtime-root "$HOME/.local/share/starfleet-ai/replicator" \
+  --bin-dir "$HOME/.local/bin"
+replicator successor configure --seat SEAT --worktree /absolute/path/to/worktree
+model-preferences handoff-start SEAT --brief /path/to/brief.md \
+  --roadmap /path/to/roadmap.md --cwd /absolute/path/to/worktree
+```
+
+`handoff-start` delegates to the exact configured Replicator intent and freezes its versioned record without creating a Model Preferences legacy handoff or launch record.
+Read the public `replicator-v1:<engine-id>` handle from `handoff.handle`.
+The response includes the raw engine ID in `handoff.engine_id` for Replicator inspection.
+Pass `handoff.handle` to Model Preferences transition commands so a versioned record cannot be mistaken for an unversioned legacy UUID.
+When the intent uses a non-default Replicator state directory, pass `--replicator-state-dir PATH` to `handoff-start` and repeat it on later transition commands.
+The current Replicator engine does not launch a successor or establish native receiving readiness, so the command returns a blocked result and exit code 2 while retaining the outgoing owner.
+The command does not select the active Model Preferences profile as a fallback when no explicit successor choice was saved.
+Missing Replicator, an invalid protocol response, or an absent exact successor intent fails without falling back to the legacy start engine.
+Namespaced versioned handles never fall back to the legacy handler.
+Existing unversioned Model Preferences UUIDs keep their legacy transition handler when the exact unversioned record exists and Replicator is unavailable, or when an installed Replicator returns a valid not-found response for that ID.
+If Replicator is available but returns an invalid protocol, or the same raw ID exists in both stores, the adapter refuses the transition and preserves both records.
+Uncertain legacy opening and closing states remain inspect-only and are not replayed by the adapter.
+Inspect a frozen engine record with `replicator handoff show ENGINE_ID --json`.
+Readiness, launch, transfer, and predecessor cleanup remain blocked or not applicable in this source slice.
+
 ## Human approval authority
 
 No human approval authority is assigned by default.
@@ -207,6 +238,8 @@ Run the component verifier from the repository root.
 
 Use the installer with isolated runtime, binary, config, state and harness settings paths when checking installation behavior.
 The installer preserves unrelated settings and refuses unowned or modified runtime files.
+The installed Model Preferences runtime includes the versioned Replicator handoff adapter.
+Install Replicator separately before using the new `handoff-start` delegation path.
 For installed hooks, configuration and hook registration do not prove that a native session loaded, trusted or received the context.
 Review the harness's own trust controls and confirm behavior through the exact session that will use the saved profile.
 

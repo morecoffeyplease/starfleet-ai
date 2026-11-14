@@ -119,6 +119,7 @@ def install(args):
     transport_source = source.with_name("cmux_transport.py")
     opencode_source = source.with_name("opencode_dispatch.py")
     adapter_source = source.with_name("opencode_adapter.py")
+    handoff_source = source.with_name("handoff_adapter.py")
     if not adapter_source.is_file():
         adapter_source = source.parents[2] / "apps" / "opencode-adapter" / "opencode_adapter.py"
     runtime = args.runtime_dir / "model_preferences.py"
@@ -126,10 +127,11 @@ def install(args):
     transport_runtime = args.runtime_dir / "cmux_transport.py"
     opencode_runtime = args.runtime_dir / "opencode_dispatch.py"
     adapter_runtime = args.runtime_dir / "opencode_adapter.py"
+    handoff_runtime = args.runtime_dir / "handoff_adapter.py"
     launcher = args.bin_dir / "model-preferences"
     manifest = args.runtime_dir / "install.json"
     for path in (args.runtime_dir, args.bin_dir, runtime, guidance_runtime, transport_runtime, opencode_runtime,
-                 adapter_runtime, launcher, manifest):
+                 adapter_runtime, handoff_runtime, launcher, manifest):
         require(not path.is_symlink(), f"Refusing symlink: {path}")
     if launcher.exists():
         require(LAUNCHER_MARKER in launcher.read_text().splitlines()[:3], "Existing model-preferences command is not installer-owned.")
@@ -149,6 +151,9 @@ def install(args):
     if adapter_runtime.exists():
         require(previous.get("owner") == OWNER and previous.get("adapter_sha256") == hashlib.sha256(adapter_runtime.read_bytes()).hexdigest(),
                 "Existing OpenCode adapter runtime is unowned or modified; installation refused.")
+    if handoff_runtime.exists():
+        require(previous.get("owner") == OWNER and previous.get("handoff_adapter_sha256") == hashlib.sha256(handoff_runtime.read_bytes()).hexdigest(),
+                "Existing handoff adapter runtime is unowned or modified; installation refused.")
     plans = [plan_hooks(source, runtime, args, h, args.claude_settings if h == "claude" else args.codex_settings)
              for h in dict.fromkeys(args.harness)]
     payload = source.read_bytes()
@@ -156,10 +161,13 @@ def install(args):
     require(opencode_source.is_file() and adapter_source.is_file(), "OpenCode helper or shared adapter source is unavailable.")
     opencode_payload = opencode_source.read_bytes()
     adapter_payload = adapter_source.read_bytes()
+    require(handoff_source.is_file(), "Replicator handoff adapter source is unavailable.")
+    handoff_payload = handoff_source.read_bytes()
     require(guidance_source.is_file(), "Reviewer guidance source is unavailable.")
     guidance_payload = guidance_source.read_bytes()
     snapshots = {p: p.read_bytes() if p.exists() else None
-                 for p in (runtime, guidance_runtime, transport_runtime, opencode_runtime, adapter_runtime, manifest, launcher)}
+                 for p in (runtime, guidance_runtime, transport_runtime, opencode_runtime, adapter_runtime,
+                           handoff_runtime, manifest, launcher)}
     launcher_text = "#!/bin/sh\n" + LAUNCHER_MARKER + "\nexec " + shlex.join([
         sys.executable, str(runtime), "--config-dir", str(args.config_dir), "--state-dir", str(args.state_dir)]) + ' "$@"\n'
     with lock(args.runtime_dir / ".install.lock"):
@@ -174,6 +182,8 @@ def install(args):
             atomic(opencode_runtime, opencode_payload)
         if not adapter_runtime.exists() or adapter_runtime.read_bytes() != adapter_payload:
             atomic(adapter_runtime, adapter_payload)
+        if not handoff_runtime.exists() or handoff_runtime.read_bytes() != handoff_payload:
+            atomic(handoff_runtime, handoff_payload)
         if not guidance_runtime.exists() or guidance_runtime.read_bytes() != guidance_payload:
             atomic(guidance_runtime, guidance_payload)
         if not runtime.exists() or runtime.read_bytes() != payload:
@@ -199,6 +209,7 @@ def install(args):
                     "transport_sha256": hashlib.sha256(transport_payload).hexdigest(),
                     "opencode_sha256": hashlib.sha256(opencode_payload).hexdigest(),
                     "adapter_sha256": hashlib.sha256(adapter_payload).hexdigest(),
+                    "handoff_adapter_sha256": hashlib.sha256(handoff_payload).hexdigest(),
                     "command": str(launcher), "config_dir": str(args.config_dir), "state_dir": str(args.state_dir)}
         if not manifest.exists() or json.loads(manifest.read_text()) != metadata:
             atomic(manifest, (json.dumps(metadata, indent=2) + "\n").encode())
