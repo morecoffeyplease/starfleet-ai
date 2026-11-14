@@ -113,6 +113,13 @@ Unsealed messages can be assigned to the new generation, and a group never combi
 An unexplained generation change without the matching ownership-event chain holds its groups.
 An uncertain send stays uncertain across transfer.
 
+`custody-adoption` is a separate, explicit current-generation assignment for selected existing threads and timers when historical process continuity is unavailable.
+It preserves the old and current generation identities, records continuity as unestablished, and requires a private approval-reference audit note plus independent acceptance by the current exact native owner.
+The approval reference is cooperative evidence and is not authenticated proof.
+Preview is read-only and omits reply bodies, attachment URLs, and continuation text.
+Apply holds only the selected obligations while it appends the per-resource events and preserves their existing delivery state.
+The full workflow and interruption rules are in the [setup guide](guide.md#explicit-current-generation-custody-adoption).
+
 ## Commands
 
 Global path options go before the command:
@@ -121,7 +128,7 @@ Global path options go before the command:
 discord-watch --state-dir PATH --notify-home PATH --hailing-state PATH --cmux PATH status
 ```
 
-The main commands are `register`, `managed`, `receive`, `close`, `transfer`, `status`, `doctor`, `scan`, `serve`, and `supervise`.
+The main commands are `register`, `managed`, `receive`, `close`, `transfer`, `custody-adoption`, `status`, `doctor`, `scan`, `serve`, and `supervise`.
 `scan` is observe-only unless `--send` is supplied.
 `serve` runs one Gateway, REST, and sender topology, while `supervise` owns a separate supervisor lock and restarts a crashed worker with bounded backoff.
 Both accept `--send` and `--only-thread THREAD`.
@@ -144,7 +151,7 @@ python3 apps/discord-watch/install.py
 discord-watch guide --print
 ```
 
-The installer stages Discord Watch, the pinned dependency, this README, the guide, and the Hailing Frequencies source dependency into an immutable content-addressed runtime.
+The installer stages Discord Watch, the custody adoption module, Temporal Beacon, the pinned dependency, this README, the guide, and the Hailing Frequencies source dependency into an immutable content-addressed runtime.
 It verifies the wheel hash, vendored import location, package version, and runtime integrity record before replacing the launcher.
 The installed guide can print before initialization, enrollment, Discord credentials, or a Git checkout.
 Uninstalling the launcher preserves the runtime and local state.

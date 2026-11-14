@@ -5,6 +5,7 @@ import argparse
 import contextlib
 from datetime import datetime
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -70,6 +71,12 @@ STARFLEET_DIAGNOSTIC_LIMIT = 256 * 1024
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def _sha256_owner(value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def snowflake(value, label="Discord snowflake"):
@@ -411,7 +418,24 @@ class Watch:
           from_session TEXT NOT NULL,
           to_session TEXT NOT NULL,
           at REAL NOT NULL,
-          owner_generation INTEGER NOT NULL
+          owner_generation INTEGER NOT NULL,
+          event_type TEXT NOT NULL DEFAULT 'transfer',
+          operation_id TEXT,
+          plan_digest TEXT,
+          from_owner_json TEXT,
+          to_owner_json TEXT,
+          old_owner_digest TEXT,
+          new_owner_digest TEXT,
+          before_digest TEXT,
+          after_preserved_digest TEXT,
+          from_worktree TEXT,
+          to_worktree TEXT,
+          continuity TEXT,
+          UNIQUE(operation_id,thread_id)
+        );
+        CREATE TABLE IF NOT EXISTS custody_adoption_holds (
+          operation_id TEXT NOT NULL, thread_id TEXT NOT NULL, plan_digest TEXT NOT NULL,
+          PRIMARY KEY(operation_id,thread_id)
         );
         CREATE TABLE IF NOT EXISTS delivery_groups (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -510,6 +534,19 @@ class Watch:
             db.execute("ALTER TABLE delivery_group_attempts ADD COLUMN target_owner_json TEXT")
         if "target_owner_generation" not in attempt_columns:
             db.execute("ALTER TABLE delivery_group_attempts ADD COLUMN target_owner_generation INTEGER")
+        ownership_columns = {row[1] for row in db.execute("PRAGMA table_info(ownership_events)")}
+        for name, declaration in (
+                ("event_type", "TEXT NOT NULL DEFAULT 'transfer'"),
+                ("operation_id", "TEXT"), ("plan_digest", "TEXT"),
+                ("from_owner_json", "TEXT"), ("to_owner_json", "TEXT"),
+                ("old_owner_digest", "TEXT"), ("new_owner_digest", "TEXT"),
+                ("before_digest", "TEXT"), ("after_preserved_digest", "TEXT"),
+                ("from_worktree", "TEXT"), ("to_worktree", "TEXT"),
+                ("continuity", "TEXT")):
+            if name not in ownership_columns:
+                db.execute(f"ALTER TABLE ownership_events ADD COLUMN {name} {declaration}")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ownership_adoption_operation "
+                   "ON ownership_events(operation_id,thread_id) WHERE operation_id IS NOT NULL")
         thread_columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
         if "catchup_before" not in thread_columns:
             db.execute("ALTER TABLE threads ADD COLUMN catchup_before TEXT")
@@ -725,7 +762,7 @@ class Watch:
                     require(isinstance(data, dict), "Discord Gateway MESSAGE_CREATE payload is invalid")
                     thread_id = snowflake(data.get("channel_id"), "Gateway message channel ID")
                     known = db.execute("SELECT 1 FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
-                    if known:
+                    if known and not self._custody_adoption_hold(db, thread_id):
                         inserted = self._ingest_message(db, thread_id, data, configured_user_id, now,
                                                         source="gateway")
                 db.execute("UPDATE gateway_state SET sequence=?,last_event_at=?,updated_at=? WHERE id=1",
@@ -908,6 +945,11 @@ class Watch:
 
     def register(self, thread_id, after=None, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
+        database_path = self.directory / "discord-watch.sqlite3"
+        if database_path.is_file() and not database_path.is_symlink():
+            with contextlib.closing(self.database(create=False)) as existing_db:
+                require(not self._custody_adoption_hold(existing_db, thread_id),
+                        "Thread is held by an explicit custody adoption")
         owner = self._identity_owner(session_hint=session_hint)
         credentials, api = self.read_credentials()
         remote = self.remote_thread(api, thread_id)
@@ -962,13 +1004,87 @@ class Watch:
         require(not require_open or result["is_open"], "Thread registration is closed")
         return result
 
-    @staticmethod
-    def _refresh_dormancy(db, now):
-        cutoff = now - DORMANT_AFTER
+    def _custody_adoption_hold(self, db, thread_id):
+        rows = db.execute(
+            "SELECT operation_id,plan_digest FROM custody_adoption_holds WHERE thread_id=?",
+            (thread_id,)).fetchall()
+        path = self.hailing_state / "receipts.sqlite3"
+        try:
+            if path.is_symlink() or not path.is_file():
+                return None if not rows else {"operation_id": rows[0][0], "state": "missing"}
+            with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
+                                                    uri=True, timeout=1)) as journal:
+                table = journal.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    ("custody_adoption_holds",)).fetchone()
+                if table is None:
+                    return None if not rows else {"operation_id": rows[0][0], "state": "missing"}
+                central = journal.execute(
+                    "SELECT operation_id,plan_digest FROM custody_adoption_holds "
+                    "WHERE resource_kind='discord_thread' AND resource_id=?",
+                    (thread_id,)).fetchall()
+        except (OSError, sqlite3.Error):
+            return {"operation_id": rows[0][0] if rows else "unknown", "state": "unavailable"}
+        rows = list(dict.fromkeys(rows + central))
+        if not rows:
+            return None
+        for operation_id, hold_digest in rows:
+            try:
+                with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
+                                                        uri=True, timeout=1)) as journal:
+                    operation = journal.execute(
+                        "SELECT plan_digest,state FROM custody_adoption_operations WHERE operation_id=?",
+                        (operation_id,)).fetchone()
+            except (OSError, sqlite3.Error):
+                return {"operation_id": operation_id, "state": "unavailable"}
+            if operation is None or operation[0] != hold_digest or operation[1] != "complete":
+                return {"operation_id": operation_id, "state": operation[1] if operation else "missing"}
+        return None
+
+    def _refresh_dormancy(self, db, now):
+        local_holds = db.execute(
+            "SELECT operation_id,thread_id,plan_digest FROM custody_adoption_holds").fetchall()
+        held = set()
+        path = self.hailing_state / "receipts.sqlite3"
+        if path.is_symlink():
+            return
+        if path.is_file():
+            try:
+                with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
+                                                        uri=True, timeout=1)) as journal:
+                    tables = {row[0] for row in journal.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                        "('custody_adoption_holds','custody_adoption_operations')")}
+                    if local_holds and not tables:
+                        return
+                    if tables and tables != {"custody_adoption_holds", "custody_adoption_operations"}:
+                        return
+                    if tables:
+                        for operation_id, thread_id, hold_digest in local_holds:
+                            operation = journal.execute(
+                                "SELECT plan_digest,state FROM custody_adoption_operations "
+                                "WHERE operation_id=?", (operation_id,)).fetchone()
+                            if operation is None or operation != (hold_digest, "complete"):
+                                held.add(thread_id)
+                        held.update(row[0] for row in journal.execute(
+                            "SELECT h.resource_id FROM custody_adoption_holds h "
+                            "JOIN custody_adoption_operations o USING(operation_id) "
+                            "WHERE h.resource_kind='discord_thread' "
+                            "AND (h.plan_digest!=o.plan_digest OR o.state!='complete')"))
+            except (OSError, sqlite3.Error):
+                return
+        elif local_holds:
+            return
+        exclusion = ""
+        values = [now - DORMANT_AFTER]
+        if held:
+            exclusion = " AND thread_id NOT IN (" + ",".join("?" for _ in held) + ")"
+            values.extend(sorted(held))
         with db:
             db.execute("UPDATE threads SET subscription_state='dormant' "
                        "WHERE subscription_state='active' "
-                       "AND COALESCE(last_activity_at,registered_at)<?", (cutoff,))
+                       "AND COALESCE(last_activity_at,registered_at)<?" + exclusion,
+                       values)
 
     @staticmethod
     def _catchup_incomplete(thread):
@@ -993,6 +1109,8 @@ class Watch:
         current = self._identity_owner(session_hint=session_hint)
         with contextlib.closing(self.database(create=False)) as db:
             thread = self._thread(db, thread_id, require_open=False)
+            require(not self._custody_adoption_hold(db, thread_id),
+                    "Thread is held by an explicit custody adoption")
             require(thread["owner"] == current,
                     "Thread belongs to another exact session; use explicit transfer")
             active = db.execute("SELECT state,COUNT(*) FROM messages WHERE thread_id=? GROUP BY state",
@@ -1010,6 +1128,8 @@ class Watch:
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
             thread = self._thread(db, thread_id, require_open=False)
+            require(not self._custody_adoption_hold(db, thread_id),
+                    "Thread is held by an explicit custody adoption")
             require(thread["owner"] == current,
                     "Only the registered current owner can close this Discord Watch registration")
             with db:
@@ -1026,6 +1146,9 @@ class Watch:
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
             self._refresh_dormancy(db, now)
+            if self._custody_adoption_hold(db, thread_id):
+                return {"thread": thread_id, "message": None, "ingested": False,
+                        "held": "custody_adoption"}
             with db:
                 db.execute("BEGIN IMMEDIATE")
                 inserted = self._ingest_message(db, thread_id, message, self._configured_user_id, now,
@@ -1044,6 +1167,8 @@ class Watch:
             with db:
                 db.execute("BEGIN IMMEDIATE")
                 thread = self._thread(db, thread_id, require_open=False)
+                require(not self._custody_adoption_hold(db, thread_id),
+                        "Thread is held by an explicit custody adoption")
                 require(thread["owner"].get("session") == old_session,
                         "--from-session does not match the registered owner")
                 require(thread["owner"] != current, "Thread already belongs to this exact session")
@@ -1267,6 +1392,8 @@ class Watch:
                             routine=False, stop_event=None):
         max_pages = MAX_CATCHUP_PAGES if max_pages is None else max_pages
         thread_id = thread["thread_id"]
+        if self._custody_adoption_hold(db, thread_id):
+            return {"thread": thread_id, "status": "custody_adoption_hold", "poll_skipped": True}
         if stop_event is not None and stop_event.is_set():
             return {"thread": thread_id, "status": "stopped"}
         if now < self.global_not_before:
@@ -1339,31 +1466,91 @@ class Watch:
 
     def _generation_chain_valid(self, db, thread, group_generation, group_owner):
         current_generation = thread["owner_generation"]
-        if group_generation > current_generation:
+        if (not isinstance(group_owner, dict) or type(group_generation) is not int or
+                group_generation < 1 or group_generation > current_generation):
             return False
         if current_generation == 1:
             return group_generation == 1 and group_owner == thread["owner"]
         events = db.execute(
-            "SELECT owner_generation,from_session,to_session FROM ownership_events "
-            "WHERE thread_id=? AND owner_generation<=? ORDER BY owner_generation",
+            "SELECT owner_generation,from_session,to_session,event_type,from_owner_json,to_owner_json,"
+            "operation_id,plan_digest,old_owner_digest,new_owner_digest,before_digest,"
+            "after_preserved_digest,from_worktree,to_worktree,continuity "
+            "FROM ownership_events WHERE thread_id=? AND owner_generation<=? ORDER BY owner_generation",
             (thread["thread_id"], current_generation)).fetchall()
         if len(events) != current_generation - 1:
             return False
         previous = events[0][1]
-        owner_at_generation = previous
-        for expected_generation, (generation, from_session, to_session) in enumerate(events, start=2):
+        sessions = {1: previous}
+        exact_owners = {}
+        for expected_generation, event in enumerate(events, start=2):
+            (generation, from_session, to_session, event_type, from_owner_json, to_owner_json,
+             operation_id, plan_digest, old_owner_digest, new_owner_digest, before_digest,
+             after_preserved_digest, from_worktree, to_worktree, continuity) = event
             if generation != expected_generation or from_session != previous:
                 return False
+            if event_type == "custody_adoption":
+                try:
+                    from_owner = json.loads(from_owner_json)
+                    to_owner = json.loads(to_owner_json)
+                except (TypeError, ValueError):
+                    return False
+                old_harness = from_owner.get("harness") if isinstance(from_owner, dict) else None
+                if old_harness == "opencode" and isinstance(from_owner, dict):
+                    try:
+                        old_worktree_matches = (
+                            isinstance(from_owner.get("worktree_directory"), str) and
+                            str(Path(from_owner["worktree_directory"]).expanduser().resolve(strict=True)) ==
+                            from_worktree)
+                    except (OSError, RuntimeError):
+                        old_worktree_matches = False
+                else:
+                    old_worktree_matches = from_worktree == "not_recorded_by_hf_or_dw"
+                if (not isinstance(from_owner, dict) or not isinstance(to_owner, dict) or
+                        from_owner.get("session") != from_session or
+                        to_owner.get("session") != to_session or
+                        continuity != "not_established" or
+                        not old_worktree_matches or
+                        not isinstance(to_worktree, str) or not to_worktree):
+                    return False
+                try:
+                    if (self.binding_snapshot(from_owner) != from_owner or
+                            self.binding_snapshot(to_owner) != to_owner):
+                        return False
+                except (ValueError, KeyError, TypeError):
+                    return False
+                if (not isinstance(operation_id, str) or
+                        re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                                     operation_id) is None or
+                        not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                                for value in (plan_digest, old_owner_digest, new_owner_digest,
+                                              before_digest, after_preserved_digest))):
+                    return False
+                if (_sha256_owner(from_owner) != old_owner_digest or
+                        _sha256_owner(to_owner) != new_owner_digest or
+                        (from_owner["harness"], from_owner["session"], from_owner["surface"],
+                         from_owner["workspace"]) !=
+                        (to_owner["harness"], to_owner["session"], to_owner["surface"],
+                         to_owner["workspace"]) or
+                        from_owner["started_at"] == to_owner["started_at"]):
+                    return False
+                if generation - 1 in exact_owners and exact_owners[generation - 1] != from_owner:
+                    return False
+                exact_owners[generation - 1] = from_owner
+                exact_owners[generation] = to_owner
+            elif event_type != "transfer":
+                return False
+            sessions[generation - 1] = from_session
+            sessions[generation] = to_session
             previous = to_session
-            if generation == group_generation:
-                owner_at_generation = to_session
         if previous != thread["owner"].get("session"):
             return False
-        if group_generation == 1:
-            return group_owner.get("session") == owner_at_generation
+        if sessions.get(group_generation) != group_owner.get("session"):
+            return False
+        if group_generation in exact_owners:
+            return group_owner == exact_owners[group_generation]
         if group_generation == current_generation:
             return group_owner == thread["owner"]
-        return group_owner.get("session") == owner_at_generation
+        return True
 
     @staticmethod
     def _reconcile_group_receipts(db, thread_id=None):
@@ -1489,6 +1676,8 @@ class Watch:
 
     def _wake_one_locked(self, db, thread, now):
         thread_id = thread["thread_id"]
+        if self._custody_adoption_hold(db, thread_id):
+            return {"state": "custody_adoption_hold", "would_wake": False}
         with db:
             self._reconcile_group_receipts(db, thread_id)
         formed = self._seal_delivery_groups(db, thread, now)
@@ -1662,6 +1851,11 @@ class Watch:
                     "ORDER BY registered_at,thread_id")]
             send_scope = list(thread_ids) if send else []
             for thread_id in thread_ids:
+                if self._custody_adoption_hold(db, thread_id):
+                    report["threads"].append({"thread": thread_id,
+                                               "status": "custody_adoption_hold",
+                                               "poll_skipped": True, "wake_skipped": True})
+                    continue
                 try:
                     thread = self._thread(db, thread_id, require_open=False)
                 except ValueError as error:
@@ -1922,6 +2116,8 @@ class Watch:
             for thread_id in thread_ids:
                 if not send:
                     break
+                if self._custody_adoption_hold(db, thread_id):
+                    continue
                 delay_row = db.execute("SELECT value FROM meta WHERE key=?",
                                        (f"sender_retry_after:{thread_id}",)).fetchone()
                 if delay_row and float(delay_row[0]) > now:
@@ -2019,6 +2215,8 @@ class Watch:
                 "Select either an exact message or a delivery group, not both")
         with self.locked(timeout=LOCK_TIMEOUT, name="receive.lock"):
             with contextlib.closing(self.database(create=False)) as db:
+                require(not self._custody_adoption_hold(db, thread_id),
+                        "Thread is held by an explicit custody adoption")
                 with db:
                     self._reconcile_group_receipts(db, thread_id)
                 thread = self._thread(db, thread_id, require_open=False)
@@ -2972,6 +3170,22 @@ def parser():
     transfer.add_argument("thread")
     transfer.add_argument("--from-session", required=True)
     transfer.add_argument("--session", help="Select an exact OpenCode ses_ owner when the surface is ambiguous")
+    adoption = sub.add_parser("custody-adoption",
+                              help="Explicitly adopt selected obligations for a verified current generation")
+    adoption_sub = adoption.add_subparsers(dest="adoption_action", required=True)
+    for action in ("preview", "prepare"):
+        child = adoption_sub.add_parser(action)
+        child.add_argument("--operation-id", required=True)
+        child.add_argument("--thread", action="append", default=[])
+        child.add_argument("--timer-id", action="append", default=[])
+        child.add_argument("--approval-reference", required=True,
+                           help="Cooperative audit reference; this is not authenticated proof")
+        if action == "prepare":
+            child.add_argument("--plan-digest", required=True)
+    for action in ("accept", "apply", "status"):
+        child = adoption_sub.add_parser(action)
+        child.add_argument("--operation-id", required=True)
+        child.add_argument("--plan-digest", required=True)
     sub.add_parser("status", help="Show worker health and private queue metadata")
     doctor = sub.add_parser("doctor", help="Check state and configuration without printing credentials")
     doctor.add_argument("--starfleet-json", action="store_true",
@@ -3002,7 +3216,10 @@ def main(argv=None):
         print(json.dumps(report, separators=(",", ":")))
         return 0
     app = Watch(args.state_dir, args.hailing_state, args.notify_home, args.cmux)
-    if args.command == "register":
+    if args.command == "custody-adoption":
+        import custody_adoption
+        result = custody_adoption.run(app, args)
+    elif args.command == "register":
         with app.locked():
             result = app.register(args.thread, args.after, args.session)
     elif args.command == "managed":

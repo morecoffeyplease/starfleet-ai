@@ -3052,7 +3052,7 @@ class InstallerTests(unittest.TestCase):
             runtime = Path(result["runtime"])
             before = {path.relative_to(runtime): (path.read_bytes(), path.stat().st_mode & 0o777)
                       for path in runtime.rglob("*") if path.is_file()}
-            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(root)}
+            env = {"PATH": os.defpath, "HOME": str(root)}
             completed = __import__("subprocess").run(
                 [str(bin_dir / "discord-watch"), "guide", "--print"], cwd=cwd,
                 env=env, stdout=__import__("subprocess").PIPE,

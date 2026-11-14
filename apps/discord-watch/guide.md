@@ -34,7 +34,7 @@ discord-watch guide --print
 ```
 
 The Discord Watch installer creates the `discord-watch` launcher and an immutable runtime under `~/.local/share/starfleet-ai/discord-watch/`.
-It packages the maintained guide, README, source, pinned Gateway dependency, and a source copy of Hailing Frequencies' guarded CMUX binding.
+It packages the maintained guide, README, source, pinned Gateway dependency, custody adoption module, Temporal Beacon source, and a source copy of Hailing Frequencies' guarded CMUX binding.
 Installation does not initialize state, register a thread, start a worker, or alter harness or CMUX settings.
 If either launcher is already installed, run its guide and continue with the setup below.
 To install into a different location, pass `--runtime-root PATH` and `--bin-dir PATH` to `install.py`.
@@ -110,6 +110,51 @@ An explicit transfer preserves frozen group membership and lets the authorized n
 Unsealed messages can be assigned to the new generation, while a group never combines messages from different generations.
 An unexplained generation change without a matching ownership-event chain holds the affected groups.
 Uncertain submissions are never retried automatically.
+
+## Explicit current-generation custody adoption
+
+Use custody adoption only for an externally approved, enumerated set of existing obligations when the old native process generation is unavailable.
+The operation records an explicit assignment to the verified current generation and never claims that the old and current generations are one continuous process.
+The old Hailing Frequencies and Discord Watch records do not retain the old canonical worktree for Claude or Codex, so the preview labels that historical worktree as unrecorded.
+The current worktree is read from the current native hook record and checked by the existing exact CMUX binding.
+An approval reference is a cooperative private audit record, not authenticated proof of human approval.
+Select one or more exact Discord Watch thread IDs or Temporal timer UUIDs, and the operation includes the exact Hailing Frequencies session registration.
+One operation can select at most 24 threads and timers combined.
+No unselected thread or timer is adopted.
+
+Run the preview from the current owner after an operator has approved the exact resource scope:
+
+```sh
+discord-watch custody-adoption preview --operation-id OPERATION_UUID \
+  --approval-reference APPROVAL_REFERENCE --thread THREAD_ID --timer-id TIMER_UUID
+```
+
+The preview reads state and the current exact native binding without creating locks, writing state, polling Discord, or sending input.
+It prints only owner tuples, resource IDs, state summaries, and digests, never reply bodies, attachment URLs, or timer continuation text.
+Review the `continuity: not_established` limitation and preservation summaries before preparing the immutable plan.
+Repeat the exact resource flags, operation ID, approval reference, and plan digest from the preview when preparing:
+
+```sh
+discord-watch custody-adoption prepare --operation-id OPERATION_UUID \
+  --approval-reference APPROVAL_REFERENCE --plan-digest PREVIEW_DIGEST \
+  --thread THREAD_ID --timer-id TIMER_UUID
+```
+
+The current native owner must separately accept the exact prepared digest, then apply it from that same exact owner:
+
+```sh
+discord-watch custody-adoption accept --operation-id OPERATION_UUID --plan-digest PREVIEW_DIGEST
+discord-watch custody-adoption apply --operation-id OPERATION_UUID --plan-digest PREVIEW_DIGEST
+discord-watch custody-adoption status --operation-id OPERATION_UUID --plan-digest PREVIEW_DIGEST
+```
+
+Apply changes only the selected owner mappings and appends per-resource adoption events.
+It preserves the original Hailing Frequencies cutoff and receipts, Discord messages and attachments, cursors and catch-up boundaries, frozen groups and attempts, and timer cadence, continuation, deadlines, statuses, and occurrence identities.
+Selected resources remain held during a partial operation, including timers that become due, until the same operation completes or an operator reconciles the recorded state.
+Uncertain submissions remain uncertain and are never replayed automatically.
+Retry only the same operation ID and digest after an interruption, and stop if a snapshot changed or another owner transition is present.
+The ordinary enrollment, transfer, receive, and binding guards remain strict.
+This command does not authorize production adoption or a legacy-listener shutdown.
 
 ## Observe, pilot, and supervise
 
