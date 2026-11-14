@@ -352,6 +352,17 @@ class NativeObserverTests(unittest.TestCase):
         guidance_file = self.root / "AGENTS.md"
         context_file.write_text("context bytes stay private", encoding="utf-8")
         guidance_file.write_text("guidance bytes stay private", encoding="utf-8")
+        original_hook_identity = self.hook_path.stat()
+        replacement_hook = self.hook_path.with_name("codex-hook-sessions.replacement")
+        replacement_hook.write_bytes(self.hook_path.read_bytes())
+        replacement_hook.chmod(0o600)
+        os.replace(replacement_hook, self.hook_path)
+        replacement_hook_identity = self.hook_path.stat()
+        self.assertEqual(self.hook_path.read_bytes(), json.dumps(
+            {"version": 1, "sessions": {SESSION: self.hook_record}},
+        ).encode("utf-8"))
+        self.assertNotEqual((original_hook_identity.st_dev, original_hook_identity.st_ino),
+                            (replacement_hook_identity.st_dev, replacement_hook_identity.st_ino))
         access_result = subprocess.run(
             [sys.executable, str(ROOT / "replicator.py"), "--state-dir", str(intent_state),
              "handoff", "observe-access", frozen["id"], "--context-file", str(context_file),
@@ -363,6 +374,13 @@ class NativeObserverTests(unittest.TestCase):
         access = access_response["observation"]
         self.assertEqual(access["checks"]["owner_binding"]["status"], "ready")
         self.assertEqual(access["checks"]["native_settings_match"]["status"], "ready")
+        predecessor_snapshot = response["handoff"]["native_predecessor_snapshot"]
+        access_snapshot = access["native_snapshot"]
+        self.assertEqual(access_snapshot["subject"], predecessor_snapshot["subject"])
+        self.assertEqual(access_snapshot["process_identity"], predecessor_snapshot["process_identity"])
+        self.assertEqual(access_snapshot["hook_generation"], predecessor_snapshot["hook_generation"])
+        self.assertEqual(access_snapshot["settings"], predecessor_snapshot["settings"])
+        self.assertNotEqual(access_snapshot["hook_source"]["inode"], predecessor_snapshot["hook_source"]["inode"])
         self.assertEqual(access["checks"]["context_access"]["status"], "ready")
         self.assertEqual(access["checks"]["guidance_access"]["status"], "ready")
         self.assertEqual(access["checks"]["git_metadata_access"]["status"], "ready")
@@ -420,6 +438,17 @@ class NativeObserverTests(unittest.TestCase):
         self.assertEqual(same["owner_binding"]["status"], "ready")
         self.assertEqual(same["native_settings_match"]["status"], "ready")
 
+        replaced_hook_store = json.loads(json.dumps(baseline))
+        replaced_hook_store["hook_source"]["inode"] += 1
+        replaced_hook_store["hook_source"]["modified_at_ns"] += 1
+        replacement_comparison = access_observer.compare_native_snapshots(
+            handoff["scope"], baseline, replaced_hook_store,
+        )
+        self.assertEqual(replacement_comparison["owner_binding"]["status"], "ready")
+        self.assertEqual(replacement_comparison["native_settings_match"]["status"], "ready")
+        self.assertNotEqual(access_observer.operation_identity(baseline),
+                            access_observer.operation_identity(replaced_hook_store))
+
         changed_owner = json.loads(json.dumps(baseline))
         changed_owner["process_identity"]["pid"] += 1
         self.assertEqual(access_observer.compare_native_snapshots(
@@ -429,6 +458,16 @@ class NativeObserverTests(unittest.TestCase):
         changed_generation["hook_generation"] = "123.456"
         self.assertEqual(access_observer.compare_native_snapshots(
             handoff["scope"], baseline, changed_generation,
+        )["owner_binding"]["status"], "blocked")
+        changed_hook_path = json.loads(json.dumps(baseline))
+        changed_hook_path["hook_source"]["path"] += ".other"
+        self.assertEqual(access_observer.compare_native_snapshots(
+            handoff["scope"], baseline, changed_hook_path,
+        )["owner_binding"]["status"], "blocked")
+        changed_hook_device = json.loads(json.dumps(baseline))
+        changed_hook_device["hook_source"]["device"] += 1
+        self.assertEqual(access_observer.compare_native_snapshots(
+            handoff["scope"], baseline, changed_hook_device,
         )["owner_binding"]["status"], "blocked")
         changed_worktree = json.loads(json.dumps(baseline))
         changed_worktree["subject"]["worktree"]["root"] += "-elsewhere"
@@ -440,6 +479,91 @@ class NativeObserverTests(unittest.TestCase):
         comparison = access_observer.compare_native_snapshots(handoff["scope"], baseline, changed_settings)
         self.assertEqual(comparison["owner_binding"]["status"], "ready")
         self.assertEqual(comparison["native_settings_match"]["status"], "blocked")
+
+    def test_legacy_inode_only_blocked_observation_remains_readable_and_blocked(self):
+        state_dir = self.root / "legacy-inode-history-state"
+        handoff, baseline = self.frozen_with_snapshot(state_dir)
+        observed = json.loads(json.dumps(baseline))
+        observed["hook_source"]["inode"] += 1
+        observed["hook_source"]["modified_at_ns"] += 1
+        request = access_observer.normalize_request()
+        comparison = access_observer.compare_native_snapshots(handoff["scope"], baseline, observed)
+        self.assertEqual(comparison["owner_binding"]["status"], "ready")
+        observation = access_observer.make_observation(
+            handoff, observed, request, access_observer.read_inputs(request),
+            access_observer.git_metadata_check(handoff["scope"]["worktree"], handoff["scope"]["worktree"]),
+            access_observer.git_origin_check(request, str(self.worktree), lambda *args, **kwargs: None),
+            observed_at=observed["observed_at"],
+        )
+        observation["checks"]["owner_binding"] = {
+            **comparison["owner_binding"],
+            "status": "blocked",
+            "differences": ["hook_source"],
+        }
+        self.assertEqual(observation["checks"]["owner_binding"]["status"], "blocked")
+        self.assertTrue(access_observer.validate_access_observation(observation, handoff, baseline))
+
+        with successor_intents.mutation_lock(state_dir) as root:
+            store = successor_intents.read_store(root)
+            stored_handoff = store["handoffs"][handoff["id"]]
+            stored_handoff["access_observations"] = access_observer.empty_access_observations()
+            stored_handoff["access_observations"]["predecessor"].append(observation)
+            successor_intents.write_store(root, store)
+
+        store_path = state_dir / successor_intents.STORE_NAME
+        before_inspection = store_path.read_bytes()
+        loaded = successor_intents.read_store(state_dir)["handoffs"][handoff["id"]]
+        self.assertEqual(loaded["access_observations"]["predecessor"][0], observation)
+        shown = handoff_engine.show_handoff(state_dir, handoff["id"])["handoff"]
+        self.assertEqual(store_path.read_bytes(), before_inspection)
+        self.assertEqual(shown["access_observations"]["predecessor"][0], observation)
+        self.assertEqual(shown["access_observations"]["predecessor"][0]
+                         ["checks"]["owner_binding"]["status"], "blocked")
+        self.assertEqual(shown["phase_readiness"]["launch"]["checks"]["predecessor_owner_binding"], "blocked")
+        self.assertEqual(shown["phase_readiness"]["launch"]["status"], "blocked")
+
+    def test_legacy_inode_only_compatibility_rejects_tampered_shapes(self):
+        handoff, baseline = self.frozen_with_snapshot(self.root / "legacy-inode-shape-state")
+        observed = json.loads(json.dumps(baseline))
+        observed["hook_source"]["inode"] += 1
+        observed["hook_source"]["modified_at_ns"] += 1
+        request = access_observer.normalize_request()
+
+        def old_block(snapshot):
+            candidate = access_observer.make_observation(
+                handoff, snapshot, request, access_observer.read_inputs(request),
+                access_observer.git_metadata_check(handoff["scope"]["worktree"], handoff["scope"]["worktree"]),
+                access_observer.git_origin_check(request, str(self.worktree), lambda *args, **kwargs: None),
+                observed_at=snapshot["observed_at"],
+            )
+            candidate["checks"]["owner_binding"] = {
+                **candidate["checks"]["owner_binding"],
+                "status": "blocked",
+                "differences": ["hook_source"],
+            }
+            return candidate
+
+        valid_legacy = old_block(observed)
+        self.assertTrue(access_observer.validate_access_observation(valid_legacy, handoff, baseline))
+
+        malformed = json.loads(json.dumps(valid_legacy))
+        malformed["checks"]["owner_binding"]["differences"] = ["hook_source", "process_identity"]
+        with self.assertRaisesRegex(access_observer.AccessObservationError, "comparison"):
+            access_observer.validate_access_observation(malformed, handoff, baseline)
+
+        malformed = json.loads(json.dumps(valid_legacy))
+        malformed["checks"]["owner_binding"]["status"] = "ready"
+        with self.assertRaisesRegex(access_observer.AccessObservationError, "comparison"):
+            access_observer.validate_access_observation(malformed, handoff, baseline)
+
+        malformed = json.loads(json.dumps(valid_legacy))
+        malformed["checks"]["native_settings_match"]["status"] = "blocked"
+        with self.assertRaisesRegex(access_observer.AccessObservationError, "comparison"):
+            access_observer.validate_access_observation(malformed, handoff, baseline)
+
+        same_inode = old_block(baseline)
+        with self.assertRaisesRegex(access_observer.AccessObservationError, "comparison"):
+            access_observer.validate_access_observation(same_inode, handoff, baseline)
 
     def test_access_probe_retry_reconciles_exact_pending_file_and_preserves_phase_gates(self):
         state_dir = self.root / "access-retry-state"

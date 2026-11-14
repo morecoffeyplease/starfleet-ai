@@ -167,6 +167,31 @@ def _source_identity(snapshot, key):
     return {name: source.get(name) for name in fields}
 
 
+def _hook_owner_identity(snapshot):
+    source = _source_identity(snapshot, "hook_source")
+    if not isinstance(source, dict):
+        return None
+    return {name: source[name] for name in ("kind", "path", "device")}
+
+
+def _matches_legacy_inode_only_owner_block(checks, baseline, observed, expected_comparisons):
+    if expected_comparisons["owner_binding"]["status"] != "ready":
+        return False
+    baseline_hook = _source_identity(baseline, "hook_source")
+    observed_hook = _source_identity(observed, "hook_source")
+    if (not isinstance(baseline_hook, dict) or not isinstance(observed_hook, dict)
+            or baseline_hook["inode"] == observed_hook["inode"]
+            or any(baseline_hook[name] != observed_hook[name] for name in ("kind", "path", "device"))):
+        return False
+    legacy_owner_check = {
+        **expected_comparisons["owner_binding"],
+        "status": "blocked",
+        "differences": ["hook_source"],
+    }
+    return (checks.get("owner_binding") == legacy_owner_check
+            and checks.get("native_settings_match") == expected_comparisons["native_settings_match"])
+
+
 def _rollout_identity(snapshot):
     source = snapshot.get("rollout_source") if isinstance(snapshot, dict) else None
     if not isinstance(source, dict):
@@ -199,9 +224,9 @@ def compare_native_snapshots(scope, baseline, observed):
     baseline_hook_generation = baseline.get("hook_generation")
     hook_generation_matches = (isinstance(baseline_hook_generation, str) and bool(baseline_hook_generation)
                                and baseline_hook_generation == observed.get("hook_generation"))
-    baseline_hook_source = _source_identity(baseline, "hook_source")
+    baseline_hook_source = _hook_owner_identity(baseline)
     hook_source_matches = (isinstance(baseline_hook_source, dict) and bool(baseline_hook_source)
-                           and baseline_hook_source == _source_identity(observed, "hook_source"))
+                           and baseline_hook_source == _hook_owner_identity(observed))
     baseline_rollout = _rollout_identity(baseline)
     rollout_matches = (isinstance(baseline_rollout, dict) and bool(baseline_rollout)
                        and baseline_rollout == _rollout_identity(observed))
@@ -649,7 +674,11 @@ def validate_access_observation(observation, handoff, baseline):
         if not isinstance(check, dict) or check.get("status") not in ACCESS_STATES:
             raise AccessObservationError("The scoped access check status is malformed.")
     expected_comparisons = compare_native_snapshots(handoff["scope"], baseline, native)
-    if any(checks[name] != expected_comparisons[name] for name in expected_comparisons):
+    comparisons_match = all(checks[name] == expected_comparisons[name] for name in expected_comparisons)
+    legacy_inode_only_block = _matches_legacy_inode_only_owner_block(
+        checks, baseline, native, expected_comparisons,
+    )
+    if not comparisons_match and not legacy_inode_only_block:
         raise AccessObservationError("The native owner or settings comparison does not match its snapshots.")
     _validate_input_check(checks["context_access"], request["context_files"])
     _validate_input_check(checks["guidance_access"], request["guidance_files"])
