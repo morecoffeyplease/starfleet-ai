@@ -154,7 +154,7 @@ Selected resources remain held during a partial operation, including timers that
 Uncertain submissions remain uncertain and are never replayed automatically.
 Retry only the same operation ID and digest after an interruption, and stop if a snapshot changed or another owner transition is present.
 The ordinary enrollment, transfer, receive, and binding guards remain strict.
-This command does not authorize production ButterTrip adoption or a legacy-listener shutdown.
+This command does not authorize production adoption or a legacy-listener shutdown.
 
 ## Observe, pilot, and supervise
 
