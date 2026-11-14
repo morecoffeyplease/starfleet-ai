@@ -364,13 +364,6 @@ def route_transition(app, handoff_id, runner=None, replicator_state_dir=None):
             raise HandoffAdapterError("Unknown legacy handoff; use its versioned Replicator handle if applicable.")
         if legacy.get("status") in UNCERTAIN_LEGACY_STATES:
             raise HandoffAdapterError("Uncertain legacy handoffs remain inspect-only and cannot be replayed.")
-        try:
-            record = _lookup_versioned_handoff(
-                handoff_id, runner=runner, replicator_state_dir=replicator_state_dir)
-        except ReplicatorUnavailable:
-            return "legacy"
-        if record is not None:
-            raise HandoffAdapterError("Handoff ID exists in both Replicator and legacy Model Preferences state; both records were preserved.")
         return "legacy"
 
     legacy = _legacy_record(app, engine_id)

@@ -18,6 +18,7 @@ class HandoffAdapterTests(unittest.TestCase):
     args = fixtures.PreferencesTest.args
     call = fixtures.PreferencesTest.call
     activate = fixtures.PreferencesTest.activate
+    inventory = fixtures.PreferencesTest.inventory
     repo = fixtures.PreferencesTest.repo
     run_cli = fixtures.PreferencesTest.run_cli
 
@@ -327,16 +328,17 @@ class HandoffAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(mp.handoff_adapter.ReplicatorUnavailable, "not installed"):
                 mp.execute(args)
 
-    def test_legacy_route_requires_replicator_absence_and_holds_uncertain_records(self):
+    def test_legacy_route_uses_exact_record_and_holds_uncertain_records(self):
         handoff_id = "c" * 32
         legacy = {"id": handoff_id, "status": "briefing", "name": "lane"}
         self.app.save_state(f"handoffs/{handoff_id}", legacy)
-        environment, _call_log = self.write_replicator({"show": None})
+        environment, call_log = self.write_replicator({"show": {"schema_version": 1, "protocol": "wrong"}})
         args = self.args("handoff-ready", handoff_id, "--remaining-questions", "none")
         with patch.dict(os.environ, environment), patch.object(mp, "handoff", return_value={"legacy": handoff_id}) as old:
             result = mp.execute(args)
         self.assertEqual(result, {"legacy": handoff_id})
         old.assert_called_once()
+        self.assertFalse(call_log.exists())
 
         for status, command in (("opening-unconfirmed", "handoff-ready"),
                                 ("close-unconfirmed", "handoff-close")):
@@ -353,27 +355,103 @@ class HandoffAdapterTests(unittest.TestCase):
                     with self.assertRaisesRegex(mp.handoff_adapter.HandoffAdapterError, "inspect-only"):
                         mp.execute(self.args(*call_args))
                 self.assertEqual(before, (self.state_dir / "handoffs" / f"{handoff_id}.json").read_bytes())
+                self.assertFalse(call_log.exists())
 
-    def test_legacy_transition_survives_missing_runtime_and_blocks_invalid_protocol(self):
+    def test_legacy_namespace_ignores_unsupported_runtime_but_versioned_namespace_stays_strict(self):
         handoff_id = "d" * 32
         legacy = {"id": handoff_id, "status": "briefing", "name": "lane"}
         self.app.save_state(f"handoffs/{handoff_id}", legacy)
         before = (self.state_dir / "handoffs" / f"{handoff_id}.json").read_bytes()
         args = self.args("handoff-ready", handoff_id, "--remaining-questions", "none")
-        with patch.dict(os.environ, {"PATH": ""}), \
-                patch.object(mp, "handoff", return_value={"legacy": handoff_id}) as old:
+        environment, call_log = self.write_replicator({"show": {"schema_version": 1, "protocol": "wrong"}})
+        with patch.dict(os.environ, environment), patch.object(mp, "handoff", return_value={"legacy": handoff_id}) as old:
             self.assertEqual(mp.execute(args), {"legacy": handoff_id})
         old.assert_called_once()
+        self.assertFalse(call_log.exists())
 
-        environment, _call_log = self.write_replicator({"show": {"schema_version": 1, "protocol": "wrong"}})
         with patch.dict(os.environ, environment), \
                 patch.object(mp, "locked", side_effect=AssertionError("invalid protocol must stay pre-lock")), \
                 patch.object(mp, "handoff", side_effect=AssertionError("invalid protocol cannot fall back")):
             with self.assertRaisesRegex(mp.handoff_adapter.HandoffAdapterError, "unsupported versioned protocol"):
-                mp.execute(args)
+                mp.execute(self.args("handoff-ready", "replicator-v1:" + handoff_id,
+                                     "--remaining-questions", "none"))
+        self.assertEqual(len(call_log.read_text(encoding="utf-8").splitlines()), 1)
         self.assertEqual(before, (self.state_dir / "handoffs" / f"{handoff_id}.json").read_bytes())
 
-    def test_replicator_handoff_adapter_is_packaged_by_isolated_model_preferences_installer(self):
+    def test_actual_cli_legacy_transition_survives_an_unsupported_replicator(self):
+        self.activate()
+        successor = dict(self.recipient, harness="codex", surface=str(uuid.uuid4()), session="fixture-successor")
+        handoff_id = uuid.uuid4().hex
+        record = {
+            "id": handoff_id,
+            "name": "lane",
+            "status": "transferred",
+            "outgoing": self.recipient,
+            "choice": {"harness": "codex"},
+            "successor_surface": successor["surface"],
+            "successor_session": successor["session"],
+        }
+        self.app.save_state(f"handoffs/{handoff_id}", record)
+        handoff_path = self.state_dir / "handoffs" / f"{handoff_id}.json"
+        original = handoff_path.read_bytes()
+        fake_bin = self.root / "legacy-transition-bin"
+        fake_bin.mkdir()
+        replicator_trace = self.root / "replicator-trace.jsonl"
+        replicator = fake_bin / "replicator"
+        replicator.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, os, sys\n"
+            f"with open({str(replicator_trace)!r}, 'a', encoding='utf-8') as stream:\n"
+            "    stream.write(json.dumps(sys.argv[1:]) + chr(10))\n"
+            "sys.stderr.write('unsupported installed Replicator handoff protocol' + chr(10))\n"
+            "raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        replicator.chmod(0o755)
+        cmux_trace = self.root / "cmux-trace.jsonl"
+        fixture_path = self.root / "cmux-current.json"
+        fixture_path.write_text(json.dumps(self.inventory(successor)), encoding="utf-8")
+        cmux = fake_bin / "cmux"
+        cmux.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            f"with open({str(cmux_trace)!r}, 'a', encoding='utf-8') as stream:\n"
+            "    stream.write(json.dumps(args) + chr(10))\n"
+            "if 'current' in args:\n"
+            "    sys.stdout.write(open(os.environ['CMUX_FIXTURE'], encoding='utf-8').read())\n"
+            f"elif 'identify' in args: sys.stdout.write(json.dumps({{'caller': {{'surface_id': {successor['surface']!r}}}}}))\n"
+            "elif 'message' in args:\n"
+            "    sys.stdout.write(json.dumps({'id': 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'state': 'queued'}))\n"
+            "else: sys.stderr.write('unexpected cmux command' + chr(10)); raise SystemExit(90)\n",
+            encoding="utf-8",
+        )
+        cmux.chmod(0o755)
+        env = dict(os.environ)
+        env.update({
+            "HOME": str(self.root / "home"),
+            "XDG_STATE_HOME": str(self.root / "xdg-state"),
+            "PATH": str(fake_bin) + os.pathsep + env.get("PATH", ""),
+            "CMUX_FIXTURE": str(fixture_path),
+        })
+        empty_authorization = self.run_cli(
+            env, "handoff-approve-close", handoff_id, "--authorization", "")
+        self.assertEqual(empty_authorization.returncode, 1)
+        self.assertIn("Record the configured authority's explicit approval", empty_authorization.stderr)
+        self.assertEqual(handoff_path.read_bytes(), original)
+
+        authorized = self.run_cli(
+            env, "handoff-approve-close", handoff_id,
+            "--authorization", "Fixture authority approved this close")
+        self.assertEqual(authorized.returncode, 0, authorized.stderr)
+        result = json.loads(authorized.stdout)
+        self.assertEqual(result["status"], "transferred")
+        self.assertEqual(result["close_approval"]["authorization"], "Fixture authority approved this close")
+        self.assertTrue(cmux_trace.exists())
+        self.assertFalse(replicator_trace.exists())
+        self.assertFalse(any("close-surface" in line for line in cmux_trace.read_text(encoding="utf-8").splitlines()))
+
+    def test_handoff_and_registry_adapters_are_packaged_by_isolated_model_preferences_installer(self):
         installer = Path(__file__).resolve().parents[1] / "install.py"
         runtime_dir = self.root / "installed-runtime"
         bin_dir = self.root / "installed-bin"
@@ -388,6 +466,11 @@ class HandoffAdapterTests(unittest.TestCase):
         source = installer.with_name("handoff_adapter.py")
         self.assertEqual(packaged.read_bytes(), source.read_bytes())
         self.assertEqual(installed["handoff_adapter_sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
+        registry = Path(installed["runtime"]).parent / "orchestrator_registry.py"
+        registry_source = installer.with_name("orchestrator_registry.py")
+        self.assertEqual(registry.read_bytes(), registry_source.read_bytes())
+        self.assertEqual(installed["orchestrator_registry_sha256"],
+                         hashlib.sha256(registry_source.read_bytes()).hexdigest())
         help_result = subprocess.run([installed["command"], "--help"], capture_output=True, text=True, check=False,
                                       timeout=10, env=dict(os.environ, HOME=str(self.root)))
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
