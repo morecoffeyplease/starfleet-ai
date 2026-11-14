@@ -21,7 +21,8 @@ class InstallTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.source = self.root / "source checkout"
         self.source.mkdir()
-        for name in ("install.py", "model_preferences.py", "opencode_dispatch.py", "reviewer_guidance.py"):
+        for name in ("install.py", "model_preferences.py", "opencode_dispatch.py", "reviewer_guidance.py",
+                     "handoff_adapter.py", "orchestrator_registry.py"):
             shutil.copyfile(APP / name, self.source / name)
         shutil.copyfile(APP / "cmux_transport.py", self.source / "cmux_transport.py")
         shutil.copyfile(APP.parent / "opencode-adapter" / "opencode_adapter.py", self.source / "opencode_adapter.py")

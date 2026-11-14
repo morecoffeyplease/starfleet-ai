@@ -42,6 +42,11 @@ _handoff_adapter_path = Path(__file__).resolve().with_name("handoff_adapter.py")
 _handoff_adapter_spec = importlib.util.spec_from_file_location("model_preferences_handoff_adapter", _handoff_adapter_path)
 handoff_adapter = importlib.util.module_from_spec(_handoff_adapter_spec)
 _handoff_adapter_spec.loader.exec_module(handoff_adapter)
+_orchestrator_registry_path = Path(__file__).resolve().with_name("orchestrator_registry.py")
+_orchestrator_registry_spec = importlib.util.spec_from_file_location(
+    "model_preferences_orchestrator_registry", _orchestrator_registry_path)
+orchestrator_registry = importlib.util.module_from_spec(_orchestrator_registry_spec)
+_orchestrator_registry_spec.loader.exec_module(orchestrator_registry)
 
 
 def now():
@@ -356,10 +361,40 @@ class App(CmuxTransport):
 
     def state(self, name, default):
         p = self.state_dir / f"{name}.json"
-        return read(p) if p.exists() else copy.deepcopy(default)
+        if not p.exists():
+            return copy.deepcopy(default)
+        document = read(p)
+        if name == "orchestrators":
+            return orchestrator_registry.read_recipients(document)
+        return document
 
     def save_state(self, name, value):
+        if name == "orchestrators":
+            path = self.state_dir / "orchestrators.json"
+            current = read(path) if path.exists() else None
+            write(path, orchestrator_registry.replace_recipients(current, value))
+            return
         write(self.state_dir / f"{name}.json", value)
+
+    def _commit_handoff_owner_receipt(self, handoff_id, name, expected_owner, next_owner):
+        path = self.state_dir / "orchestrators.json"
+        with locked(self.config_dir):
+            current = read(path) if path.exists() else None
+            updated, receipt, reused = orchestrator_registry._commit_owner_receipt(
+                current, handoff_id, name, expected_owner, next_owner)
+            if not reused:
+                write(path, updated)
+        return {"receipt": receipt, "reused": reused}
+
+    def _acknowledge_handoff_receipt(self, handoff_id, request_digest):
+        path = self.state_dir / "orchestrators.json"
+        with locked(self.config_dir):
+            current = read(path) if path.exists() else None
+            updated, receipt, reused = orchestrator_registry._acknowledge_receipt(
+                current, handoff_id, request_digest)
+            if not reused:
+                write(path, updated)
+        return {"receipt": receipt, "reused": reused}
 
     def caller(self):
         """Discover the sole current owner of this terminal, never from environment hints."""
@@ -1352,7 +1387,8 @@ def read_only_diagnostic_report(app, caller=None):
         statuses["configuration"] = "blocked"
         active = None
     try:
-        recipients = read_only_diagnostic_json(app.state_dir / "orchestrators.json") or {}
+        recipients_document = read_only_diagnostic_json(app.state_dir / "orchestrators.json")
+        recipients = orchestrator_registry.read_recipients(recipients_document)
         adoptions = read_only_diagnostic_json(app.state_dir / "adoptions.json") or {}
     except (PreferenceError, OSError, ValueError, KeyError, TypeError):
         return {"schema_version": 1, "checks": statuses}

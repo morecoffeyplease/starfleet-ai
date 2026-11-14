@@ -107,6 +107,8 @@ The configured authority label does not grant tool access or change native appro
 ## Exact session and handoff ownership
 
 Enroll orchestrators by stable native workspace, surface and session identity.
+Model Preferences reads existing plain-map `orchestrators.json` files and writes the versioned registry format on the next recipient update.
+The registry keeps pending handoff receipts with the recipient map and blocks changes to an owner while its receipt is pending.
 The exact current owner must acknowledge adoption from its own session before the app reports adoption.
 Queued notifications are distinct from delivery receipts, owner acknowledgments and model comprehension.
 Handoff preserves the outgoing session until ownership has transferred, the successor is confirmed active, dependent jobs are checked and the configured authority explicitly approves closure.
