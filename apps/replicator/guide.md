@@ -79,9 +79,10 @@ Pass `--mp-config-dir` and `--mp-state-dir` to configure or show when the existi
 Repeating the same configured request for the same seat and worktree returns the existing intent.
 Cancel the current intent before configuring a different choice for that scope.
 Only one-shot intents are supported, and persistent defaults are unsupported.
-The preserve-observed request records the intended policy while predecessor model and effort remain `unknown` until an exact-session observation exists.
-The current CMUX snapshot does not expose a supported native generation, model, effort, or effective-permission observation.
-Replicator therefore leaves generation, predecessor settings, effective permissions, and readiness `unknown` and does not claim native binding or parity.
+The preserve-observed request records the intended policy while predecessor model and effort remain `unknown` until you record an exact-session observation.
+The current CMUX item does not expose model, effort, or effective permission fields.
+The explicit Codex observation command reads the exact open rollout only after it matches the caller's CMUX identity, hook record, live process, and frozen worktree.
+Configuration alone does not bind a native generation or establish runtime parity.
 These configuration commands do not launch a successor, transfer custody, close the predecessor, or consume an intent.
 
 ## Freeze and inspect a versioned handoff
@@ -102,12 +103,39 @@ replicator handoff reconcile HANDOFF_ID --json
 
 Freeze stores one immutable `starfleet.replicator.handoff/v1` record and its one-to-one intent link in the same atomic private state-file replacement.
 Repeating freeze returns the same handoff ID and application handoff generation without creating another record.
-The application generation is not a native hook or process generation, and the native binding stays `unknown` until a supported exact-session observation exists.
-Show reports configured choice and provenance separately from unknown native model, effort, permissions, and readiness.
+The application generation is not a native hook or process generation.
+The native binding stays `unknown` until you record a supported exact-session observation.
+Show reports configured choice and provenance separately from native settings, effective permissions, and readiness.
 Reconcile reads local state only and performs no native queries or writes.
-The frozen handoff is blocked on unavailable native observations.
-The freeze-only interface does not launch a successor, transfer custody, close a predecessor, or claim delivery.
+The frozen handoff remains blocked while required native observations are unavailable.
+Freeze does not launch a successor, transfer custody, close a predecessor, or claim delivery.
 Cancel is available only before freeze.
+
+## Record the Codex predecessor settings snapshot
+
+Run the observation command from the exact registered Codex predecessor in the frozen worktree.
+
+```sh
+replicator handoff observe-predecessor HANDOFF_ID
+replicator handoff show HANDOFF_ID --json
+replicator handoff reconcile HANDOFF_ID --json
+```
+
+The command matches the caller session, panel, workspace, and canonical worktree against the frozen handoff and the current CMUX item.
+It then matches the exact CMUX Codex hook record to a stable live `ps` process and the one open native rollout for that session.
+It checks the process and open file identity again after reading the bounded session metadata and latest turn settings.
+The rollout turn must follow the OS process start time.
+The hook record's `startedAt` value remains a separate hook generation.
+Replicator records the process generation, hook generation, model, effort, approval policy, sandbox policy snapshot, source identity, and native turn timestamp.
+The command accepts no rollout path or caller-supplied observation JSON.
+It does not expose conversation bodies.
+Repeated observation reuses the same source snapshot and refuses a different snapshot.
+
+This observer supports Codex CLI versions `0.166.0` and `0.169.0`.
+Other Codex versions and other harnesses remain unsupported until their native source contract is verified.
+The settings describe the observed turn and do not prove historical continuity, future settings, effective file or Git access, network access, or native trust.
+Effective permissions remain `unknown`, so readiness stays `blocked`.
+Observation records settings only and does not launch a successor, transfer custody, close a predecessor, or consume the intent.
 
 Run the passive diagnostic outside Git or before configuring an intent:
 

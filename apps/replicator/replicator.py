@@ -13,6 +13,7 @@ import sys
 
 import successor_intents
 import handoff_engine
+import native_observer
 
 
 STATUSES = ("ready", "blocked", "unknown", "skipped")
@@ -567,6 +568,34 @@ def handoff_freeze(args):
     )
 
 
+def handoff_observe_predecessor(args):
+    handoff = handoff_engine.show_handoff(args.state_dir, args.handoff_id)["handoff"]
+    native_cwd, caller, identity_check = caller_identity(os.environ)
+    if identity_check.status != "ready" or caller is None or native_cwd is None:
+        raise native_observer.NativeObservationError(identity_check.source)
+    seat = handoff["scope"]["seat"]
+    expected_caller = {
+        "harness": seat["harness"],
+        "session_id": seat["session_id"],
+        "panel_id": seat["panel_id"],
+        "workspace_id": seat["workspace_id"],
+    }
+    if caller != expected_caller:
+        raise native_observer.NativeObservationError("The live caller does not match this frozen predecessor seat.")
+    worktree = canonical_worktree_identity(native_cwd)
+    if worktree != handoff["scope"]["worktree"]:
+        raise native_observer.NativeObservationError("The live caller worktree does not match this frozen handoff.")
+    snapshot = native_observer.observe_codex_predecessor(
+        handoff["scope"],
+        caller,
+        worktree,
+        home=Path.home(),
+        environment=os.environ,
+        runner=run_bounded,
+    )
+    return handoff_engine.record_predecessor_observation(args.state_dir, args.handoff_id, snapshot)
+
+
 def print_handoff_summary(result):
     handoff = result["handoff"]
     seat = handoff["scope"]["seat"]
@@ -587,6 +616,14 @@ def print_handoff_summary(result):
     print(f"Native hook generation: {handoff['native_generation']['status']}")
     print(f"Observed predecessor model: {handoff['observations']['predecessor_model']['status']}")
     print(f"Observed predecessor effort: {handoff['observations']['predecessor_effort']['status']}")
+    predecessor_snapshot = handoff.get("native_predecessor_snapshot")
+    if predecessor_snapshot is not None:
+        settings = predecessor_snapshot["settings"]
+        process = predecessor_snapshot["process_identity"]
+        print(f"Native process: PID {process['pid']} started {process['started_at']}")
+        print(f"Native turn: {predecessor_snapshot['turn']['id']} at {predecessor_snapshot['turn']['recorded_at']}")
+        print(f"Native approval policy snapshot: {settings['approval_policy']}")
+        print(f"Native sandbox policy snapshot: {json.dumps(settings['sandbox_policy'], sort_keys=True)}")
     print(f"Observed successor model: {handoff['observations']['successor_model']['status']}")
     print(f"Observed successor effort: {handoff['observations']['successor_effort']['status']}")
     print(f"Effective permissions: {handoff['observations']['effective_permissions']['status']}")
@@ -689,6 +726,11 @@ def build_parser():
     reconcile = handoff_commands.add_parser("reconcile", help="read local handoff state without native queries or writes")
     reconcile.add_argument("handoff_id")
     reconcile.add_argument("--json", action="store_true", help="print the reconciliation as JSON")
+    observe = handoff_commands.add_parser(
+        "observe-predecessor", help="record a scoped Codex settings snapshot from the exact predecessor",
+    )
+    observe.add_argument("handoff_id")
+    observe.add_argument("--json", action="store_true", help="print the persisted observation as JSON")
     doctor = commands.add_parser("doctor", help="inspect Replicator configuration without writes or native queries")
     doctor.add_argument("--starfleet-json", action="store_true", help="print the agreed structured diagnostic protocol")
     preflight = commands.add_parser("preflight", help="inspect the current caller and worktree without writes")
@@ -754,6 +796,12 @@ def main(argv=None):
                 result = handoff_show(args)
                 if not args.json:
                     print_handoff_summary({"handoff": result["handoff"]})
+                    return 0
+            elif args.handoff_command == "observe-predecessor":
+                result = handoff_observe_predecessor(args)
+                if not args.json:
+                    print_handoff_summary(result)
+                    print(f"Observation reused: {str(result['reused']).lower()}")
                     return 0
             else:
                 result = handoff_reconcile(args)

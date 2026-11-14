@@ -81,6 +81,7 @@ def _new_handoff(intent, handoff_id, frozen_at):
         "intent_snapshot": snapshot,
         "scope": copy.deepcopy(intent["scope"]),
         "choice": copy.deepcopy(intent["choice"]),
+        "native_predecessor_snapshot": None,
         "native_generation": copy.deepcopy(UNKNOWN),
         "native_predecessor_binding": copy.deepcopy(UNKNOWN_BINDING),
         "native_successor_binding": copy.deepcopy(UNKNOWN_BINDING),
@@ -122,6 +123,72 @@ def freeze_handoff(state_dir, intent_id, revalidated_scope, revalidated_choice, 
         return {"handoff": copy.deepcopy(handoff), "reused": False}
 
 
+def _snapshot_identity(snapshot):
+    identity = copy.deepcopy(snapshot)
+    identity.pop("observed_at", None)
+    return successor_intents.digest(identity)
+
+
+def record_predecessor_observation(state_dir, handoff_id, snapshot):
+    if not isinstance(snapshot, dict):
+        raise HandoffError("The native predecessor observation is malformed.")
+    with successor_intents.mutation_lock(state_dir) as root:
+        store = successor_intents.read_store(root)
+        handoff = _find_handoff(store, handoff_id)
+        if handoff["state"] != "frozen" or handoff.get("launch") != {"status": "not_started"}:
+            raise HandoffError("A native predecessor observation requires a frozen handoff before launch.")
+        existing = handoff.get("native_predecessor_snapshot")
+        if existing is not None:
+            if _snapshot_identity(existing) == _snapshot_identity(snapshot):
+                return {"handoff": copy.deepcopy(handoff), "reused": True}
+            raise HandoffError("A different predecessor observation is already recorded.")
+        updated = copy.deepcopy(handoff)
+        snapshot = copy.deepcopy(snapshot)
+        snapshot_digest = successor_intents.digest(snapshot)
+        process = snapshot.get("process_identity")
+        turn = snapshot.get("turn")
+        settings = snapshot.get("settings")
+        if not isinstance(process, dict) or not isinstance(turn, dict) or not isinstance(settings, dict):
+            raise HandoffError("The native predecessor observation is malformed.")
+        updated["native_predecessor_snapshot"] = snapshot
+        updated["native_generation"] = {
+            "status": "observed",
+            "value": copy.deepcopy(process),
+            "evidence": {
+                "source": "ps",
+                "snapshot_digest": snapshot_digest,
+                "observed_at": snapshot.get("observed_at"),
+            },
+        }
+        updated["native_predecessor_binding"] = {
+            "status": "observed",
+            "hook_generation": snapshot.get("hook_generation"),
+            "evidence": {
+                "source": "cmux_codex_hook_store_v1",
+                "snapshot_digest": snapshot_digest,
+            },
+        }
+        setting_evidence = {
+            "source": "open_codex_rollout",
+            "snapshot_digest": snapshot_digest,
+            "turn_id": turn.get("id"),
+            "recorded_at": turn.get("recorded_at"),
+        }
+        updated["observations"]["predecessor_model"] = {
+            "status": "observed", "value": settings.get("model"),
+            "evidence": copy.deepcopy(setting_evidence),
+        }
+        updated["observations"]["predecessor_effort"] = {
+            "status": "observed", "value": settings.get("effort"),
+            "evidence": copy.deepcopy(setting_evidence),
+        }
+        updated["readiness"] = {"status": "blocked", "reason": "effective_access_unobserved"}
+        store["handoffs"][handoff_id] = updated
+        successor_intents._validate_store(store)
+        successor_intents.write_store(root, store)
+        return {"handoff": copy.deepcopy(updated), "reused": False}
+
+
 def show_handoff(state_dir, handoff_id):
     store = successor_intents.read_store(state_dir)
     handoff = _find_handoff(store, handoff_id)
@@ -132,12 +199,18 @@ def show_handoff(state_dir, handoff_id):
 def reconcile_handoff(state_dir, handoff_id):
     result = show_handoff(state_dir, handoff_id)
     handoff = result["handoff"]
-    blockers = [
-        "native_generation_unavailable",
-        "predecessor_model_effort_unobserved",
-        "successor_model_effort_unobserved",
-        "effective_permissions_unobserved",
-    ]
+    blockers = []
+    if handoff["native_generation"]["status"] != "observed":
+        blockers.append("native_generation_unavailable")
+    if any(handoff["observations"][name]["status"] != "observed"
+           for name in ("predecessor_model", "predecessor_effort")):
+        blockers.append("predecessor_model_effort_unobserved")
+    if (handoff["native_successor_binding"]["status"] != "observed"
+            or any(handoff["observations"][name]["status"] != "observed"
+                   for name in ("successor_model", "successor_effort"))):
+        blockers.append("successor_model_effort_unobserved")
+    if handoff["observations"]["effective_permissions"]["status"] != "observed":
+        blockers.append("effective_permissions_unobserved")
     return {
         **result,
         "reconciliation": {

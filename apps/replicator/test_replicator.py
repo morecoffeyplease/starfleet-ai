@@ -11,7 +11,10 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent
-SOURCE_NAMES = ("replicator.py", "successor_intents.py", "handoff_engine.py", "install.py", "guide.md", "README.md")
+SOURCE_NAMES = (
+    "replicator.py", "successor_intents.py", "handoff_engine.py", "native_observer.py",
+    "install.py", "guide.md", "README.md",
+)
 MODEL_PREFERENCES_SCRIPT = ROOT.parents[0] / "model-preferences" / "model_preferences.py"
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True

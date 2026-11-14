@@ -1,6 +1,6 @@
 # Replicator
 
-Replicator packages a maintained guide, read-only preflight, one-shot successor intent configuration, and a versioned handoff freeze for an explicitly requested manual handoff between orchestrator sessions.
+Replicator packages a maintained guide, read-only preflight, one-shot successor intent configuration, a versioned handoff freeze, and a scoped Codex predecessor settings observation for an explicitly requested manual handoff between orchestrator sessions.
 The guide describes the handoff procedure, preflight reports only the caller, worktree, and explicit input checks it can observe, and successor intent records a frozen choice for a configured seat and worktree.
 Replicator does not start agents, workers, timers, or an automatic handoff trigger.
 
@@ -69,8 +69,9 @@ Replicator stores the candidate and its separate provenance digest in a private 
 A different configured request for that scope requires cancelling the current intent first.
 This interface supports one-shot intents only, and persistent defaults are unsupported.
 The default preserve-observed request does not infer a predecessor model or effort from the saved profile, argv, or environment.
-The stored native generation, predecessor model and effort, effective permissions, and readiness remain `unknown` until supported exact-session observations exist.
-The current CMUX snapshot provides no supported native generation, model, effort, or effective-permission observation, so configuration does not bind a generation or establish runtime parity or readiness.
+The stored native generation, predecessor model and effort, effective permissions, and readiness remain `unknown` until you record a supported exact-session observation.
+The current CMUX item provides session and placement identity but no model, effort, or effective-permission fields.
+Configuration does not bind a generation or establish runtime parity or readiness.
 Configuration does not launch a successor, transfer custody, close a predecessor, or consume an intent.
 
 ## Freeze and inspect a versioned handoff
@@ -92,12 +93,38 @@ replicator handoff reconcile HANDOFF_ID --json
 
 Freeze stores one immutable `starfleet.replicator.handoff/v1` record and links it to the one-shot intent in the same atomic state-file replacement.
 Repeating freeze for that intent returns the same handoff ID and handoff generation.
-The application-owned handoff generation is distinct from native hook generation, which remains `unknown` because no supported exact-session generation observation is available.
+The application-owned handoff generation is distinct from the native process generation and CMUX hook generation.
+Both native generations remain `unknown` until you record a supported exact-session observation.
 Show separates configured Model Preferences choice and provenance from native observations and readiness.
 Reconcile reads only the private local state, performs no native queries or writes, and reports the current native-observation blockers.
 The frozen record leaves native model, effort, effective permissions, native bindings, readiness, transfer, and predecessor cleanup unknown, blocked, or not applicable as appropriate.
 Cancel refuses a frozen intent, and another candidate cannot replace it.
-This freeze-only slice has no launch, ready, transfer, or close command and does not establish native parity, custody, or delivery.
+
+## Record the Codex predecessor settings snapshot
+
+Run the observation command from the exact registered Codex predecessor in the frozen worktree.
+
+```sh
+replicator handoff observe-predecessor HANDOFF_ID
+replicator handoff show HANDOFF_ID --json
+replicator handoff reconcile HANDOFF_ID --json
+```
+
+Replicator matches the caller's session, panel, workspace, and canonical worktree against the frozen scope and current CMUX item.
+It matches the CMUX Codex hook record to a stable live process and the one open rollout for that session.
+It rechecks process and file identity after it reads bounded session metadata and the latest native turn settings.
+The native turn must follow the OS process start time.
+Replicator records the process generation separately from the hook generation.
+It records the turn's model, effort, approval policy, sandbox policy, source identity, and timestamp.
+It does not accept a rollout path or observation JSON from the caller.
+It does not expose conversation bodies.
+An identical observation is idempotent, and a different observation for the frozen predecessor is refused.
+
+The observer supports Codex CLI versions `0.166.0` and `0.169.0`.
+It does not support other Codex versions or other harnesses.
+The settings describe one observed turn and do not prove historical continuity, future settings, effective file or Git access, network access, or native trust.
+Effective permissions remain `unknown`, so readiness stays `blocked`.
+This command records settings only and does not launch a successor, transfer custody, close a predecessor, or consume the intent.
 
 Run the passive configuration diagnostic outside a Git checkout:
 

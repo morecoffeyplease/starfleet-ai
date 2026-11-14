@@ -12,6 +12,7 @@ import stat
 import tempfile
 import time
 import uuid
+from datetime import datetime
 
 
 STORE_NAME = "successor-intents.json"
@@ -26,6 +27,7 @@ MAX_INTENTS_PER_SCOPE = 32
 MAX_TOTAL_HANDOFFS = 256
 LOCK_TIMEOUT_SECONDS = 5
 DOCTOR_STATES = {"ready", "missing", "blocked", "unknown", "not_applicable", "skipped"}
+NATIVE_OBSERVATION_PROTOCOL = "starfleet.replicator.native-observation/codex-rollout/v1"
 
 
 class IntentError(ValueError):
@@ -42,6 +44,187 @@ def canonical_json(value):
 
 def digest(value):
     return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def _timestamp(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _finite_generation(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        number = float(value)
+    except ValueError:
+        return False
+    return math.isfinite(number) and format(number, ".17g") == value
+
+
+def _json_value(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_json_value(entry) for entry in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _json_value(entry) for key, entry in value.items())
+    return False
+
+
+def _validate_native_predecessor_snapshot(handoff):
+    unknown = {"status": "unknown", "value": None, "evidence": None}
+    unknown_binding = {"status": "unknown", "hook_generation": None, "evidence": None}
+    snapshot = handoff.get("native_predecessor_snapshot")
+    if snapshot is None:
+        expected = {
+            "predecessor_model": unknown,
+            "predecessor_effort": unknown,
+            "successor_model": unknown,
+            "successor_effort": unknown,
+            "effective_permissions": unknown,
+        }
+        if (handoff.get("native_generation") != unknown
+                or handoff.get("native_predecessor_binding") != unknown_binding
+                or handoff.get("native_successor_binding") != unknown_binding
+                or handoff.get("observations") != expected
+                or handoff.get("readiness") != {
+                    "status": "blocked", "reason": "native_observations_unavailable"}):
+            raise IntentError("Successor handoff native observation state is malformed.")
+        return
+    snapshot_fields = {
+        "protocol", "observed_at", "subject", "hook_generation", "process_identity",
+        "hook_source", "rollout_source", "turn", "settings",
+    }
+    subject_fields = {"harness", "session_id", "panel_id", "workspace_id", "worktree"}
+    process_fields = {"pid", "parent_pid", "started_at", "executable"}
+    hook_source_fields = {"kind", "path", "device", "inode", "modified_at_ns", "updated_at"}
+    rollout_fields = {
+        "kind", "path", "device", "inode", "size", "modified_at_ns", "cli_version",
+        "session_meta_cwd", "session_meta_source", "session_meta_originator",
+    }
+    turn_fields = {"id", "recorded_at", "cwd"}
+    settings_fields = {"model", "effort", "approval_policy", "sandbox_policy"}
+    if (not isinstance(snapshot, dict) or set(snapshot) != snapshot_fields
+            or snapshot.get("protocol") != NATIVE_OBSERVATION_PROTOCOL
+            or not _timestamp(snapshot.get("observed_at"))
+            or not isinstance(snapshot.get("subject"), dict)
+            or set(snapshot["subject"]) != subject_fields
+            or snapshot["subject"].get("harness") != "codex"
+            or snapshot["subject"].get("worktree") != handoff.get("scope", {}).get("worktree")
+            or snapshot["subject"].get("session_id") != handoff.get("scope", {}).get("seat", {}).get("session_id")
+            or snapshot["subject"].get("panel_id") != handoff.get("scope", {}).get("seat", {}).get("panel_id")
+            or snapshot["subject"].get("workspace_id") != handoff.get("scope", {}).get("seat", {}).get("workspace_id")
+            or not _finite_generation(snapshot.get("hook_generation"))
+            or not isinstance(snapshot.get("process_identity"), dict)
+            or set(snapshot["process_identity"]) != process_fields
+            or type(snapshot["process_identity"].get("pid")) is not int
+            or snapshot["process_identity"]["pid"] <= 0
+            or type(snapshot["process_identity"].get("parent_pid")) is not int
+            or snapshot["process_identity"]["parent_pid"] <= 0
+            or not _timestamp(snapshot["process_identity"].get("started_at"))
+            or not isinstance(snapshot["process_identity"].get("executable"), str)
+            or not Path(snapshot["process_identity"]["executable"]).is_absolute()
+            or Path(snapshot["process_identity"]["executable"]).name != "codex"
+            or not isinstance(snapshot.get("hook_source"), dict)
+            or set(snapshot["hook_source"]) != hook_source_fields
+            or snapshot["hook_source"].get("kind") != "cmux_codex_hook_store_v1"
+            or not isinstance(snapshot["hook_source"].get("path"), str)
+            or not Path(snapshot["hook_source"]["path"]).is_absolute()
+            or any(type(snapshot["hook_source"].get(name)) is not int or snapshot["hook_source"][name] < 0
+                   for name in ("device", "inode", "modified_at_ns"))
+            or type(snapshot["hook_source"].get("updated_at")) not in (int, float)
+            or not math.isfinite(snapshot["hook_source"]["updated_at"])
+            or not isinstance(snapshot.get("rollout_source"), dict)
+            or set(snapshot["rollout_source"]) != rollout_fields
+            or snapshot["rollout_source"].get("kind") != "open_codex_rollout"
+            or not isinstance(snapshot["rollout_source"].get("path"), str)
+            or not Path(snapshot["rollout_source"]["path"]).is_absolute()
+            or any(type(snapshot["rollout_source"].get(name)) is not int or snapshot["rollout_source"][name] < 0
+                   for name in ("device", "inode", "size", "modified_at_ns"))
+            or not isinstance(snapshot["rollout_source"].get("cli_version"), str)
+            or not snapshot["rollout_source"]["cli_version"]
+            or not isinstance(snapshot["rollout_source"].get("session_meta_cwd"), str)
+            or not isinstance(snapshot["rollout_source"].get("session_meta_source"), str)
+            or not isinstance(snapshot["rollout_source"].get("session_meta_originator"), str)
+            or not isinstance(snapshot.get("turn"), dict)
+            or set(snapshot["turn"]) != turn_fields
+            or not isinstance(snapshot["turn"].get("id"), str)
+            or not snapshot["turn"]["id"]
+            or not _timestamp(snapshot["turn"].get("recorded_at"))
+            or not isinstance(snapshot["turn"].get("cwd"), str)
+            or not isinstance(snapshot.get("settings"), dict)
+            or set(snapshot["settings"]) != settings_fields
+            or any(not isinstance(snapshot["settings"].get(name), str) or not snapshot["settings"][name]
+                   for name in ("model", "effort", "approval_policy"))
+            or not isinstance(snapshot["settings"].get("sandbox_policy"), dict)
+            or not snapshot["settings"]["sandbox_policy"]
+            or not _json_value(snapshot["settings"]["sandbox_policy"])):
+        raise IntentError("Successor handoff native predecessor snapshot is malformed.")
+    scope_worktree = handoff["scope"]["worktree"]["root"]
+    if (os.path.realpath(snapshot["rollout_source"]["session_meta_cwd"]) != scope_worktree
+            or os.path.realpath(snapshot["turn"]["cwd"]) != scope_worktree):
+        raise IntentError("Successor handoff native predecessor worktree does not match its scope.")
+    try:
+        observed_at = datetime.fromisoformat(snapshot["observed_at"].replace("Z", "+00:00"))
+        process_started = datetime.fromisoformat(snapshot["process_identity"]["started_at"].replace("Z", "+00:00"))
+        turn_recorded = datetime.fromisoformat(snapshot["turn"]["recorded_at"].replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise IntentError("Successor handoff native predecessor timestamps are malformed.") from exc
+    if turn_recorded <= process_started or turn_recorded > observed_at:
+        raise IntentError("Successor handoff native turn does not match its process generation.")
+    snapshot_digest = digest(snapshot)
+    process = snapshot["process_identity"]
+    turn = snapshot["turn"]
+    expected_generation = {
+        "status": "observed",
+        "value": process,
+        "evidence": {
+            "source": "ps",
+            "snapshot_digest": snapshot_digest,
+            "observed_at": snapshot["observed_at"],
+        },
+    }
+    expected_predecessor_binding = {
+        "status": "observed",
+        "hook_generation": snapshot["hook_generation"],
+        "evidence": {
+            "source": "cmux_codex_hook_store_v1",
+            "snapshot_digest": snapshot_digest,
+        },
+    }
+    expected_model_effort_evidence = {
+        "source": "open_codex_rollout",
+        "snapshot_digest": snapshot_digest,
+        "turn_id": turn["id"],
+        "recorded_at": turn["recorded_at"],
+    }
+    expected_observations = {
+        "predecessor_model": {
+            "status": "observed", "value": snapshot["settings"]["model"],
+            "evidence": expected_model_effort_evidence,
+        },
+        "predecessor_effort": {
+            "status": "observed", "value": snapshot["settings"]["effort"],
+            "evidence": expected_model_effort_evidence,
+        },
+        "successor_model": unknown,
+        "successor_effort": unknown,
+        "effective_permissions": unknown,
+    }
+    if (handoff.get("native_generation") != expected_generation
+            or handoff.get("native_predecessor_binding") != expected_predecessor_binding
+            or handoff.get("native_successor_binding") != unknown_binding
+            or handoff.get("observations") != expected_observations
+            or handoff.get("readiness") != {
+                "status": "blocked", "reason": "effective_access_unobserved"}):
+        raise IntentError("Successor handoff native observation state is malformed.")
 
 
 def _validate_store(value):
@@ -194,25 +377,9 @@ def _validate_store(value):
                 or handoff.get("choice") != intent.get("choice")
                 or handoff.get("intent_digest") != digest(snapshot)):
             raise IntentError("Successor handoff snapshot is malformed.")
-        if (handoff.get("native_generation") != {
-                "status": "unknown", "value": None, "evidence": None}
-                or handoff.get("native_predecessor_binding") != {
-                    "status": "unknown", "hook_generation": None, "evidence": None}
-                or handoff.get("native_successor_binding") != {
-                    "status": "unknown", "hook_generation": None, "evidence": None}):
-            raise IntentError("Successor handoff native binding is malformed.")
-        unknown_observation = {"status": "unknown", "value": None, "evidence": None}
-        observations = handoff.get("observations")
-        expected_observations = {
-            "predecessor_model", "predecessor_effort", "successor_model", "successor_effort",
-            "effective_permissions",
-        }
-        if (not isinstance(observations, dict) or set(observations) != expected_observations
-                or any(observations.get(name) != unknown_observation for name in expected_observations)
-                or handoff.get("permission_requirement") != {
+        _validate_native_predecessor_snapshot(handoff)
+        if (handoff.get("permission_requirement") != {
                     "kind": "match_predecessor_effective", "status": "unknown"}
-                or handoff.get("readiness") != {
-                    "status": "blocked", "reason": "native_observations_unavailable"}
                 or handoff.get("launch") != {"status": "not_started"}
                 or handoff.get("transfer") != {"status": "not_applicable"}
                 or handoff.get("predecessor_cleanup") != {"status": "not_applicable"}):

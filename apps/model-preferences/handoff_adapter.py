@@ -2,11 +2,14 @@
 
 import hashlib
 import json
+import math
+import os
 import re
 from pathlib import Path
 import shutil
 import subprocess
 import uuid
+from datetime import datetime
 
 
 HANDOFF_PROTOCOL = "starfleet.replicator.handoff/v1"
@@ -20,6 +23,7 @@ HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 MAX_OUTPUT_BYTES = 256 * 1024
 COMMAND_TIMEOUT_SECONDS = 5
 UNCERTAIN_LEGACY_STATES = {"opening", "opening-unconfirmed", "close-requested", "close-unconfirmed"}
+NATIVE_OBSERVATION_PROTOCOL = "starfleet.replicator.native-observation/codex-rollout/v1"
 
 
 class HandoffAdapterError(ValueError):
@@ -159,6 +163,149 @@ def _validate_intent_report(report, seat_name, worktree_root):
     return intent
 
 
+def _timestamp(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _finite_generation(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        number = float(value)
+    except ValueError:
+        return False
+    return math.isfinite(number) and format(number, ".17g") == value
+
+
+def _valid_observed_snapshot(record, scope, snapshot, observations):
+    if not isinstance(snapshot, dict):
+        return False
+    if set(snapshot) != {
+            "protocol", "observed_at", "subject", "hook_generation", "process_identity",
+            "hook_source", "rollout_source", "turn", "settings"}:
+        return False
+    subject = snapshot.get("subject")
+    process = snapshot.get("process_identity")
+    hook_source = snapshot.get("hook_source")
+    rollout_source = snapshot.get("rollout_source")
+    turn = snapshot.get("turn")
+    settings = snapshot.get("settings")
+    if (snapshot.get("protocol") != NATIVE_OBSERVATION_PROTOCOL
+            or not _timestamp(snapshot.get("observed_at"))
+            or not isinstance(subject, dict)
+            or set(subject) != {"harness", "session_id", "panel_id", "workspace_id", "worktree"}
+            or subject.get("harness") != "codex"
+            or subject.get("session_id") != scope["seat"]["session_id"]
+            or subject.get("panel_id") != scope["seat"]["panel_id"]
+            or subject.get("workspace_id") != scope["seat"]["workspace_id"]
+            or subject.get("worktree") != scope["worktree"]
+            or not _finite_generation(snapshot.get("hook_generation"))):
+        return False
+    if (not isinstance(process, dict)
+            or set(process) != {"pid", "parent_pid", "started_at", "executable"}
+            or type(process.get("pid")) is not int or process["pid"] <= 0
+            or type(process.get("parent_pid")) is not int or process["parent_pid"] <= 0
+            or not _timestamp(process.get("started_at"))
+            or not isinstance(process.get("executable"), str)
+            or not Path(process["executable"]).is_absolute()
+            or Path(process["executable"]).name != "codex"):
+        return False
+    if (not isinstance(hook_source, dict)
+            or set(hook_source) != {"kind", "path", "device", "inode", "modified_at_ns", "updated_at"}
+            or hook_source.get("kind") != "cmux_codex_hook_store_v1"
+            or not isinstance(hook_source.get("path"), str)
+            or not Path(hook_source["path"]).is_absolute()
+            or any(type(hook_source.get(key)) is not int or hook_source[key] < 0
+                   for key in ("device", "inode", "modified_at_ns"))
+            or type(hook_source.get("updated_at")) not in (int, float)
+            or not math.isfinite(hook_source["updated_at"])):
+        return False
+    if (not isinstance(rollout_source, dict)
+            or set(rollout_source) != {
+                "kind", "path", "device", "inode", "size", "modified_at_ns", "cli_version",
+                "session_meta_cwd", "session_meta_source", "session_meta_originator",
+            }
+            or rollout_source.get("kind") != "open_codex_rollout"
+            or not isinstance(rollout_source.get("path"), str)
+            or not Path(rollout_source["path"]).is_absolute()
+            or any(type(rollout_source.get(key)) is not int or rollout_source[key] < 0
+                   for key in ("device", "inode", "size", "modified_at_ns"))
+            or not isinstance(rollout_source.get("cli_version"), str)
+            or not isinstance(rollout_source.get("session_meta_cwd"), str)
+            or os.path.realpath(rollout_source["session_meta_cwd"]) != scope["worktree"]["root"]
+            or rollout_source.get("session_meta_source") != "cli"
+            or rollout_source.get("session_meta_originator") != "codex-tui"):
+        return False
+    if (not isinstance(turn, dict)
+            or set(turn) != {"id", "recorded_at", "cwd"}
+            or not isinstance(turn.get("id"), str) or not turn["id"]
+            or not _timestamp(turn.get("recorded_at"))
+            or not isinstance(turn.get("cwd"), str)
+            or os.path.realpath(turn["cwd"]) != scope["worktree"]["root"]
+            or not isinstance(settings, dict)
+            or set(settings) != {"model", "effort", "approval_policy", "sandbox_policy"}
+            or any(not isinstance(settings.get(key), str) or not settings[key]
+                   for key in ("model", "effort", "approval_policy"))
+            or not isinstance(settings.get("sandbox_policy"), dict)
+            or not settings["sandbox_policy"]):
+        return False
+    try:
+        observed_at = datetime.fromisoformat(snapshot["observed_at"].replace("Z", "+00:00"))
+        process_started = datetime.fromisoformat(process["started_at"].replace("Z", "+00:00"))
+        turn_recorded = datetime.fromisoformat(turn["recorded_at"].replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if turn_recorded <= process_started or turn_recorded > observed_at:
+        return False
+    snapshot_digest = _digest(snapshot)
+    setting_evidence = {
+        "source": "open_codex_rollout",
+        "snapshot_digest": snapshot_digest,
+        "turn_id": turn["id"],
+        "recorded_at": turn["recorded_at"],
+    }
+    unknown = UNKNOWN
+    return (
+        record.get("native_generation") == {
+            "status": "observed", "value": process,
+            "evidence": {
+                "source": "ps", "snapshot_digest": snapshot_digest,
+                "observed_at": snapshot["observed_at"],
+            },
+        }
+        and record.get("native_predecessor_binding") == {
+            "status": "observed", "hook_generation": snapshot["hook_generation"],
+            "evidence": {
+                "source": "cmux_codex_hook_store_v1", "snapshot_digest": snapshot_digest,
+            },
+        }
+        and record.get("native_successor_binding") == UNKNOWN_BINDING
+        and isinstance(observations, dict)
+        and set(observations) == {
+            "predecessor_model", "predecessor_effort", "successor_model",
+            "successor_effort", "effective_permissions",
+        }
+        and observations.get("predecessor_model") == {
+            "status": "observed", "value": settings["model"], "evidence": setting_evidence,
+        }
+        and observations.get("predecessor_effort") == {
+            "status": "observed", "value": settings["effort"], "evidence": setting_evidence,
+        }
+        and observations.get("successor_model") == unknown
+        and observations.get("successor_effort") == unknown
+        and observations.get("effective_permissions") == unknown
+        and record.get("readiness") == {
+            "status": "blocked", "reason": "effective_access_unobserved",
+        }
+    )
+
+
 def _validate_handoff(record, *, intent=None, handoff_id=None):
     if (not isinstance(record, dict) or record.get("schema_version") != 1
             or record.get("protocol") != HANDOFF_PROTOCOL
@@ -233,23 +380,30 @@ def _validate_handoff(record, *, intent=None, handoff_id=None):
                 or snapshot.get("choice") != intent["choice"]
                 or snapshot.get("request_digest") != intent["request_digest"]):
             raise HandoffAdapterError("Replicator handoff does not preserve the exact configured intent.")
-    if (record.get("native_generation") != UNKNOWN
-            or record.get("native_predecessor_binding") != UNKNOWN_BINDING
-            or record.get("native_successor_binding") != UNKNOWN_BINDING):
-        raise HandoffAdapterError("Replicator handoff claims unsupported native generation evidence.")
     observations = record.get("observations")
-    if (not isinstance(observations, dict)
-            or set(observations) != {"predecessor_model", "predecessor_effort", "successor_model",
-                                     "successor_effort", "effective_permissions"}
-            or any(observations.get(key) != UNKNOWN for key in observations)
-            or record.get("permission_requirement") != {
+    unknown_binding = {"status": "unknown", "hook_generation": None, "evidence": None}
+    expected_observations = {"predecessor_model", "predecessor_effort", "successor_model",
+                             "successor_effort", "effective_permissions"}
+    native_snapshot = record.get("native_predecessor_snapshot")
+    if native_snapshot is None:
+        if (record.get("native_generation") != UNKNOWN
+                or record.get("native_predecessor_binding") != UNKNOWN_BINDING
+                or record.get("native_successor_binding") != UNKNOWN_BINDING
+                or not isinstance(observations, dict)
+                or set(observations) != expected_observations
+                or any(observations.get(key) != UNKNOWN for key in observations)
+                or record.get("readiness") != {
+                    "status": "blocked", "reason": "native_observations_unavailable"}):
+            raise HandoffAdapterError("Replicator handoff has malformed native observation state.")
+    else:
+        if not _valid_observed_snapshot(record, scope, native_snapshot, observations):
+            raise HandoffAdapterError("Replicator handoff has malformed native observation state.")
+    if (record.get("permission_requirement") != {
                 "kind": "match_predecessor_effective", "status": "unknown"}
-            or record.get("readiness") != {
-                "status": "blocked", "reason": "native_observations_unavailable"}
             or record.get("launch") != {"status": "not_started"}
             or record.get("transfer") != {"status": "not_applicable"}
             or record.get("predecessor_cleanup") != {"status": "not_applicable"}):
-        raise HandoffAdapterError("Replicator handoff does not match the supported freeze-only state.")
+        raise HandoffAdapterError("Replicator handoff has an unsupported readiness or lifecycle state.")
     return record
 
 
