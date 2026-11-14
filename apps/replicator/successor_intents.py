@@ -709,8 +709,9 @@ def _validate_store(value):
                 preflight = attempt.get("preflight", {})
                 history = handoff["access_observations"].get("predecessor", [])
                 latest = history[-1] if history else None
+                pending_access = access_observer.pending_access_entry(handoff["access_observations"])
                 if (not isinstance(latest, dict)
-                        or handoff["access_observations"].get("pending") is not None
+                        or (pending_access is not None and pending_access[0] != "successor")
                         or preflight.get("access_observation_id") != latest.get("id")
                         or preflight.get("access_observation_digest") != digest(latest)
                         or preflight.get("context_access_digest") != digest(latest.get("checks", {}).get("context_access"))

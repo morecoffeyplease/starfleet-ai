@@ -222,6 +222,26 @@ Approval and sandbox differences remain visible and block transfer assessment.
 Native trust, effective permissions, successor scoped access, receiving, and custody are still independent unknowns and keep transfer blocked.
 Opening and observation do not consume the one-shot intent, transfer custody, enroll tools, or close the predecessor.
 
+## Observe scoped access from the successor
+
+Run this command from the exact observed successor after `observe-successor` succeeds:
+
+```sh
+replicator handoff observe-access HANDOFF_ID --actor successor \
+  --context-file /path/to/required-context.md \
+  --guidance-file /path/to/AGENTS.md --json
+```
+
+Use the same normalized context and guidance paths and the same write and origin probe choices that the predecessor recorded before opening.
+Replicator refuses a different access request before reading or probing it.
+The command matches the live session, panel, workspace, worktree, process, hook generation, rollout, and settings against the recorded successor snapshot.
+The successor writes its access evidence to a separate history in the same handoff record.
+The opening preflight and predecessor access history remain unchanged.
+Show compares successor context and guidance byte digests with the immutable opening reference.
+Changed bytes block that comparison, and this command does not rewrite the opening preflight.
+Only the exact actor that created pending write cleanup can reconcile that operation with the same request.
+Scoped access does not prove native trust or complete effective permissions, so transfer remains blocked while either is unknown.
+
 Run the passive diagnostic outside Git or before configuring an intent:
 
 ```sh

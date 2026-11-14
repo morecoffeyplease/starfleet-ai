@@ -211,6 +211,80 @@ def _expected_subject(scope):
     }
 
 
+def access_baseline(handoff, actor):
+    if actor == "predecessor":
+        baseline = handoff.get("native_predecessor_snapshot")
+        if not isinstance(baseline, dict):
+            raise AccessObservationError("Record the exact predecessor settings snapshot before observing access.")
+        return handoff["scope"], baseline
+    if actor != "successor":
+        raise AccessObservationError("The scoped access actor is unsupported.")
+    launch = handoff.get("launch", {})
+    baseline = handoff.get("native_successor_snapshot")
+    if launch.get("status") != "successor_observed" or not isinstance(baseline, dict):
+        raise AccessObservationError("Record the exact opened successor settings snapshot before observing successor access.")
+    subject = baseline.get("subject")
+    returned = launch.get("returned_surface")
+    predecessor = handoff.get("scope", {}).get("seat", {})
+    if (not isinstance(subject, dict) or not isinstance(returned, dict)
+            or subject.get("harness") != "codex"
+            or subject.get("session_id") == predecessor.get("session_id")
+            or subject.get("panel_id", "").upper() != returned.get("surface_id", "").upper()
+            or subject.get("workspace_id", "").upper() != returned.get("workspace_id", "").upper()
+            or subject.get("worktree") != handoff["scope"]["worktree"]):
+        raise AccessObservationError("The recorded successor does not match the exact opened surface and worktree.")
+    scope = {
+        "seat": {
+            **handoff["scope"]["seat"],
+            "harness": subject["harness"],
+            "session_id": subject["session_id"],
+            "panel_id": subject["panel_id"],
+            "workspace_id": subject["workspace_id"],
+        },
+        "worktree": handoff["scope"]["worktree"],
+    }
+    return scope, baseline
+
+
+def opening_access_observation(handoff):
+    launch = handoff.get("launch", {})
+    attempt = launch.get("attempt", {})
+    preflight = attempt.get("preflight", {})
+    access = handoff.get("access_observations", {})
+    observations = access.get("predecessor", []) if isinstance(access, dict) else []
+    observation_id = preflight.get("access_observation_id") if isinstance(preflight, dict) else None
+    recorded = next((item for item in observations if item.get("id") == observation_id), None)
+    if (not isinstance(recorded, dict) or preflight.get("status") != "ready"
+            or preflight.get("access_observation_digest") != digest(recorded)):
+        raise AccessObservationError("The immutable opening access reference is unavailable or malformed.")
+    return recorded
+
+
+def validate_successor_request(handoff, request):
+    opening = opening_access_observation(handoff)["request"]
+    same_paths = all(
+        len(request[name]) == len(opening[name]) and set(request[name]) == set(opening[name])
+        for name in ("context_files", "guidance_files")
+    )
+    if (not same_paths or request["probe_write"] != opening["probe_write"]
+            or request["probe_origin"] != opening["probe_origin"]):
+        raise AccessObservationError(
+            "Successor access must use the opening's exact context, guidance, and probe request."
+        )
+    return opening
+
+
+def pending_access_entry(value):
+    pending_id = value.get("pending") if isinstance(value, dict) else None
+    if pending_id is None:
+        return None
+    matches = [(actor, observation) for actor in ("predecessor", "successor")
+               for observation in value.get(actor, []) if observation.get("id") == pending_id]
+    if len(matches) != 1:
+        raise AccessObservationError("The pending access identity does not select one exact actor observation.")
+    return matches[0]
+
+
 def compare_native_snapshots(scope, baseline, observed):
     baseline = baseline if isinstance(baseline, dict) else {}
     observed = observed if isinstance(observed, dict) else {}
@@ -279,11 +353,12 @@ def operation_key(request, snapshot, *, retry_nonce=None):
                    "nonce": retry_nonce})
 
 
-def make_observation(handoff, snapshot, request, inputs, git_check, origin_check, *, observed_at, retry=False):
-    baseline = handoff.get("native_predecessor_snapshot")
-    if not isinstance(baseline, dict):
-        raise AccessObservationError("Record the exact predecessor settings snapshot before observing access.")
-    comparisons = compare_native_snapshots(handoff["scope"], baseline, snapshot)
+def make_observation(handoff, snapshot, request, inputs, git_check, origin_check, *, observed_at,
+                     actor="predecessor", retry=False):
+    scope, baseline = access_baseline(handoff, actor)
+    if actor == "successor":
+        validate_successor_request(handoff, request)
+    comparisons = compare_native_snapshots(scope, baseline, snapshot)
     write_status = "not_assessed"
     write_reason = "not_requested"
     targets = []
@@ -601,31 +676,41 @@ def validate_access_history(value, handoff):
             or len(value["predecessor"]) > MAX_ACCESS_HISTORY
             or len(value["successor"]) > MAX_ACCESS_HISTORY):
         raise AccessObservationError("The scoped access observation history is malformed.")
-    if value["successor"]:
-        raise AccessObservationError("Successor access evidence requires a separately bound native successor.")
     pending_id = value.get("pending")
     if pending_id is not None and (not isinstance(pending_id, str) or len(pending_id) != 32
                                    or any(char not in "0123456789abcdef" for char in pending_id)):
         raise AccessObservationError("The pending access operation identity is malformed.")
     seen = set()
     pending_matches = []
-    baseline = handoff.get("native_predecessor_snapshot")
-    for observation in value["predecessor"]:
-        validate_access_observation(observation, handoff, baseline)
-        if observation["id"] in seen:
-            raise AccessObservationError("The scoped access observation identity is duplicated.")
-        seen.add(observation["id"])
-        if observation["id"] == pending_id:
-            pending_matches.append(observation)
+    for actor in ("predecessor", "successor"):
+        observations = value[actor]
+        if actor == "successor" and observations and handoff.get("launch", {}).get("status") != "successor_observed":
+            raise AccessObservationError("Successor access evidence requires the exact observed native successor.")
+        try:
+            _scope, baseline = access_baseline(handoff, actor)
+        except AccessObservationError:
+            if observations:
+                raise
+            baseline = None
+        for observation in observations:
+            validate_access_observation(observation, handoff, baseline, actor=actor)
+            if actor == "successor":
+                validate_successor_request(handoff, observation["request"])
+            if observation["id"] in seen:
+                raise AccessObservationError("The scoped access observation identity is duplicated.")
+            seen.add(observation["id"])
+            if observation["id"] == pending_id:
+                pending_matches.append((actor, observation))
     if pending_id is not None and (len(pending_matches) != 1
-                                   or pending_matches[0]["state"] != "cleanup_incomplete"):
+                                   or pending_matches[0][1]["state"] != "cleanup_incomplete"):
         raise AccessObservationError("The pending access operation does not match retained cleanup evidence.")
-    if pending_id is None and any(item["state"] == "cleanup_incomplete" for item in value["predecessor"]):
+    if pending_id is None and any(item["state"] == "cleanup_incomplete"
+                                  for actor in ("predecessor", "successor") for item in value[actor]):
         raise AccessObservationError("Incomplete access cleanup cannot be detached from its pending operation.")
     return True
 
 
-def validate_access_observation(observation, handoff, baseline):
+def validate_access_observation(observation, handoff, baseline, *, actor="predecessor"):
     required = {
         "schema_version", "protocol", "id", "operation_key", "request_digest", "request", "state",
         "subject", "baseline_snapshot_digest", "native_snapshot", "native_settings_ref", "observed_at",
@@ -644,7 +729,7 @@ def validate_access_observation(observation, handoff, baseline):
             or type(observation.get("retry")) is not bool
             or not isinstance(observation.get("native_snapshot"), dict)
             or observation.get("subject") != observation["native_snapshot"].get("subject")
-            or observation.get("subject") != _expected_subject(handoff["scope"])):
+            or observation.get("subject") != _expected_subject(access_baseline(handoff, actor)[0])):
         raise AccessObservationError("The scoped access observation identity is malformed.")
     request = observation.get("request")
     if (not isinstance(request, dict)
@@ -656,6 +741,8 @@ def validate_access_observation(observation, handoff, baseline):
                           or len(path) > MAX_ACCESS_PATH_LENGTH for path in request[name])
                    for name in ("context_files", "guidance_files"))):
         raise AccessObservationError("The scoped access request is malformed.")
+    if actor == "successor":
+        validate_successor_request(handoff, request)
     native = observation.get("native_snapshot")
     if not _valid_native_snapshot(native, observation["subject"]):
         raise AccessObservationError("The native snapshot referenced by access evidence is malformed.")
@@ -673,11 +760,14 @@ def validate_access_observation(observation, handoff, baseline):
     for name, check in checks.items():
         if not isinstance(check, dict) or check.get("status") not in ACCESS_STATES:
             raise AccessObservationError("The scoped access check status is malformed.")
-    expected_comparisons = compare_native_snapshots(handoff["scope"], baseline, native)
+    actor_scope, actor_baseline = access_baseline(handoff, actor)
+    if actor_baseline != baseline:
+        raise AccessObservationError("The scoped access baseline does not match its recorded actor.")
+    expected_comparisons = compare_native_snapshots(actor_scope, baseline, native)
     comparisons_match = all(checks[name] == expected_comparisons[name] for name in expected_comparisons)
     legacy_inode_only_block = _matches_legacy_inode_only_owner_block(
         checks, baseline, native, expected_comparisons,
-    )
+    ) if actor == "predecessor" else False
     if not comparisons_match and not legacy_inode_only_block:
         raise AccessObservationError("The native owner or settings comparison does not match its snapshots.")
     _validate_input_check(checks["context_access"], request["context_files"])
@@ -754,9 +844,9 @@ def validate_access_observation(observation, handoff, baseline):
                 or revalidation["native_snapshot"].get("turn", {}).get("id") != revalidation["turn_id"]
                 or revalidation["native_snapshot"].get("turn", {}).get("recorded_at") != revalidation["turn_recorded_at"]
                 or revalidation["native_snapshot"].get("observed_at") != revalidation["observed_at"]
-                or compare_native_snapshots(handoff["scope"], baseline,
+                or compare_native_snapshots(actor_scope, baseline,
                                             revalidation["native_snapshot"])["owner_binding"]["status"] != "ready"
-                or compare_native_snapshots(handoff["scope"], baseline,
+                or compare_native_snapshots(actor_scope, baseline,
                                             revalidation["native_snapshot"])["native_settings_match"]["status"] != "ready"):
             raise AccessObservationError("A pending access revalidation is malformed.")
     for target in observation["write_plan"]:

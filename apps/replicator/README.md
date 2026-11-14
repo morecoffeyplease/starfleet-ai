@@ -1,8 +1,8 @@
 # Replicator
 
-Replicator packages a maintained guide, read-only preflight, one-shot successor intent configuration, a versioned handoff freeze, and scoped Codex predecessor settings and access observations for an explicitly requested manual handoff between orchestrator sessions.
+Replicator packages a maintained guide, read-only preflight, one-shot successor intent configuration, a versioned handoff freeze, and scoped Codex predecessor and successor settings and access observations for an explicitly requested manual handoff between orchestrator sessions.
 The guide describes the handoff procedure, preflight reports only the caller, worktree, and explicit input checks it can observe, and successor intent records a frozen choice for a configured seat and worktree.
-Replicator does not start agents, workers, timers, or an automatic handoff trigger.
+An explicit `handoff open` request can create one Codex candidate terminal; Replicator does not start workers, timers, or an automatic handoff trigger.
 
 ## Print the guide
 
@@ -179,6 +179,25 @@ Observed model and effort are compared with the frozen configured choice or obse
 Approval and sandbox differences remain visible and block transfer assessment.
 Unknown effective permissions, native trust, successor scoped access, receiving, and custody keep transfer blocked.
 Opening and observation do not consume the one-shot intent, transfer custody, enroll tools, or close the predecessor.
+
+## Observe scoped successor access
+
+After `observe-successor` records the exact opened Codex successor, run the access command with `--actor successor` from that successor's session.
+
+```sh
+replicator handoff observe-access HANDOFF_ID --actor successor \
+  --context-file /path/to/required-context.md \
+  --guidance-file /path/to/AGENTS.md --json
+```
+
+Use the same normalized context and guidance paths and the same write and origin probe choices recorded before opening.
+Replicator refuses another access scope before reading or probing it.
+Successor access matches process, hook generation, rollout, and settings against the recorded successor snapshot.
+It stores successor evidence in the existing handoff record and leaves the predecessor observation and opening preflight unchanged.
+Show exposes whether the successor read the same context and guidance bytes that the opening preflight recorded.
+Changed bytes block that transfer comparison, and this command does not rewrite the opening preflight.
+Only the actor that created pending probe cleanup can reconcile it.
+Unknown native trust and effective permissions keep transfer blocked after scoped access succeeds.
 
 Run the passive configuration diagnostic outside a Git checkout:
 

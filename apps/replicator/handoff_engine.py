@@ -387,17 +387,23 @@ def show_handoff(state_dir, handoff_id):
     return {"schema_version": 1, "protocol": HANDOFF_PROTOCOL, "handoff": handoff}
 
 
-def existing_access_observation(state_dir, handoff_id, snapshot, request):
+def existing_access_observation(state_dir, handoff_id, snapshot, request, *, actor="predecessor"):
     store = successor_intents.read_store(state_dir)
     handoff = copy.deepcopy(_find_handoff(store, handoff_id))
     access = handoff.get("access_observations", access_observer.empty_access_observations())
-    if access.get("pending") is not None:
-        pending = next(item for item in access["predecessor"] if item["id"] == access["pending"])
+    pending_entry = access_observer.pending_access_entry(access)
+    if pending_entry is not None:
+        pending_actor, pending = pending_entry
+        if pending_actor != actor:
+            raise HandoffError("Only the exact actor that created pending access cleanup can reconcile it.")
         if pending["request_digest"] != access_observer.request_digest(request):
             raise HandoffError("An access probe has incomplete cleanup; repeat its exact request to reconcile it.")
         return None
+    observations = access.get(actor)
+    if not isinstance(observations, list):
+        raise HandoffError("The scoped access actor is unsupported.")
     operation_key = access_observer.operation_key(request, snapshot)
-    existing = next((item for item in access.get("predecessor", [])
+    existing = next((item for item in observations
                      if item.get("operation_key") == operation_key), None)
     if existing is None:
         return None
@@ -424,25 +430,42 @@ def _update_access_summary(observation):
 
 
 def record_access_observation(state_dir, handoff_id, snapshot, request, inputs, git_check, origin_check,
-                              worktree_identity, *, observed_at, identity_resolver, retry=False):
+                              worktree_identity, *, observed_at, identity_resolver, actor="predecessor", retry=False):
     if not isinstance(snapshot, dict):
         raise HandoffError("The exact native access observation is malformed.")
     with successor_intents.mutation_lock(state_dir) as root:
         store = successor_intents.read_store(root)
         handoff = _find_handoff(store, handoff_id)
-        if handoff["state"] != "frozen" or handoff.get("launch") != {"status": "not_started"}:
-            raise HandoffError("Scoped access observation requires a frozen handoff before launch.")
+        if handoff["state"] != "frozen":
+            raise HandoffError("Scoped access observation requires the frozen handoff state.")
+        launch_status = handoff.get("launch", {}).get("status")
+        if actor == "predecessor" and launch_status != "not_started":
+            raise HandoffError("Predecessor scoped access observation requires a frozen handoff before launch.")
+        if actor == "successor" and launch_status != "successor_observed":
+            raise HandoffError("Successor scoped access observation requires the exact observed successor.")
         if worktree_identity != handoff["scope"]["worktree"]:
             raise HandoffError("Scoped access observation requires the exact frozen canonical worktree identity.")
-        baseline = handoff.get("native_predecessor_snapshot")
-        if not isinstance(baseline, dict):
-            raise HandoffError("Record the exact predecessor settings snapshot before observing access.")
+        try:
+            actor_scope, baseline = access_observer.access_baseline(handoff, actor)
+            if actor == "successor":
+                access_observer.validate_successor_request(handoff, request)
+        except access_observer.AccessObservationError as exc:
+            raise HandoffError(str(exc)) from exc
         access = handoff.setdefault("access_observations", access_observer.empty_access_observations())
         access_observer.validate_access_history(access, handoff)
-        comparisons = access_observer.compare_native_snapshots(handoff["scope"], baseline, snapshot)
+        comparisons = access_observer.compare_native_snapshots(actor_scope, baseline, snapshot)
+        observations = access.get(actor)
+        if not isinstance(observations, list):
+            raise HandoffError("The scoped access actor is unsupported.")
+        if actor == "successor" and (comparisons["owner_binding"]["status"] != "ready"
+                                      or comparisons["native_settings_match"]["status"] != "ready"):
+            raise HandoffError("Successor access requires the exact recorded successor process, generation, and settings.")
+        pending_entry = access_observer.pending_access_entry(access)
         pending_id = access.get("pending")
-        if pending_id is not None:
-            observation = next(item for item in access["predecessor"] if item["id"] == pending_id)
+        if pending_entry is not None:
+            pending_actor, observation = pending_entry
+            if pending_actor != actor:
+                raise HandoffError("Only the exact actor that created pending access cleanup can reconcile it.")
             if observation["request_digest"] != access_observer.request_digest(request):
                 raise HandoffError("An access probe has incomplete cleanup; repeat its exact request to reconcile it.")
             if (comparisons["owner_binding"]["status"] != "ready"
@@ -466,15 +489,15 @@ def record_access_observation(state_dir, handoff_id, snapshot, request, inputs, 
         else:
             observation = access_observer.make_observation(
                 handoff, snapshot, request, inputs, git_check, origin_check,
-                observed_at=observed_at, retry=retry,
+                observed_at=observed_at, actor=actor, retry=retry,
             )
-            existing = next((item for item in access["predecessor"]
+            existing = next((item for item in observations
                              if item["operation_key"] == observation["operation_key"]), None)
             if existing is not None:
                 public_handoff = copy.deepcopy(handoff)
                 public_handoff["phase_readiness"] = phase_readiness(public_handoff)
                 return {"handoff": public_handoff, "observation": copy.deepcopy(existing), "reused": True}
-            if len(access["predecessor"]) >= access_observer.MAX_ACCESS_HISTORY:
+            if len(observations) >= access_observer.MAX_ACCESS_HISTORY:
                 raise HandoffError("Scoped access observation history reached its record limit.")
             if request["probe_write"] and (comparisons["owner_binding"]["status"] == "ready"
                                             and comparisons["native_settings_match"]["status"] == "ready"):
@@ -484,7 +507,7 @@ def record_access_observation(state_dir, handoff_id, snapshot, request, inputs, 
                     observation["cleanup"] = {"status": "incomplete", "targets": []}
                     observation["state"] = "cleanup_incomplete"
                     access["pending"] = observation["id"]
-            access["predecessor"].append(observation)
+            observations.append(observation)
             if access.get("pending") is None:
                 observation["cleanup"] = {"status": "verified", "targets": []} if observation["write_plan"] else observation["cleanup"]
                 _update_access_summary(observation)
@@ -541,10 +564,58 @@ def _phase_status(checks, *, unknown_means_blocked=False):
     return "ready"
 
 
+def _successor_access_status(observation):
+    if not isinstance(observation, dict):
+        return "unknown"
+    checks = observation.get("checks", {})
+    required = {
+        "owner_binding": checks.get("owner_binding"),
+        "native_settings_match": checks.get("native_settings_match"),
+        "context_access": checks.get("context_access"),
+        "guidance_access": checks.get("guidance_access"),
+        "git_metadata_access": checks.get("git_metadata_access"),
+    }
+    request = observation.get("request", {})
+    if request.get("probe_write"):
+        required["write_access"] = checks.get("write_access")
+    if request.get("probe_origin"):
+        required["git_origin_access"] = checks.get("git_origin_access")
+    return _phase_status(required)
+
+
+def _successor_content_match(handoff, observation, check_name):
+    if not isinstance(observation, dict):
+        return "unknown"
+    try:
+        opening = access_observer.opening_access_observation(handoff)
+    except access_observer.AccessObservationError:
+        return "unknown"
+    original = opening.get("checks", {}).get(check_name, {})
+    successor = observation.get("checks", {}).get(check_name, {})
+    if original.get("status") == "blocked" or successor.get("status") == "blocked":
+        return "blocked"
+    if original.get("status") != "ready" or successor.get("status") != "ready":
+        return "unknown"
+    original_items = original.get("items")
+    successor_items = successor.get("items")
+    if not isinstance(original_items, list) or not isinstance(successor_items, list):
+        return "unknown"
+    fields = ("path", "bytes_read", "sha256")
+    original_content = {item.get("path"): tuple(item.get(name) for name in fields[1:])
+                        for item in original_items if isinstance(item, dict) and item.get("status") == "ready"}
+    successor_content = {item.get("path"): tuple(item.get(name) for name in fields[1:])
+                         for item in successor_items if isinstance(item, dict) and item.get("status") == "ready"}
+    if len(original_content) != len(original_items) or len(successor_content) != len(successor_items):
+        return "unknown"
+    return "ready" if original_content == successor_content else "blocked"
+
+
 def phase_readiness(handoff):
     access = handoff.get("access_observations", access_observer.empty_access_observations())
     history = access.get("predecessor", []) if isinstance(access, dict) else []
     latest = history[-1] if history else None
+    successor_history = access.get("successor", []) if isinstance(access, dict) else []
+    latest_successor = successor_history[-1] if successor_history else None
     launch_checks = {
         "frozen_intent": "ready" if handoff.get("intent_digest") else "blocked",
         "predecessor_owner_binding": _check_status(latest, "owner_binding"),
@@ -566,7 +637,13 @@ def phase_readiness(handoff):
         ) else "unknown",
         "successor_choice_match": _successor_choice_status(handoff),
         "successor_policy_match": _successor_policy_status(handoff),
-        "successor_access": "ready" if access.get("successor") else "unknown",
+        "successor_access": _successor_access_status(latest_successor),
+        "successor_context_matches_opening": _successor_content_match(
+            handoff, latest_successor, "context_access",
+        ),
+        "successor_guidance_matches_opening": _successor_content_match(
+            handoff, latest_successor, "guidance_access",
+        ),
         "effective_permissions": handoff.get("observations", {}).get("effective_permissions", {}).get("status", "unknown"),
         "native_trust": _check_status(latest, "native_trust"),
         "receiving": "unknown",

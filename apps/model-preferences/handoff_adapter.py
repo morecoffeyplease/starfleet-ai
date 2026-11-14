@@ -352,6 +352,204 @@ def _choice_model_effort(record, predecessor_snapshot):
     return None, None
 
 
+def _valid_access_request(request):
+    return (
+        isinstance(request, dict)
+        and set(request) == {"context_files", "guidance_files", "probe_write", "probe_origin"}
+        and all(
+            isinstance(request.get(name), list)
+            and len(request[name]) <= 16
+            and all(isinstance(path, str) and path and os.path.isabs(path)
+                    and os.path.abspath(path) == path and len(path) <= 2048 for path in request[name])
+            and len(set(request[name])) == len(request[name])
+            for name in ("context_files", "guidance_files")
+        )
+        and type(request.get("probe_write")) is bool
+        and type(request.get("probe_origin")) is bool
+    )
+
+
+def _access_operation_identity(snapshot):
+    hook_source = snapshot.get("hook_source") if isinstance(snapshot, dict) else None
+    rollout_source = snapshot.get("rollout_source") if isinstance(snapshot, dict) else None
+    return _digest({
+        "subject": snapshot.get("subject"),
+        "hook_generation": snapshot.get("hook_generation"),
+        "process_identity": snapshot.get("process_identity"),
+        "hook_source": ({name: hook_source.get(name) for name in ("kind", "path", "device", "inode")}
+                        if isinstance(hook_source, dict) else None),
+        "rollout_source": ({name: rollout_source.get(name) for name in (
+            "kind", "path", "device", "inode", "cli_version",
+            "session_meta_cwd", "session_meta_source", "session_meta_originator",
+        )} if isinstance(rollout_source, dict) else None),
+        "settings": snapshot.get("settings"),
+        "turn": snapshot.get("turn"),
+    })
+
+
+def _valid_successor_pending_cleanup(record, access, opening_observation):
+    pending_id = access.get("pending")
+    if not isinstance(pending_id, str) or HEX_32.fullmatch(pending_id) is None:
+        return False
+    matches = [(actor, observation) for actor in ("predecessor", "successor")
+               for observation in access[actor]
+               if isinstance(observation, dict) and observation.get("id") == pending_id]
+    if len(matches) != 1 or matches[0][0] != "successor":
+        return False
+    observation = matches[0][1]
+    request = observation.get("request")
+    opening_request = opening_observation.get("request")
+    if (not _valid_access_request(request) or not _valid_access_request(opening_request)
+            or any(len(request[name]) != len(opening_request[name])
+                   or set(request[name]) != set(opening_request[name])
+                   for name in ("context_files", "guidance_files"))
+            or request["probe_write"] != opening_request["probe_write"]
+            or request["probe_origin"] != opening_request["probe_origin"]
+            or request["probe_write"] is not True
+            or observation.get("state") != "cleanup_incomplete"
+            or observation.get("schema_version") != 1
+            or observation.get("protocol") != "starfleet.replicator.access-observation/v1"
+            or observation.get("request_digest") != _digest(request)
+            or not isinstance(observation.get("operation_key"), str)
+            or HEX_64.fullmatch(observation["operation_key"]) is None
+            or observation.get("id") != observation["operation_key"][:32]
+            or observation.get("baseline_snapshot_digest") != _digest(record.get("native_successor_snapshot"))
+            or not _timestamp(observation.get("observed_at"))
+            or type(observation.get("retry")) is not bool
+            or not isinstance(observation.get("revalidations"), list)):
+        return False
+
+    scope = record.get("scope")
+    launch = record.get("launch")
+    baseline = record.get("native_successor_snapshot")
+    if (not isinstance(scope, dict) or not isinstance(launch, dict)
+            or launch.get("status") != "successor_observed" or not isinstance(baseline, dict)):
+        return False
+    subject = baseline.get("subject")
+    returned = launch.get("returned_surface")
+    if (not isinstance(subject, dict) or not isinstance(returned, dict)
+            or subject.get("harness") != "codex"
+            or subject.get("session_id") == scope["seat"].get("session_id")
+            or subject.get("panel_id", "").upper() != returned.get("surface_id", "").upper()
+            or subject.get("workspace_id", "").upper() != returned.get("workspace_id", "").upper()
+            or subject.get("worktree") != scope.get("worktree")
+            or observation.get("subject") != subject):
+        return False
+    successor_scope = {
+        "seat": {**scope["seat"], "session_id": subject["session_id"],
+                 "panel_id": subject["panel_id"], "workspace_id": subject["workspace_id"]},
+        "worktree": scope["worktree"],
+    }
+    native = observation.get("native_snapshot")
+    native_record = _snapshot_bound_record(native)
+    if (not isinstance(native_record.get("observations"), dict)
+            or not _valid_observed_snapshot(native_record, successor_scope, native, native_record["observations"])
+            or native.get("subject") != baseline.get("subject")
+            or native.get("process_identity") != baseline.get("process_identity")
+            or native.get("hook_generation") != baseline.get("hook_generation")
+            or not isinstance(native.get("hook_source"), dict)
+            or not isinstance(baseline.get("hook_source"), dict)
+            or any(native["hook_source"].get(name) != baseline["hook_source"].get(name)
+                   for name in ("kind", "path", "device"))
+            or not isinstance(native.get("rollout_source"), dict)
+            or not isinstance(baseline.get("rollout_source"), dict)
+            or any(native["rollout_source"].get(name) != baseline["rollout_source"].get(name)
+                   for name in ("kind", "path", "device", "inode", "cli_version", "session_meta_cwd",
+                                "session_meta_source", "session_meta_originator"))):
+        return False
+    setting_names = ("model", "effort", "approval_policy", "sandbox_policy")
+    if (not isinstance(native.get("settings"), dict) or not isinstance(baseline.get("settings"), dict)
+            or any(native["settings"].get(name) != baseline["settings"].get(name) for name in setting_names)):
+        return False
+
+    baseline_digest = _digest(baseline)
+    native_digest = _digest(native)
+    checks = observation.get("checks")
+    expected_owner_check = {
+        "status": "ready", "baseline_snapshot_digest": baseline_digest,
+        "observed_snapshot_digest": native_digest, "differences": [],
+    }
+    expected_settings_check = {
+        "status": "ready", "baseline_snapshot_digest": baseline_digest,
+        "observed_snapshot_digest": native_digest, "differences": [],
+    }
+    check_names = {"owner_binding", "native_settings_match", "context_access", "guidance_access",
+                   "git_metadata_access", "write_access", "git_origin_access", "native_trust",
+                   "effective_permissions"}
+    if (not isinstance(checks, dict) or set(checks) != check_names
+            or checks.get("owner_binding") != expected_owner_check
+            or checks.get("native_settings_match") != expected_settings_check
+            or checks.get("native_trust") != {
+                "status": "unknown", "reason": "no_supported_exact_trust_source"}
+            or checks.get("effective_permissions") != {
+                "status": "unknown", "reason": "scoped_checks_do_not_prove_complete_permissions"}):
+        return False
+
+    native_settings_ref = observation.get("native_settings_ref")
+    if (not isinstance(native_settings_ref, dict)
+            or native_settings_ref != {"snapshot_digest": native_digest,
+                                       "operation_identity": _access_operation_identity(native)}):
+        return False
+    worktree = scope["worktree"]
+    scoped_paths = {}
+    for label in ("root", "git_dir", "common_dir"):
+        scoped_paths.setdefault(worktree[label], []).append(
+            {"root": "worktree", "git_dir": "git_dir", "common_dir": "common_dir"}[label])
+    write_plan = observation.get("write_plan")
+    if not isinstance(write_plan, list) or not write_plan or len(write_plan) > 3:
+        return False
+    expected_cleanup_targets = []
+    indices = set()
+    paths = set()
+    incomplete = False
+    for target in write_plan:
+        target_fields = {"index", "path", "scopes", "device", "inode", "probe_name", "marker",
+                         "file_identity", "stage", "status", "cleanup_status", "reason", "evidence"}
+        if (not isinstance(target, dict) or set(target) != target_fields
+                or type(target.get("index")) is not int or target["index"] < 0
+                or target["index"] in indices
+                or not isinstance(target.get("path"), str)
+                or target["path"] not in scoped_paths or target["path"] in paths
+                or target.get("scopes") != scoped_paths[target["path"]]
+                or target.get("stage") not in ("planned", "created", "access_verified", "complete",
+                                                "failed", "identity_unverified")
+                or target.get("status") not in ("ready", "blocked", "unknown", "not_assessed")
+                or target.get("cleanup_status") not in ("not_started", "incomplete", "verified")
+                or not isinstance(target.get("reason"), str)):
+            return False
+        indices.add(target["index"])
+        paths.add(target["path"])
+        if target["stage"] != "failed" and (
+                target.get("probe_name") != f'.replicator-access-probe-{pending_id}-{target["index"]}'
+                or target.get("marker") != f'starfleet.replicator.access-probe/v1:{pending_id}:{target["index"]}'):
+            return False
+        if target["stage"] in ("created", "access_verified", "complete"):
+            file_identity = target.get("file_identity")
+            if (not isinstance(file_identity, dict) or set(file_identity) != {"device", "inode"}
+                    or any(type(file_identity[name]) is not int or file_identity[name] < 0
+                           for name in ("device", "inode"))):
+                return False
+        if target["cleanup_status"] == "incomplete":
+            incomplete = True
+        expected_cleanup_targets.append({
+            "index": target["index"], "scopes": target["scopes"],
+            "status": target["cleanup_status"], "reason": target["reason"],
+        })
+    cleanup = observation.get("cleanup")
+    if (not incomplete or not any(target["stage"] != "failed" for target in write_plan)
+            or observation.get("state") != "cleanup_incomplete"
+            or not isinstance(cleanup, dict)
+            or cleanup != {"status": "incomplete", "targets": expected_cleanup_targets}
+            or checks.get("write_access") != {
+                "status": "ready" if all(target["status"] == "ready" for target in write_plan)
+                else "blocked" if any(target["status"] == "blocked" for target in write_plan)
+                else "unknown",
+                "reason": "scoped_write_probe", "targets": write_plan,
+            }):
+        return False
+    return True
+
+
 def _valid_opening_attempt(record, launch, predecessor_snapshot):
     if not isinstance(launch, dict) or set(launch) != {"status", "attempt", "returned_surface"}:
         return False
@@ -473,7 +671,7 @@ def _valid_opening_attempt(record, launch, predecessor_snapshot):
         return False
     access = record.get("access_observations")
     if (not isinstance(access, dict) or set(access) != {"schema_version", "predecessor", "successor", "pending"}
-            or access.get("schema_version") != 1 or access.get("pending") is not None
+            or access.get("schema_version") != 1
             or not isinstance(access.get("predecessor"), list) or not access["predecessor"]
             or not isinstance(access.get("successor"), list)):
         return False
@@ -493,6 +691,13 @@ def _valid_opening_attempt(record, launch, predecessor_snapshot):
             or _digest(context_access) != preflight.get("context_access_digest")
             or _digest(guidance_access) != preflight.get("guidance_access_digest")
             or _digest(record.get("scope", {}).get("worktree")) != preflight.get("git_identity_digest")):
+        return False
+    pending = access.get("pending")
+    if pending is not None:
+        if not _valid_successor_pending_cleanup(record, access, latest):
+            return False
+    elif any(isinstance(item, dict) and item.get("state") == "cleanup_incomplete"
+             for actor in ("predecessor", "successor") for item in access[actor]):
         return False
     return True
 

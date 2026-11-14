@@ -294,6 +294,94 @@ class NativeObserverTests(unittest.TestCase):
             cwd=self.worktree, env=environment, capture_output=True, text=True, check=False,
         )
 
+    def _run_mp_handoff_ready(self, replicator_state_dir, handoff_id, environment):
+        mp_script = ROOT.parent / "model-preferences" / "model_preferences.py"
+        fake_bin = self.root / "mp-reader-bin"
+        fake_bin.mkdir(exist_ok=True)
+        wrapper = fake_bin / "replicator"
+        wrapper.write_text(
+            "#!" + sys.executable + "\n"
+            "import os, sys\n"
+            f"os.execv({sys.executable!r}, [{sys.executable!r}, {str(ROOT / 'replicator.py')!r}, "
+            f"'--state-dir', {str(replicator_state_dir)!r}, *sys.argv[1:]])\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        reader_environment = dict(environment)
+        reader_environment["PATH"] = str(fake_bin) + os.pathsep + reader_environment["PATH"]
+        return subprocess.run(
+            [sys.executable, str(mp_script), "--config-dir", str(self.root / "mp-reader-config"),
+             "--state-dir", str(self.root / "mp-reader-state"), "handoff-ready",
+             f"replicator-v1:{handoff_id}", "--remaining-questions", "none",
+             "--replicator-state-dir", str(replicator_state_dir)],
+            cwd=self.worktree, env=reader_environment, capture_output=True, text=True, check=False,
+        )
+
+    def _opened_successor_fixture(self, state_dir, *, probe_write=False):
+        frozen, _snapshot = self.frozen_with_snapshot(state_dir)
+        context_file = self.root / "successor-access-context.md"
+        guidance_file = self.root / "successor-access-guide.md"
+        packet_file = self.root / "successor-access-packet.md"
+        context_file.write_bytes(b"successor access context")
+        guidance_file.write_bytes(b"successor access guide")
+        packet_file.write_bytes(b"synthetic handoff packet")
+        current_path = self.root / "successor-access-current.json"
+        response_path = self.root / "successor-access-response.json"
+        call_log = self.root / "successor-access-cmux-calls.jsonl"
+        native_map = self.root / "successor-access-native-map.json"
+        environment = self._fake_cli_tools(current_path, response_path, call_log, native_map)
+        access_args = ["handoff", "observe-access", frozen["id"], "--context-file", str(context_file),
+                       "--guidance-file", str(guidance_file)]
+        if probe_write:
+            access_args.append("--probe-write")
+        access = self._run_cli(state_dir, environment, *access_args, "--json")
+        self.assertEqual(access.returncode, 0, access.stderr)
+        native_command = json.dumps([
+            str(self.executable), "-m", "gpt-6.1-sol", "-c", 'model_reasoning_effort="medium"',
+        ])
+        opened = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", native_command, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        successor_session = "55555555-5555-4555-8555-555555555555"
+        successor_panel = "44444444-4444-4444-8444-444444444444"
+        successor_pid = 4343
+        successor_started = self.now - timedelta(minutes=30)
+        successor_turn = self.now - timedelta(minutes=5)
+        successor_rollout = self._add_native_session(
+            successor_session, successor_panel, WORKSPACE, successor_pid, successor_started, successor_turn,
+            "gpt-6.1-sol", "medium", "successor-access-turn",
+        )
+        current_path.write_text(
+            json.dumps(self._current_snapshot(successor_session, successor_panel, WORKSPACE)), encoding="utf-8",
+        )
+        native_map.write_text(json.dumps({
+            "processes": {str(self.pid): self._ps_line(self.process_started),
+                          str(successor_pid): self._ps_line_for(successor_pid, successor_started)},
+            "rollouts": {str(self.pid): [str(self.rollout)], str(successor_pid): [str(successor_rollout)]},
+        }), encoding="utf-8")
+        predecessor_environment = dict(environment)
+        environment.update({"CODEX_THREAD_ID": successor_session, "CMUX_SURFACE_ID": successor_panel,
+                            "CMUX_WORKSPACE_ID": WORKSPACE})
+        observed = self._run_cli(state_dir, environment, "handoff", "observe-successor", frozen["id"], "--json")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        return {
+            "state_dir": state_dir,
+            "handoff": json.loads(observed.stdout)["handoff"],
+            "environment": environment,
+            "predecessor_environment": predecessor_environment,
+            "context_file": context_file,
+            "guidance_file": guidance_file,
+            "current_path": current_path,
+            "native_map": native_map,
+            "successor_session": successor_session,
+            "successor_panel": successor_panel,
+            "successor_pid": successor_pid,
+            "successor_started": successor_started,
+            "successor_rollout": successor_rollout,
+        }
+
     def test_observer_reads_exact_process_rollout_and_keeps_access_unknown(self):
         snapshot = self.observe()
         self.assertEqual(snapshot["protocol"], native_observer.OBSERVATION_PROTOCOL)
@@ -747,6 +835,263 @@ class NativeObserverTests(unittest.TestCase):
 
         self.assertEqual(handoff["native_successor_snapshot"]["settings"]["model"], "gpt-6.1-sol")
 
+    def test_successor_access_uses_its_own_snapshot_and_preserves_opening_bytes(self):
+        fixture = self._opened_successor_fixture(self.root / "successor-access-state")
+        handoff = fixture["handoff"]
+        state_dir = fixture["state_dir"]
+        opening_preflight = json.loads(json.dumps(handoff["launch"]["attempt"]["preflight"]))
+        predecessor_access = json.loads(json.dumps(handoff["access_observations"]["predecessor"]))
+        request_args = ["handoff", "observe-access", handoff["id"], "--actor", "successor",
+                        "--context-file", str(fixture["context_file"]),
+                        "--guidance-file", str(fixture["guidance_file"]), "--json"]
+        mp_before_access = self._run_mp_handoff_ready(
+            state_dir, handoff["id"], fixture["environment"],
+        )
+        self.assertEqual(mp_before_access.returncode, 1, mp_before_access.stderr)
+        self.assertIn("readiness blocked", mp_before_access.stderr)
+        observed = self._run_cli(state_dir, fixture["environment"], *request_args)
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        result = json.loads(observed.stdout)
+        observation = result["observation"]
+        self.assertEqual(observation["checks"]["owner_binding"]["status"], "ready")
+        self.assertEqual(observation["checks"]["native_settings_match"]["status"], "ready")
+        self.assertEqual(observation["native_snapshot"]["subject"],
+                         handoff["native_successor_snapshot"]["subject"])
+        self.assertEqual(observation["native_snapshot"]["process_identity"],
+                         handoff["native_successor_snapshot"]["process_identity"])
+        self.assertEqual(observation["native_snapshot"]["hook_generation"],
+                         handoff["native_successor_snapshot"]["hook_generation"])
+        self.assertEqual(observation["native_snapshot"]["settings"],
+                         handoff["native_successor_snapshot"]["settings"])
+        self.assertEqual(observation["baseline_snapshot_digest"], access_observer.digest(
+            handoff["native_successor_snapshot"],
+        ))
+        self.assertEqual(len(result["handoff"]["access_observations"]["predecessor"]), 1)
+        self.assertEqual(result["handoff"]["access_observations"]["predecessor"], predecessor_access)
+        self.assertEqual(len(result["handoff"]["access_observations"]["successor"]), 1)
+        transfer = result["handoff"]["phase_readiness"]["transfer"]
+        self.assertEqual(transfer["checks"]["successor_access"], "ready")
+        self.assertEqual(transfer["checks"]["successor_context_matches_opening"], "ready")
+        self.assertEqual(transfer["checks"]["successor_guidance_matches_opening"], "ready")
+        self.assertEqual(transfer["checks"]["native_trust"], "unknown")
+        self.assertEqual(transfer["checks"]["effective_permissions"], "unknown")
+        self.assertEqual(transfer["status"], "blocked")
+        self.assertEqual(result["handoff"]["launch"]["attempt"]["preflight"], opening_preflight)
+        mp_after_access = self._run_mp_handoff_ready(
+            state_dir, handoff["id"], fixture["environment"],
+        )
+        self.assertEqual(mp_after_access.returncode, 1, mp_after_access.stderr)
+        self.assertIn("readiness blocked", mp_after_access.stderr)
+        self.assertEqual(successor_intents.intent_lifecycle_state(
+            successor_intents.read_store(state_dir), successor_intents.read_store(state_dir)["scopes"]
+            [successor_intents.scope_key(handoff["scope"])][0],
+        ), "frozen")
+
+        repeated = self._run_cli(state_dir, fixture["environment"], *request_args)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertTrue(json.loads(repeated.stdout)["reused"])
+        self.assertEqual(len(successor_intents.read_store(state_dir)["handoffs"][handoff["id"]]
+                             ["access_observations"]["successor"]), 1)
+
+        extra_context = self.root / "successor-access-extra.md"
+        extra_context.write_bytes(b"outside the frozen opening request")
+        refused = self._run_cli(
+            state_dir, fixture["environment"], "handoff", "observe-access", handoff["id"],
+            "--actor", "successor", "--context-file", str(fixture["context_file"]),
+            "--context-file", str(extra_context), "--guidance-file", str(fixture["guidance_file"]),
+            "--probe-origin", "--json",
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("opening's exact context, guidance, and probe request", refused.stderr)
+        state_path = state_dir / successor_intents.STORE_NAME
+        unchanged_state = state_path.read_bytes()
+        for probe_option in ("--probe-write", "--probe-origin"):
+            refused_probe = self._run_cli(
+                state_dir, fixture["environment"], "handoff", "observe-access", handoff["id"],
+                "--actor", "successor", "--context-file", str(fixture["context_file"]),
+                "--guidance-file", str(fixture["guidance_file"]), probe_option, "--json",
+            )
+            self.assertEqual(refused_probe.returncode, 1, probe_option)
+            self.assertIn("opening's exact context, guidance, and probe request", refused_probe.stderr)
+            self.assertEqual(state_path.read_bytes(), unchanged_state)
+        self.assertEqual(list(self.worktree.rglob(".replicator-access-probe-*")), [])
+
+        before_retry = successor_intents.read_store(state_dir)["handoffs"][handoff["id"]]
+        original_digest = before_retry["access_observations"]["successor"][0]["checks"]["context_access"]["items"][0]["sha256"]
+        fixture["context_file"].write_bytes(b"changed after candidate opening")
+        changed = self._run_cli(state_dir, fixture["environment"], *request_args[:-1], "--retry", "--json")
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        changed_result = json.loads(changed.stdout)
+        self.assertEqual(changed_result["observation"]["checks"]["context_access"]["status"], "ready")
+        self.assertNotEqual(changed_result["observation"]["checks"]["context_access"]["items"][0]["sha256"],
+                            original_digest)
+        transfer = changed_result["handoff"]["phase_readiness"]["transfer"]
+        self.assertEqual(transfer["checks"]["successor_context_matches_opening"], "blocked")
+        self.assertEqual(transfer["checks"]["successor_guidance_matches_opening"], "ready")
+        self.assertEqual(transfer["status"], "blocked")
+        self.assertEqual(changed_result["handoff"]["launch"]["attempt"]["preflight"], opening_preflight)
+
+    def test_successor_access_refuses_wrong_identity_process_generation_and_settings(self):
+        fixture = self._opened_successor_fixture(self.root / "successor-access-binding-state")
+        state_dir = fixture["state_dir"]
+        handoff = fixture["handoff"]
+        store_path = state_dir / successor_intents.STORE_NAME
+        saved_bytes = store_path.read_bytes()
+        command = ["handoff", "observe-access", handoff["id"], "--actor", "successor",
+                   "--context-file", str(fixture["context_file"]),
+                   "--guidance-file", str(fixture["guidance_file"]), "--json"]
+
+        wrong_session = dict(fixture["predecessor_environment"])
+        result = self._run_cli(state_dir, wrong_session, *command)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(store_path.read_bytes(), saved_bytes)
+
+        wrong_panel = dict(fixture["environment"])
+        wrong_panel["CMUX_SURFACE_ID"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        result = self._run_cli(state_dir, wrong_panel, *command)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(store_path.read_bytes(), saved_bytes)
+
+        other_worktree = self.root / "wrong-successor-worktree"
+        other_worktree.mkdir()
+        initialized = subprocess.run([self.git, "init", "--quiet", str(other_worktree)],
+                                     capture_output=True, text=True, check=False)
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        fixture["current_path"].write_text(json.dumps({
+            **self._current_snapshot(fixture["successor_session"], fixture["successor_panel"], WORKSPACE),
+            "items": [{
+                "agents": [{"kind": "codex", "session_id": fixture["successor_session"], "state": "idle"}],
+                "projections": [{"panel_id": fixture["successor_panel"], "workspace_id": WORKSPACE}],
+                "placement": {"kind": "local"}, "cwd": str(other_worktree),
+            }],
+        }), encoding="utf-8")
+        result = self._run_cli(state_dir, fixture["environment"], *command)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("worktree", result.stderr)
+        self.assertEqual(store_path.read_bytes(), saved_bytes)
+        fixture["current_path"].write_text(json.dumps(
+            self._current_snapshot(fixture["successor_session"], fixture["successor_panel"], WORKSPACE),
+        ), encoding="utf-8")
+
+        native_map = json.loads(fixture["native_map"].read_text(encoding="utf-8"))
+        native_map["processes"][str(fixture["successor_pid"])] = self._ps_line_for(
+            fixture["successor_pid"], self.now - timedelta(minutes=10),
+        )
+        fixture["native_map"].write_text(json.dumps(native_map), encoding="utf-8")
+        result = self._run_cli(state_dir, fixture["environment"], *command)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exact recorded successor process, generation, and settings", result.stderr)
+        self.assertEqual(store_path.read_bytes(), saved_bytes)
+
+        native_map["processes"][str(fixture["successor_pid"])] = self._ps_line_for(
+            fixture["successor_pid"], fixture["successor_started"],
+        )
+        fixture["native_map"].write_text(json.dumps(native_map), encoding="utf-8")
+        hook = json.loads(self.hook_path.read_text(encoding="utf-8"))
+        hook["sessions"][fixture["successor_session"]]["startedAt"] += 1
+        self.hook_path.write_text(json.dumps(hook), encoding="utf-8")
+        result = self._run_cli(state_dir, fixture["environment"], *command)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exact recorded successor process, generation, and settings", result.stderr)
+        self.assertEqual(store_path.read_bytes(), saved_bytes)
+
+        hook["sessions"][fixture["successor_session"]]["startedAt"] -= 1
+        self.hook_path.write_text(json.dumps(hook), encoding="utf-8")
+        rollout_rows = [json.loads(line) for line in fixture["successor_rollout"].read_text().splitlines()]
+        rollout_rows[-1]["payload"]["effort"] = "xhigh"
+        fixture["successor_rollout"].write_text(
+            "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rollout_rows),
+            encoding="utf-8",
+        )
+        result = self._run_cli(state_dir, fixture["environment"], *command)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exact recorded successor process, generation, and settings", result.stderr)
+        self.assertEqual(store_path.read_bytes(), saved_bytes)
+
+    def test_successor_pending_write_cleanup_rejects_the_other_actor(self):
+        fixture = self._opened_successor_fixture(
+            self.root / "successor-access-cleanup-state", probe_write=True,
+        )
+        handoff = fixture["handoff"]
+        state_dir = fixture["state_dir"]
+        opening_preflight = json.loads(json.dumps(handoff["launch"]["attempt"]["preflight"]))
+        snapshot = handoff["native_successor_snapshot"]
+        request = access_observer.normalize_request(
+            [str(fixture["context_file"])], [str(fixture["guidance_file"])], probe_write=True,
+        )
+        inputs = access_observer.read_inputs(request)
+        identity = replicator.canonical_worktree_identity(str(self.worktree))
+        git_check = access_observer.git_metadata_check(identity, handoff["scope"]["worktree"])
+        origin_check = access_observer.git_origin_check(
+            request, str(self.worktree), lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args)),
+        )
+        with mock.patch.object(access_observer, "_remove_exact_probe", side_effect=OSError("fixture cleanup hold")):
+            pending = handoff_engine.record_access_observation(
+                state_dir, handoff["id"], snapshot, request, inputs, git_check, origin_check, identity,
+                observed_at=snapshot["observed_at"], identity_resolver=replicator.canonical_worktree_identity,
+                actor="successor",
+            )
+        self.assertEqual(pending["observation"]["state"], "cleanup_incomplete")
+        saved = successor_intents.read_store(state_dir)["handoffs"][handoff["id"]]
+        pending_id = saved["access_observations"]["pending"]
+        self.assertEqual(saved["access_observations"]["successor"][0]["id"], pending_id)
+        self.assertEqual(saved["launch"]["attempt"]["preflight"], opening_preflight)
+        self.assertTrue(list(self.worktree.rglob(".replicator-access-probe-*")))
+        adapter = model_preferences_handoff_adapter
+        invalid_pending = json.loads(json.dumps(saved))
+        invalid_pending["access_observations"]["pending"] = \
+            invalid_pending["access_observations"]["predecessor"][0]["id"]
+        with self.assertRaises(adapter.HandoffAdapterError):
+            adapter._validate_handoff(invalid_pending)
+        invalid_request = json.loads(json.dumps(saved))
+        pending_observation = invalid_request["access_observations"]["successor"][0]
+        pending_observation["request"]["probe_origin"] = True
+        pending_observation["request_digest"] = adapter._digest(pending_observation["request"])
+        with self.assertRaises(adapter.HandoffAdapterError):
+            adapter._validate_handoff(invalid_request)
+        invalid_owner = json.loads(json.dumps(saved))
+        pending_observation = invalid_owner["access_observations"]["successor"][0]
+        pending_observation["native_snapshot"]["process_identity"]["pid"] += 1
+        changed_digest = adapter._digest(pending_observation["native_snapshot"])
+        pending_observation["native_settings_ref"] = {
+            "snapshot_digest": changed_digest,
+            "operation_identity": access_observer.operation_identity(pending_observation["native_snapshot"]),
+        }
+        for name in ("owner_binding", "native_settings_match"):
+            pending_observation["checks"][name]["observed_snapshot_digest"] = changed_digest
+        with self.assertRaises(adapter.HandoffAdapterError):
+            adapter._validate_handoff(invalid_owner)
+        detached_pending = json.loads(json.dumps(saved))
+        detached_pending["access_observations"]["pending"] = None
+        with self.assertRaises(adapter.HandoffAdapterError):
+            adapter._validate_handoff(detached_pending)
+        store_path = state_dir / successor_intents.STORE_NAME
+        before_wrong_actor = store_path.read_bytes()
+        pending_inspection = self._run_mp_handoff_ready(state_dir, handoff["id"], fixture["environment"])
+        self.assertEqual(pending_inspection.returncode, 1, pending_inspection.stderr)
+        self.assertIn("frozen with readiness blocked", pending_inspection.stderr)
+        self.assertEqual(store_path.read_bytes(), before_wrong_actor)
+        wrong_actor = self._run_cli(
+            state_dir, fixture["predecessor_environment"], "handoff", "observe-access", handoff["id"],
+            "--actor", "predecessor", "--context-file", str(fixture["context_file"]),
+            "--guidance-file", str(fixture["guidance_file"]), "--probe-write", "--json",
+        )
+        self.assertEqual(wrong_actor.returncode, 1)
+        self.assertIn("exact actor that created pending access cleanup", wrong_actor.stderr)
+        self.assertEqual(store_path.read_bytes(), before_wrong_actor)
+
+        resumed = handoff_engine.record_access_observation(
+            state_dir, handoff["id"], snapshot, request, inputs, git_check, origin_check, identity,
+            observed_at=snapshot["observed_at"], identity_resolver=replicator.canonical_worktree_identity,
+            actor="successor",
+        )
+        self.assertTrue(resumed["reused"])
+        self.assertEqual(resumed["observation"]["id"], pending_id)
+        self.assertEqual(resumed["observation"]["state"], "complete")
+        self.assertIsNone(resumed["handoff"]["access_observations"]["pending"])
+        self.assertEqual(resumed["handoff"]["launch"]["attempt"]["preflight"], opening_preflight)
+        self.assertEqual(list(self.worktree.rglob(".replicator-access-probe-*")), [])
+
     def test_cli_candidate_opening_uses_saved_mp_luna_xhigh_against_sol_medium_predecessor(self):
         mp_script = ROOT.parent / "model-preferences" / "model_preferences.py"
         mp_config_dir = self.root / "saved-model-preferences-config"
@@ -884,6 +1229,32 @@ class NativeObserverTests(unittest.TestCase):
         saved = successor_intents.read_store(state_dir)
         stored_intent = saved["scopes"][successor_intents.scope_key(frozen["scope"])][0]
         self.assertEqual(successor_intents.intent_lifecycle_state(saved, stored_intent), "frozen")
+        successor_access = self._run_cli(
+            state_dir, environment, "handoff", "observe-access", frozen["id"],
+            "--actor", "successor", "--context-file", str(context_file),
+            "--guidance-file", str(guidance_file), "--json",
+        )
+        self.assertEqual(successor_access.returncode, 0, successor_access.stderr)
+        access_response = json.loads(successor_access.stdout)
+        access_observation = access_response["observation"]
+        self.assertEqual(access_observation["checks"]["owner_binding"]["status"], "ready")
+        self.assertEqual(access_observation["checks"]["native_settings_match"]["status"], "ready")
+        self.assertEqual(access_observation["native_snapshot"]["settings"]["model"], "gpt-6-luna")
+        self.assertEqual(access_observation["native_snapshot"]["settings"]["effort"], "xhigh")
+        self.assertEqual(access_observation["baseline_snapshot_digest"],
+                         access_observer.digest(completed["native_successor_snapshot"]))
+        self.assertEqual(len(access_response["handoff"]["access_observations"]["predecessor"]), 1)
+        self.assertEqual(len(access_response["handoff"]["access_observations"]["successor"]), 1)
+        self.assertEqual(access_response["handoff"]["phase_readiness"]["transfer"]["checks"]
+                         ["successor_access"], "ready")
+        self.assertEqual(access_response["handoff"]["phase_readiness"]["transfer"]["checks"]
+                         ["successor_context_matches_opening"], "ready")
+        self.assertEqual(access_response["handoff"]["phase_readiness"]["transfer"]["status"], "blocked")
+        self.assertEqual(access_response["handoff"]["observations"]["effective_permissions"]["status"],
+                         "unknown")
+        self.assertEqual(successor_intents.intent_lifecycle_state(
+            successor_intents.read_store(state_dir), stored_intent,
+        ), "frozen")
         resolver_calls = [json.loads(line) for line in mp_log.read_text(encoding="utf-8").splitlines()]
         self.assertGreaterEqual(len(resolver_calls), 2)
         self.assertTrue(all("resolve-successor" in call for call in resolver_calls))

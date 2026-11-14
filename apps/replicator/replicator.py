@@ -608,11 +608,20 @@ def handoff_observe_access(args):
     request = access_observer.normalize_request(
         args.context_file, args.guidance_file, probe_write=args.probe_write, probe_origin=args.probe_origin,
     )
+    actor = args.actor
+    try:
+        actor_scope, baseline = access_observer.access_baseline(handoff, actor)
+        if actor == "successor":
+            access_observer.validate_successor_request(handoff, request)
+    except access_observer.AccessObservationError as exc:
+        raise handoff_engine.HandoffError(str(exc)) from exc
     access_state = handoff["access_observations"]
+    pending_entry = access_observer.pending_access_entry(access_state)
     pending = None
-    if access_state.get("pending") is not None:
-        pending = next(item for item in access_state["predecessor"]
-                       if item["id"] == access_state["pending"])
+    if pending_entry is not None:
+        pending_actor, pending = pending_entry
+        if pending_actor != actor:
+            raise handoff_engine.HandoffError("Only the exact actor that created pending access cleanup can reconcile it.")
         if pending["request_digest"] != access_observer.request_digest(request):
             raise handoff_engine.HandoffError(
                 "An access probe has incomplete cleanup; repeat its exact request to reconcile it."
@@ -620,7 +629,7 @@ def handoff_observe_access(args):
     native_cwd, caller, identity_check = caller_identity(os.environ)
     if identity_check.status != "ready" or caller is None or native_cwd is None:
         raise native_observer.NativeObservationError(identity_check.source)
-    seat = handoff["scope"]["seat"]
+    seat = actor_scope["seat"]
     expected_caller = {
         "harness": seat["harness"],
         "session_id": seat["session_id"],
@@ -628,16 +637,23 @@ def handoff_observe_access(args):
         "workspace_id": seat["workspace_id"],
     }
     if caller != expected_caller:
-        raise native_observer.NativeObservationError("The live caller does not match this frozen predecessor seat.")
+        raise native_observer.NativeObservationError("The live caller does not match the selected frozen handoff actor.")
     worktree = canonical_worktree_identity(native_cwd)
-    if worktree != handoff["scope"]["worktree"]:
+    if worktree != actor_scope["worktree"]:
         raise native_observer.NativeObservationError("The live caller worktree does not match this frozen handoff.")
     snapshot = native_observer.observe_codex_predecessor(
-        handoff["scope"], caller, worktree, home=Path.home(), environment=os.environ, runner=run_bounded,
+        actor_scope, caller, worktree, home=Path.home(), environment=os.environ, runner=run_bounded,
     )
+    if actor == "successor":
+        comparisons = access_observer.compare_native_snapshots(actor_scope, baseline, snapshot)
+        if (comparisons["owner_binding"]["status"] != "ready"
+                or comparisons["native_settings_match"]["status"] != "ready"):
+            raise handoff_engine.HandoffError(
+                "Successor access requires the exact recorded successor process, generation, and settings."
+            )
     if not args.retry and pending is None:
         existing = handoff_engine.existing_access_observation(
-            args.state_dir, args.handoff_id, snapshot, request,
+            args.state_dir, args.handoff_id, snapshot, request, actor=actor,
         )
         if existing is not None:
             return existing
@@ -660,7 +676,7 @@ def handoff_observe_access(args):
     return handoff_engine.record_access_observation(
         args.state_dir, args.handoff_id, snapshot, request, inputs, git_check, origin_check,
         worktree, observed_at=snapshot["observed_at"], identity_resolver=canonical_worktree_identity,
-        retry=args.retry,
+        actor=actor, retry=args.retry,
     )
 
 
@@ -1045,9 +1061,11 @@ def build_parser():
     observe_successor.add_argument("handoff_id")
     observe_successor.add_argument("--json", action="store_true", help="print the persisted observation as JSON")
     access = handoff_commands.add_parser(
-        "observe-access", help="record bounded access evidence from the exact Codex predecessor",
+        "observe-access", help="record bounded access evidence from the exact Codex actor",
     )
     access.add_argument("handoff_id")
+    access.add_argument("--actor", choices=("predecessor", "successor"), default="predecessor",
+                        help="select the exact observed actor; defaults to predecessor")
     access.add_argument("--context-file", action="append", default=[], metavar="PATH")
     access.add_argument("--guidance-file", action="append", default=[], metavar="PATH")
     access.add_argument("--probe-write", action="store_true",
