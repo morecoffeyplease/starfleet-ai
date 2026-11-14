@@ -96,9 +96,12 @@ class NativeObserverTests(unittest.TestCase):
         return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
     def _ps_line(self, started):
+        return self._ps_line_for(self.pid, started)
+
+    def _ps_line_for(self, pid, started):
         local = started.astimezone()
         return (
-            f"{self.pid} 1610 {local.strftime('%a %b %d %H:%M:%S %Y')} "
+            f"{pid} 1610 {local.strftime('%a %b %d %H:%M:%S %Y')} "
             f"{self.executable}\n"
         )
 
@@ -187,6 +190,109 @@ class NativeObserverTests(unittest.TestCase):
         snapshot = self.observe()
         handoff = handoff_engine.record_predecessor_observation(state_dir, handoff["id"], snapshot)["handoff"]
         return handoff, snapshot
+
+    def _current_snapshot(self, session, panel, workspace):
+        return {
+            "truncated": False,
+            "owner_availability": {"agent_sessions": "available"},
+            "items": [{
+                "agents": [{"kind": "codex", "session_id": session, "state": "idle"}],
+                "projections": [{"panel_id": panel, "workspace_id": workspace}],
+                "placement": {"kind": "local"},
+                "cwd": str(self.worktree),
+            }],
+        }
+
+    def _add_native_session(self, session, panel, workspace, pid, started, turn_time, model, effort, turn_id,
+                            approval_policy="never", sandbox_policy=None):
+        rollout = self.home / ".codex" / "sessions" / "2026" / "11" / "14" / f"rollout-{turn_id}-{session}.jsonl"
+        metadata = {"type": "session_meta", "payload": {
+            "id": session, "cwd": str(self.worktree), "cli_version": "0.166.0",
+            "originator": "codex-tui", "source": "cli", "model_provider": "openai",
+        }}
+        context = {"type": "turn_context", "timestamp": self._iso(turn_time), "payload": {
+            "turn_id": turn_id, "cwd": str(self.worktree), "model": model, "effort": effort,
+            "approval_policy": approval_policy,
+            "sandbox_policy": {"type": "danger-full-access"} if sandbox_policy is None else sandbox_policy,
+        }}
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        rollout.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in (metadata, context)),
+                           encoding="utf-8")
+        rollout.chmod(0o600)
+        hook_document = json.loads(self.hook_path.read_text(encoding="utf-8"))
+        hook_document["sessions"][session] = {
+            "sessionId": session, "surfaceId": panel, "workspaceId": workspace,
+            "cwd": str(self.worktree), "pid": pid,
+            "startedAt": started.timestamp() - 86400, "updatedAt": self.now.timestamp() - 30,
+        }
+        self.hook_path.write_text(json.dumps(hook_document), encoding="utf-8")
+        self.hook_path.chmod(0o600)
+        return rollout
+
+    def _fake_cli_tools(self, current_path, response_path, call_log, native_map_path):
+        fake_bin = self.root / "candidate-bin"
+        fake_bin.mkdir(exist_ok=True)
+        cmux = fake_bin / "cmux"
+        cmux.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, sys\n"
+            f"current_path = {str(current_path)!r}\n"
+            f"response_path = {str(response_path)!r}\n"
+            f"call_log = {str(call_log)!r}\n"
+            "args = sys.argv[1:]\n"
+            "if 'current' in args:\n"
+            "    print(open(current_path, encoding='utf-8').read())\n"
+            "elif 'new-surface' in args:\n"
+            "    with open(call_log, 'a', encoding='utf-8') as stream: stream.write(json.dumps(args) + '\\n')\n"
+            "    response = json.load(open(response_path, encoding='utf-8'))\n"
+            "    print(json.dumps(response['body']))\n"
+            "    raise SystemExit(response.get('exit_code', 0))\n"
+            "else:\n"
+            "    raise SystemExit(90)\n",
+            encoding="utf-8",
+        )
+        cmux.chmod(0o755)
+        ps = fake_bin / "ps"
+        ps.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, sys\n"
+            f"records = json.load(open({str(native_map_path)!r}, encoding='utf-8'))\n"
+            "sys.stdout.write(records['processes'][sys.argv[2]])\n",
+            encoding="utf-8",
+        )
+        ps.chmod(0o755)
+        lsof = fake_bin / "lsof"
+        lsof.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, sys\n"
+            f"records = json.load(open({str(native_map_path)!r}, encoding='utf-8'))\n"
+            "pid = sys.argv[4]\n"
+            "paths = records['rollouts'][pid]\n"
+            "sys.stdout.write('p' + pid + '\\n' + ''.join('f' + str(i) + '\\nn' + path + '\\n' for i, path in enumerate(paths)))\n",
+            encoding="utf-8",
+        )
+        lsof.chmod(0o755)
+        current_path.write_text(json.dumps(self._current_snapshot(SESSION, PANEL, WORKSPACE)), encoding="utf-8")
+        response_path.write_text(json.dumps({"body": {"surface_id": "44444444-4444-4444-8444-444444444444",
+                                                       "workspace_id": WORKSPACE}}), encoding="utf-8")
+        native_map_path.write_text(json.dumps({
+            "processes": {str(self.pid): self._ps_line(self.process_started)},
+            "rollouts": {str(self.pid): [str(self.rollout)]},
+        }), encoding="utf-8")
+        environment = dict(os.environ)
+        environment.update({
+            "HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
+            "CODEX_THREAD_ID": SESSION, "CMUX_SURFACE_ID": PANEL, "CMUX_WORKSPACE_ID": WORKSPACE,
+            "PATH": str(fake_bin) + os.pathsep + str(Path(self.git).parent),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        return environment
+
+    def _run_cli(self, state_dir, environment, *arguments):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "replicator.py"), "--state-dir", str(state_dir), *arguments],
+            cwd=self.worktree, env=environment, capture_output=True, text=True, check=False,
+        )
 
     def test_observer_reads_exact_process_rollout_and_keeps_access_unknown(self):
         snapshot = self.observe()
@@ -431,6 +537,418 @@ class NativeObserverTests(unittest.TestCase):
         self.assertFalse(reconciliation["writes_performed"])
         self.assertEqual(reconciliation["phase_readiness"]["transfer"]["status"], "blocked")
         self.assertEqual(before_inspection, stored_state.read_bytes())
+
+    def test_cli_candidate_opening_records_one_exact_codex_route_and_is_idempotent(self):
+        state_dir = self.root / "candidate-open-state"
+        frozen, _snapshot = self.frozen_with_snapshot(state_dir)
+        context_file = self.root / "handoff-context.md"
+        guidance_file = self.root / "handoff-guidance.md"
+        packet_file = self.root / "handoff-packet.md"
+        context_file.write_bytes(b"current handoff context")
+        guidance_file.write_bytes(b"maintained guide bytes")
+        packet_file.write_bytes(b"handoff packet bytes")
+        current_path = self.root / "cmux-current.json"
+        response_path = self.root / "cmux-create-response.json"
+        call_log = self.root / "cmux-create-calls.jsonl"
+        native_map = self.root / "native-command-fixtures.json"
+        environment = self._fake_cli_tools(current_path, response_path, call_log, native_map)
+        access = self._run_cli(
+            state_dir, environment, "handoff", "observe-access", frozen["id"],
+            "--context-file", str(context_file), "--guidance-file", str(guidance_file), "--json",
+        )
+        self.assertEqual(access.returncode, 0, access.stderr)
+        native_command = json.dumps([
+            str(self.executable), "-m", "gpt-6.1-sol", "-c", 'model_reasoning_effort="medium"',
+        ])
+        opened = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", native_command, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        response = json.loads(opened.stdout)
+        handoff = response["handoff"]
+        self.assertFalse(response["reused"])
+        self.assertEqual(handoff["launch"]["status"], "opened_unobserved")
+        self.assertEqual(handoff["launch"]["returned_surface"], {
+            "surface_id": "44444444-4444-4444-8444-444444444444", "workspace_id": WORKSPACE,
+        })
+        self.assertEqual(handoff["native_successor_binding"], {
+            "status": "unknown", "hook_generation": None, "evidence": None,
+        })
+        self.assertEqual(handoff["observations"]["effective_permissions"]["status"], "unknown")
+        self.assertEqual(handoff["phase_readiness"]["candidate_opening"]["status"], "ready")
+        self.assertEqual(handoff["phase_readiness"]["transfer"]["status"], "blocked")
+        attempt = handoff["launch"]["attempt"]
+        self.assertEqual(attempt["native_command"]["argv"], [
+            str(self.executable.absolute()), "-m", "gpt-6.1-sol", "-c", 'model_reasoning_effort="medium"',
+        ])
+        self.assertEqual(attempt["final_native_argv"][-1].split(" ")[0], "You")
+        self.assertNotIn("STARFLEET_MODEL_LAUNCH", repr(attempt["cmux"]["argv"]))
+        self.assertEqual(attempt["packet"]["sha256"], hashlib.sha256(b"handoff packet bytes").hexdigest())
+        self.assertNotIn("handoff packet bytes", opened.stdout)
+        create_calls = call_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(create_calls), 1)
+        create_args = json.loads(create_calls[0])
+        self.assertEqual(create_args[create_args.index("--workspace") + 1], WORKSPACE)
+        self.assertEqual(create_args[create_args.index("--working-directory") + 1], str(self.worktree.resolve()))
+        self.assertEqual(create_args[create_args.index("--focus") + 1], "false")
+        self.assertIn("new-surface", create_args)
+
+        repeated = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", native_command, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertTrue(json.loads(repeated.stdout)["reused"])
+        self.assertEqual(len(call_log.read_text(encoding="utf-8").splitlines()), 1)
+        saved = successor_intents.read_store(state_dir)
+        stored_intent = saved["scopes"][successor_intents.scope_key(frozen["scope"])][0]
+        self.assertEqual(stored_intent["state"], "configured")
+        self.assertEqual(successor_intents.intent_lifecycle_state(saved, stored_intent), "frozen")
+
+    def test_cli_candidate_opening_rejects_unsupported_argv_without_state_change(self):
+        state_dir = self.root / "candidate-invalid-command-state"
+        frozen, _snapshot = self.frozen_with_snapshot(state_dir)
+        context_file = self.root / "invalid-context.md"
+        guidance_file = self.root / "invalid-guidance.md"
+        packet_file = self.root / "invalid-packet.md"
+        context_file.write_bytes(b"context")
+        guidance_file.write_bytes(b"guidance")
+        packet_file.write_bytes(b"packet")
+        current_path = self.root / "invalid-current.json"
+        response_path = self.root / "invalid-response.json"
+        call_log = self.root / "invalid-call-log.jsonl"
+        native_map = self.root / "invalid-native-map.json"
+        environment = self._fake_cli_tools(current_path, response_path, call_log, native_map)
+        access = self._run_cli(
+            state_dir, environment, "handoff", "observe-access", frozen["id"],
+            "--context-file", str(context_file), "--guidance-file", str(guidance_file), "--json",
+        )
+        self.assertEqual(access.returncode, 0, access.stderr)
+        store_path = state_dir / successor_intents.STORE_NAME
+        before = store_path.read_bytes()
+        invalid = json.dumps([str(self.executable), "-m", "gpt-6.1-sol", "--dangerously-bypass-approvals-and-sandbox"])
+        result = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", invalid, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("five-token Codex", result.stderr)
+        self.assertEqual(store_path.read_bytes(), before)
+        self.assertFalse(call_log.exists())
+        saved = successor_intents.read_store(state_dir)["handoffs"][frozen["id"]]
+        self.assertEqual(saved["launch"], {"status": "not_started"})
+
+    def test_cli_uncertain_candidate_opening_cannot_repeat_after_malformed_return(self):
+        state_dir = self.root / "candidate-uncertain-state"
+        frozen, _snapshot = self.frozen_with_snapshot(state_dir)
+        context_file = self.root / "uncertain-context.md"
+        guidance_file = self.root / "uncertain-guidance.md"
+        packet_file = self.root / "uncertain-packet.md"
+        context_file.write_bytes(b"context")
+        guidance_file.write_bytes(b"guidance")
+        packet_file.write_bytes(b"packet")
+        current_path = self.root / "uncertain-current.json"
+        response_path = self.root / "uncertain-response.json"
+        call_log = self.root / "uncertain-call-log.jsonl"
+        native_map = self.root / "uncertain-native-map.json"
+        environment = self._fake_cli_tools(current_path, response_path, call_log, native_map)
+        access = self._run_cli(
+            state_dir, environment, "handoff", "observe-access", frozen["id"],
+            "--context-file", str(context_file), "--guidance-file", str(guidance_file), "--json",
+        )
+        self.assertEqual(access.returncode, 0, access.stderr)
+        response_path.write_text(json.dumps({"body": {"unexpected": True}}), encoding="utf-8")
+        native_command = json.dumps([
+            str(self.executable), "-m", "gpt-6.1-sol", "-c", 'model_reasoning_effort="medium"',
+        ])
+        first = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", native_command, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(first.returncode, 1)
+        self.assertIn("unconfirmed", first.stderr)
+        saved = successor_intents.read_store(state_dir)["handoffs"][frozen["id"]]
+        self.assertEqual(saved["launch"]["status"], "opening_unconfirmed")
+        self.assertIsNone(saved["launch"]["returned_surface"])
+        repeated = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", native_command, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertTrue(json.loads(repeated.stdout)["reused"])
+        self.assertEqual(len(call_log.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_cli_successor_observation_is_exact_and_transfer_stays_blocked(self):
+        state_dir = self.root / "candidate-observation-state"
+        frozen, _snapshot = self.frozen_with_snapshot(state_dir)
+        context_file = self.root / "successor-context.md"
+        guidance_file = self.root / "successor-guidance.md"
+        packet_file = self.root / "successor-packet.md"
+        context_file.write_bytes(b"context")
+        guidance_file.write_bytes(b"guidance")
+        packet_file.write_bytes(b"packet")
+        current_path = self.root / "successor-current.json"
+        response_path = self.root / "successor-response.json"
+        call_log = self.root / "successor-call-log.jsonl"
+        native_map = self.root / "successor-native-map.json"
+        environment = self._fake_cli_tools(current_path, response_path, call_log, native_map)
+        access = self._run_cli(
+            state_dir, environment, "handoff", "observe-access", frozen["id"],
+            "--context-file", str(context_file), "--guidance-file", str(guidance_file), "--json",
+        )
+        self.assertEqual(access.returncode, 0, access.stderr)
+        native_command = json.dumps([
+            str(self.executable), "-m", "gpt-6.1-sol", "-c", 'model_reasoning_effort="medium"',
+        ])
+        opened = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", native_command, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+
+        successor_session = "55555555-5555-4555-8555-555555555555"
+        successor_panel = "44444444-4444-4444-8444-444444444444"
+        successor_pid = 4343
+        successor_started = self.now - timedelta(minutes=30)
+        successor_turn = self.now - timedelta(minutes=5)
+        successor_rollout = self._add_native_session(
+            successor_session, successor_panel, WORKSPACE, successor_pid, successor_started, successor_turn,
+            "gpt-6.1-sol", "medium", "successor-turn-1",
+        )
+        current_path.write_text(json.dumps(self._current_snapshot(successor_session, successor_panel, WORKSPACE)),
+                                encoding="utf-8")
+        native_map.write_text(json.dumps({
+            "processes": {str(self.pid): self._ps_line(self.process_started),
+                          str(successor_pid): self._ps_line_for(successor_pid, successor_started)},
+            "rollouts": {str(self.pid): [str(self.rollout)], str(successor_pid): [str(successor_rollout)]},
+        }), encoding="utf-8")
+        environment.update({"CODEX_THREAD_ID": successor_session, "CMUX_SURFACE_ID": successor_panel,
+                            "CMUX_WORKSPACE_ID": WORKSPACE})
+        observed = self._run_cli(state_dir, environment, "handoff", "observe-successor", frozen["id"], "--json")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        response = json.loads(observed.stdout)
+        handoff = response["handoff"]
+        self.assertEqual(handoff["launch"]["status"], "successor_observed")
+        self.assertEqual(handoff["native_successor_snapshot"]["subject"]["session_id"], successor_session)
+        self.assertNotEqual(handoff["native_successor_snapshot"]["hook_generation"],
+                            handoff["native_predecessor_binding"]["hook_generation"])
+        self.assertNotEqual(handoff["native_successor_generation"]["value"],
+                            handoff["native_generation"]["value"])
+        self.assertEqual(handoff["phase_readiness"]["transfer"]["checks"]["successor_choice_match"], "ready")
+        self.assertEqual(handoff["phase_readiness"]["transfer"]["checks"]["successor_policy_match"], "ready")
+        self.assertEqual(handoff["observations"]["effective_permissions"]["status"], "unknown")
+        self.assertEqual(handoff["phase_readiness"]["transfer"]["status"], "blocked")
+        stored_intent = successor_intents.read_store(state_dir)["scopes"][successor_intents.scope_key(frozen["scope"])][0]
+        self.assertEqual(stored_intent["state"], "configured")
+        self.assertEqual(successor_intents.intent_lifecycle_state(
+            successor_intents.read_store(state_dir), stored_intent,
+        ), "frozen")
+
+        self.assertEqual(handoff["native_successor_snapshot"]["settings"]["model"], "gpt-6.1-sol")
+
+    def test_cli_candidate_opening_uses_saved_mp_luna_xhigh_against_sol_medium_predecessor(self):
+        mp_script = ROOT.parent / "model-preferences" / "model_preferences.py"
+        mp_config_dir = self.root / "saved-model-preferences-config"
+        mp_state_dir = self.root / "saved-model-preferences-state"
+        initialized = subprocess.run(
+            [sys.executable, str(mp_script), "--config-dir", str(mp_config_dir),
+             "--state-dir", str(mp_state_dir), "init", "--examples"],
+            env=self.environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        config_path = mp_config_dir / "profiles.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["active"] = "Codex-only"
+        config["activation"] = "synthetic-successor-choice"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        mp_state_dir.mkdir(mode=0o700)
+        registration = self.scope["seat"]
+        (mp_state_dir / "orchestrators.json").write_text(json.dumps({"lane": {
+            "workspace": registration["workspace_id"], "surface": registration["panel_id"],
+            "session": registration["session_id"], "harness": "codex",
+        }}), encoding="utf-8")
+        (mp_state_dir / "orchestrators.json").chmod(0o600)
+
+        resolved = subprocess.run(
+            [sys.executable, str(mp_script), "--config-dir", str(mp_config_dir),
+             "--state-dir", str(mp_state_dir), "resolve-successor", "--seat", "lane",
+             "--family", "codex-luna", "--effort", "xhigh"],
+            env=self.environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        resolution = json.loads(resolved.stdout)
+        self.assertEqual(resolution["choice"], {
+            "role": "orchestrator", "family": "codex-luna", "harness": "codex",
+            "model": "gpt-6-luna", "effort": "xhigh",
+        })
+        self.assertEqual(resolution["active_profile"], "Codex-only")
+        self.assertFalse(resolution["candidate_matches_active_orchestrator"])
+
+        current_path = self.root / "explicit-current.json"
+        response_path = self.root / "explicit-response.json"
+        cmux_log = self.root / "explicit-cmux-calls.jsonl"
+        native_map = self.root / "explicit-native-map.json"
+        environment = self._fake_cli_tools(current_path, response_path, cmux_log, native_map)
+        fake_bin = Path(environment["PATH"].split(os.pathsep)[0])
+        mp_log = self.root / "model-preferences-resolver-calls.jsonl"
+        mp_launcher = fake_bin / "model-preferences"
+        mp_launcher.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, os, sys\n"
+            f"with open({str(mp_log)!r}, 'a', encoding='utf-8') as stream: stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            f"os.execv({sys.executable!r}, [{sys.executable!r}, {str(mp_script)!r}, *sys.argv[1:]])\n",
+            encoding="utf-8",
+        )
+        mp_launcher.chmod(0o755)
+        state_dir = self.root / "explicit-candidate-handoff-state"
+        configure = self._run_cli(
+            state_dir, environment, "successor", "configure", "--seat", "lane",
+            "--worktree", str(self.worktree), "--mp-config-dir", str(mp_config_dir),
+            "--mp-state-dir", str(mp_state_dir), "--family", "codex-luna", "--effort", "xhigh",
+        )
+        self.assertEqual(configure.returncode, 0, configure.stderr)
+        configured_intent = json.loads(configure.stdout)
+        self.assertEqual(configured_intent["choice"]["snapshot"]["model"], "gpt-6-luna")
+        self.assertEqual(configured_intent["choice"]["snapshot"]["effort"], "xhigh")
+
+        frozen_result = self._run_cli(
+            state_dir, environment, "handoff", "freeze", configured_intent["id"],
+            "--worktree", str(self.worktree), "--mp-config-dir", str(mp_config_dir),
+            "--mp-state-dir", str(mp_state_dir), "--json",
+        )
+        self.assertEqual(frozen_result.returncode, 0, frozen_result.stderr)
+        frozen = json.loads(frozen_result.stdout)["handoff"]
+        self.assertEqual(frozen["choice"], configured_intent["choice"])
+
+        predecessor = self._run_cli(state_dir, environment, "handoff", "observe-predecessor", frozen["id"], "--json")
+        self.assertEqual(predecessor.returncode, 0, predecessor.stderr)
+        predecessor_handoff = json.loads(predecessor.stdout)["handoff"]
+        self.assertEqual(predecessor_handoff["native_predecessor_snapshot"]["settings"]["model"], "gpt-6.1-sol")
+        self.assertEqual(predecessor_handoff["native_predecessor_snapshot"]["settings"]["effort"], "medium")
+
+        context_file = self.root / "explicit-handoff-context.md"
+        guidance_file = self.root / "explicit-handoff-guide.md"
+        packet_file = self.root / "explicit-handoff-packet.md"
+        context_file.write_bytes(b"explicit candidate context")
+        guidance_file.write_bytes(b"maintained guide")
+        packet_file.write_bytes(b"synthetic handoff packet")
+        access = self._run_cli(
+            state_dir, environment, "handoff", "observe-access", frozen["id"],
+            "--context-file", str(context_file), "--guidance-file", str(guidance_file), "--json",
+        )
+        self.assertEqual(access.returncode, 0, access.stderr)
+        native_command = json.dumps([
+            str(self.executable), "-m", "gpt-6-luna", "-c", 'model_reasoning_effort="xhigh"',
+        ])
+        opened = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", native_command, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        opened_handoff = json.loads(opened.stdout)["handoff"]
+        self.assertEqual(opened_handoff["launch"]["status"], "opened_unobserved")
+        self.assertEqual(opened_handoff["launch"]["attempt"]["native_command"]["argv"], [
+            str(self.executable.absolute()), "-m", "gpt-6-luna", "-c", 'model_reasoning_effort="xhigh"',
+        ])
+        self.assertEqual(opened_handoff["native_predecessor_snapshot"]["settings"]["model"], "gpt-6.1-sol")
+        self.assertEqual(opened_handoff["observations"]["effective_permissions"]["status"], "unknown")
+        self.assertEqual(opened_handoff["phase_readiness"]["transfer"]["status"], "blocked")
+
+        successor_session = "55555555-5555-4555-8555-555555555555"
+        successor_panel = "44444444-4444-4444-8444-444444444444"
+        successor_pid = 4343
+        successor_started = self.now - timedelta(minutes=30)
+        successor_turn = self.now - timedelta(minutes=5)
+        successor_rollout = self._add_native_session(
+            successor_session, successor_panel, WORKSPACE, successor_pid, successor_started, successor_turn,
+            "gpt-6-luna", "xhigh", "explicit-successor-turn",
+        )
+        current_path.write_text(json.dumps(self._current_snapshot(successor_session, successor_panel, WORKSPACE)),
+                                encoding="utf-8")
+        native_map.write_text(json.dumps({
+            "processes": {str(self.pid): self._ps_line(self.process_started),
+                          str(successor_pid): self._ps_line_for(successor_pid, successor_started)},
+            "rollouts": {str(self.pid): [str(self.rollout)], str(successor_pid): [str(successor_rollout)]},
+        }), encoding="utf-8")
+        environment.update({"CODEX_THREAD_ID": successor_session, "CMUX_SURFACE_ID": successor_panel,
+                            "CMUX_WORKSPACE_ID": WORKSPACE})
+        observed = self._run_cli(state_dir, environment, "handoff", "observe-successor", frozen["id"], "--json")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        completed = json.loads(observed.stdout)["handoff"]
+        self.assertEqual(completed["native_successor_snapshot"]["settings"]["model"], "gpt-6-luna")
+        self.assertEqual(completed["native_successor_snapshot"]["settings"]["effort"], "xhigh")
+        self.assertEqual(completed["phase_readiness"]["transfer"]["checks"]["successor_choice_match"], "ready")
+        self.assertEqual(completed["observations"]["effective_permissions"]["status"], "unknown")
+        self.assertEqual(completed["phase_readiness"]["transfer"]["status"], "blocked")
+        saved = successor_intents.read_store(state_dir)
+        stored_intent = saved["scopes"][successor_intents.scope_key(frozen["scope"])][0]
+        self.assertEqual(successor_intents.intent_lifecycle_state(saved, stored_intent), "frozen")
+        resolver_calls = [json.loads(line) for line in mp_log.read_text(encoding="utf-8").splitlines()]
+        self.assertGreaterEqual(len(resolver_calls), 2)
+        self.assertTrue(all("resolve-successor" in call for call in resolver_calls))
+
+    def test_cli_unexpected_successor_settings_are_observed_and_block_transfer(self):
+        state_dir = self.root / "candidate-mismatch-state"
+        frozen, _snapshot = self.frozen_with_snapshot(state_dir)
+        context_file = self.root / "mismatch-context.md"
+        guidance_file = self.root / "mismatch-guidance.md"
+        packet_file = self.root / "mismatch-packet.md"
+        context_file.write_bytes(b"context")
+        guidance_file.write_bytes(b"guidance")
+        packet_file.write_bytes(b"packet")
+        current_path = self.root / "mismatch-current.json"
+        response_path = self.root / "mismatch-response.json"
+        call_log = self.root / "mismatch-call-log.jsonl"
+        native_map = self.root / "mismatch-native-map.json"
+        environment = self._fake_cli_tools(current_path, response_path, call_log, native_map)
+        access = self._run_cli(
+            state_dir, environment, "handoff", "observe-access", frozen["id"],
+            "--context-file", str(context_file), "--guidance-file", str(guidance_file), "--json",
+        )
+        self.assertEqual(access.returncode, 0, access.stderr)
+        native_command = json.dumps([
+            str(self.executable), "-m", "gpt-6.1-sol", "-c", 'model_reasoning_effort="medium"',
+        ])
+        opened = self._run_cli(
+            state_dir, environment, "handoff", "open", frozen["id"],
+            "--native-command", native_command, "--packet-file", str(packet_file), "--json",
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        successor_session = "77777777-7777-4777-8777-777777777777"
+        successor_panel = "44444444-4444-4444-8444-444444444444"
+        successor_pid = 4545
+        successor_started = self.now - timedelta(minutes=30)
+        successor_turn = self.now - timedelta(minutes=5)
+        successor_rollout = self._add_native_session(
+            successor_session, successor_panel, WORKSPACE, successor_pid, successor_started, successor_turn,
+            "gpt-6.1-other", "xhigh", "mismatched-successor-turn", approval_policy="on-request",
+            sandbox_policy={"type": "workspace-write"},
+        )
+        current_path.write_text(json.dumps(self._current_snapshot(successor_session, successor_panel, WORKSPACE)),
+                                encoding="utf-8")
+        native_map.write_text(json.dumps({
+            "processes": {str(self.pid): self._ps_line(self.process_started),
+                          str(successor_pid): self._ps_line_for(successor_pid, successor_started)},
+            "rollouts": {str(self.pid): [str(self.rollout)], str(successor_pid): [str(successor_rollout)]},
+        }), encoding="utf-8")
+        environment.update({"CODEX_THREAD_ID": successor_session, "CMUX_SURFACE_ID": successor_panel,
+                            "CMUX_WORKSPACE_ID": WORKSPACE})
+        observed = self._run_cli(state_dir, environment, "handoff", "observe-successor", frozen["id"], "--json")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        handoff = json.loads(observed.stdout)["handoff"]
+        self.assertEqual(handoff["observations"]["successor_model"]["value"], "gpt-6.1-other")
+        self.assertEqual(handoff["observations"]["successor_effort"]["value"], "xhigh")
+        self.assertEqual(handoff["native_successor_snapshot"]["settings"]["approval_policy"], "on-request")
+        self.assertEqual(handoff["native_successor_snapshot"]["settings"]["sandbox_policy"],
+                         {"type": "workspace-write"})
+        self.assertEqual(handoff["phase_readiness"]["transfer"]["checks"]["successor_choice_match"], "blocked")
+        self.assertEqual(handoff["phase_readiness"]["transfer"]["checks"]["successor_policy_match"], "blocked")
+        self.assertEqual(handoff["observations"]["effective_permissions"]["status"], "unknown")
+        self.assertEqual(handoff["phase_readiness"]["transfer"]["status"], "blocked")
+        saved_store = successor_intents.read_store(state_dir)
+        stored_intent = saved_store["scopes"][successor_intents.scope_key(frozen["scope"])][0]
+        self.assertEqual(successor_intents.intent_lifecycle_state(saved_store, stored_intent), "frozen")
 
     def test_access_snapshot_rejects_scope_and_settings_drift_and_keeps_checks_separate(self):
         handoff, baseline = self.frozen_with_snapshot(self.root / "access-drift-state")

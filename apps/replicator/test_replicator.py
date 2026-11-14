@@ -228,12 +228,16 @@ class ReplicatorCliTests(unittest.TestCase):
         launcher = Path(installation["command"])
         before = self.tree_snapshot()
         help_result = self.run_process([str(launcher), "--help"])
+        handoff_help = self.run_process([str(launcher), "handoff", "--help"])
         guide_result = self.run_process([str(launcher), "guide", "--print"])
         after = self.tree_snapshot()
 
         self.assertEqual(help_result.returncode, 0, help_result.stderr.decode())
         self.assertIn(b"usage: replicator", help_result.stdout)
         self.assertIn(b"guide", help_result.stdout)
+        self.assertEqual(handoff_help.returncode, 0, handoff_help.stderr.decode())
+        self.assertIn(b"open", handoff_help.stdout)
+        self.assertIn(b"observe-successor", handoff_help.stdout)
         self.assertEqual(guide_result.returncode, 0, guide_result.stderr.decode())
         self.assertEqual(guide_result.stdout, expected_guide)
         self.assertEqual(before, after)
@@ -872,7 +876,7 @@ class ReplicatorCliTests(unittest.TestCase):
         unchanged = json.loads((intent_state / "successor-intents.json").read_text(encoding="utf-8"))
         self.assertEqual(unchanged["handoffs"], {})
 
-    def test_preserve_observed_freeze_stays_blocked_and_reducers_are_idempotent(self):
+    def test_preserve_observed_freeze_stays_blocked_and_transfer_receipt_reducer_is_idempotent(self):
         installation = self.install_copy()
         config_dir, mp_state_dir, environment = self.model_preferences_fixture()
         repo = self.init_repo(self.root / "handoff-preserve-worktree")
@@ -895,21 +899,6 @@ class ReplicatorCliTests(unittest.TestCase):
         self.assertEqual(frozen["observations"]["predecessor_effort"]["value"], None)
         self.assertEqual(frozen["readiness"]["status"], "blocked")
         self.assertEqual(frozen["native_generation"]["status"], "unknown")
-
-        with self.assertRaises(handoff_engine.HandoffError):
-            handoff_engine._begin_opening(frozen)
-        synthetic_ready = {**frozen, "readiness": {"status": "ready"}}
-        opening, attempt_allowed = handoff_engine._begin_opening(synthetic_ready)
-        self.assertTrue(attempt_allowed)
-        same_opening, retry_allowed = handoff_engine._begin_opening(opening)
-        self.assertFalse(retry_allowed)
-        self.assertEqual(same_opening, opening)
-        uncertain = handoff_engine._mark_opening_uncertain(opening)
-        self.assertEqual(uncertain["state"], "opening_unconfirmed")
-        self.assertEqual(handoff_engine._mark_opening_uncertain(uncertain), uncertain)
-        same_uncertain, uncertain_retry = handoff_engine._begin_opening(uncertain)
-        self.assertFalse(uncertain_retry)
-        self.assertEqual(same_uncertain, uncertain)
 
         synthetic_intent = {"id": "intent", "lifecycle_state": "frozen"}
         synthetic_handoff = {

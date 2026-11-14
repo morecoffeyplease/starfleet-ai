@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
@@ -270,7 +271,6 @@ def _valid_observed_snapshot(record, scope, snapshot, observations):
         "turn_id": turn["id"],
         "recorded_at": turn["recorded_at"],
     }
-    unknown = UNKNOWN
     return (
         record.get("native_generation") == {
             "status": "observed", "value": process,
@@ -285,7 +285,6 @@ def _valid_observed_snapshot(record, scope, snapshot, observations):
                 "source": "cmux_codex_hook_store_v1", "snapshot_digest": snapshot_digest,
             },
         }
-        and record.get("native_successor_binding") == UNKNOWN_BINDING
         and isinstance(observations, dict)
         and set(observations) == {
             "predecessor_model", "predecessor_effort", "successor_model",
@@ -297,13 +296,286 @@ def _valid_observed_snapshot(record, scope, snapshot, observations):
         and observations.get("predecessor_effort") == {
             "status": "observed", "value": settings["effort"], "evidence": setting_evidence,
         }
-        and observations.get("successor_model") == unknown
-        and observations.get("successor_effort") == unknown
-        and observations.get("effective_permissions") == unknown
+        and observations.get("effective_permissions") == UNKNOWN
         and record.get("readiness") == {
             "status": "blocked", "reason": "effective_access_unobserved",
         }
     )
+
+
+def _snapshot_bound_record(snapshot):
+    if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("settings"), dict)
+            or not isinstance(snapshot.get("process_identity"), dict)
+            or not isinstance(snapshot.get("turn"), dict)):
+        return {}
+    settings = snapshot["settings"]
+    process = snapshot["process_identity"]
+    turn = snapshot["turn"]
+    snapshot_digest = _digest(snapshot)
+    evidence = {
+        "source": "open_codex_rollout",
+        "snapshot_digest": snapshot_digest,
+        "turn_id": turn["id"],
+        "recorded_at": turn["recorded_at"],
+    }
+    return {
+        "native_generation": {
+            "status": "observed", "value": process,
+            "evidence": {"source": "ps", "snapshot_digest": snapshot_digest,
+                         "observed_at": snapshot["observed_at"]},
+        },
+        "native_predecessor_binding": {
+            "status": "observed", "hook_generation": snapshot["hook_generation"],
+            "evidence": {"source": "cmux_codex_hook_store_v1", "snapshot_digest": snapshot_digest},
+        },
+        "observations": {
+            "predecessor_model": {"status": "observed", "value": settings["model"], "evidence": evidence},
+            "predecessor_effort": {"status": "observed", "value": settings["effort"], "evidence": evidence},
+            "successor_model": UNKNOWN,
+            "successor_effort": UNKNOWN,
+            "effective_permissions": UNKNOWN,
+        },
+        "readiness": {"status": "blocked", "reason": "effective_access_unobserved"},
+    }
+
+
+def _choice_model_effort(record, predecessor_snapshot):
+    choice = record.get("choice")
+    if isinstance(choice, dict) and choice.get("kind") == "model_preferences_candidate":
+        candidate = choice.get("snapshot")
+        if isinstance(candidate, dict):
+            return candidate.get("model"), candidate.get("effort")
+    settings = predecessor_snapshot.get("settings") if isinstance(predecessor_snapshot, dict) else None
+    if isinstance(choice, dict) and choice.get("kind") == "preserve_observed_predecessor":
+        if isinstance(settings, dict):
+            return settings.get("model"), settings.get("effort")
+    return None, None
+
+
+def _valid_opening_attempt(record, launch, predecessor_snapshot):
+    if not isinstance(launch, dict) or set(launch) != {"status", "attempt", "returned_surface"}:
+        return False
+    attempt = launch.get("attempt")
+    if (not isinstance(attempt, dict)
+            or set(attempt) != {"id", "at", "request_digest", "native_command", "final_native_argv",
+                                "cmux", "packet", "preflight"}
+            or not isinstance(attempt.get("id"), str) or HEX_32.fullmatch(attempt["id"]) is None
+            or not _timestamp(attempt.get("at"))
+            or not isinstance(attempt.get("request_digest"), str)
+            or HEX_64.fullmatch(attempt["request_digest"]) is None):
+        return False
+    native_command = attempt.get("native_command")
+    model, effort = _choice_model_effort(record, predecessor_snapshot)
+    if (record.get("scope", {}).get("seat", {}).get("harness") != "codex"
+            or not isinstance(model, str) or not model or not isinstance(effort, str) or not effort
+            or not isinstance(native_command, dict) or set(native_command) != {"executable", "argv"}
+            or not isinstance(native_command.get("executable"), str)
+            or not Path(native_command["executable"]).is_absolute()
+            or Path(native_command["executable"]).name != "codex"
+            or native_command.get("argv") != [native_command["executable"], "-m", model, "-c",
+                                                 f'model_reasoning_effort="{effort}"']):
+        return False
+    packet = attempt.get("packet")
+    if (not isinstance(packet, dict) or set(packet) != {"path", "bytes", "sha256"}
+            or not isinstance(packet.get("path"), str) or not Path(packet["path"]).is_absolute()
+            or type(packet.get("bytes")) is not int or not 0 < packet["bytes"] <= 48 * 1024
+            or not isinstance(packet.get("sha256"), str) or HEX_64.fullmatch(packet["sha256"]) is None):
+        return False
+    expected_request_digest = _digest({"native_command": native_command, "packet": packet})
+    if attempt.get("request_digest") != expected_request_digest:
+        return False
+    final_argv = attempt.get("final_native_argv")
+    handoff_id = record.get("id")
+    if not isinstance(handoff_id, str):
+        return False
+    expected_bootstrap = (
+        f"You are a same-harness successor candidate for handoff {handoff_id}. "
+        f"Read the packet at {packet['path']} only if its SHA-256 is {packet['sha256']}. "
+        "Start with read-only preparation and print replicator guide --print. "
+        "Do not edit files, dispatch work, contact agents, transfer custody, close the predecessor, "
+        "or claim that permissions or trust have been verified."
+    )
+    if (not isinstance(final_argv, list) or final_argv != [*native_command["argv"], expected_bootstrap]):
+        return False
+    scope = record.get("scope", {})
+    seat = scope.get("seat", {})
+    worktree = scope.get("worktree", {})
+    cmux = attempt.get("cmux")
+    if (not isinstance(cmux, dict) or set(cmux) != {"executable", "argv", "cwd", "workspace_id"}
+            or not isinstance(cmux.get("executable"), str)
+            or not Path(cmux["executable"]).is_absolute()
+            or Path(cmux["executable"]).name != "cmux"
+            or cmux.get("cwd") != worktree.get("root")
+            or cmux.get("workspace_id", "").upper() != seat.get("workspace_id", "").upper()):
+        return False
+    expected_cmux_argv = [
+        cmux["executable"], "--json", "--id-format", "uuids", "new-surface", "--type", "terminal",
+        "--workspace", seat["workspace_id"], "--working-directory", worktree["root"],
+        "--focus", "false", "--command", shlex.join(final_argv),
+    ]
+    if cmux.get("argv") != expected_cmux_argv:
+        return False
+    returned = launch.get("returned_surface")
+    if launch.get("status") == "opening_unconfirmed":
+        if returned is not None:
+            return False
+    else:
+        if (not isinstance(returned, dict) or set(returned) != {"surface_id", "workspace_id"}
+                or not isinstance(returned.get("surface_id"), str)
+                or not isinstance(returned.get("workspace_id"), str)):
+            return False
+        try:
+            if (str(uuid.UUID(returned["surface_id"])) != returned["surface_id"]
+                    or str(uuid.UUID(returned["workspace_id"])) != returned["workspace_id"]
+                    or returned["workspace_id"].upper() != seat.get("workspace_id", "").upper()
+                    or returned["surface_id"].upper() == seat.get("panel_id", "").upper()):
+                return False
+        except (ValueError, TypeError, AttributeError):
+            return False
+    preflight = attempt.get("preflight")
+    preflight_fields = {
+        "status", "checked_at", "checks", "predecessor_snapshot_digest", "access_observation_id",
+        "access_observation_digest", "current_snapshot_digest", "current_native_snapshot",
+        "current_hook_generation", "current_process_identity", "context_access_digest",
+        "guidance_access_digest", "git_identity_digest", "packet_sha256",
+    }
+    check_names = {
+        "frozen_intent", "predecessor_owner_binding", "predecessor_settings", "context_access",
+        "guidance_access", "context_unchanged", "guidance_unchanged", "git_metadata_access", "packet_access",
+    }
+    if (not isinstance(preflight, dict) or set(preflight) != preflight_fields
+            or preflight.get("status") != "ready" or not _timestamp(preflight.get("checked_at"))
+            or not isinstance(preflight.get("checks"), dict)
+            or set(preflight["checks"]) != check_names
+            or any(value != "ready" for value in preflight["checks"].values())
+            or preflight.get("predecessor_snapshot_digest") != _digest(predecessor_snapshot)
+            or not isinstance(preflight.get("access_observation_id"), str)
+            or HEX_32.fullmatch(preflight["access_observation_id"]) is None
+            or preflight.get("packet_sha256") != packet["sha256"]):
+        return False
+    for name in ("access_observation_digest", "current_snapshot_digest", "context_access_digest",
+                 "guidance_access_digest", "git_identity_digest"):
+        if not isinstance(preflight.get(name), str) or HEX_64.fullmatch(preflight[name]) is None:
+            return False
+    current_snapshot = preflight.get("current_native_snapshot")
+    if not isinstance(current_snapshot, dict):
+        return False
+    current_record = _snapshot_bound_record(current_snapshot)
+    if not _valid_observed_snapshot(current_record, scope, current_snapshot, current_record["observations"]):
+        return False
+    if (preflight.get("current_snapshot_digest") != _digest(current_snapshot)
+            or preflight.get("current_hook_generation") != current_snapshot.get("hook_generation")
+            or preflight.get("current_process_identity") != current_snapshot.get("process_identity")
+            or current_snapshot.get("subject") != predecessor_snapshot.get("subject")
+            or current_snapshot.get("process_identity") != predecessor_snapshot.get("process_identity")
+            or current_snapshot.get("hook_generation") != predecessor_snapshot.get("hook_generation")
+            or current_snapshot.get("settings") != predecessor_snapshot.get("settings")):
+        return False
+    access = record.get("access_observations")
+    if (not isinstance(access, dict) or set(access) != {"schema_version", "predecessor", "successor", "pending"}
+            or access.get("schema_version") != 1 or access.get("pending") is not None
+            or not isinstance(access.get("predecessor"), list) or not access["predecessor"]
+            or not isinstance(access.get("successor"), list)):
+        return False
+    latest = access["predecessor"][-1]
+    latest_checks = latest.get("checks") if isinstance(latest, dict) else None
+    context_access = latest_checks.get("context_access") if isinstance(latest_checks, dict) else None
+    guidance_access = latest_checks.get("guidance_access") if isinstance(latest_checks, dict) else None
+    if (not isinstance(latest, dict) or latest.get("id") != preflight.get("access_observation_id")
+            or _digest(latest) != preflight.get("access_observation_digest")
+            or not isinstance(latest_checks, dict)
+            or not isinstance(context_access, dict) or context_access.get("status") != "ready"
+            or not isinstance(guidance_access, dict) or guidance_access.get("status") != "ready"
+            or latest_checks.get("native_trust") != {
+                "status": "unknown", "reason": "no_supported_exact_trust_source"}
+            or latest_checks.get("effective_permissions") != {
+                "status": "unknown", "reason": "scoped_checks_do_not_prove_complete_permissions"}
+            or _digest(context_access) != preflight.get("context_access_digest")
+            or _digest(guidance_access) != preflight.get("guidance_access_digest")
+            or _digest(record.get("scope", {}).get("worktree")) != preflight.get("git_identity_digest")):
+        return False
+    return True
+
+
+def _valid_successor_observation(record, scope, launch, predecessor_snapshot, observations):
+    if (not isinstance(observations, dict)
+            or observations.get("effective_permissions") != UNKNOWN):
+        return False
+    launch_status = launch.get("status") if isinstance(launch, dict) else None
+    successor_snapshot = record.get("native_successor_snapshot")
+    successor_generation = record.get("native_successor_generation", UNKNOWN)
+    successor_binding = record.get("native_successor_binding", UNKNOWN_BINDING)
+    if launch_status != "successor_observed":
+        return (successor_snapshot is None and successor_generation == UNKNOWN
+                and successor_binding == UNKNOWN_BINDING
+                and observations.get("successor_model") == UNKNOWN
+                and observations.get("successor_effort") == UNKNOWN)
+    returned = launch.get("returned_surface")
+    if not isinstance(returned, dict) or not isinstance(successor_snapshot, dict):
+        return False
+    subject = successor_snapshot.get("subject")
+    if (not isinstance(subject, dict) or subject.get("harness") != "codex"
+            or not isinstance(subject.get("session_id"), str) or not subject["session_id"]
+            or subject.get("session_id") == scope["seat"].get("session_id")
+            or subject.get("panel_id", "").upper() != returned.get("surface_id", "").upper()
+            or subject.get("workspace_id", "").upper() != returned.get("workspace_id", "").upper()
+            or subject.get("worktree") != scope.get("worktree")):
+        return False
+    successor_scope = {
+        "seat": {**scope["seat"], "session_id": subject["session_id"],
+                 "panel_id": subject["panel_id"], "workspace_id": subject["workspace_id"]},
+        "worktree": scope["worktree"],
+    }
+    snapshot_record = _snapshot_bound_record(successor_snapshot)
+    if not _valid_observed_snapshot(snapshot_record, successor_scope, successor_snapshot,
+                                    snapshot_record["observations"]):
+        return False
+    process = successor_snapshot["process_identity"]
+    predecessor_process = predecessor_snapshot.get("process_identity")
+    hook_generation = successor_snapshot["hook_generation"]
+    if (process == predecessor_process
+            or hook_generation == predecessor_snapshot.get("hook_generation")):
+        return False
+    snapshot_digest = _digest(successor_snapshot)
+    expected_generation = {
+        "status": "observed", "value": process,
+        "evidence": {"source": "ps", "snapshot_digest": snapshot_digest,
+                     "observed_at": successor_snapshot["observed_at"]},
+    }
+    expected_binding = {
+        "status": "observed", "hook_generation": hook_generation,
+        "evidence": {"source": "cmux_codex_hook_store_v1", "snapshot_digest": snapshot_digest},
+    }
+    turn = successor_snapshot["turn"]
+    evidence = {"source": "open_codex_rollout", "snapshot_digest": snapshot_digest,
+                "turn_id": turn["id"], "recorded_at": turn["recorded_at"]}
+    return (
+        successor_generation == expected_generation
+        and successor_binding == expected_binding
+        and observations.get("successor_model") == {
+            "status": "observed", "value": successor_snapshot["settings"]["model"], "evidence": evidence,
+        }
+        and observations.get("successor_effort") == {
+            "status": "observed", "value": successor_snapshot["settings"]["effort"], "evidence": evidence,
+        }
+    )
+
+
+def _validate_launch_state(record, scope, predecessor_snapshot, observations):
+    launch = record.get("launch")
+    if launch == {"status": "not_started"}:
+        if (record.get("native_successor_snapshot") is not None
+                or record.get("native_successor_generation", UNKNOWN) != UNKNOWN
+                or record.get("native_successor_binding") != UNKNOWN_BINDING
+                or observations.get("successor_model") != UNKNOWN
+                or observations.get("successor_effort") != UNKNOWN):
+            raise HandoffAdapterError("Replicator handoff has malformed successor observation state.")
+    elif (not isinstance(launch, dict)
+          or launch.get("status") not in ("opening_unconfirmed", "opened_unobserved", "successor_observed")
+          or not _valid_opening_attempt(record, launch, predecessor_snapshot)):
+        raise HandoffAdapterError("Replicator handoff has malformed candidate opening evidence.")
+    if not _valid_successor_observation(record, scope, launch, predecessor_snapshot, observations):
+        raise HandoffAdapterError("Replicator handoff has malformed successor native observation evidence.")
 
 
 def _validate_handoff(record, *, intent=None, handoff_id=None):
@@ -381,7 +653,6 @@ def _validate_handoff(record, *, intent=None, handoff_id=None):
                 or snapshot.get("request_digest") != intent["request_digest"]):
             raise HandoffAdapterError("Replicator handoff does not preserve the exact configured intent.")
     observations = record.get("observations")
-    unknown_binding = {"status": "unknown", "hook_generation": None, "evidence": None}
     expected_observations = {"predecessor_model", "predecessor_effort", "successor_model",
                              "successor_effort", "effective_permissions"}
     native_snapshot = record.get("native_predecessor_snapshot")
@@ -389,6 +660,8 @@ def _validate_handoff(record, *, intent=None, handoff_id=None):
         if (record.get("native_generation") != UNKNOWN
                 or record.get("native_predecessor_binding") != UNKNOWN_BINDING
                 or record.get("native_successor_binding") != UNKNOWN_BINDING
+                or record.get("native_successor_generation", UNKNOWN) != UNKNOWN
+                or record.get("native_successor_snapshot") is not None
                 or not isinstance(observations, dict)
                 or set(observations) != expected_observations
                 or any(observations.get(key) != UNKNOWN for key in observations)
@@ -398,9 +671,9 @@ def _validate_handoff(record, *, intent=None, handoff_id=None):
     else:
         if not _valid_observed_snapshot(record, scope, native_snapshot, observations):
             raise HandoffAdapterError("Replicator handoff has malformed native observation state.")
+    _validate_launch_state(record, scope, native_snapshot, observations)
     if (record.get("permission_requirement") != {
                 "kind": "match_predecessor_effective", "status": "unknown"}
-            or record.get("launch") != {"status": "not_started"}
             or record.get("transfer") != {"status": "not_applicable"}
             or record.get("predecessor_cleanup") != {"status": "not_applicable"}):
         raise HandoffAdapterError("Replicator handoff has an unsupported readiness or lifecycle state.")

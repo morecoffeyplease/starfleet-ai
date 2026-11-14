@@ -97,7 +97,7 @@ The application-owned handoff generation is distinct from the native process gen
 Both native generations remain `unknown` until you record a supported exact-session observation.
 Show separates configured Model Preferences choice and provenance from native observations and readiness.
 Reconcile reads only the private local state, performs no native queries or writes, and reports the current native-observation blockers.
-The frozen record leaves native model, effort, effective permissions, native bindings, readiness, transfer, and predecessor cleanup unknown, blocked, or not applicable as appropriate.
+The frozen record begins with native model, effort, effective permissions, native bindings, readiness, transfer, and predecessor cleanup unknown, blocked, or not applicable as appropriate.
 Cancel refuses a frozen intent, and another candidate cannot replace it.
 
 ## Record the Codex predecessor settings snapshot
@@ -147,6 +147,39 @@ Local access checks do not establish effective permissions or native trust, and 
 Handoff inspection exposes phase-specific launch and transfer readiness; successor parity is a transfer requirement.
 This observation command never launches a successor, transfers custody, closes the predecessor, or consumes the intent.
 
+## Open and observe one Codex candidate
+
+Opening requires the predecessor's exact current process and settings to match the frozen observation, the latest scoped context and guidance bytes to remain readable and unchanged, the canonical Git identity to match, and a bounded packet file to be readable.
+Pass the exact Codex executable and only the frozen model and effort selection as a JSON argv array:
+
+```sh
+replicator handoff open HANDOFF_ID \
+  --native-command '["/absolute/path/to/codex","-m","MODEL","-c","model_reasoning_effort=\"EFFORT\""]' \
+  --packet-file /absolute/path/to/handoff-packet.md
+```
+
+The command rejects extra flags, settings, environment overrides, wrapper text, and shell syntax.
+It records the full final Codex argv, exact CMUX terminal route, working directory, packet digest, and one opening attempt in the existing handoff record before calling CMUX.
+CMUX must return one UUID surface in the frozen workspace.
+An exception, timeout, malformed response, or workspace mismatch stays `opening_unconfirmed`; inspect the exact outcome and do not retry another opening.
+Repeating the same request returns the recorded state without another CMUX call.
+An opening response does not establish that Codex started or received the packet.
+
+Observe settings only from the distinct Codex session on the exact returned surface and frozen worktree:
+
+```sh
+replicator handoff observe-successor HANDOFF_ID
+replicator handoff show HANDOFF_ID --json
+replicator handoff reconcile HANDOFF_ID --json
+```
+
+The observer records the successor's exact hook generation, OS process generation, model, effort, approval policy, sandbox policy, and rollout provenance.
+It checks that the successor process, hook generation, session, panel, workspace, and worktree are distinct and match the recorded opening.
+Observed model and effort are compared with the frozen configured choice or observed predecessor settings.
+Approval and sandbox differences remain visible and block transfer assessment.
+Unknown effective permissions, native trust, successor scoped access, receiving, and custody keep transfer blocked.
+Opening and observation do not consume the one-shot intent, transfer custody, enroll tools, or close the predecessor.
+
 Run the passive configuration diagnostic outside a Git checkout:
 
 ```sh
@@ -179,7 +212,8 @@ Read the [manual handoff guide](guide.md) before using its checklist.
 The guide keeps tool-specific custody checks in existing CMUX, Pattern Buffer, Hailing Frequencies, Temporal Beacon, Warp-drive, Discord Watch, Agent Notify, and Policy Guard controls.
 Preflight does not aggregate those tool checks or register tools.
 It does not qualify a Claude or Codex native pilot or prove that a successor received a handoff.
-Each same-harness route needs its own native evidence.
+The current opening and native observation route supports Codex only.
+Each future same-harness route needs its own native evidence.
 An automatic activity-budget trigger remains a later increment that must use the same procedure.
 
 ## Verify

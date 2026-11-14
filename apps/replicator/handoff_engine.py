@@ -85,7 +85,9 @@ def _new_handoff(intent, handoff_id, frozen_at):
         "native_predecessor_snapshot": None,
         "native_generation": copy.deepcopy(UNKNOWN),
         "native_predecessor_binding": copy.deepcopy(UNKNOWN_BINDING),
+        "native_successor_generation": copy.deepcopy(UNKNOWN),
         "native_successor_binding": copy.deepcopy(UNKNOWN_BINDING),
+        "native_successor_snapshot": None,
         "observations": {name: copy.deepcopy(UNKNOWN) for name in OBSERVATIONS},
         "permission_requirement": {"kind": "match_predecessor_effective", "status": "unknown"},
         "readiness": {"status": "blocked", "reason": "native_observations_unavailable"},
@@ -129,6 +131,191 @@ def _snapshot_identity(snapshot):
     identity = copy.deepcopy(snapshot)
     identity.pop("observed_at", None)
     return successor_intents.digest(identity)
+
+
+def _choice_model_effort(handoff):
+    choice = handoff.get("choice")
+    if isinstance(choice, dict) and choice.get("kind") == "model_preferences_candidate":
+        snapshot = choice.get("snapshot")
+        if isinstance(snapshot, dict):
+            return snapshot.get("model"), snapshot.get("effort")
+    predecessor = handoff.get("native_predecessor_snapshot")
+    settings = predecessor.get("settings") if isinstance(predecessor, dict) else None
+    if isinstance(settings, dict):
+        return settings.get("model"), settings.get("effort")
+    return None, None
+
+
+def _recorded_predecessor_access(handoff):
+    access = handoff.get("access_observations")
+    if not isinstance(access, dict) or access.get("pending") is not None:
+        return None
+    history = access.get("predecessor")
+    if not isinstance(history, list) or not history:
+        return None
+    return history[-1]
+
+
+def _public_handoff(handoff):
+    result = copy.deepcopy(handoff)
+    result["phase_readiness"] = phase_readiness(result)
+    return result
+
+
+def candidate_opening_checks(handoff, current_snapshot, fresh_inputs, git_identity, packet_check):
+    """Assess only the evidence needed to open the candidate, not transfer parity."""
+    baseline = handoff.get("native_predecessor_snapshot")
+    access = _recorded_predecessor_access(handoff)
+    if isinstance(baseline, dict) and isinstance(current_snapshot, dict):
+        comparisons = access_observer.compare_native_snapshots(handoff["scope"], baseline, current_snapshot)
+        owner = comparisons["owner_binding"]["status"]
+        settings = comparisons["native_settings_match"]["status"]
+    else:
+        owner = settings = "unknown"
+    recorded = access.get("checks", {}) if isinstance(access, dict) else {}
+    recorded_request = access.get("request") if isinstance(access, dict) else None
+    input_checks = fresh_inputs if isinstance(fresh_inputs, dict) else {}
+    has_context = bool(recorded_request and recorded_request.get("context_files"))
+    has_guidance = bool(recorded_request and recorded_request.get("guidance_files"))
+    expected_worktree = handoff.get("scope", {}).get("worktree")
+    checks = {
+        "frozen_intent": "ready" if handoff.get("state") == "frozen" and handoff.get("intent_digest") else "blocked",
+        "predecessor_owner_binding": owner,
+        "predecessor_settings": settings,
+        "context_access": (input_checks.get("context_access", {}).get("status", "unknown")
+                           if has_context else "unknown"),
+        "guidance_access": (input_checks.get("guidance_access", {}).get("status", "unknown")
+                            if has_guidance else "unknown"),
+        "context_unchanged": ("ready" if has_context
+                               and input_checks.get("context_access") == recorded.get("context_access") else "blocked"),
+        "guidance_unchanged": ("ready" if has_guidance
+                                and input_checks.get("guidance_access") == recorded.get("guidance_access") else "blocked"),
+        "git_metadata_access": ("ready" if git_identity == expected_worktree else "blocked"),
+        "packet_access": packet_check.get("status", "unknown") if isinstance(packet_check, dict) else "unknown",
+    }
+    return {"status": _phase_status(checks), "checks": checks}
+
+
+def begin_candidate_opening(state_dir, handoff_id, attempt):
+    with successor_intents.mutation_lock(state_dir) as root:
+        store = successor_intents.read_store(root)
+        handoff = _find_handoff(store, handoff_id)
+        launch = handoff.get("launch")
+        if isinstance(launch, dict) and launch.get("status") != "not_started":
+            previous = launch.get("attempt")
+            if isinstance(previous, dict) and previous.get("request_digest") == attempt.get("request_digest"):
+                return {"handoff": _public_handoff(handoff), "reused": True}
+            raise HandoffError("A candidate opening was already attempted; inspect its exact outcome before any other action.")
+        if handoff.get("state") != "frozen" or launch != {"status": "not_started"}:
+            raise HandoffError("Only an unopened frozen handoff can begin candidate opening.")
+        expected_snapshot = attempt.get("preflight", {}).get("predecessor_snapshot_digest")
+        if expected_snapshot != successor_intents.digest(handoff.get("native_predecessor_snapshot")):
+            raise HandoffError("The predecessor snapshot changed during opening preflight; no candidate was opened.")
+        expected_access = attempt.get("preflight", {}).get("access_observation_id")
+        latest_access = _recorded_predecessor_access(handoff)
+        if latest_access is None or latest_access.get("id") != expected_access:
+            raise HandoffError("The scoped access evidence changed during opening preflight; no candidate was opened.")
+        updated = copy.deepcopy(handoff)
+        updated["launch"] = {"status": "opening_unconfirmed", "attempt": copy.deepcopy(attempt),
+                              "returned_surface": None}
+        store["handoffs"][handoff_id] = updated
+        successor_intents._validate_store(store)
+        successor_intents.write_store(root, store)
+        return {"handoff": _public_handoff(updated), "reused": False}
+
+
+def record_candidate_opened(state_dir, handoff_id, request_digest, surface_id, workspace_id):
+    if not isinstance(surface_id, str) or not isinstance(workspace_id, str):
+        raise HandoffError("CMUX returned an incomplete surface identity; the opening remains unconfirmed.")
+    with successor_intents.mutation_lock(state_dir) as root:
+        store = successor_intents.read_store(root)
+        handoff = _find_handoff(store, handoff_id)
+        launch = handoff.get("launch", {})
+        attempt = launch.get("attempt") if isinstance(launch, dict) else None
+        if (launch.get("status") != "opening_unconfirmed" or not isinstance(attempt, dict)
+                or attempt.get("request_digest") != request_digest):
+            raise HandoffError("The recorded opening attempt changed before its return was recorded.")
+        if surface_id.upper() == handoff["scope"]["seat"]["panel_id"].upper():
+            raise HandoffError("CMUX returned the predecessor surface; the opening remains unconfirmed.")
+        updated = copy.deepcopy(handoff)
+        updated["launch"] = {
+            "status": "opened_unobserved",
+            "attempt": copy.deepcopy(attempt),
+            "returned_surface": {"surface_id": surface_id, "workspace_id": workspace_id},
+        }
+        store["handoffs"][handoff_id] = updated
+        successor_intents._validate_store(store)
+        successor_intents.write_store(root, store)
+        return {"handoff": _public_handoff(updated), "reused": False}
+
+
+def record_successor_observation(state_dir, handoff_id, snapshot):
+    if not isinstance(snapshot, dict):
+        raise HandoffError("The native successor observation is malformed.")
+    with successor_intents.mutation_lock(state_dir) as root:
+        store = successor_intents.read_store(root)
+        handoff = _find_handoff(store, handoff_id)
+        launch = handoff.get("launch", {})
+        if launch.get("status") == "successor_observed":
+            existing = handoff.get("native_successor_snapshot")
+            if isinstance(existing, dict) and _snapshot_identity(existing) == _snapshot_identity(snapshot):
+                return {"handoff": _public_handoff(handoff), "reused": True}
+            raise HandoffError("A different successor observation is already recorded.")
+        if launch.get("status") != "opened_unobserved":
+            raise HandoffError("Successor observation requires one recorded CMUX surface return.")
+        returned = launch.get("returned_surface")
+        subject = snapshot.get("subject")
+        if (not isinstance(returned, dict) or not isinstance(subject, dict)
+                or subject.get("panel_id", "").upper() != returned.get("surface_id", "").upper()
+                or subject.get("workspace_id", "").upper() != returned.get("workspace_id", "").upper()
+                or subject.get("worktree") != handoff["scope"]["worktree"]
+                or subject.get("harness") != "codex"
+                or subject.get("session_id") == handoff["scope"]["seat"]["session_id"]
+                or returned.get("surface_id", "").upper() == handoff["scope"]["seat"]["panel_id"].upper()):
+            raise HandoffError("The observed native session is not the exact newly returned successor surface.")
+        predecessor = handoff.get("native_predecessor_snapshot")
+        process = snapshot.get("process_identity")
+        predecessor_process = predecessor.get("process_identity") if isinstance(predecessor, dict) else None
+        predecessor_generation = handoff.get("native_predecessor_binding", {}).get("hook_generation")
+        if (not isinstance(process, dict) or process == predecessor_process
+                or snapshot.get("hook_generation") == predecessor_generation):
+            raise HandoffError("The successor process and hook generation must be distinct from the predecessor.")
+        updated = copy.deepcopy(handoff)
+        snapshot = copy.deepcopy(snapshot)
+        snapshot_digest = successor_intents.digest(snapshot)
+        process = snapshot["process_identity"]
+        turn = snapshot["turn"]
+        settings = snapshot["settings"]
+        evidence = {
+            "source": "open_codex_rollout",
+            "snapshot_digest": snapshot_digest,
+            "turn_id": turn["id"],
+            "recorded_at": turn["recorded_at"],
+        }
+        updated["native_successor_snapshot"] = snapshot
+        updated["native_successor_generation"] = {
+            "status": "observed", "value": copy.deepcopy(process),
+            "evidence": {"source": "ps", "snapshot_digest": snapshot_digest,
+                         "observed_at": snapshot["observed_at"]},
+        }
+        updated["native_successor_binding"] = {
+            "status": "observed", "hook_generation": snapshot["hook_generation"],
+            "evidence": {"source": "cmux_codex_hook_store_v1", "snapshot_digest": snapshot_digest},
+        }
+        updated["observations"]["successor_model"] = {
+            "status": "observed", "value": settings["model"], "evidence": copy.deepcopy(evidence),
+        }
+        updated["observations"]["successor_effort"] = {
+            "status": "observed", "value": settings["effort"], "evidence": copy.deepcopy(evidence),
+        }
+        updated["launch"] = {
+            "status": "successor_observed", "attempt": copy.deepcopy(launch["attempt"]),
+            "returned_surface": copy.deepcopy(returned),
+        }
+        store["handoffs"][handoff_id] = updated
+        successor_intents._validate_store(store)
+        successor_intents.write_store(root, store)
+        return {"handoff": _public_handoff(updated), "reused": False}
 
 
 def record_predecessor_observation(state_dir, handoff_id, snapshot):
@@ -377,17 +564,63 @@ def phase_readiness(handoff):
             handoff.get("observations", {}).get(name, {}).get("status") == "observed"
             for name in ("successor_model", "successor_effort")
         ) else "unknown",
+        "successor_choice_match": _successor_choice_status(handoff),
+        "successor_policy_match": _successor_policy_status(handoff),
         "successor_access": "ready" if access.get("successor") else "unknown",
         "effective_permissions": handoff.get("observations", {}).get("effective_permissions", {}).get("status", "unknown"),
         "native_trust": _check_status(latest, "native_trust"),
         "receiving": "unknown",
         "custody_acceptance": handoff.get("custody_acceptance", {}).get("status", "unknown"),
     }
+    launch = handoff.get("launch", {})
+    attempt = launch.get("attempt") if isinstance(launch, dict) else None
+    if isinstance(attempt, dict) and isinstance(attempt.get("preflight"), dict):
+        candidate_checks = copy.deepcopy(attempt["preflight"].get("checks", {}))
+        candidate_status = attempt["preflight"].get("status", "unknown")
+    else:
+        candidate_checks = {
+            "frozen_intent": "ready" if handoff.get("intent_digest") else "blocked",
+            "predecessor_owner_binding": _check_status(latest, "owner_binding"),
+            "predecessor_settings": _check_status(latest, "native_settings_match"),
+            "context_access": _check_status(latest, "context_access"),
+            "guidance_access": _check_status(latest, "guidance_access"),
+            "context_unchanged": "unknown",
+            "guidance_unchanged": "unknown",
+            "git_metadata_access": _check_status(latest, "git_metadata_access"),
+            "packet_access": "unknown",
+        }
+        candidate_status = _phase_status(candidate_checks)
     return {
         "launch": {"status": _phase_status(launch_checks), "checks": launch_checks},
+        "candidate_opening": {"status": candidate_status, "checks": candidate_checks},
         "transfer": {"status": _phase_status(transfer_checks, unknown_means_blocked=True),
                      "checks": transfer_checks},
     }
+
+
+def _successor_choice_status(handoff):
+    observed = handoff.get("observations", {})
+    model = observed.get("successor_model", {})
+    effort = observed.get("successor_effort", {})
+    if model.get("status") != "observed" or effort.get("status") != "observed":
+        return "unknown"
+    expected_model, expected_effort = _choice_model_effort(handoff)
+    if expected_model is None or expected_effort is None:
+        return "unknown"
+    return "ready" if (model.get("value") == expected_model and effort.get("value") == expected_effort) else "blocked"
+
+
+def _successor_policy_status(handoff):
+    predecessor = handoff.get("native_predecessor_snapshot")
+    successor = handoff.get("native_successor_snapshot")
+    if not isinstance(predecessor, dict) or not isinstance(successor, dict):
+        return "unknown"
+    expected = predecessor.get("settings", {})
+    observed = successor.get("settings", {})
+    if not isinstance(expected, dict) or not isinstance(observed, dict):
+        return "unknown"
+    return "ready" if all(expected.get(name) == observed.get(name)
+                           for name in ("approval_policy", "sandbox_policy")) else "blocked"
 
 
 def reconcile_handoff(state_dir, handoff_id):
@@ -404,6 +637,15 @@ def reconcile_handoff(state_dir, handoff_id):
             or any(handoff["observations"][name]["status"] != "observed"
                    for name in ("successor_model", "successor_effort"))):
         blockers.append("successor_model_effort_unobserved")
+    if phases["transfer"]["checks"]["successor_choice_match"] == "blocked":
+        blockers.append("successor_choice_mismatch")
+    if phases["transfer"]["checks"]["successor_policy_match"] == "blocked":
+        blockers.append("successor_policy_mismatch")
+    launch_status = handoff.get("launch", {}).get("status")
+    if launch_status == "opening_unconfirmed":
+        blockers.append("candidate_opening_unconfirmed")
+    elif launch_status == "opened_unobserved":
+        blockers.append("successor_native_observation_unavailable")
     if handoff["observations"]["effective_permissions"]["status"] != "observed":
         blockers.append("effective_permissions_unobserved")
     if phases["launch"]["status"] != "ready":
@@ -421,32 +663,6 @@ def reconcile_handoff(state_dir, handoff_id):
             "blockers": blockers,
         },
     }
-
-
-def _begin_opening(handoff):
-    current = copy.deepcopy(handoff)
-    state = current.get("state")
-    launch = current.get("launch", {})
-    if state == "frozen" and launch.get("status") == "not_started":
-        if current.get("readiness", {}).get("status") != "ready":
-            raise HandoffError("Native readiness must be established before an opening attempt.")
-        current["state"] = "opening"
-        current["launch"] = {"status": "opening"}
-        return current, True
-    if state in ("opening", "opening_unconfirmed"):
-        return current, False
-    raise HandoffError("This handoff cannot begin another opening attempt.")
-
-
-def _mark_opening_uncertain(handoff):
-    current = copy.deepcopy(handoff)
-    if current.get("state") == "opening_unconfirmed":
-        return current
-    if current.get("state") != "opening":
-        raise HandoffError("Only an opening attempt can become unconfirmed.")
-    current["state"] = "opening_unconfirmed"
-    current["launch"] = {"status": "opening_unconfirmed"}
-    return current
 
 
 def _consume_confirmed_transfer(intent, handoff, receipt):

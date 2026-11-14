@@ -3,13 +3,17 @@
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 
 import access_observer
 import successor_intents
@@ -24,6 +28,7 @@ MAX_INPUT_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 5
 TOOL_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")
 MAX_MODEL_PREFERENCES_OUTPUT = 256 * 1024
+MAX_HANDOFF_PACKET_BYTES = 48 * 1024
 
 
 @dataclass(frozen=True)
@@ -659,6 +664,210 @@ def handoff_observe_access(args):
     )
 
 
+def _resolve_codex_executable(value):
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise handoff_engine.HandoffError("The native command executable is malformed.")
+    candidate = value if Path(value).is_absolute() else shutil.which(value)
+    if not candidate:
+        raise handoff_engine.HandoffError("The exact Codex executable is unavailable; no opening attempt was recorded.")
+    path = Path(os.path.abspath(candidate))
+    try:
+        path.stat()
+    except (OSError, RuntimeError) as exc:
+        raise handoff_engine.HandoffError("The exact Codex executable could not be verified; no opening attempt was recorded.") from exc
+    if (path.name != "codex" or not path.is_file() or not os.access(path, os.X_OK)):
+        raise handoff_engine.HandoffError("Only an executable named codex is supported; no opening attempt was recorded.")
+    return str(path)
+
+
+def _native_command(args, handoff):
+    raw = getattr(args, "native_command", None)
+    if not isinstance(raw, str) or len(raw.encode("utf-8", "replace")) > 4096:
+        raise handoff_engine.HandoffError("Pass the exact supported Codex argv as --native-command JSON; no opening attempt was recorded.")
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise handoff_engine.HandoffError("--native-command must be a JSON argv array; no opening attempt was recorded.") from exc
+    if (not isinstance(value, list) or len(value) != 5
+            or any(not isinstance(token, str) or not token or "\x00" in token for token in value)
+            or handoff.get("scope", {}).get("seat", {}).get("harness") != "codex"):
+        raise handoff_engine.HandoffError("Only the exact five-token Codex model and effort argv is supported; no opening attempt was recorded.")
+    expected_model, expected_effort = handoff_engine._choice_model_effort(handoff)
+    if expected_model is None or expected_effort is None:
+        raise handoff_engine.HandoffError("Record the predecessor model and effort before opening a successor; no opening attempt was recorded.")
+    executable = _resolve_codex_executable(value[0])
+    expected = [executable, "-m", expected_model, "-c", f'model_reasoning_effort="{expected_effort}"']
+    if value[1:] != expected[1:]:
+        raise handoff_engine.HandoffError("--native-command must match the frozen model and effort exactly; no opening attempt was recorded.")
+    return {"executable": executable, "argv": expected}
+
+
+def _read_handoff_packet(path_value):
+    if not isinstance(path_value, str) or not path_value:
+        raise handoff_engine.HandoffError("Pass a handoff packet file; no opening attempt was recorded.")
+    path = os.path.abspath(os.path.expanduser(path_value))
+    if len(path) > access_observer.MAX_ACCESS_PATH_LENGTH:
+        raise handoff_engine.HandoffError("The handoff packet path exceeds the supported path limit; no opening attempt was recorded.")
+    result = access_observer._read_file(path)
+    if result.get("status") != "ready" or not isinstance(result.get("bytes_read"), int):
+        raise handoff_engine.HandoffError("The handoff packet could not be read as stable regular-file bytes; no opening attempt was recorded.")
+    if result["bytes_read"] > MAX_HANDOFF_PACKET_BYTES:
+        raise handoff_engine.HandoffError("The handoff packet exceeds 48 KiB; no opening attempt was recorded.")
+    return {"path": path, "bytes": result["bytes_read"], "sha256": result["sha256"]}
+
+
+def _opening_request(args, handoff):
+    native_command = _native_command(args, handoff)
+    packet = _read_handoff_packet(args.packet_file)
+    request_digest = successor_intents.digest({"native_command": native_command, "packet": packet})
+    return native_command, packet, request_digest
+
+
+def _candidate_bootstrap(handoff, packet):
+    return (
+        f"You are a same-harness successor candidate for handoff {handoff['id']}. "
+        f"Read the packet at {packet['path']} only if its SHA-256 is {packet['sha256']}. "
+        "Start with read-only preparation and print replicator guide --print. "
+        "Do not edit files, dispatch work, contact agents, transfer custody, close the predecessor, "
+        "or claim that permissions or trust have been verified."
+    )
+
+
+def _opening_preflight(args, handoff, packet):
+    native_cwd, caller, identity_check = caller_identity(os.environ)
+    if identity_check.status != "ready" or caller is None or native_cwd is None:
+        raise handoff_engine.HandoffError("The exact active predecessor identity is unavailable; no opening attempt was recorded.")
+    seat = handoff["scope"]["seat"]
+    expected_caller = {key: seat[key] for key in ("harness", "session_id", "panel_id", "workspace_id")}
+    if caller != expected_caller:
+        raise handoff_engine.HandoffError("The active caller does not match the exact frozen predecessor; no opening attempt was recorded.")
+    worktree = canonical_worktree_identity(native_cwd)
+    if worktree != handoff["scope"]["worktree"]:
+        raise handoff_engine.HandoffError("The active predecessor is outside the frozen canonical worktree; no opening attempt was recorded.")
+    snapshot = native_observer.observe_codex_predecessor(
+        handoff["scope"], caller, worktree, home=Path.home(), environment=os.environ, runner=run_bounded,
+    )
+    access = handoff.get("access_observations", {})
+    if not isinstance(access, dict) or access.get("pending") is not None:
+        raise handoff_engine.HandoffError("Resolve any pending scoped access cleanup before candidate opening.")
+    history = access.get("predecessor")
+    if not isinstance(history, list) or not history:
+        raise handoff_engine.HandoffError("Record scoped context, guidance, and Git access before candidate opening.")
+    latest = history[-1]
+    request = latest.get("request") if isinstance(latest, dict) else None
+    if not isinstance(request, dict):
+        raise handoff_engine.HandoffError("The exact scoped access request is unavailable; no opening attempt was recorded.")
+    fresh_inputs = access_observer.read_inputs(request)
+    git_identity = canonical_worktree_identity(handoff["scope"]["worktree"]["root"])
+    packet_check = {"status": "ready" if 0 < packet["bytes"] <= MAX_HANDOFF_PACKET_BYTES else "blocked"}
+    assessment = handoff_engine.candidate_opening_checks(
+        handoff, snapshot, fresh_inputs, git_identity, packet_check,
+    )
+    if assessment["status"] != "ready":
+        refused = ", ".join(name for name, state in assessment["checks"].items() if state != "ready")
+        raise handoff_engine.HandoffError(f"Candidate opening is blocked by current evidence: {refused}.")
+    preflight = {
+        "status": "ready",
+        "checked_at": snapshot["observed_at"],
+        "checks": assessment["checks"],
+        "predecessor_snapshot_digest": successor_intents.digest(handoff["native_predecessor_snapshot"]),
+        "access_observation_id": latest["id"],
+        "access_observation_digest": successor_intents.digest(latest),
+        "current_snapshot_digest": successor_intents.digest(snapshot),
+        "current_native_snapshot": snapshot,
+        "current_hook_generation": snapshot["hook_generation"],
+        "current_process_identity": snapshot["process_identity"],
+        "context_access_digest": successor_intents.digest(latest["checks"]["context_access"]),
+        "guidance_access_digest": successor_intents.digest(latest["checks"]["guidance_access"]),
+        "git_identity_digest": successor_intents.digest(handoff["scope"]["worktree"]),
+        "packet_sha256": packet["sha256"],
+    }
+    return preflight
+
+
+def handoff_open(args):
+    handoff = handoff_engine.show_handoff(args.state_dir, args.handoff_id)["handoff"]
+    native_command, packet, request_digest = _opening_request(args, handoff)
+    launch = handoff.get("launch", {})
+    if launch.get("status") != "not_started":
+        attempt = launch.get("attempt", {})
+        if attempt.get("request_digest") != request_digest:
+            raise handoff_engine.HandoffError("A different candidate opening was already attempted; inspect it without retrying.")
+        return {"handoff": handoff, "reused": True}
+    cmux = shutil.which("cmux")
+    if not cmux:
+        raise handoff_engine.HandoffError("CMUX is unavailable; no opening attempt was recorded.")
+    cmux_path = os.path.abspath(cmux)
+    worktree = handoff["scope"]["worktree"]["root"]
+    workspace_id = handoff["scope"]["seat"]["workspace_id"]
+    final_native_argv = [*native_command["argv"], _candidate_bootstrap(handoff, packet)]
+    cmux_argv = [cmux_path, "--json", "--id-format", "uuids", "new-surface", "--type", "terminal",
+                 "--workspace", workspace_id, "--working-directory", worktree, "--focus", "false",
+                 "--command", shlex.join(final_native_argv)]
+    preflight = _opening_preflight(args, handoff, packet)
+    attempt = {
+        "id": uuid.uuid4().hex,
+        "at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "request_digest": request_digest,
+        "native_command": native_command,
+        "final_native_argv": final_native_argv,
+        "cmux": {"executable": cmux_path, "argv": cmux_argv, "cwd": worktree, "workspace_id": workspace_id},
+        "packet": packet,
+        "preflight": preflight,
+    }
+    opening = handoff_engine.begin_candidate_opening(args.state_dir, args.handoff_id, attempt)
+    if opening["reused"]:
+        return opening
+    status, output = run_bounded(cmux_argv, cwd=worktree, closed_stdin=True)
+    if status != "ready" or not isinstance(output, str):
+        raise handoff_engine.HandoffError(
+            f"Opening attempt {attempt['id']} is unconfirmed; inspect the exact CMUX outcome and do not retry."
+        )
+    try:
+        returned = json.loads(output)
+        surface_id = str(uuid.UUID(returned.get("surface_id")))
+        returned_workspace = str(uuid.UUID(returned.get("workspace_id")))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise handoff_engine.HandoffError(
+            f"Opening attempt {attempt['id']} is unconfirmed because CMUX returned no exact surface identity; do not retry."
+        ) from exc
+    if returned_workspace.upper() != workspace_id.upper():
+        raise handoff_engine.HandoffError(
+            f"Opening attempt {attempt['id']} is unconfirmed because CMUX returned a different workspace; do not retry."
+        )
+    result = handoff_engine.record_candidate_opened(
+        args.state_dir, args.handoff_id, request_digest, surface_id, returned_workspace,
+    )
+    return result
+
+
+def handoff_observe_successor(args):
+    handoff = handoff_engine.show_handoff(args.state_dir, args.handoff_id)["handoff"]
+    launch = handoff.get("launch", {})
+    returned = launch.get("returned_surface") if isinstance(launch, dict) else None
+    if launch.get("status") not in ("opened_unobserved", "successor_observed") or not isinstance(returned, dict):
+        raise handoff_engine.HandoffError("Successor observation requires one recorded CMUX surface return.")
+    native_cwd, caller, identity_check = caller_identity(os.environ)
+    if identity_check.status != "ready" or caller is None or native_cwd is None:
+        raise native_observer.NativeObservationError(identity_check.source)
+    if (caller["harness"] != "codex"
+            or caller["panel_id"].upper() != returned["surface_id"].upper()
+            or caller["workspace_id"].upper() != returned["workspace_id"].upper()
+            or caller["session_id"] == handoff["scope"]["seat"]["session_id"]):
+        raise native_observer.NativeObservationError("The live caller is not the distinct Codex session on the exact returned surface.")
+    worktree = canonical_worktree_identity(native_cwd)
+    if worktree != handoff["scope"]["worktree"]:
+        raise native_observer.NativeObservationError("The live successor worktree does not match the frozen handoff.")
+    successor_scope = {
+        "seat": {"name": handoff["scope"]["seat"]["name"], **caller},
+        "worktree": worktree,
+    }
+    snapshot = native_observer.observe_codex_predecessor(
+        successor_scope, caller, worktree, home=Path.home(), environment=os.environ, runner=run_bounded,
+    )
+    return handoff_engine.record_successor_observation(args.state_dir, args.handoff_id, snapshot)
+
+
 def print_handoff_summary(result):
     handoff = result["handoff"]
     seat = handoff["scope"]["seat"]
@@ -693,9 +902,18 @@ def print_handoff_summary(result):
     print(f"Readiness: {handoff['readiness']['status']} ({handoff['readiness']['reason']})")
     print(f"Launch: {handoff['launch']['status']}")
     phases = handoff.get("phase_readiness", handoff_engine.phase_readiness(handoff))
+    print(f"Candidate opening readiness: {phases['candidate_opening']['status']}")
     print(f"Launch readiness: {phases['launch']['status']}")
     print(f"Transfer readiness: {phases['transfer']['status']}")
-    print("No native launch, transfer, or predecessor close was performed.")
+    returned = handoff.get("launch", {}).get("returned_surface")
+    if returned:
+        print(f"Returned CMUX surface: {returned['surface_id']} in {returned['workspace_id']}")
+        print("A returned CMUX surface does not confirm that Codex started or received the packet.")
+    elif handoff.get("launch", {}).get("status") == "opening_unconfirmed":
+        print("The opening attempt is unconfirmed. Inspect the exact CMUX outcome before any new action.")
+    else:
+        print("No CMUX candidate opening was attempted.")
+    print("No custody transfer or predecessor close was performed.")
 
 
 def print_access_summary(result):
@@ -802,6 +1020,14 @@ def build_parser():
     freeze.add_argument("--mp-config-dir")
     freeze.add_argument("--mp-state-dir")
     freeze.add_argument("--json", action="store_true", help="print the frozen handoff as JSON")
+    open_candidate = handoff_commands.add_parser(
+        "open", help="open one same-harness Codex candidate after exact predecessor preflight",
+    )
+    open_candidate.add_argument("handoff_id")
+    open_candidate.add_argument("--native-command", required=True,
+                                help="JSON argv with executable, -m frozen-model, and -c model_reasoning_effort selection")
+    open_candidate.add_argument("--packet-file", required=True, help="bounded handoff packet whose exact bytes are hashed")
+    open_candidate.add_argument("--json", action="store_true", help="print the recorded opening outcome as JSON")
     show_handoff_parser = handoff_commands.add_parser("show", help="inspect a frozen handoff without native queries")
     show_handoff_parser.add_argument("handoff_id")
     show_handoff_parser.add_argument("--json", action="store_true", help="print the handoff as JSON")
@@ -813,6 +1039,11 @@ def build_parser():
     )
     observe.add_argument("handoff_id")
     observe.add_argument("--json", action="store_true", help="print the persisted observation as JSON")
+    observe_successor = handoff_commands.add_parser(
+        "observe-successor", help="record the exact Codex successor's own native settings snapshot",
+    )
+    observe_successor.add_argument("handoff_id")
+    observe_successor.add_argument("--json", action="store_true", help="print the persisted observation as JSON")
     access = handoff_commands.add_parser(
         "observe-access", help="record bounded access evidence from the exact Codex predecessor",
     )
@@ -891,11 +1122,23 @@ def main(argv=None):
                 if not args.json:
                     print_handoff_summary({"handoff": result["handoff"]})
                     return 0
+            elif args.handoff_command == "open":
+                result = handoff_open(args)
+                if not args.json:
+                    print_handoff_summary(result)
+                    print(f"Opening request reused: {str(result['reused']).lower()}")
+                    return 0
             elif args.handoff_command == "observe-predecessor":
                 result = handoff_observe_predecessor(args)
                 if not args.json:
                     print_handoff_summary(result)
                     print(f"Observation reused: {str(result['reused']).lower()}")
+                    return 0
+            elif args.handoff_command == "observe-successor":
+                result = handoff_observe_successor(args)
+                if not args.json:
+                    print_handoff_summary(result)
+                    print(f"Successor observation reused: {str(result['reused']).lower()}")
                     return 0
             elif args.handoff_command == "observe-access":
                 result = handoff_observe_access(args)

@@ -185,6 +185,43 @@ Launch assessment uses the frozen intent and predecessor observations without re
 Transfer remains blocked until a successor has an exact native binding, matching settings and applicable access, verified receiving, and accepted custody.
 This access unit does not observe a successor or perform a launch, transfer, predecessor close, or intent consumption.
 
+## Open one Codex candidate
+
+Candidate opening requires a fresh exact predecessor process and settings observation, unchanged readable context and guidance bytes, the exact canonical Git identity, and a bounded packet file.
+Pass the exact Codex executable and only the frozen model and effort selection in a structured JSON argv array:
+
+```sh
+replicator handoff open HANDOFF_ID \
+  --native-command '["/absolute/path/to/codex","-m","MODEL","-c","model_reasoning_effort=\"EFFORT\""]' \
+  --packet-file /absolute/path/to/handoff-packet.md
+```
+
+The accepted argv contains exactly the executable, `-m` model, and `-c` model reasoning effort selection.
+Do not pass shell text, extra options, environment overrides, approval flags, sandbox flags, or permission bypasses.
+Replicator adds a short read-only bootstrap naming the packet path and digest, then records the final argv, CMUX route, working directory, packet identity, and one attempt before asking CMUX to create a terminal in the frozen workspace.
+The CMUX terminal is configured to use the frozen canonical worktree.
+Only a returned UUID surface in the frozen workspace is recorded as `opened_unobserved`.
+An exception, timeout, malformed result, or mismatched workspace stays `opening_unconfirmed`; inspect the outcome and do not retry.
+The exact same request returns its saved state without another CMUX call.
+Neither a requested command nor a returned surface proves Codex started or received the packet.
+
+## Observe the Codex successor
+
+Run the command from the distinct Codex session on the exact recorded surface and worktree:
+
+```sh
+replicator handoff observe-successor HANDOFF_ID
+replicator handoff show HANDOFF_ID --json
+replicator handoff reconcile HANDOFF_ID --json
+```
+
+The observer binds the actual session, panel, workspace, worktree, CMUX hook generation, stable OS process identity, open rollout, and post-start settings turn.
+It records model, effort, approval policy, and sandbox policy from the native rollout and keeps them separate from the configured command.
+Model and effort must match the frozen choice or exact observed predecessor settings.
+Approval and sandbox differences remain visible and block transfer assessment.
+Native trust, effective permissions, successor scoped access, receiving, and custody are still independent unknowns and keep transfer blocked.
+Opening and observation do not consume the one-shot intent, transfer custody, enroll tools, or close the predecessor.
+
 Run the passive diagnostic outside Git or before configuring an intent:
 
 ```sh
