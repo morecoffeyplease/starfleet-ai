@@ -73,6 +73,23 @@ Existing sessions retain their launch records even if a later profile changes.
 Review plans bind to the current selection and repository scope, and any relevant change requires a new plan.
 Advanced review needs an authorization record matching both the current review scope and selection.
 
+### Inspect and reconcile interrupted Codex launches
+
+Use `launch-inspect` to read the saved launch, current owner, recorded process identities, native session and any linked Pattern Buffer task.
+Recovery requires the exact recorded launch owner, proven stopped dispatcher and child processes, a fresh complete CMUX observation of the exact native session as ended, and a consistent native binding.
+Use `launch-reconcile` with a new canonical UUID request key to record an `interrupted` or `abandoned` disposition after inspection confirms the stopped state.
+The interrupted record keeps the native exit code unknown and can continue only through an explicit `resume` after the same owner and stopped-state checks pass again.
+An abandoned launch cannot resume.
+Legacy launches and new launches whose CMUX owner or process identity could not be captured remain inspect-only.
+
+    model-preferences launch-inspect LAUNCH_ID
+    model-preferences launch-reconcile LAUNCH_ID --disposition interrupted --request-key CANONICAL_UUID
+
+Pattern Buffer state is read-only during inspection and reconciliation.
+If inspection reports an unfinished unbound task, use the exact `finish-task` and `task-status` commands it prints, then inspect again before reconciling abandonment.
+An active task bound to the exact ended native session may continue only through the explicit resume command shown by inspection.
+Finished Pattern Buffer tasks can be abandoned but never resumed.
+
 ### Track light-profile reviews by target and cycle
 
 The opt-in `claude-codex-light` profile keeps the Claude-Codex launch choices and advanced-review pair.

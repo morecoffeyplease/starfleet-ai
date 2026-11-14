@@ -36,6 +36,10 @@ class PreferencesTest(unittest.TestCase):
         native_guard = patch.object(mp.subprocess, "Popen", side_effect=isolated_popen)
         native_guard.start(); self.addCleanup(native_guard.stop)
         self.workspace, self.surface, self.pane = [str(uuid.uuid4()) for _ in range(3)]
+        caller_guard = patch.object(mp.App, "caller", return_value={
+            "workspace": self.workspace, "surface": self.surface,
+            "session": "fixture-caller-session", "harness": "codex"})
+        caller_guard.start(); self.addCleanup(caller_guard.stop)
         self.recipient = {"workspace": self.workspace, "surface": self.surface, "session": "outgoing", "harness": "claude"}
 
     def args(self, *args):
@@ -131,7 +135,7 @@ class PreferencesTest(unittest.TestCase):
 
         with patch.object(mp.shutil, "which", return_value="native"), \
                 patch.object(mp.subprocess, "run", side_effect=run), \
-                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd:
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs:
                              subprocess.CompletedProcess(argv, exit_code)):
             return self.call(*args)
 
@@ -292,7 +296,7 @@ class PreferencesTest(unittest.TestCase):
                 "--task-file", str(brief), "--review-plan", plan["id"], "--review-target", target,
                 "--review-cycle", cycle["id"])
         with patch.object(mp.shutil, "which", return_value="native"), \
-                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd:
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs:
                              subprocess.CompletedProcess(argv, 0)):
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 results = list(pool.map(lambda _: self.call(*args), range(2)))
@@ -386,7 +390,7 @@ class PreferencesTest(unittest.TestCase):
 
         with patch.object(mp.shutil, "which", return_value="native"), \
                 patch.object(mp.subprocess, "run", side_effect=run), \
-                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd:
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs:
                              subprocess.CompletedProcess(argv, 0)):
             result = self.call("dispatch", "--role", "advanced_review", "--slot", "1", "--cwd", str(repo),
                                "--task-file", str(brief), "--review-plan", advanced["id"],
@@ -555,7 +559,7 @@ class PreferencesTest(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0) if argv[0] == "codex" else original(argv, **kwargs)
         with patch.object(mp.shutil, "which", return_value="codex"), \
                 patch.object(mp.subprocess, "run", side_effect=run), \
-                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd: mp.subprocess.run(argv, cwd=cwd, env=env)):
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs: mp.subprocess.run(argv, cwd=cwd, env=env)):
             result = self.call(*command, "--review-authorization", "Authorize this one standard review launch")
         launch = self.app.state(f"launches/{result['launch']}", None)
         self.assertEqual(launch["choice"]["model"], "gpt-6.1-sol")
@@ -668,7 +672,7 @@ class PreferencesTest(unittest.TestCase):
         original = subprocess.run
         def run(argv, **kwargs):
             return subprocess.CompletedProcess(argv, 0) if argv[0] == "codex" else original(argv, **kwargs)
-        with patch.object(mp.shutil, "which", return_value="codex"), patch.object(mp.subprocess, "run", side_effect=run), patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd: mp.subprocess.run(argv, cwd=cwd, env=env)):
+        with patch.object(mp.shutil, "which", return_value="codex"), patch.object(mp.subprocess, "run", side_effect=run), patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs: mp.subprocess.run(argv, cwd=cwd, env=env)):
             result = self.call(*args, "--approval", approval["id"])
         self.assertEqual(self.app.state(f"launches/{result['launch']}", None)["choice"]["model"], "gpt-6-astra")
 
@@ -1224,7 +1228,7 @@ class PreferencesTest(unittest.TestCase):
     def test_dispatch_records_actual_choice_and_exit_status(self):
         self.activate("Codex-only")
         brief = self.root / "brief"; brief.write_text("fixture task")
-        with patch.dict(os.environ, STARFLEET_CONTEXT_DISPATCH="parent-fresh-token"), patch.object(mp.shutil, "which", return_value="codex"), patch.object(mp.subprocess, "run", return_value=subprocess.CompletedProcess([], 7)) as runner, patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd: mp.subprocess.run(argv, cwd=cwd, env=env)):
+        with patch.dict(os.environ, STARFLEET_CONTEXT_DISPATCH="parent-fresh-token"), patch.object(mp.shutil, "which", return_value="codex"), patch.object(mp.subprocess, "run", return_value=subprocess.CompletedProcess([], 7)) as runner, patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs: mp.subprocess.run(argv, cwd=cwd, env=env)):
             result = self.call("dispatch", "--role", "implementer", "--cwd", str(self.root), "--task-file", str(brief))
         self.assertEqual(result["exit_code"], 7)
         record = self.app.state(f"launches/{result['launch']}", None)
@@ -1242,7 +1246,7 @@ class PreferencesTest(unittest.TestCase):
         brief = self.root / "brief"; brief.write_text("Check correctness.")
         original = subprocess.run
         for slot in ("1", "2"):
-            with patch.object(mp.shutil, "which", return_value="harness"), patch.object(mp.subprocess, "run", wraps=mp.subprocess.run) as runner, patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd: mp.subprocess.run(argv, cwd=cwd, env=env)):
+            with patch.object(mp.shutil, "which", return_value="harness"), patch.object(mp.subprocess, "run", wraps=mp.subprocess.run) as runner, patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs: mp.subprocess.run(argv, cwd=cwd, env=env)):
                 # Keep real Git scope checks while replacing only the harness invocation.
                 def run(argv, **kwargs):
                     return subprocess.CompletedProcess(argv, 0) if argv[0] in ("codex", "claude") else original(argv, **kwargs)
@@ -1366,7 +1370,11 @@ class PreferencesTest(unittest.TestCase):
         injector = self.root / "context_injector.py"
         # This checks the boundary contract without changing or installing the owning app.
         injector.write_text("# fixture interface\n")
-        with patch.object(mp.shutil, "which", return_value="codex"), patch.object(mp.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as runner, patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd: mp.subprocess.run(argv, cwd=cwd, env=env)):
+        with patch.object(mp.shutil, "which", return_value="codex"), \
+                patch.object(mp, "process_birth_identity", return_value=None), \
+                patch.object(mp.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as runner, \
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs:
+                             mp.subprocess.run(argv, cwd=cwd, env=env)):
             self.call("dispatch", "--role", "implementer", "--cwd", str(self.root), "--task-file", str(brief),
                       "--context-injector", str(injector), "--owner-worktree", str(self.root))
         argv = runner.call_args.args[0]
@@ -1378,7 +1386,11 @@ class PreferencesTest(unittest.TestCase):
         self.activate("Codex-only")
         brief = self.root / "pattern-buffer-brief"; brief.write_text("Exact authorized brief.")
         injector = self.root / "pattern_buffer.py"; injector.write_text("# fixture interface\n")
-        with patch.object(mp.shutil, "which", return_value="codex"), patch.object(mp.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as runner, patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd: mp.subprocess.run(argv, cwd=cwd, env=env)):
+        with patch.object(mp.shutil, "which", return_value="codex"), \
+                patch.object(mp, "process_birth_identity", return_value=None), \
+                patch.object(mp.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as runner, \
+                patch.object(mp, "stream_codex", side_effect=lambda app, launch, argv, env, cwd, **kwargs:
+                             mp.subprocess.run(argv, cwd=cwd, env=env)):
             self.call("dispatch", "--role", "implementer", "--cwd", str(self.root), "--task-file", str(brief),
                       "--pattern-buffer", str(injector), "--owner-worktree", str(self.root))
         argv = runner.call_args.args[0]
