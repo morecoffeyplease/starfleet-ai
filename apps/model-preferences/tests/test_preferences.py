@@ -1374,41 +1374,109 @@ class PreferencesTest(unittest.TestCase):
         with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), self.assertRaises(mp.PreferenceError):
             self.call("hook", "--harness", "codex")
 
-    def test_handoff_new_tab_same_workspace_and_permission_gates(self):
-        self.activate(); self.app.save_state("orchestrators", {"lane": self.recipient})
-        successor = str(uuid.uuid4())
+    def test_handoff_delegates_to_replicator_and_keeps_owner_until_native_readiness(self):
+        self.activate()
+        self.app.save_state("orchestrators", {"lane": self.recipient})
+        worktree = self.repo()
         brief = self.root / "brief"; brief.write_text("Current task and evidence.")
         roadmap = self.root / "roadmap"; roadmap.write_text("Authoritative goal.")
-        tree = {"windows": [{"workspaces": [{"id": self.workspace, "panes": [{"id": self.pane, "surfaces": [{"id": self.surface}]}]}]}]}
-        def cmux(argv, stdin=None):
-            if "tree" in argv: return tree
-            if "new-surface" in argv:
-                self.assertEqual(argv[argv.index("--workspace") + 1], self.workspace)
-                self.assertEqual(argv[argv.index("--pane") + 1], self.pane)
-                self.assertNotIn("new-workspace", argv)
-                self.assertIn("STARFLEET_MODEL_LAUNCH=", argv[argv.index("--command") + 1])
-                return {"surface_id": successor, "workspace_id": self.workspace}
-            return {"caller": {"surface_id": successor}}
-        with patch.object(mp.App, "current", return_value=self.inventory()), patch.object(mp, "run_json", side_effect=cmux), patch.object(mp.shutil, "which", return_value="claude"):
-            record = self.call("handoff-start", "lane", "--brief", str(brief), "--roadmap", str(roadmap), "--cwd", str(self.root))
-        self.assertEqual(record["status"], "briefing")
-        incoming = dict(self.recipient, surface=successor, session="successor")
-        inv = self.inventory(); inv["items"].extend(self.inventory(incoming)["items"])
-        with patch.object(mp.App, "current", return_value=inv), patch.object(mp, "run_json", return_value={"caller": {"surface_id": successor}}):
-            with self.assertRaises(mp.PreferenceError): self.call("handoff-transfer", record["id"], "--outgoing-paused")
-            ready = self.call("handoff-ready", record["id"], "--remaining-questions", "none")
-        self.assertEqual(ready["status"], "ready")
-        with patch.object(mp.App, "current", return_value=inv), patch.object(mp, "run_json", return_value={"caller": {"surface_id": self.surface}}):
-            transferred = self.call("handoff-transfer", record["id"], "--outgoing-paused")
-        self.assertEqual(transferred["status"], "transferred")
-        self.assertEqual(self.app.state("orchestrators", {})["lane"]["surface"], successor)
-        with patch.object(mp.App, "current", return_value=inv), patch.object(mp, "run_json", return_value={"caller": {"surface_id": successor}}) as close:
-            with self.assertRaises(mp.PreferenceError):
-                self.call("handoff-close", record["id"], "--dependent-jobs-cleared", "--authorization", "")
-            self.assertFalse(any("close-surface" in c.args[0] for c in close.call_args_list))
-            closed = self.call("handoff-close", record["id"], "--dependent-jobs-cleared", "--authorization", "Authority approved fixture closure")
-            self.assertTrue(any("close-surface" in c.args[0] and "--force" in c.args[0] for c in close.call_args_list))
-        self.assertEqual(closed["status"], "closed")
+        scope = {
+            "seat": {
+                "name": "lane", "harness": self.recipient["harness"], "session_id": self.recipient["session"],
+                "workspace_id": self.recipient["workspace"], "panel_id": self.recipient["surface"],
+            },
+            "worktree": {
+                "root": str(worktree.resolve()), "git_dir": str((worktree / ".git").resolve()),
+                "common_dir": str((worktree / ".git").resolve()),
+            },
+        }
+        choice = {"kind": "preserve_observed_predecessor"}
+        intent = {
+            "schema_version": 1,
+            "protocol": "starfleet.replicator.successor-intent/v1",
+            "id": uuid.uuid4().hex,
+            "scope": scope,
+            "policy": "once",
+            "choice": choice,
+            "state": "configured",
+            "request_digest": mp.handoff_adapter._digest({
+                "protocol": "starfleet.replicator.successor-intent/v1",
+                "policy": "once",
+                "scope": scope,
+                "choice": choice,
+            }),
+            "native_generation": {"status": "unknown", "value": None, "evidence": None},
+            "observations": {
+                "predecessor_model": {"status": "unknown", "value": None, "evidence": None},
+                "predecessor_effort": {"status": "unknown", "value": None, "evidence": None},
+                "effective_permissions": {"status": "unknown", "value": None, "evidence": None},
+            },
+            "permission_requirement": {"kind": "match_predecessor_effective", "status": "unknown"},
+            "readiness": {"status": "unknown"},
+            "custody_acceptance": {"status": "not_applicable"},
+            "predecessor_cleanup": {"status": "not_applicable"},
+            "lifecycle_state": "configured",
+        }
+        snapshot = {key: value for key, value in intent.items() if key != "lifecycle_state"}
+        unknown = {"status": "unknown", "value": None, "evidence": None}
+        handoff = {
+            "schema_version": 1,
+            "protocol": "starfleet.replicator.handoff/v1",
+            "id": uuid.uuid4().hex,
+            "handoff_generation": uuid.uuid4().hex,
+            "intent_id": intent["id"],
+            "state": "frozen",
+            "frozen_at": 1.0,
+            "intent_digest": mp.handoff_adapter._digest(snapshot),
+            "intent_snapshot": snapshot,
+            "scope": scope,
+            "choice": choice,
+            "native_generation": unknown,
+            "native_predecessor_binding": {"status": "unknown", "hook_generation": None, "evidence": None},
+            "native_successor_binding": {"status": "unknown", "hook_generation": None, "evidence": None},
+            "observations": {
+                "predecessor_model": unknown,
+                "predecessor_effort": unknown,
+                "successor_model": unknown,
+                "successor_effort": unknown,
+                "effective_permissions": unknown,
+            },
+            "permission_requirement": {"kind": "match_predecessor_effective", "status": "unknown"},
+            "readiness": {"status": "blocked", "reason": "native_observations_unavailable"},
+            "launch": {"status": "not_started"},
+            "transfer": {"status": "not_applicable"},
+            "predecessor_cleanup": {"status": "not_applicable"},
+        }
+        report = {"schema_version": 2, "intent": intent}
+        with patch.object(mp.handoff_adapter, "_read_json", side_effect=[
+                report, {"handoff": handoff, "reused": False}]) as replicator, \
+                patch.object(mp, "locked", side_effect=AssertionError("new handoff freeze must stay pre-lock")), \
+                patch.object(mp, "run_json", side_effect=AssertionError("new handoff must not query CMUX")):
+            result = self.call("handoff-start", "lane", "--brief", str(brief), "--roadmap", str(roadmap),
+                               "--cwd", str(worktree))
+        self.assertEqual(replicator.call_count, 2)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertEqual(result["handoff"]["handle"], "replicator-v1:" + handoff["id"])
+        self.assertEqual(result["handoff"]["record"]["readiness"]["status"], "blocked")
+        self.assertFalse(result["native_launch_performed"])
+        self.assertFalse(result["briefing_recorded"])
+        self.assertEqual(self.app.state("orchestrators", {})["lane"], self.recipient)
+        self.assertFalse((self.state_dir / "handoffs" / f"{handoff['id']}.json").exists())
+        self.assertFalse((self.state_dir / "launches" / f"{handoff['id']}.json").exists())
+
+        native_report = json.dumps({
+            "schema_version": 1,
+            "protocol": "starfleet.replicator.handoff/v1",
+            "handoff": handoff,
+        })
+        response = subprocess.CompletedProcess([], 0, stdout=native_report, stderr="")
+        with patch.object(mp.handoff_adapter, "_call", return_value=response), \
+                patch.object(mp, "locked", side_effect=AssertionError("blocked versioned handoff stays pre-lock")), \
+                patch.object(mp, "run_json", side_effect=AssertionError("blocked transition must not query CMUX")):
+            with self.assertRaisesRegex(mp.handoff_adapter.HandoffAdapterError, "readiness blocked"):
+                self.call("handoff-ready", result["handoff"]["handle"], "--remaining-questions", "none")
+        self.assertEqual(self.app.state("orchestrators", {})["lane"], self.recipient)
 
     def test_close_error_after_tab_removal_is_reconciled_without_retry(self):
         self.activate()
