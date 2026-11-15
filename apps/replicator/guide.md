@@ -101,7 +101,7 @@ Preflight does not replace these tool-specific owner checks.
 ## Record applicable resources
 
 Query authoritative owner records instead of relying only on the outgoing agent's memory.
-Check Pattern Buffer owner tasks and native child sessions, exact Hailing Frequencies bindings, standing context and checkpoint ownership, Warp requests and helpers, Temporal Beacon timers and occurrences, owned Agent Notify conversations, Discord Watch generations and queued replies, Policy Guard seat attachments, Git worktrees, and maintained plans.
+Check Pattern Buffer owner tasks and native child sessions, exact Hailing Frequencies bindings, standing context and checkpoint ownership, Warp requests and helpers, Temporal Beacon timers and occurrences, owned Agent Notify conversations, Discord Watch generations and queued replies, Policy Guard seat attachments, Model Preferences owner registration and adoption, Away Mode lane ownership, Git worktrees, and maintained plans.
 Inspect only records owned by the outgoing session or resources explicitly in scope for this handoff.
 Enroll only the exact successor when a documented tool requires enrollment for this handoff.
 Do not blanket-enroll sessions or tools.
@@ -213,7 +213,12 @@ Use `--harness claude` for Claude.
 Do not use `--include-existing`, enroll a guessed identity, reset another owner's cutoff, or start another worker.
 Verify the exact saved binding separately from actual native attention receipt.
 
-The outgoing owner uses the existing Pattern Buffer release command only for the exact current enrollment:
+Inspect the exact current Pattern Buffer enrollment before choosing release and adoption.
+
+If `enrollment-status` reports no enrollment because standing context comes from the worktree default, there is nothing to release or adopt.
+Preserve that standing-context mode and enroll the successor's own checkpoint through the documented workflow.
+Do not invent an enrollment ID or create an enrollment merely to fill a handoff row.
+Run the following release command only when an exact enrollment exists:
 
 ```sh
 pattern-buffer --cwd /worktree enrollment-release --harness codex --session OUTGOING_SESSION_ID --enrollment-id ENROLLMENT_ID --next-harness codex --next-session SUCCESSOR_SESSION_ID --evidence HANDOFF_REFERENCE
@@ -227,7 +232,7 @@ An unenrolled successor can report an unassigned role and fail a checkpoint owne
 Distinguish those status results from a literal native standing-context STOP alarm.
 If an alarm occurs, follow its supported binding-recovery instructions before dependent work.
 
-The successor adopts that exact enrollment from its own session with reviewed standing context and a fresh checkpoint:
+When an exact enrollment was released to it, the successor adopts it from its own session with reviewed standing context and a fresh checkpoint:
 
 ```sh
 pattern-buffer --cwd /worktree enrollment-adopt --harness codex --session SUCCESSOR_SESSION_ID --enrollment-id ENROLLMENT_ID --context-file /path/to/reviewed-standing.md --checkpoint-file /path/to/reviewed-checkpoint.md --evidence HANDOFF_REFERENCE
@@ -280,6 +285,27 @@ Do not inherit the outgoing owner's receipt or claim that a configured hook prov
 An explicit delivery-adapter probe proves only that adapter path.
 A successful Git command does not prove that a native hook activated.
 Verify a covered native action through its supported owner workflow.
+
+## Finish other applicable owner registrations
+
+Read the installed Model Preferences and Away Mode guides and inspect their actual owner records when those tools apply to the seat.
+Complete applicable successor registration before its first new worker dispatch or proposed roadmap work.
+Do not cancel already running work merely to satisfy setup.
+
+For a manual succession, use the successor's own `model-preferences enroll-self ORCHESTRATOR_NAME` workflow.
+Use `--replace` only after status confirms the intended name's prior binding and the authorized handoff covers replacing it.
+Read the current saved profile through `startup --expect-profile EXPECTED_PROFILE`, then acknowledge its fresh selection with `adopt ORCHESTRATOR_NAME --selection CURRENT_SELECTION`.
+Preserve existing configuration and state prefixes, and do not change a global profile to match the native session.
+This registration and adoption do not transfer tasks or prove native model parity.
+Do not invent a Model Preferences handoff intent for a successor already launched through this manual procedure.
+If its exact-owner guard finds multiple non-ended agents on the successor's surface, preserve the refusal and let authorized child work finish normally before a fresh sole-owner check.
+Retiring a predecessor on another tab does not resolve that shared-surface condition.
+
+For an authorized Away Mode handoff, the successor uses the documented same-lane enrollment with its own exact native identity.
+Do not unenroll the predecessor first: same-lane replacement preserves its enrollment and transition evidence in `previous_enrollments`.
+Read `away-mode context`, acknowledge only the actual current transition from the successor's own session, and verify the new binding and archived predecessor evidence.
+Do not copy an acknowledgment, create a duplicate lane, or change user presence during handoff.
+If an unenroll-and-recreate sequence already occurred, record that sequence and its retained evidence honestly instead of claiming the tool preserved an archive.
 
 ## Preserve owned work and conversations
 
