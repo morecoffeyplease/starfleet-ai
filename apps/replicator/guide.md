@@ -133,6 +133,17 @@ It checks relevance to the approved outcome and identifies repeated repairs, dup
 It checks the outgoing owner's answers and existing decisions before asking the user a question that has already been resolved.
 It concludes with one disposition: continue, simplify within authority, investigate one bounded material uncertainty, or ask for a genuine scope or authority decision.
 It records the judgment and material answers in the existing checkpoint or roadmap.
+
+After completing this assessment, send the user your opinion through the current Agent Notify workflow with explicit Discord delivery (`--delivery discord`), including when the user is local.
+State whether the work is on track or off track against the approved outcome and next deliverable, the concrete evidence behind that opinion, any material uncertainty, and the recommended next action.
+If the evidence cannot support a verdict, say what remains unknown instead of inventing confidence.
+Present a concrete proposal to continue the roadmap or change course, explain the tradeoffs, and discuss it with the user in Discord.
+Use an existing owning thread for this assessment, or open one conversation when none exists, and keep follow-up discussion in that thread with an owning reply path.
+Wait for the user's specific approval of the proposal before starting or resuming the proposed work, unless the user explicitly waived this discussion and approval requirement in advance for that work.
+An on-track opinion, a successful handoff, a general assignment, or silence is not that approval or waiver.
+Record the conversation reference, approved scope and constraints, or the explicit advance waiver in the existing checkpoint or roadmap.
+While waiting, preserve running jobs, resource custody and human holds; continue only independent work already authorized outside the proposal.
+
 Only work or retirement that depends on a material unresolved issue stays on hold.
 Do not rewrite the goal, weaken required proof, expand repair authority, or add a model, panel, or mandatory questionnaire.
 
@@ -166,6 +177,7 @@ From a source checkout, use `python3 apps/replicator/replicator.py guide --print
 Let the successor discover the maintained procedure and independently inspect the handoff records.
 Keep private launch recipes and transcripts out of the procedure.
 After startup, inspect the actual native session and verify its provider, model, effort, and effective permissions.
+Name the successor's tab using the outgoing orchestrator's established naming convention, preserving the lane and model identity and updating the session date when the convention includes one.
 Inspect flags added by the installed wrapper as well as the flags supplied by the caller.
 Resolve any difference from the user's authorized permission and trust policy before transferring ownership.
 Use the integration's normal permission dialogs when authorized.
