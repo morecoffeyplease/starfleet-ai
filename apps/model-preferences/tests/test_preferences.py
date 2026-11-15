@@ -789,6 +789,102 @@ class PreferencesTest(unittest.TestCase):
         self.assertEqual(unreadable["approval_records_status"], "unknown")
         self.assertEqual(unreadable["approval_status"], "unknown")
 
+    def test_review_cli_guidance_ignores_only_proven_unrelated_legacy_records(self):
+        self.activate("Codex-only")
+        repo = self.repo()
+        env = dict(os.environ)
+
+        def cli(*args):
+            result = self.run_cli(env, *args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        plan = cli("review-plan", "--cwd", str(repo), "--base", "HEAD",
+                   "--facts", str(self.facts(money=True)))
+        approvals = self.state_dir / "approvals"
+        approvals.mkdir(exist_ok=True)
+
+        def snapshot(directory):
+            return {str(path.relative_to(directory)): path.read_bytes()
+                    for path in directory.rglob("*") if path.is_file()}
+
+        def inspect_readonly():
+            before_config = snapshot(self.config_dir)
+            before_state = snapshot(self.state_dir)
+            report = cli("review-inspect", plan["id"])
+            self.assertEqual(snapshot(self.config_dir), before_config)
+            self.assertEqual(snapshot(self.state_dir), before_state)
+            return report["review_guidance"]
+
+        advanced = cli("approve-review", plan["id"], "--authorization", "Synthetic authority approved advanced review.")
+        advanced_guidance = inspect_readonly()
+        self.assertEqual(advanced_guidance["approval_status"], "approved")
+        self.assertEqual(advanced_guidance["approval_records_status"], "available")
+        (approvals / f"{advanced['id']}.json").unlink()
+
+        standard = cli("approve-review", plan["id"], "--standard-instead",
+                       "--authorization", "Synthetic authority selected standard review.")
+        standard_guidance = inspect_readonly()
+        self.assertEqual(standard_guidance["approval_status"], "standard_instead")
+        self.assertEqual(standard_guidance["review_role"], "standard_review")
+        self.assertIn(standard["id"], standard_guidance["next_action_command"])
+
+        unrelated_records = {
+            "different_scope": {
+                "id": "f" * 32,
+                "scope": mp.digest("unrelated scope"),
+                "selection": plan["selection"],
+                "role": "advanced_review",
+            },
+            "different_selection": {
+                "id": "e" * 32,
+                "scope": plan["scope"],
+                "selection": mp.digest("unrelated selection"),
+                "role": "advanced_review",
+            },
+        }
+        for label, record in unrelated_records.items():
+            path = approvals / f"000-{label}.json"
+            path.write_text(json.dumps(record))
+            guidance = inspect_readonly()
+            self.assertEqual(guidance["approval_records_status"], "available", label)
+            self.assertEqual(guidance["approval_status"], "standard_instead", label)
+            path.unlink()
+
+        unknown_records = {
+            "matching_incomplete": {
+                "id": "d" * 32,
+                "scope": plan["scope"],
+                "selection": plan["selection"],
+                "role": "advanced_review",
+            },
+            "missing_identity": {
+                "id": "c" * 32,
+                "scope": mp.digest("unrelated scope"),
+                "role": "advanced_review",
+            },
+            "invalid_identity": {
+                "id": "b" * 32,
+                "scope": "not-a-digest",
+                "selection": mp.digest("unrelated selection"),
+                "role": "advanced_review",
+            },
+            "nonobject": [],
+        }
+        for label, record in unknown_records.items():
+            path = approvals / f"000-{label}.json"
+            path.write_text(json.dumps(record))
+            guidance = inspect_readonly()
+            self.assertEqual(guidance["approval_records_status"], "unknown", label)
+            self.assertEqual(guidance["approval_status"], "unknown", label)
+            path.unlink()
+
+        unreadable = approvals / "000-unreadable.json"
+        unreadable.write_text("{")
+        guidance = inspect_readonly()
+        self.assertEqual(guidance["approval_records_status"], "unknown")
+        self.assertEqual(guidance["approval_status"], "unknown")
+
     def test_light_review_cli_guidance_uses_frozen_cycle_slots_and_context(self):
         self.activate("claude-codex-light")
         repo = self.repo()
