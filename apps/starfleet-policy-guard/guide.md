@@ -100,6 +100,42 @@ Disclosing an unknown as an assumption or uncertainty does not complete a prereq
 The `uncertainty` list may still record honest tool-capability limits or future outcomes, such as a later authenticated comment read being unavailable.
 Do not claim future repair verification is complete.
 
+### Starfleet handoff acceptance
+
+For `github.com/morecoffeyplease/starfleet-ai`, record concise successor acceptance in the existing evidence packet after the supported owner rebind.
+The default checklist's `packet_successor_acceptance_repositories` selects this policy only for Starfleet.
+Other repositories retain their existing publication requirements.
+Existing publication references and owner history remain preserved.
+
+```json
+{
+  "handoff_acceptance": {
+    "version": 1,
+    "owner": {"harness": "codex", "session_id": "ACTUAL_CURRENT_SESSION"},
+    "from_owner": {"harness": "codex", "session_id": "ACTUAL_PREDECESSOR_SESSION"},
+    "candidate": "FULL_CURRENT_CANDIDATE_SHA",
+    "summary": "Accepted the reconciled work and current evidence in this handoff packet.",
+    "repair_history_ref": "Existing repair history with cumulative counts and remaining gaps.",
+    "scope_and_holds_ref": "Existing approved scope and unchanged human holds."
+  }
+}
+```
+
+Run the existing `record --evidence PATH` command from the exact incoming owner session.
+Use the current candidate's successful canonical verification, including an explicit successful unaffected verdict when applicable.
+The report preserves its normal candidate, target, packet, policy and evidence freshness checks.
+The recorded predecessor must connect to the current native owner through the existing supported owner history.
+When Pattern Buffer has required reads, complete them through its native owner flow before recording.
+The report uses those current receipts directly, without copying read hashes into another attestation.
+Changed required-read bytes invalidate the recorded acceptance.
+
+No successor-render command, new public comment, copied predecessor publication hash or comment reread is needed for this selected policy.
+Keep the existing handoff packet as the acceptance record.
+This does not approve a new repair batch, reset repair counts, waive a human hold, grant delivery authority or prove comprehension.
+Immutable installed seats still require their supported source upgrade before this behavior is available.
+
+### Published successor validation for other policies
+
 After a supported `rebind-owner` handoff on an already adopted target, the current native owner can use `stage: "successor_validation"` to reconcile work that is already complete.
 The `prior_publication_ref` must be an exact copy of the current `guidance_attestation_ref` object shown in the owner session's `status` JSON, including any nested predecessor reference.
 The packet must include `repair_history_ref` and a `reconciliation` object with nonempty `inherited_work`, `repair_history`, `scope_and_holds`, and `current_owner_work` entries.
@@ -218,8 +254,8 @@ For each later PR, discover its current binding and validate its own published c
 Opening and repair-batch publications remain bound to their original owner and PR; after a supported owner handoff, successor validation creates a separate current-owner publication that links the exact predecessor.
 There is no disable or fallback flag.
 
-An adopted target refuses covered ready or merge unless its current packet attestation, exact local reread bytes and per-PR publication reference match.
-Each covered action reads the exact authenticated GitHub comment using the captured `gh` executable with a bounded timeout; unavailable, edited, deleted or mismatched comments fail closed.
+Under the published policy, an adopted target refuses covered ready or merge unless its current packet attestation, exact local reread bytes and per-PR publication reference match.
+Under that policy, each covered action reads the exact authenticated GitHub comment using the captured `gh` executable with a bounded timeout; unavailable, edited, deleted or mismatched comments fail closed.
 When evaluating a recorded report, ordinary `status` checks the attestation packet and reread bytes locally without querying GitHub for comment freshness.
 The explicit `attestation-start-check` and each covered ready or merge action still make a fresh authenticated read.
 The ordinary report still checks candidate freshness and preserves its existing checklist-gap behavior.

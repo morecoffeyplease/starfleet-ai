@@ -561,7 +561,46 @@ def check_guidance_publication_comment(publication, state, executable, label, *,
     return remote
 
 
+def packet_successor_acceptance(state, receipt, packet):
+    policy = json.loads(Path(receipt['policy_path']).read_text())
+    ref = github.reference(state['pr_url'], 'pull')
+    repositories = policy.get('packet_successor_acceptance_repositories', [])
+    if not isinstance(repositories, list) or any(not isinstance(value, str) for value in repositories):
+        raise ValueError('Malformed packet successor acceptance repository policy')
+    if ref['host'] + '/' + ref['repo'] not in repositories:
+        raise ValueError('This repository retains its published successor validation policy')
+    acceptance = packet.get('handoff_acceptance')
+    if not isinstance(acceptance, dict) or acceptance.get('version') != 1:
+        raise ValueError('The current handoff packet needs a version 1 handoff_acceptance')
+    owner = guidance_owner_key(state.get('lane_owner'), 'Current lane owner')
+    if guidance_owner_key(acceptance.get('owner'), 'Handoff acceptance') != owner:
+        raise ValueError('Handoff acceptance belongs to a different native owner')
+    previous = guidance_owner_key(acceptance.get('from_owner'), 'Handoff predecessor')
+    guidance_handoff_path(state, previous, owner)
+    for key in ('summary', 'repair_history_ref', 'scope_and_holds_ref'):
+        delivery.text(acceptance, key)
+    report = receipt['report']
+    if acceptance.get('candidate') != report['snapshot']['head'] or not delivery.opening_report_ready(report):
+        raise ValueError('Handoff acceptance requires the current clean candidate and successful canonical verification')
+    return acceptance
+
+
+def require_packet_successor_acceptance(state, cwd):
+    receipt = state.get('receipt')
+    delivery_runs.check(receipt, cwd, state['pr_url'])
+    packet = json.loads(Path(receipt['packet_path']).read_text())
+    acceptance = packet_successor_acceptance(state, receipt, packet)
+    for entry in (receipt.get('required_reads') or {}).get('entries', []):
+        if hashlib.sha256(Path(entry['path']).read_bytes()).hexdigest() != entry['sha256']:
+            raise ValueError('Required read changed after handoff acceptance; reread and record the current packet')
+    return acceptance
+
+
 def require_guidance_attestation(state, cwd, *, local_inspection=False):
+    receipt = state.get('receipt')
+    if isinstance(receipt, dict) and receipt.get('handoff_acceptance') is True:
+        require_packet_successor_acceptance(state, cwd)
+        return
     published = state.get('guidance_attestation_ref')
     if (not isinstance(published, dict) or type(published.get('version')) is not int or
             published['version'] != 1):
@@ -2702,9 +2741,15 @@ def record(args):
             owner = state['lane_owner']
             receipt_report = delivery.required_reads_status(state['root'], owner['harness'],
                                                             owner['session_id'])
+            if 'handoff_acceptance' in packet:
+                packet = {**packet, 'guidance_attestation': {
+                    'reread': delivery.required_read_packet_entries(receipt_report)}}
             receipt_context = delivery.require_required_read_receipts(
                 receipt_report, packet, evidence_path.parent)
         receipt = delivery_runs.run(args.cwd, state['base_ref'], state['pr_url'], args.evidence, args.policy)
+        if packet is not None and 'handoff_acceptance' in packet:
+            packet_successor_acceptance(state, receipt, packet)
+            receipt['handoff_acceptance'] = True
         if receipt_context is not None:
             attestation = packet['guidance_attestation']
             receipt['required_reads'] = {**receipt_context, 'stage': attestation.get('stage')}
@@ -3148,12 +3193,13 @@ def status(cwd, session_id=None, state=None, native_context=None):
     published_context = publication.get('required_reads') if isinstance(publication, dict) else None
     report_receipt = (state or {}).get('receipt')
     recorded_context = report_receipt.get('required_reads') if isinstance(report_receipt, dict) else None
-    receipt_context = published_context if isinstance(published_context, dict) else recorded_context
+    receipt_context = (recorded_context if isinstance(report_receipt, dict) and report_receipt.get('handoff_acceptance')
+                       else published_context if isinstance(published_context, dict) else recorded_context)
     if isinstance(receipt_context, dict):
         entries = receipt_context.get('entries')
         result['guidance_attestation_receipts'] = {
-            'stage': (publication.get('stage') if isinstance(publication, dict) else
-                      receipt_context.get('stage')),
+            'stage': ('handoff_acceptance' if isinstance(report_receipt, dict) and report_receipt.get('handoff_acceptance')
+                      else publication.get('stage') if isinstance(publication, dict) else receipt_context.get('stage')),
             'list_sha256': receipt_context.get('list_sha256'),
             'generation': receipt_context.get('generation'),
             'observed_at': receipt_context.get('observed_at'),

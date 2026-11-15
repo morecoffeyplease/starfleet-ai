@@ -14,6 +14,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  STARFLEET_VERIFY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'HEAD^' }}
+
 jobs:
   python-matrix:
     name: Prepare Python component matrix
@@ -21,6 +24,8 @@ jobs:
     timeout-minutes: 35
     outputs:
       components: ${{ steps.matrix.outputs.value }}
+      has-python: ${{ steps.matrix.outputs.has-python }}
+      markup: ${{ steps.matrix.outputs.markup }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -32,15 +37,31 @@ jobs:
         with:
           python-version: "3.10"
       - name: Test verification runner
-        run: python3 -m unittest scripts.tests.test_verify -v
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Check documentation and privacy
+        run: python3 scripts/verify.py --check-docs
       - id: matrix
         name: Build component matrix
         shell: bash
-        run: echo "value=$(python3 scripts/verify.py --print-python-matrix)" >> "$GITHUB_OUTPUT"
+        run: |
+          python3 scripts/verify.py --plan > "$RUNNER_TEMP/verification-plan.json"
+          cat "$RUNNER_TEMP/verification-plan.json"
+          python3 - <<'PYPLAN' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          plan = json.loads((Path(os.environ["RUNNER_TEMP"]) / "verification-plan.json").read_text())
+          matrix = subprocess.check_output(["python3", "scripts/verify.py", "--print-python-matrix"], text=True).strip()
+          print("value=" + matrix)
+          print("has-python=" + str(bool(plan["python_checks"])).lower())
+          print("markup=" + str(plan["markup"]).lower())
+          PYPLAN
 
   python-components:
     name: Python component (${{ matrix.os }}, Python ${{ matrix.python }}, ${{ matrix.check }})
     needs: python-matrix
+    if: needs.python-matrix.outputs.has-python == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     strategy:
@@ -102,6 +123,7 @@ jobs:
 
   markup:
     name: Starfleet Markup
+    needs: python-matrix
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -109,20 +131,29 @@ jobs:
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Report unaffected Markup
+        if: needs.python-matrix.outputs.markup != 'true'
+        run: echo 'Starfleet Markup runtime checks unaffected by this candidate.'
+      - if: needs.python-matrix.outputs.markup == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
       - name: Install locked dependencies
+        if: needs.python-matrix.outputs.markup == 'true'
         working-directory: apps/starfleet-markup
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Run source and unit verification
+        if: needs.python-matrix.outputs.markup == 'true'
         working-directory: apps/starfleet-markup
         run: npm run verify
       - name: Install Chromium and Linux libraries
+        if: needs.python-matrix.outputs.markup == 'true'
         working-directory: apps/starfleet-markup
         run: ./node_modules/.bin/playwright install --with-deps chromium
       - name: Run browser verification
+        if: needs.python-matrix.outputs.markup == 'true'
         working-directory: apps/starfleet-markup
         env:
           STARFLEET_MARKUP_EVIDENCE: ${{ runner.temp }}/starfleet-markup-evidence

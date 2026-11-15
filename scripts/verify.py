@@ -10,6 +10,12 @@ import subprocess
 import sys
 import tempfile
 
+try:
+    from scripts import affected, check_docs
+except ModuleNotFoundError:
+    import affected
+    import check_docs
+
 ROOT = Path(__file__).resolve().parents[1]
 MARKUP = ROOT / "apps" / "starfleet-markup"
 
@@ -45,16 +51,17 @@ def select_python_checks(name=None):
     raise ValueError(f"Unknown Python check: {name!r}")
 
 
-def python_component_matrix():
+def python_component_matrix(selected=None):
     return [
         {"os": operating_system, "python": version, "check": label}
         for operating_system, version in PYTHON_PLATFORMS
         for label, _ in PYTHON_CHECKS
+        if selected is None or label in selected
     ]
 
 
-def python_verification_succeeded(component_result, preparation_result):
-    return component_result == "success" and preparation_result == "success"
+def python_verification_succeeded(component_result, preparation_result, *, required=True):
+    return component_result == ("success" if required else "skipped") and preparation_result == "success"
 
 
 def run(label, command, cwd=ROOT, env=None):
@@ -74,7 +81,7 @@ def verify_python(check_name=None):
 
 def verify_runner_tests():
     label = "Verification runner tests"
-    code = run(label, [sys.executable, "-m", "unittest", "scripts.tests.test_verify", "-v"])
+    code = run(label, [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])
     return [(label, code)] if code else []
 
 
@@ -134,6 +141,11 @@ def verify_markup():
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", default=os.environ.get("STARFLEET_VERIFY_BASE") or None,
+                        help="compare this exact commit to HEAD, including local changes")
+    parser.add_argument("--all", action="store_true", help="run the complete maintained suite")
+    parser.add_argument("--plan", action="store_true", help="print affected verification scope without running checks")
+    parser.add_argument("--check-docs", action="store_true", help="run documentation, link and portable-example privacy checks")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--python-only",
@@ -163,12 +175,24 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
+    paths, base = affected.changed_paths(ROOT, args.base)
+    if args.check_docs:
+        return check_docs.verify(ROOT, base if paths is not None else None)
+    components, reason = affected.select_components(paths) if paths is not None else (set(affected.COMPONENT_CHECKS), "change base unavailable; full verification")
+    if args.all:
+        components, reason = set(affected.COMPONENT_CHECKS), "explicit full verification"
+    selected = {label for component in components for label in affected.COMPONENT_CHECKS[component]}
+    if args.plan:
+        print(json.dumps({"base": base, "reason": reason, "components": sorted(components),
+                          "python_checks": sorted(selected), "markup": "starfleet-markup" in components}))
+        return 0
+
     if args.print_python_matrix:
-        print(json.dumps({"include": python_component_matrix()}, separators=(",", ":")))
+        print(json.dumps({"include": python_component_matrix(selected)}, separators=(",", ":")))
         return 0
     if args.require_python_results is not None:
         component_result, preparation_result = args.require_python_results
-        if python_verification_succeeded(component_result, preparation_result):
+        if python_verification_succeeded(component_result, preparation_result, required=bool(selected)):
             return 0
         print(
             "Python verification requires successful component and preparation jobs "
@@ -179,10 +203,21 @@ def main(argv=None):
         return 1
 
     failures = []
+    print(f"Verification scope: {reason}", flush=True)
+    print("Unaffected runtime checks: " + ", ".join(sorted(set(affected.COMPONENT_CHECKS) - components)), flush=True)
     if args.python_check is None:
         failures.extend(verify_runner_tests())
-    failures.extend(verify_python(args.python_check))
-    if not (args.python_only or args.python_check):
+        if check_docs.verify(ROOT, base if paths is not None else None):
+            failures.append(("Documentation and privacy", 1))
+        if selected == {label for label, _ in PYTHON_CHECKS}:
+            failures.extend(verify_python(None))
+        else:
+            for label, _ in PYTHON_CHECKS:
+                if label in selected:
+                    failures.extend(verify_python(label))
+    else:
+        failures.extend(verify_python(args.python_check))
+    if not (args.python_only or args.python_check) and "starfleet-markup" in components:
         failures.extend(verify_markup())
     if failures:
         print("\nVerification failures:", file=sys.stderr)

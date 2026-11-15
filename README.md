@@ -39,24 +39,32 @@ Read the selected component documentation for its required CMUX capabilities, su
 Python 3.10 or newer is required by the repository-wide verification suite.
 Starfleet Markup requires Node.js 22 or newer for its local source workflow.
 
-## Set up an orchestrator with all Starfleet tools
+## Set up tools for the task and role
 
-When the user asks an orchestrator to install or set up Starfleet, cover every component listed above unless the user names a smaller tool set or explicitly leaves a tool disabled.
-Do not stop after Pattern Buffer and Hailing Frequencies.
-Report an explicitly excluded tool as "Skipped by user instruction" and leave it disabled.
-Exclude it from setup completeness failures, and explain any dependent capability that remains unavailable.
+Set up the tools needed for the assigned task and native role.
+Reuse working installations and unchanged registrations before installing or configuring anything.
+A source checkout does not require every component to be enabled.
+When the user explicitly requests all Starfleet tools, cover the full checklist below.
+Preserve an explicitly disabled tool and explain any dependent capability that remains unavailable.
 
-1. Read each component's maintained setup and usage instructions, including its installed `guide --print` command when available.
-2. Install each tool that provides a runtime, or verify that its existing installation is current for the coordinated release.
-   Use the component's supported installer and preserve existing configuration and owned state.
-3. Complete every supported registration for your actual native session, worktree and orchestrator role.
-   Reuse unchanged registrations, and use the documented owner handoff when replacing a session.
-   Register packaged skills with the current harness where the component requires agent discovery.
-4. Verify each installation and registration with the component's documented status, doctor or enrollment command.
-   Check shared worker health without starting a second worker.
-5. Report each component as ready, blocked or without a registration step for this role.
-   Name missing credentials, unsupported capabilities, explicit holds and required native trust interactions instead of silently skipping a tool.
-   Keep configured readiness separate from observed message or feedback receipt.
+1. Select the tools needed by the actual task, role and resources.
+   For human contact, follow Agent Notify's companion Hailing Frequencies and Discord Watch requirements.
+   For checkpoint recovery, follow Pattern Buffer's companion enrollment requirements.
+   Use Warp-drive for scheduled local commands, Policy Guard for covered delivery, and Replicator for an authorized handoff.
+   Use Temporal Beacon when a timed continuation is needed and Markup when a review document is requested.
+2. Read the selected components' maintained instructions, including installed `guide --print` commands when available.
+3. Verify existing installations and registrations through the documented read-only diagnostics.
+   Install or update only what the selected work needs, using supported installers and preserving owned state.
+4. Complete only registrations applicable to the actual native session, role, checkout or existing resource.
+   Use the supported owner handoff when replacing a session.
+5. Check required shared worker health without starting a second worker.
+   Report relevant missing credentials, unsupported capabilities, human holds and native trust interactions.
+   Keep configured readiness separate from observed delivery.
+
+Treat the checklist as an inventory, not a requirement to create resources or repeat setup at every task.
+For a selected tool set, use Starfleet Doctor's repeatable `--skip TOOL` option to exclude tools outside that set.
+Required dependencies remain visible even when a tool is skipped.
+Record the selected scope and any material gaps in the existing task handoff rather than creating a separate setup report.
 
 Use the following checklist with the linked component instructions.
 
@@ -114,7 +122,7 @@ Configuration, submission, and observed receipt are separate facts.
 
 ## Verify the source
 
-Run the full aggregate verification from the repository root:
+Run the canonical verification from the repository root:
 
 ```sh
 python3 scripts/verify.py
@@ -126,12 +134,25 @@ The Python-only portion is also available when the Node.js browser suite is outs
 python3 scripts/verify.py --python-only
 ```
 
-The aggregate runner checks its own selection and matrix behavior, then uses each component's maintained verification and test commands.
-Starfleet Markup verification uses its checked-in npm lockfile and a local Chromium browser.
-The test suite uses synthetic data and does not contact a live model, CMUX session, or Discord account.
-Hosted GitHub Actions runs each maintained Python command in its own job across Ubuntu and macOS with an overall parallel cap of four.
-The existing Python verification checks require the complete component matrix and its preparation to succeed.
-Hosted GitHub Actions is the routine CI path; local verification is welcome.
+The runner compares the candidate with the merge base of `origin/main`, including staged, unstaged and untracked inputs.
+Use `--base COMMIT` to select the exact comparison base and `--plan` to inspect the selection without running checks.
+Missing change information and unclassified paths select the full suite.
+Use `--all` to request full verification explicitly.
+
+Documentation-only changes run the runner's own tests, local Markdown links, portable-example privacy checks and whitespace checks.
+They report runtime checks as unaffected, not as tests passed.
+Component changes select that component and its transitive dependents from `scripts/affected.py`.
+Shared runtime, hook and custody implementations, verification infrastructure and unknown inputs retain broad verification.
+Update the dependency map when adding a cross-component dependency.
+
+The selected runtime checks use each component's maintained commands.
+Selected Markup verification uses its checked-in npm lockfile and a local Chromium browser.
+The suite uses synthetic data without contacting live models, CMUX sessions or Discord accounts.
+Hosted GitHub Actions uses the same exact-base selection and preserves the required Python and Markup check names.
+An unaffected required check reports its scope and succeeds only after successful preparation.
+Source scanning still runs for every candidate, including documentation-only changes.
+Local portable-example checks do not replace the hosted credential scanner.
+Native pilots and observed delivery remain separate evidence.
 
 ## Contributing
 
