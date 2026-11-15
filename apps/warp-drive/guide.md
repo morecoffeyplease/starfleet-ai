@@ -46,6 +46,11 @@ Use `warp-drive doctor` to inspect sample freshness, stale helpers, the optional
 Doctor counts pending and unavailable completion wakes separately from uncertain sends.
 Use `warp-drive inspect REQUEST_ID` to see one completion's wake status and event history.
 Status and inspect are passive observations and do not attach to or replace a helper.
+Read each request's `helper_diagnostic` for its attachment classification, evidence and next action: `never_attached`, `stale_attached_helper`, and `unknown_history` distinguish a known first attach, a stale prior attach, and insufficient or conflicting history.
+For a waiting request with no launch intent, `recovery_command` prints an exact-owner `attach --detach` command only when helper history is known and one valid Hailing enrollment matches the stored owner.
+Running that command attaches to the existing request; any existing hold or delay remains in force, and admission is not guaranteed.
+Fresh helpers are not replacement candidates, and no attach command is printed after launch intent or a start timestamp.
+For launched work, follow the diagnostic's inspect and reconcile guidance after obtaining owner evidence; never replay an uncertain command.
 Use `status` or `inspect` for the current point-in-time admission snapshot; initial `run` output cannot predict a later scheduler decision.
 The snapshot shows host sample freshness, observed and projected CPU, memory pressure, reserved claim counts, the configured warning heavy limit, estimated active managed contributors, and current candidate constraints.
 The memory-pressure field reports `normal`, `warning`, `critical`, or `unknown`.
