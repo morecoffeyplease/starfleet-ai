@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -67,6 +68,14 @@ class InstallTests(unittest.TestCase):
             )
             self.assertEqual(guide.stdout.rstrip("\n"), expected_guide.rstrip("\n"))
             self.assertIn("no personal-name defaults", guide.stdout)
+            diagnostic = subprocess.run(
+                [str(launcher), "--state-dir", str(state), "doctor", "--starfleet-json"],
+                cwd=root, env=env, input="", capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(diagnostic.returncode, 0, diagnostic.stderr)
+            report = json.loads(diagnostic.stdout)
+            self.assertEqual(report["checks"]["configuration"], "missing")
+            self.assertEqual(report["checks"]["registration"], "unknown")
             self.assertFalse(state.exists())
             self.assertFalse(home.exists())
 
