@@ -618,17 +618,28 @@ def review_approval_decisions(app, plan):
     if not directory.is_dir():
         return [], "available"
     decisions = []
+
+    def is_digest(value):
+        return (isinstance(value, str) and len(value) == 64
+                and all(character in "0123456789abcdef" for character in value))
+
+    identity_fields = ("scope", "selection")
     for path in sorted(directory.glob("*.json")):
         try:
             approval = read(path)
         except (OSError, ValueError, TypeError, PreferenceError):
             return decisions, "unknown"
-        required = {"id", "scope", "selection", "authority", "authorization", "at", "role"}
-        if not isinstance(approval, dict) or not required.issubset(approval):
+        if not isinstance(approval, dict):
             return decisions, "unknown"
-        if (approval.get("scope") == plan.get("scope")
-                and approval.get("selection") == plan.get("selection")
-                and approval.get("role") in ("advanced_review", "standard_review")):
+        if any(not is_digest(approval.get(field)) or not is_digest(plan.get(field))
+               for field in identity_fields):
+            return decisions, "unknown"
+        if any(approval[field] != plan[field] for field in identity_fields):
+            continue
+        required = {"id", "scope", "selection", "authority", "authorization", "at", "role"}
+        if not required.issubset(approval):
+            return decisions, "unknown"
+        if approval.get("role") in ("advanced_review", "standard_review"):
             decisions.append({"id": approval.get("id", path.stem),
                               "review_role": approval["role"],
                               "authority": approval.get("authority"),

@@ -149,6 +149,8 @@ It shows whether the saved selection and scope are current, the saved approval a
 For an advanced plan that needs approval, ask the configured authority to decide on that exact plan and scope before recording the decision with `approve-review`.
 The output includes the scoped command prefix and the next supported action, including when the authority is unset or the plan is stale.
 Inspection only reads the plan, current configuration, worktree and existing approval records; it does not create approvals or launch reviewers.
+Inspection skips a record as unrelated only when its scope and selection are valid 64-character lowercase SHA-256 digests and at least one differs from the plan.
+Unreadable records, missing or malformed scope or selection values, and incomplete records matching both digests keep approval status unknown.
 For `Codex-Qwen` and `Qwen-only`, the dispatch template also retains the required fresh `--review-authorization` value for each review launch.
 Legacy plans can identify their saved authority and reviewer choices only while their selection digest still matches the active selection.
 When a plan is stale, its current configured authority is never presented as the plan's saved authority.
