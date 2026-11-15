@@ -22,7 +22,7 @@ After a fix, repeat the same path and add a regression check where it protects a
 
 ## Verification
 
-Run the canonical aggregate verification on the final candidate:
+Run the canonical verification on the final candidate:
 
 ```sh
 python3 scripts/verify.py
@@ -33,10 +33,13 @@ The Python-only subset is `python3 scripts/verify.py --python-only`.
 The full runner installs JavaScript dependencies from the checked-in lockfile and installs a local Chromium browser for Starfleet Markup.
 On Linux, install any operating-system libraries required by Playwright before running the browser suite.
 
-For a component-specific change, the aggregate command remains the expected local verification.
-GitHub Actions runs each Python component check in an isolated hosted job on Ubuntu and macOS with Python 3.10 and 3.14, with an overall parallel cap of four, plus the Node 22 browser suite on Ubuntu.
-The existing required Python checks pass only when the complete component matrix and its preparation succeed.
-Hosted CI uses synthetic boundaries and does not contact live models, CMUX sessions, Discord accounts, or paid services.
+The canonical runner selects affected checks using the maintained dependency map.
+Documentation-only changes get an explicit runtime-unaffected verdict with documentation, link, privacy and whitespace checks.
+Component changes include dependents, while shared runtime, hook, custody and unclassified changes retain full coverage.
+Use `--base COMMIT` for an exact comparison, `--plan` to inspect the selection, or `--all` for the full suite.
+A missing base falls back to full verification.
+Hosted CI uses the same selection with the PR's exact base and retains required check results for unaffected scopes.
+The hosted credential scanner always runs.
 Manual native pilots remain separate evidence.
 
 ## Pull requests

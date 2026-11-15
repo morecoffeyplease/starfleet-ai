@@ -27,14 +27,19 @@ A recorded report is a covered-delivery requirement, not proof of setup or a pre
 
 Prime Directive (Policy Guard) is the same delivery tool described by this README and its `lane.py` CLI.
 An owner can explicitly adopt its stage-specific opening and accepted repair-batch attestations for a target; older attachments remain unchanged until adoption.
-After an authorized owner handoff, the current owner can publish a successor-validation attestation that links the exact inherited publication and reconciles current evidence.
+For Starfleet itself, the successor records concise acceptance in the existing handoff evidence packet with the ordinary `record` command.
+The default checklist scopes this policy to `github.com/morecoffeyplease/starfleet-ai`.
+Exact owner history, current candidate verification, required reads, repair history and human holds remain required.
+No new public successor comment or copied predecessor publication hashes are needed.
+Other repositories retain their selected publication policy.
+Under that policy, the current owner can publish a successor-validation attestation that links the inherited publication and reconciles current evidence.
 Successor validation requires the current owner's clean report with successful canonical verification and the current required-read receipts.
 The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, handoff ancestry, recovery, the `--enable` adoption command and source/runtime upgrade requirements.
 When Pattern Buffer is installed with a required-reads list, the owner must include current matching read receipts in the attestation; `attestation-rereads` prints the required packet entries and leaves `source_ref` for the owner to supply.
 An attestation requires `assumptions: []`; unknown required facts must be investigated or raised to the configured human on Discord, then resolved before attesting.
 The packet can record honest uncertainty about tool limits and future outcomes, but it cannot prove that the author's reasoning contains no hidden assumptions.
 Existing immutable seats must use the reviewed source-upgrade flow before they can run the new pinned attestation commands.
-Adopted targets require a current per-PR comment reference before covered ready or merge actions, with source and comment freshness checked on each supported action.
+Targets retaining the published policy require a current per-PR comment reference before covered ready or merge actions, with source and comment freshness checked on each supported action.
 Codex coverage is through the explicit seat `gh` entrypoint and Claude coverage is through its supported direct ready/merge hook path; raw push, PR creation, comments and alternate tools are not intercepted.
 The notice comes from Pattern Buffer's existing SessionStart context injection, which does not detect issues or batches.
 

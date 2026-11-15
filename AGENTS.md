@@ -5,6 +5,11 @@ Read the affected component README and guide before changing its behavior.
 
 ## Product boundaries
 
+Starfleet tools are in bug-fix-only maintenance after the agreed workflow simplifications.
+Do not start new features or integrations without a new explicit user instruction.
+Use task- and role-proportional setup, reuse working installations, and retain companion requirements for the selected capability.
+Full-fleet setup applies when explicitly requested.
+
 CMUX is required for Starfleet's coordinated session workflow.
 Discord is the initial human-contact channel, and each conversation keeps its own thread.
 Components are independently installed and enabled.
@@ -22,7 +27,7 @@ Use synthetic data, disposable state, and scoped environments for routine develo
 Never run tests against another person's active sessions, Discord threads, or machine-wide services.
 If native behavior cannot be reproduced, state exactly what remains unverified.
 
-Run the canonical aggregate verification on the final candidate:
+Run the canonical verification on the final candidate:
 
 ```sh
 python3 scripts/verify.py

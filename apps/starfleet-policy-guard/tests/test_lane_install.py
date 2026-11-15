@@ -1606,8 +1606,8 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(required_reads['generation'], 3)
         self.assertEqual(required_reads['stage'], 'repair_batch')
 
-    def test_successor_validation_reuses_exact_publications_across_two_handoffs(self):
-        source = self.source_checkout_same_fingerprints('successor-validation')
+    def adopted_guidance_fixture(self, name):
+        source = self.source_checkout_same_fingerprints(name)
         readme = self.repo / 'README.md'
         readme.write_text('Canonical verification: python3 verify.py\n')
         self.git('add', 'README.md')
@@ -1675,6 +1675,63 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(old_ready.returncode, 0, old_ready.stderr)
         historical_body = self.remote['comments']['1001']['body']
 
+        return source, owner_a, first_publication, historical_body
+
+    def test_packet_successor_acceptance_uses_existing_record_without_publication(self):
+        source, owner_a, publication, old_body = self.adopted_guidance_fixture('packet-successor')
+        owner_b = dict(owner_a, CODEX_THREAD_ID='codex-packet-successor')
+        self.call_source(source, 'rebind-owner', '--from-harness', 'codex',
+                         '--from-session', 'codex-fixture-thread', '--confirm-handoff', env=owner_b)
+        packet = json.loads(self.packet.read_text())
+        packet.pop('guidance_attestation')
+        packet['handoff_acceptance'] = {
+            'version': 1,
+            'owner': {'harness': 'codex', 'session_id': 'codex-packet-successor'},
+            'from_owner': {'harness': 'codex', 'session_id': 'codex-fixture-thread'},
+            'candidate': self.head,
+            'summary': 'Accepted reconciled work and current evidence in this packet.',
+            'repair_history_ref': 'Existing accepted batch 1; no new repair batch.',
+            'scope_and_holds_ref': 'Approved fixture only; no readiness or merge authority.',
+        }
+        self.packet.write_text(json.dumps(packet))
+        outside_policy = self.call_source(source, 'record', '--evidence', self.packet,
+                                          env=owner_b, ok=False)
+        self.assertEqual(outside_policy.returncode, 2)
+        self.assertIn('retains its published successor validation policy', outside_policy.stderr)
+        policy = json.loads((source / 'config/delivery-checklist.json').read_text())
+        policy['packet_successor_acceptance_repositories'] = ['fixture.invalid/starfleet/guard']
+        policy_path = self.base / 'selected-policy.json'
+        policy_path.write_text(json.dumps(policy))
+        report = self.required_reads_report('pending')
+        report['session_id'] = 'codex-packet-successor'
+        self.set_pattern_buffer_report(report)
+        pending = self.call_source(source, 'record', '--evidence', self.packet,
+                                   '--policy', policy_path, env=owner_b, ok=False)
+        self.assertEqual(pending.returncode, 2)
+        report = self.required_reads_report('current')
+        report['session_id'] = 'codex-packet-successor'
+        self.set_pattern_buffer_report(report)
+        self.call_source(source, 'record', '--evidence', self.packet,
+                         '--policy', policy_path, env=owner_b)
+        state = lane_runtime.read(self.repo)
+        self.assertIs(state['receipt']['handoff_acceptance'], True)
+        self.assertEqual(state['guidance_attestation_ref'], publication)
+        self.assertEqual(len(state['owner_history']), 1)
+        self.api_calls.write_text('')
+        ready = self.invoke_owner(owner_b, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        self.assertNotIn('/issues/comments/', self.api_calls.read_text())
+        self.assertEqual(self.remote['comments']['1001']['body'], old_body)
+        wrong_owner = self.invoke_owner(owner_a, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(wrong_owner.returncode, 2)
+        Path(report['entries'][0]['path']).write_text('changed required guidance')
+        stale = self.invoke_owner(owner_b, 'pr', 'ready', self.url, '--starfleet-probe')
+        self.assertEqual(stale.returncode, 2)
+        self.assertIn('Required read changed', stale.stderr)
+        self.assertFalse(self.forwarded.exists())
+
+    def test_successor_validation_reuses_exact_publications_across_two_handoffs(self):
+        source, owner_a, first_publication, historical_body = self.adopted_guidance_fixture('successor-validation')
         owner_b = dict(owner_a, CODEX_THREAD_ID='codex-successor-fixture')
         self.call_source(source, 'rebind-owner', '--from-harness', 'codex',
                          '--from-session', 'codex-fixture-thread', '--confirm-handoff', env=owner_b)
