@@ -151,23 +151,24 @@ Do not rewrite the goal, weaken required proof, expand repair authority, or add 
 
 Observe the outgoing session's actual provider, model, effort, and effective permissions before launch.
 Preserve the exact minimal launch command and working directory authorized by the user.
-Use CMUX's agent-session integration when that integration is the authorized route.
-Read `cmux new-surface --help` when that is the authorized route.
+For a terminal-based orchestrator, preserve its ordinary terminal launch route through the same installed entry point.
+Read `cmux new-surface --help` before creating the terminal tab.
 Do not replace an authorized command with another launch route.
 Do not add settings, environment, compaction, version, or permission overrides.
 Inspect wrapper-added arguments and verify the actual native settings after startup.
 If the authorized command cannot run, report the blocker and retain the outgoing owner.
 
-These commands are examples only when the user authorized the CMUX route.
-Use the observed workspace and exact worktree:
+This command is an example only when the user authorized the CMUX terminal route.
+Use the observed workspace, exact worktree, and authorized installed launch command:
 
 ```sh
-cmux new-surface --type agent-session --provider claude --workspace WORKSPACE_ID --working-directory /worktree
-cmux new-surface --type agent-session --provider codex --workspace WORKSPACE_ID --working-directory /worktree
+cmux new-surface --type terminal --workspace WORKSPACE_ID --working-directory /worktree --command 'AUTHORIZED_INSTALLED_LAUNCH_COMMAND'
 ```
 
-These commands create a candidate and do not carry its model, effort, or permission settings.
-Use supported native controls to preserve those settings, and verify the result before any transfer.
+Replace the command placeholder with the same installed Claude or Codex entry point and approved launch options used by the outgoing orchestrator.
+Let the installed integration create a fresh session identity instead of copying the outgoing process's session ID or temporary settings arguments.
+The `agent-session` surface is a different interface and does not preserve this terminal launch route.
+Verify the successor's actual model, effort, and effective permissions through supported native controls before any transfer.
 Do not invent CMUX lifecycle flags or switch to an unapproved provider-binary route.
 If an authorized terminal script is part of the command, invoke its installed wrapper or verified shell integration.
 Confirm that CMUX actually tracks the resulting native session before attempting owner enrollment.
