@@ -13,7 +13,7 @@ System and developer instructions take precedence. Follow the latest human instr
 **Scope**
 - Ask the user to establish a missing or unclear mission, tracker or assignment; record explicit agreement when none applies.
 Never invent values, infer scope or treat placeholders as approval.
-Stay within authorized scope.
+Stay within the user's authorized scope.
 
 **PStack guidance - do this now**
 - Use the installed PStack runtime and Poteto Mode.
@@ -33,7 +33,8 @@ Old summaries, pilots and your harness do not select the profile or count.
 - Send blockers, approval requests and key handoffs promptly.
 
 **Test failures and claims about systems**
-- Treat causes and system claims as hypotheses until tested against a competing explanation and a decisive observation on the failing case and a passing control.
+- Every explanation is a hypothesis until tested against a competing explanation and a decisive observation.
+Check that observation on the failing run AND a passing control.
 Use existing logs, receipts, timestamps, configuration and source before requesting another run.
 - Seek evidence that could disprove the claim.
 A plausible mechanism, agreement, or an earlier message is not proof of cause.
@@ -50,9 +51,9 @@ Do not assume the current implementation must be preserved.
 Ask before changing product behavior or scope.
 - Fix here only within existing authority for a material PR regression, an unmet approved outcome, or a high-impact defect on a common path.
 - Ask the user before fixing a serious-but-rare security, data-loss, or safety-contract exception.
-- Do not turn uncertainty into a blocker or call it disproved; investigate the cheapest decisive evidence, then defer unresolved claims explicitly.
+- Investigate the cheapest decisive evidence; keep unresolved claims explicit, not disproved or automatically blocking.
 - Workers report new findings rather than expanding the batch.
-- If uncertainty remains after checking the deciding evidence, ask the user rather than guess or start a repair.
+- Ask rather than guess or repair when deciding evidence leaves uncertainty.
 - Before starting or resuming a repair cycle, read the [Policy Guard cycle guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
 - Revisit the relevant rule before each repair decision.
 
@@ -69,11 +70,11 @@ Update only changed facts in this lane's sections.
 2. Consider temporary worktrees for ready independent work, respecting dependencies, ownership and resource limits.
 
 **PR openings and accepted repair batches**
-- Read the installed Policy Guard guide's Published guidance attestations section before opening or starting an accepted batch.
+- Before opening or starting an accepted batch, read Published guidance attestations in `python3 /path/to/installed/lane.py guide --print`.
 Follow its owner rereads, source references/digests/application, resolved prerequisites, empty assumptions, opening evidence and exact draft-comment publication flow.
 Run `attestation-start-check` after publication and before repair work; use `--enable` only for first adoption.
 Adopted ready/merge requires current evidence.
-- Include Outcome, Playbook, Size and Facts in implementer briefs and PR opening explanations.
+- Use Outcome, Playbook, Size and Facts in each implementer brief and the PR opening explanation.
 
 **Repair rounds: don't spiral**
 - Record dispositions, evidence and cumulative rounds in the existing PR or tracker.
