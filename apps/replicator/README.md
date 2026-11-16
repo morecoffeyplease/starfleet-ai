@@ -45,7 +45,13 @@ It does not query tool doctors, prove native delivery, accept custody, or comple
 An unknown status means the required evidence is missing or ambiguous.
 Keep the predecessor while a required handoff check remains blocked or unknown.
 The current CMUX snapshot provides caller identity and state, but no model, effort, or effective permission fields.
-Preflight reports those settings as `unknown` until an exact-session native control provides evidence.
+Preflight reports those settings as `unknown` because the snapshot does not expose them.
+Use the [guide's model and effort evidence](guide.md#start-a-successor-with-the-authorized-command) outside preflight.
+A supported read-only `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` command reports native model and reasoning effort when the exact session exposes it.
+Its unknown result does not add a handoff gate or replace the existing evidence choices.
+See [Pattern Buffer's session effort guide](../pattern-buffer/guide.md#inspect-session-effort) for output fields and evidence limits.
+A missing live effort reading alone does not block handoff.
+Native identity, permission, trust, and custody requirements remain unchanged.
 
 ## Install the local launcher
 
