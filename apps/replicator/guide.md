@@ -94,6 +94,14 @@ python3 /path/to/installed/runtime/lane.py --cwd /worktree coverage --summary
 Replace every placeholder with a value observed for this handoff.
 Use `--harness claude` for Claude sessions and `--harness codex` for Codex sessions.
 Inspect the Policy Guard seat status for every attached checkout, then inspect coverage from each applicable checkout.
+Inspect the effective native hook configuration for every referenced Policy Guard seat and legacy lane.
+Record each route's runtime, checkout, exact owner, and current or removed attachments.
+One orchestrator can have several seats and legacy lanes with different owners.
+An omitted route remains unresolved until its ownership and required disposition are recorded.
+Keep legacy routes outside the authorized transfer unchanged, with their limitations recorded.
+If a retained route blocks a required action, ask for authorization for that exact action instead of deleting hooks or assuming ownership.
+For an older runtime, use the supported maintenance route in [Policy Guard's handoff and recovery guide](../starfleet-policy-guard/guide.md#inspect-hand-off-and-recover).
+Preserve the first refusal, runtime pins, and removed attachment history when following that route.
 Do not infer a native identity from a title, a parent session, a saved profile, or a worktree default.
 An empty result covers only the exact owner and scope queried.
 Preflight does not replace these tool-specific owner checks.
@@ -101,7 +109,7 @@ Preflight does not replace these tool-specific owner checks.
 ## Record applicable resources
 
 Query authoritative owner records instead of relying only on the outgoing agent's memory.
-Check Pattern Buffer owner tasks and native child sessions, exact Hailing Frequencies bindings, standing context and checkpoint ownership, Warp requests and helpers, Temporal Beacon timers and occurrences, owned Agent Notify conversations, Discord Watch generations and queued replies, Policy Guard seat attachments, Git worktrees, and maintained plans.
+Check Pattern Buffer owner tasks and native child sessions, exact Hailing Frequencies bindings, standing context and checkpoint ownership, Warp requests and helpers, Temporal Beacon timers and occurrences, owned Agent Notify conversations, Discord Watch generations and queued replies, Policy Guard seat attachments, Model Preferences owner registration and adoption, Away Mode lane ownership, Git worktrees, and maintained plans.
 Inspect only records owned by the outgoing session or resources explicitly in scope for this handoff.
 Enroll only the exact successor when a documented tool requires enrollment for this handoff.
 Do not blanket-enroll sessions or tools.
@@ -133,6 +141,17 @@ It checks relevance to the approved outcome and identifies repeated repairs, dup
 It checks the outgoing owner's answers and existing decisions before asking the user a question that has already been resolved.
 It concludes with one disposition: continue, simplify within authority, investigate one bounded material uncertainty, or ask for a genuine scope or authority decision.
 It records the judgment and material answers in the existing checkpoint or roadmap.
+
+After completing this assessment, send the user your opinion through the current Agent Notify workflow with explicit Discord delivery (`--delivery discord`), including when the user is local.
+State whether the work is on track or off track against the approved outcome and next deliverable, the concrete evidence behind that opinion, any material uncertainty, and the recommended next action.
+If the evidence cannot support a verdict, say what remains unknown instead of inventing confidence.
+Present a concrete proposal to continue the roadmap or change course, explain the tradeoffs, and discuss it with the user in Discord.
+Use an existing owning thread for this assessment, or open one conversation when none exists, and keep follow-up discussion in that thread with an owning reply path.
+Wait for the user's specific approval of the proposal before starting or resuming the proposed work, unless the user explicitly waived this discussion and approval requirement in advance for that work.
+An on-track opinion, a successful handoff, a general assignment, or silence is not that approval or waiver.
+Record the conversation reference, approved scope and constraints, or the explicit advance waiver in the existing checkpoint or roadmap.
+While waiting, preserve running jobs, resource custody and human holds; continue only independent work already authorized outside the proposal.
+
 Only work or retirement that depends on a material unresolved issue stays on hold.
 Do not rewrite the goal, weaken required proof, expand repair authority, or add a model, panel, or mandatory questionnaire.
 
@@ -140,23 +159,24 @@ Do not rewrite the goal, weaken required proof, expand repair authority, or add 
 
 Observe the outgoing session's actual provider, model, effort, and effective permissions before launch.
 Preserve the exact minimal launch command and working directory authorized by the user.
-Use CMUX's agent-session integration when that integration is the authorized route.
-Read `cmux new-surface --help` when that is the authorized route.
+For a terminal-based orchestrator, preserve its ordinary terminal launch route through the same installed entry point.
+Read `cmux new-surface --help` before creating the terminal tab.
 Do not replace an authorized command with another launch route.
 Do not add settings, environment, compaction, version, or permission overrides.
 Inspect wrapper-added arguments and verify the actual native settings after startup.
 If the authorized command cannot run, report the blocker and retain the outgoing owner.
 
-These commands are examples only when the user authorized the CMUX route.
-Use the observed workspace and exact worktree:
+This command is an example only when the user authorized the CMUX terminal route.
+Use the observed workspace, exact worktree, and authorized installed launch command:
 
 ```sh
-cmux new-surface --type agent-session --provider claude --workspace WORKSPACE_ID --working-directory /worktree
-cmux new-surface --type agent-session --provider codex --workspace WORKSPACE_ID --working-directory /worktree
+cmux new-surface --type terminal --workspace WORKSPACE_ID --working-directory /worktree --command 'AUTHORIZED_INSTALLED_LAUNCH_COMMAND'
 ```
 
-These commands create a candidate and do not carry its model, effort, or permission settings.
-Use supported native controls to preserve those settings, and verify the result before any transfer.
+Replace the command placeholder with the same installed Claude or Codex entry point and approved launch options used by the outgoing orchestrator.
+Let the installed integration create a fresh session identity instead of copying the outgoing process's session ID or temporary settings arguments.
+The `agent-session` surface is a different interface and does not preserve this terminal launch route.
+Verify the successor's actual model, effort, and effective permissions through supported native controls before any transfer.
 Do not invent CMUX lifecycle flags or switch to an unapproved provider-binary route.
 If an authorized terminal script is part of the command, invoke its installed wrapper or verified shell integration.
 Confirm that CMUX actually tracks the resulting native session before attempting owner enrollment.
@@ -166,6 +186,7 @@ From a source checkout, use `python3 apps/replicator/replicator.py guide --print
 Let the successor discover the maintained procedure and independently inspect the handoff records.
 Keep private launch recipes and transcripts out of the procedure.
 After startup, inspect the actual native session and verify its provider, model, effort, and effective permissions.
+Name the successor's tab using the outgoing orchestrator's established naming convention, preserving the lane and model identity and updating the session date when the convention includes one.
 Inspect flags added by the installed wrapper as well as the flags supplied by the caller.
 Resolve any difference from the user's authorized permission and trust policy before transferring ownership.
 Use the integration's normal permission dialogs when authorized.
@@ -200,7 +221,12 @@ Use `--harness claude` for Claude.
 Do not use `--include-existing`, enroll a guessed identity, reset another owner's cutoff, or start another worker.
 Verify the exact saved binding separately from actual native attention receipt.
 
-The outgoing owner uses the existing Pattern Buffer release command only for the exact current enrollment:
+Inspect the exact current Pattern Buffer enrollment before choosing release and adoption.
+
+If `enrollment-status` reports no enrollment because standing context comes from the worktree default, there is nothing to release or adopt.
+Preserve that standing-context mode and enroll the successor's own checkpoint through the documented workflow.
+Do not invent an enrollment ID or create an enrollment merely to fill a handoff row.
+Run the following release command only when an exact enrollment exists:
 
 ```sh
 pattern-buffer --cwd /worktree enrollment-release --harness codex --session OUTGOING_SESSION_ID --enrollment-id ENROLLMENT_ID --next-harness codex --next-session SUCCESSOR_SESSION_ID --evidence HANDOFF_REFERENCE
@@ -214,7 +240,7 @@ An unenrolled successor can report an unassigned role and fail a checkpoint owne
 Distinguish those status results from a literal native standing-context STOP alarm.
 If an alarm occurs, follow its supported binding-recovery instructions before dependent work.
 
-The successor adopts that exact enrollment from its own session with reviewed standing context and a fresh checkpoint:
+When an exact enrollment was released to it, the successor adopts it from its own session with reviewed standing context and a fresh checkpoint:
 
 ```sh
 pattern-buffer --cwd /worktree enrollment-adopt --harness codex --session SUCCESSOR_SESSION_ID --enrollment-id ENROLLMENT_ID --context-file /path/to/reviewed-standing.md --checkpoint-file /path/to/reviewed-checkpoint.md --evidence HANDOFF_REFERENCE
@@ -267,6 +293,27 @@ Do not inherit the outgoing owner's receipt or claim that a configured hook prov
 An explicit delivery-adapter probe proves only that adapter path.
 A successful Git command does not prove that a native hook activated.
 Verify a covered native action through its supported owner workflow.
+
+## Finish other applicable owner registrations
+
+Read the installed Model Preferences and Away Mode guides and inspect their actual owner records when those tools apply to the seat.
+Complete applicable successor registration before its first new worker dispatch or proposed roadmap work.
+Do not cancel already running work merely to satisfy setup.
+
+For a manual succession, use the successor's own `model-preferences enroll-self ORCHESTRATOR_NAME` workflow.
+Use `--replace` only after status confirms the intended name's prior binding and the authorized handoff covers replacing it.
+Read the current saved profile through `startup --expect-profile EXPECTED_PROFILE`, then acknowledge its fresh selection with `adopt ORCHESTRATOR_NAME --selection CURRENT_SELECTION`.
+Preserve existing configuration and state prefixes, and do not change a global profile to match the native session.
+This registration and adoption do not transfer tasks or prove native model parity.
+Do not invent a Model Preferences handoff intent for a successor already launched through this manual procedure.
+If its exact-owner guard finds multiple non-ended agents on the successor's surface, preserve the refusal and let authorized child work finish normally before a fresh sole-owner check.
+Retiring a predecessor on another tab does not resolve that shared-surface condition.
+
+For an authorized Away Mode handoff, the successor uses the documented same-lane enrollment with its own exact native identity.
+Do not unenroll the predecessor first: same-lane replacement preserves its enrollment and transition evidence in `previous_enrollments`.
+Read `away-mode context`, acknowledge only the actual current transition from the successor's own session, and verify the new binding and archived predecessor evidence.
+Do not copy an acknowledgment, create a duplicate lane, or change user presence during handoff.
+If an unenroll-and-recreate sequence already occurred, record that sequence and its retained evidence honestly instead of claiming the tool preserved an archive.
 
 ## Preserve owned work and conversations
 

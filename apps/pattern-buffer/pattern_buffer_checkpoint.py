@@ -276,7 +276,9 @@ def _arm_idle_timer(state, harness, session, intent, ci=None):
         return
     launcher = Path.home() / ".local/bin/hailing-frequencies"
     if not launcher.is_file() or not os.access(launcher, os.X_OK):
-        state["idle_timer"] = {"status": "unavailable", "detail": "Hailing Frequencies is not installed"}
+        timer = dict(state.get("idle_timer") or {})
+        timer.update({"status": "unavailable", "detail": "Hailing Frequencies is not installed"})
+        state["idle_timer"] = timer
         return
     request = str(uuid.uuid5(uuid.NAMESPACE_URL, f"pattern-buffer-idle:{session}:{intent}:{minutes}"))
     message = (f"You have been idle for {minutes:g} minutes. Automatic compaction may occur in about five minutes; "
@@ -288,8 +290,10 @@ def _arm_idle_timer(state, harness, session, intent, ci=None):
     try:
         code, output, timeout, oversized = _bounded_attention_process(command, b"")
         if timeout or oversized:
-            state["idle_timer"] = {"status": "uncertain", "request_id": request,
-                                   "detail": "Timer creation result was not confirmed; do not blindly retry"}
+            timer = dict(state.get("idle_timer") or {})
+            timer.update({"status": "uncertain", "pending_request_id": request,
+                          "detail": "Timer creation result was not confirmed; do not blindly retry"})
+            state["idle_timer"] = timer
             return
         result = json.loads(output)
         timer = result.get("timer", {})
@@ -298,7 +302,10 @@ def _arm_idle_timer(state, harness, session, intent, ci=None):
         state["idle_timer"] = {"status": "armed", "timer_id": timer["id"], "request_id": request,
                                "due_at": timer.get("due_at"), "delivery_capability": result.get("delivery_capability")}
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
-        state["idle_timer"] = {"status": "unavailable", "request_id": request, "detail": str(error)[:256]}
+        timer = dict(state.get("idle_timer") or {})
+        timer.update({"status": "unavailable", "pending_request_id": request,
+                      "detail": str(error)[:256]})
+        state["idle_timer"] = timer
     finally:
         if ci is not None:
             _record(ci, Path(state["identity"]["root"]), state, "reminder.armed",
@@ -307,14 +314,101 @@ def _arm_idle_timer(state, harness, session, intent, ci=None):
 
 
 def _cancel_idle_timer(state, harness, session):
-    timer = state.get("idle_timer") or {}
-    if not timer.get("timer_id"):
+    timer = state.get("idle_timer")
+    if not isinstance(timer, dict):
+        return
+    pending_request = timer.get("pending_request_id")
+    legacy_uncertain_request = (not timer.get("timer_id") and timer.get("request_id")
+                                and timer.get("status") in ("unavailable", "uncertain", "cancel_unconfirmed"))
+    reconcile = bool(pending_request or legacy_uncertain_request)
+    if not timer.get("timer_id") and not reconcile:
         return
     if (harness != "claude" or os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").lower() not in ("claude", "claudeteams")
             or os.environ.get("CLAUDE_CODE_SESSION_ID", session).lower() != session.lower()):
         state["idle_timer"] = {**timer, "status": "cancel_unconfirmed", "detail": "Cancel from the exact owning Claude session"}
         return
-    command = [str(Path.home() / ".local/bin/hailing-frequencies"), "temporal", "cancel", timer["timer_id"]]
+    launcher = Path.home() / ".local/bin/hailing-frequencies"
+    if reconcile:
+        candidate = None
+        try:
+            code, output, timeout, oversized = _bounded_attention_process(
+                [str(launcher), "temporal", "list"], b"", output_limit=256 * 1024)
+            if code or timeout or oversized:
+                raise ValueError("Idle timer listing was not confirmed; inspect Temporal Beacon from this exact owner")
+            report = json.loads(output)
+            if not isinstance(report, dict) or not isinstance(report.get("timers"), list):
+                raise ValueError("Idle timer listing was malformed; cancellation remains unconfirmed")
+            root = state.get("identity", {}).get("root")
+            if not isinstance(root, str) or not root:
+                raise ValueError("Checkpoint worktree identity is unavailable; cancellation remains unconfirmed")
+            replacement_key = "pattern-buffer-checkpoint-idle"
+            known_requests = {value for value in (
+                timer.get("request_id"), timer.get("pending_request_id"), timer.get("reconciled_request_id"))
+                if isinstance(value, str) and value}
+            active = []
+            for item in report["timers"]:
+                if not isinstance(item, dict):
+                    raise ValueError("Idle timer listing contained a malformed row; cancellation remains unconfirmed")
+                request_id = item.get("request_id")
+                item_key = item.get("replacement_key")
+                item_root = item.get("canonical_worktree")
+                if request_id in known_requests and (item_key != replacement_key or item_root != root):
+                    raise ValueError("A recorded timer request did not match this checkpoint scope")
+                if item_key != replacement_key:
+                    continue
+                if not isinstance(item_root, str) or not item_root:
+                    raise ValueError("Idle timer listing omitted its worktree scope; cancellation remains unconfirmed")
+                if item_root != root:
+                    continue
+                status = item.get("status")
+                if status == "active":
+                    if not isinstance(item.get("id"), str) or not item["id"]:
+                        raise ValueError("Active idle timer listing omitted its timer ID")
+                    active.append(item)
+                elif status not in ("canceled", "completed", "expired"):
+                    raise ValueError("Idle timer listing returned an unknown state; cancellation remains unconfirmed")
+            if len(active) > 1:
+                raise ValueError("Multiple active timers matched this checkpoint replacement key")
+            if not active:
+                updated = dict(timer)
+                pending = updated.pop("pending_request_id", None)
+                if not pending and legacy_uncertain_request:
+                    pending = updated.get("request_id")
+                if pending and pending != updated.get("request_id"):
+                    updated["reconciled_request_id"] = pending
+                updated.update({"status": "canceled", "submitted_input_recallable": False,
+                                "detail": "No active idle timer remained in the exact-owner listing"})
+                state["idle_timer"] = updated
+                return
+            candidate = active[0]
+            code, output, timeout, oversized = _bounded_attention_process(
+                [str(launcher), "temporal", "cancel", candidate["id"]], b"")
+            if code or timeout or oversized:
+                raise ValueError("Idle timer cancellation was not confirmed")
+            result = json.loads(output)
+            if not isinstance(result, dict) or result.get("status") not in ("canceled", "completed", "expired"):
+                raise ValueError("Idle timer cancellation was not confirmed")
+            updated = {**timer, "timer_id": candidate["id"], "status": result["status"],
+                       "submitted_input_recallable": False}
+            if isinstance(candidate.get("request_id"), str) and candidate["request_id"]:
+                updated["request_id"] = candidate["request_id"]
+            pending = updated.pop("pending_request_id", None)
+            if not pending and legacy_uncertain_request:
+                pending = timer.get("request_id")
+            if pending and pending != updated.get("request_id"):
+                updated["reconciled_request_id"] = pending
+            state["idle_timer"] = updated
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+            updated = dict(timer)
+            if candidate is not None:
+                updated["timer_id"] = candidate["id"]
+                if isinstance(candidate.get("request_id"), str) and candidate["request_id"]:
+                    updated["request_id"] = candidate["request_id"]
+                if legacy_uncertain_request and timer.get("request_id") != updated.get("request_id"):
+                    updated["pending_request_id"] = timer.get("request_id")
+            state["idle_timer"] = {**updated, "status": "cancel_unconfirmed", "detail": str(error)[:256]}
+        return
+    command = [str(launcher), "temporal", "cancel", timer["timer_id"]]
     try:
         code, output, timeout, oversized = _bounded_attention_process(command, b"")
         result = json.loads(output) if not timeout and not oversized else {}
