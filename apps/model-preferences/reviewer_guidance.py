@@ -27,14 +27,28 @@ Recommend a bounded route and leave the decision to the parent.
 """
 
 
-REVIEW_ROLES = frozenset(("standard_review", "advanced_review"))
+SKEPTICAL_REVIEW_GUIDANCE = """Skeptical continuation proposal review
+
+Challenge the premise and the material user impact of the proposed next route.
+Compare the proposal with the documented failed approaches and available evidence.
+Recommend whether to continue, revert, simplify, or defer, and explain unresolved disagreement.
+Review the continuation proposal and relevant evidence rather than repeating a full pull request review.
+This review launch does not authorize repair work; the parent must obtain a distinct bounded user decision before repairs resume.
+"""
 
 
-def compose_reviewer_prompt(role, task_text):
+REVIEW_ROLES = frozenset(("standard_review", "advanced_review", "complex_initial_review", "skeptical_review"))
+
+
+def compose_reviewer_prompt(role, task_text, context_text=None):
     """Prefix review guidance while preserving the complete task text as the final suffix."""
     if role not in REVIEW_ROLES:
         return task_text
-    return REVIEWER_GUIDANCE + "\nTask brief, unchanged and complete:\n\n" + task_text
+    specific = SKEPTICAL_REVIEW_GUIDANCE + "\n" if role == "skeptical_review" else ""
+    context = ("Review context, bound separately from the original task brief:\n\n" + context_text + "\n\n"
+               if isinstance(context_text, str) and context_text else "")
+    return (specific + REVIEWER_GUIDANCE + "\n" + context +
+            "Task brief, unchanged and complete:\n\n" + task_text)
 
 
 def main(argv=None):

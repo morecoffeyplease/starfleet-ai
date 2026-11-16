@@ -31,6 +31,8 @@ Use model-set to add a family or update its exact harness, provider slug, suppor
 Create a profile JSON whose role choices reference configured model family keys and supported effort values.
 Each profile must define orchestrator, implementer, researcher, standard_review and advanced_review.
 Review groups contain one reviewer or two independently configured reviewers.
+The four reserved Codex-only, Claude-only, Claude-Codex and claude-codex-light profiles can also define `review_policy` with exact `complex_initial` and `skeptical_proposal` reviewers.
+That policy is part of the active selection digest and never changes the other roles.
 The `claude-codex-light` profile also defines `standard_review_policy` with the fixed values `{"initial_slots": [1, 2], "later_slots": [1]}`.
 Use profile-put to save the reviewed profile.
 
@@ -73,6 +75,33 @@ Existing sessions retain their launch records even if a later profile changes.
 Review plans bind to the current selection and repository scope, and any relevant change requires a new plan.
 Advanced review needs an authorization record matching both the current review scope and selection.
 
+### Initial complexity and the adopted review policy
+
+`review-plan` records `purpose`, `classification` and the concrete classification reasons from the explicit facts and maintained money, time-zone and file-count rules.
+Use `--purpose initial` for a new initial review; this is the default when no later-cycle predecessor is supplied.
+A complex initial plan in one of the four reserved profiles uses that profile's saved `complex_initial` choices without a per-plan approval.
+Straightforward initial plans keep the saved `standard_review` group.
+Advanced-review plans created with `--purpose later` retain the existing explicit approval requirement.
+Initial and skeptical reviewer launches still pass through the current native permissions and exact plan, selection and scope checks.
+
+Existing profiles created before `review_policy` was introduced remain readable and are never rewritten on read.
+Preview the explicit migration, inspect the returned exact family and effort mapping, then apply only with its digest.
+If the migrated profile is active, choose how to notify orchestrators because the selection digest changes.
+The migration keeps custom saved model families, efforts and every unrelated profile and launch record.
+
+    model-preferences review-policy-migrate Claude-Codex
+    model-preferences review-policy-migrate Claude-Codex --apply --policy-sha256 REVIEWED_DIGEST
+    model-preferences review-policy-migrate claude-codex-light --apply --policy-sha256 REVIEWED_DIGEST --orchestrators future-only
+
+Migration supports Codex-only, Claude-only, Claude-Codex and claude-codex-light profiles.
+Review a mapping that does not match the intended provider or role before applying it.
+Other profiles keep their existing reviewer behavior and do not accept this policy field.
+
+The example `review_policy` mapping uses one Astra for Codex-only complex initial and skeptical review, and one Fable for Claude-only.
+Claude-Codex uses Astra plus Opus for complex initial review and Fable for skeptical review.
+Claude-codex-light uses Astra plus Opus for complex initial review and Astra for skeptical review.
+The application uses the exact saved family and effort values and does not query a model catalog or select a fallback.
+
 ### Inspect and reconcile interrupted Codex launches
 
 Use `launch-inspect` to read the saved launch, current owner, recorded process identities, native session and any linked Pattern Buffer task.
@@ -93,8 +122,9 @@ Finished Pattern Buffer tasks can be abandoned but never resumed.
 ### Track light-profile reviews by target and cycle
 
 The opt-in `claude-codex-light` profile keeps the Claude-Codex launch choices and advanced-review pair.
-Its first standard-review cycle requires Codex Sol high in slot 1 and Claude Opus high in slot 2.
-Later cycles use Codex Sol high in slot 1 only after every required slot in the linked predecessor chain exits successfully.
+A straightforward initial review uses Codex Sol high in slot 1 and Claude Opus high in slot 2.
+A complex initial review uses the adopted Astra plus Opus panel as the first target cycle, and that completed cycle counts as the initial review.
+Later ordinary cycles use only Codex Sol high in slot 1 after every required slot in the linked predecessor chain exits successfully.
 The cycle policy never changes the active profile or advances from a changed scope.
 
 For an existing installation, copy your saved `Claude-Codex` role choices before you add the light profile.
@@ -115,7 +145,7 @@ The target accepts one PR locator, and the locator cannot be changed after bindi
     model-preferences review-target create --cwd /absolute/path/to/worktree --id "$REVIEW_TARGET_ID" \
       --pr-locator https://github.com/owner/repository/pull/27
 
-Start the first standard-review cycle with a stable cycle key.
+Start the first straightforward review cycle with a stable cycle key.
 The plan output includes the saved plan ID and cycle ID.
 
     model-preferences review-plan --cwd /absolute/path/to/worktree --base main \
@@ -133,7 +163,7 @@ Pass `--review-target` and `--review-cycle` to `status` to inspect a saved cycle
       --review-cycle CYCLE_ID --review-plan PLAN_ID
 
 Dispatch slot 2 with the same plan to complete the first cycle.
-Create a later cycle with a new key and the exact predecessor cycle ID only after both first-cycle slots succeed.
+Create a later cycle with a new key and the exact predecessor cycle ID only after both required initial slots succeed.
 
     model-preferences review-plan --cwd /absolute/path/to/worktree --base main \
       --facts /absolute/path/to/review-facts.json --target "$REVIEW_TARGET_ID" \
@@ -161,6 +191,35 @@ The tool does not retry a launch whose state is missing, active, failed without 
 
 Standard-review cycles do not change advanced-review approval rules.
 Other profiles keep their configured standard-review behavior and do not require target or cycle IDs.
+
+For a complex light-profile initial review, use the same target and cycle workflow with complexity facts that explain the shared contract, design, repair history, concurrency, security, money or time-zone risk.
+The resulting plan records its complex class and freezes the configured Astra and Opus choices in the target's first cycle.
+Resolve and dispatch `complex_initial_review` using that plan, target, cycle and each required slot.
+After those slots complete, the next ordinary target cycle resolves to slot 1 only, using Sol.
+
+### Request an optional skeptical proposal review
+
+After three unsuccessful repair rounds, the orchestrator records the actual repair history and asks the configured human authority whether they want one skeptical review of the exact next-step proposal.
+Repair-round count is supplied by the orchestrator's history and is not inferred from a review-cycle ordinal.
+Create a target-bound `skeptical_proposal` plan with the proposal file, then inspect the single configured reviewer and the exact approval request.
+
+    model-preferences review-plan --cwd /absolute/path/to/worktree --base main \
+      --facts /absolute/path/to/review-facts.json --purpose skeptical_proposal \
+      --target "$REVIEW_TARGET_ID" --proposal-file /absolute/path/to/continuation-proposal.md
+    model-preferences approve-review PLAN_ID --authorization "Configured human authority's recorded decision to run this exact review"
+    model-preferences dispatch --role skeptical_review --slot 1 --cwd /absolute/path/to/worktree \
+      --task-file /absolute/path/to/skeptical-review-brief.md --review-plan PLAN_ID \
+      --review-target "$REVIEW_TARGET_ID" --proposal-file /absolute/path/to/continuation-proposal.md \
+      --approval APPROVAL_ID
+
+The approval binds the saved selection, target worktree scope, plan purpose and proposal bytes.
+Changing any of those inputs requires a fresh plan and decision.
+The reviewer receives the maintained skeptical task instruction plus the unchanged brief and exact proposal.
+The configured human authority may decline the optional review without launching a model.
+After a decline, a separate explicit decision may record one bounded continuation batch or a revert/defer route.
+If the review runs, inspect its recommendation and disagreement with the configured human authority before recording any separate bounded continuation approval.
+That continuation record binds the exact result and repair batch and does not claim to intercept undeclared edits.
+The feature stores no repair-round counter and does not make the optional model call a readiness or continuation gate.
 
 ### Reviewer judgment guidance
 
