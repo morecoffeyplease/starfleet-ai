@@ -18,6 +18,7 @@ from unittest import mock
 APP = Path(__file__).resolve().parents[1]
 LANE = APP / 'lane.py'
 sys.path.insert(0, str(APP))
+import delivery
 import lane as lane_runtime
 
 
@@ -1644,6 +1645,22 @@ class LaneInstallTest(unittest.TestCase):
             'accepted_batch_ref': 'https://fixture.invalid/starfleet/guard/issues/37#accepted-batch-1',
             'repair_history_ref': self.url + '#issuecomment-1',
             'prerequisites_complete': True, 'gaps': [],
+            'repair_assessment': {
+                'findings': [{
+                    'finding_ref': 'https://fixture.invalid/starfleet/guard/issues/37#finding-1',
+                    'prior_attempts': [],
+                    'premise': 'The reported failure is on the approved product path.',
+                    'deciding_observation': 'The synthetic end-to-end observation reproduces the failure.',
+                    'deciding_evidence_ref': 'https://fixture.invalid/starfleet/guard/pull/901#issuecomment-8',
+                    'disposition': 'fix here',
+                    'applicable_rules': [{
+                        'reference': 'https://fixture.invalid/starfleet/guard/blob/abc/guide.md#review-and-fix-cycles',
+                        'why_applicable': 'This is a material regression in the accepted repair batch.',
+                    }],
+                }],
+                'approval_required': False,
+                'approval_evidence_ref': None,
+            },
             'reread': [{'kind': 'playbook', 'name': 'Existing repair playbook',
                         'source_ref': 'https://fixture.invalid/starfleet/guard/blob/abc/playbook.md',
                         'path': str(old_guidance),
@@ -1955,6 +1972,22 @@ class LaneInstallTest(unittest.TestCase):
             'accepted_batch_ref': 'https://fixture.invalid/starfleet/guard/issues/37#accepted-batch-1',
             'repair_history_ref': 'https://fixture.invalid/starfleet/guard/pull/901#issuecomment-1',
             'prerequisites_complete': True, 'gaps': [],
+            'repair_assessment': {
+                'findings': [{
+                    'finding_ref': 'https://fixture.invalid/starfleet/guard/issues/37#finding-1',
+                    'prior_attempts': [],
+                    'premise': 'The reported failure is on the approved product path.',
+                    'deciding_observation': 'The synthetic end-to-end observation reproduces the failure.',
+                    'deciding_evidence_ref': 'https://fixture.invalid/starfleet/guard/pull/901#issuecomment-8',
+                    'disposition': 'fix here',
+                    'applicable_rules': [{
+                        'reference': 'https://fixture.invalid/starfleet/guard/blob/abc/guide.md#review-and-fix-cycles',
+                        'why_applicable': 'This is a material regression in the accepted repair batch.',
+                    }],
+                }],
+                'approval_required': False,
+                'approval_evidence_ref': None,
+            },
             'reread': [{'kind': 'playbook', 'name': 'Current repair playbook',
                         'source_ref': 'https://fixture.invalid/starfleet/guard/blob/abc/playbook.md',
                         'path': str(evidence), 'sha256': hashlib.sha256(evidence.read_bytes()).hexdigest()}],
@@ -2326,6 +2359,58 @@ class LaneInstallTest(unittest.TestCase):
         self.assertNotIn('required_reads', publication)
         status_after_no_list = json.loads(self.call_source(source, 'status', env=owner_env).stdout)
         self.assertNotIn('guidance_attestation_receipts', status_after_no_list)
+
+    def test_legacy_repair_publication_is_preserved_only_as_exact_current_reference(self):
+        source, owner_env, current_publication, _historical_body = self.adopted_guidance_fixture(
+            'legacy-repair-publication-compatibility')
+        packet = json.loads(self.packet.read_text())
+        packet['guidance_attestation'].pop('repair_assessment')
+        self.packet.write_text(json.dumps(packet))
+        recorded = self.call_source(source, 'record', '--evidence', self.packet, env=owner_env)
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        rendered = delivery.render_guidance_attestation(
+            packet, self.packet.parent, self.url, 'repair_batch', _allow_legacy_repair=True)
+        comment_url = self.url + '#issuecomment-1002'
+        self.remote['comments']['1002'] = {
+            'id': 1002, 'html_url': comment_url,
+            'issue_url': 'https://api.fixture.invalid/repos/starfleet/guard/issues/901',
+            'body': rendered['body'],
+        }
+        self.remote_path.write_text(json.dumps(self.remote))
+        legacy_publication = copy.deepcopy(current_publication)
+        legacy_publication.update({
+            'comment_url': comment_url,
+            'comment_id': 1002,
+            'body_sha256': rendered['body_sha256'],
+            'attestation_sha256': rendered['attestation_sha256'],
+        })
+        with lane_runtime.locked(self.repo) as state:
+            state['guidance_attestation_ref'] = legacy_publication
+
+        current = self.invoke_owner(owner_env, 'pr', 'ready', self.url)
+        self.assertEqual(current.returncode, 0, current.stderr)
+        forwarded_before = self.forwarded.read_bytes()
+
+        rendered_without_upgrade_path = self.call_source(
+            source, 'attestation-render', '--evidence', self.packet,
+            '--stage', 'repair-batch', env=owner_env, ok=False)
+        self.assertEqual(rendered_without_upgrade_path.returncode, 2)
+        self.assertIn('repair_assessment', rendered_without_upgrade_path.stderr)
+        new_legacy_publication = self.call_source(
+            source, 'attestation-start-check', '--evidence', self.packet,
+            '--stage', 'repair-batch', '--comment-url', comment_url, env=owner_env, ok=False)
+        self.assertEqual(new_legacy_publication.returncode, 2)
+        self.assertIn('repair_assessment', new_legacy_publication.stderr)
+        self.assertEqual(lane_runtime.read(self.repo)['guidance_attestation_ref'], legacy_publication)
+
+        packet['guidance_attestation']['approach'] += ' Changed after the stored publication.'
+        self.packet.write_text(json.dumps(packet))
+        self.call_source(source, 'record', '--evidence', self.packet, env=owner_env)
+        changed = self.invoke_owner(owner_env, 'pr', 'ready', self.url)
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn('repair_assessment', changed.stderr)
+        self.assertEqual(self.forwarded.read_bytes(), forwarded_before)
 
     def test_rollback_restores_exact_original_and_retains_passthrough_adapter(self):
         self.install()

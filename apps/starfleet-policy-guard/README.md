@@ -35,6 +35,10 @@ Other repositories retain their selected publication policy.
 Under that policy, the current owner can publish a successor-validation attestation that links the inherited publication and reconciles current evidence.
 Successor validation requires the current owner's clean report with successful canonical verification and the current required-read receipts.
 The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, handoff ancestry, recovery, the `--enable` adoption command and source/runtime upgrade requirements.
+New repair-batch publications require a structured assessment of the existing attempts, deciding evidence, dispositions, applicable rules and any required approval evidence.
+After a reviewed source upgrade, an existing repair publication remains usable only while its packet and rendered body still match the exact current publication reference.
+The legacy compatibility path cannot render or start-check a new repair batch without the assessment.
+For a later accepted batch, the owner publishes a new comment and start-checks it while leaving earlier comments and repair history intact.
 When Pattern Buffer is installed with a required-reads list, the owner must include current matching read receipts in the attestation; `attestation-rereads` prints the required packet entries and leaves `source_ref` for the owner to supply.
 An attestation requires `assumptions: []`; unknown required facts must be investigated or raised to the configured human on Discord, then resolved before attesting.
 The packet can record honest uncertainty about tool limits and future outcomes, but it cannot prove that the author's reasoning contains no hidden assumptions.
