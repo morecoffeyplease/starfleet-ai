@@ -1366,6 +1366,8 @@ else:
         reliability_support.write_bytes(SCRIPT.with_name("pattern_buffer_reliability.py").read_bytes())
         required_reads_support = package / "pattern_buffer_required_reads.py"
         required_reads_support.write_bytes(SCRIPT.with_name("pattern_buffer_required_reads.py").read_bytes())
+        session_effort_support = package / "pattern_buffer_session_effort.py"
+        session_effort_support.write_bytes(SCRIPT.with_name("pattern_buffer_session_effort.py").read_bytes())
         result = subprocess.run([sys.executable, str(source), "install", *options,
                                  "--runtime-dir", str(runtime)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1381,6 +1383,7 @@ else:
         session_support.unlink()
         reliability_support.unlink()
         required_reads_support.unlink()
+        session_effort_support.unlink()
         package.rmdir()
         outside = self.root.parent / "outside-git"
         outside.mkdir()
@@ -1406,6 +1409,28 @@ else:
                     self.assertEqual(result.stderr, "")
                     self.assertEqual(self.snapshot(outside), outside_before)
                     self.assertEqual(self.snapshot(home), home_before)
+        session = "11111111-1111-4111-8111-111111111111"
+        transcript = self.root.parent.resolve() / "native-session.jsonl"
+        transcript.write_text("\n".join(json.dumps(row) for row in (
+            {"type": "session_meta", "payload": {"id": session}},
+            {"type": "turn_context", "timestamp": "2026-11-15T12:00:00Z",
+             "payload": {"model": "gpt-6-codex", "effort": "high"}},
+            {"type": "event_msg", "payload": {"text": "INSTALLED-RAW-CONTENT"}},
+        )) + "\n")
+        result = subprocess.run([
+            str(runtime / "pattern-buffer"), "--cwd", str(outside), "session-effort",
+            "--harness", "codex", "--session", session, "--transcript", str(transcript),
+        ], capture_output=True, text=True,
+        env={**os.environ, "HOME": str(home), "XDG_DATA_HOME": str(home / "data")}, cwd=outside)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["model"], "gpt-6-codex")
+        self.assertEqual(report["effort"], "high")
+        self.assertEqual(report["state"], "last_observed")
+        self.assertNotIn("INSTALLED-RAW-CONTENT", result.stdout)
+        self.assertEqual(self.snapshot(outside), outside_before)
+        self.assertEqual(self.snapshot(home), home_before)
         settings_before_reinstall = settings.read_bytes()
         for installed in (runtime / "context_injector_codex.py", runtime / "pattern_buffer.py",
                           runtime / "pattern_buffer_codex.py", runtime / "pattern-buffer"):
@@ -1474,7 +1499,7 @@ else:
                 self.assertIn("def configure_hooks(args):", script.read_text())
                 cores.append(script.read_bytes())
         self.assertTrue(all(core == cores[0] for core in cores[1:]))
-        for helper in ("checkpoint", "enrollment", "sessions", "reliability"):
+        for helper in ("checkpoint", "enrollment", "sessions", "reliability", "required_reads", "session_effort"):
             copies = [runtime / f"{prefix}_{harness}_{helper}.py"
                       for harness in ("codex", "claude")
                       for prefix in ("context_injector", "pattern_buffer")]

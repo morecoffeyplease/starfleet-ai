@@ -113,6 +113,22 @@ Read the [published guidance attestation guide](../starfleet-policy-guard/guide.
 The read-only `handoff-check` distinguishes approved context and optional checkpoint state from installed-hook compatibility, native binding evidence and actual model delivery.
 Unknown native or delivery evidence stays unknown and does not add a readiness gate.
 
+## Inspect session effort
+
+Run `pattern-buffer session-effort --harness claude --session SESSION_UUID` or use `codex` for a Codex session.
+The command reports observed model, reasoning effort, source, timestamp, age and whether effort was last observed or is unknown.
+Reasoning effort is also called thought size or thought budget size.
+The report does not contain thinking tokens or remaining context.
+Missing or unsupported evidence stays unknown and is never inferred from saved settings or model self-report.
+Claude observations store only allowlisted fields in private local state, one record per exact session, and an unknown read creates no state.
+Codex reads the exact session's native `turn_context` record after validating its `session_meta` identity.
+It validates identity from the file header and reads at most the most recent 8 MiB, so long transcripts remain usable.
+Claude reports the session-selected level; Codex reports the observed turn, which can include a turn-specific override.
+A report describes the recorded observation, not a guarantee about a later turn.
+Use `--transcript PATH` to read one Codex transcript directly, or let the command look under `CODEX_HOME/sessions` for an exact UUID match.
+This diagnostic adds no handoff gate.
+Follow Replicator's existing model and effort evidence rule, and continue when a live effort reading is unavailable.
+
 ## Dispatch and task replay
 
 Dispatch enrolls an implementer worktree, binds a task brief to the owner and launches the selected Claude or Codex CLI.

@@ -762,7 +762,7 @@ def opencode_plugin_directory(runtime_dir=None):
     runtime = opencode_runtime_directory(runtime_dir) if runtime_dir else Path(__file__).resolve().parent
     return runtime / "opencode-plugin"
 
-RUNTIME_HELPERS = ("checkpoint", "enrollment", "sessions", "reliability", "required_reads")
+RUNTIME_HELPERS = ("checkpoint", "enrollment", "sessions", "reliability", "required_reads", "session_effort")
 
 
 def runtime_bundle_paths(script):
@@ -904,6 +904,7 @@ def prepare_install(args):
         "sessions": bounded(auxiliary_source("sessions"), 256 * 1024),
         "reliability": bounded(auxiliary_source("reliability"), 256 * 1024),
         "required_reads": bounded(auxiliary_source("required_reads"), 256 * 1024),
+        "session_effort": bounded(auxiliary_source("session_effort"), 256 * 1024),
     }
     launcher_template = sources["launcher_template"]
     runtime_binding = "RUNTIME_DIR = None"
@@ -1130,6 +1131,7 @@ def configure_opencode(args):
             copies = {
                 runtime / "pattern_buffer.py": Path(__file__).resolve(),
                 runtime / "pattern_buffer_sessions.py": auxiliary_source("sessions"),
+                runtime / "pattern_buffer_session_effort.py": auxiliary_source("session_effort"),
                 runtime / "pattern_buffer_reliability.py": auxiliary_source("reliability"),
                 runtime / "pattern_buffer_checkpoint.py": checkpoint_source(),
                 runtime / "pattern_buffer_enrollment.py": enrollment_source(),
@@ -3172,10 +3174,18 @@ def statusline(delegate_json):
     payload = {}
     try:
         payload = json.loads(raw) if len(raw) <= 1024 * 1024 else {}
-        if isinstance(payload, dict):
+    except (OSError, ValueError, TypeError):
+        pass
+    if isinstance(payload, dict):
+        # Observer failures must not keep the configured display from running.
+        try:
             checkpoints().statusline(sys.modules[__name__], "claude", payload)
-    except (OSError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError):
-        pass  # The original display must keep working when telemetry is unavailable.
+        except (OSError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError):
+            pass
+        try:
+            auxiliary("session_effort").observe_claude_statusline(payload)
+        except Exception:
+            pass
     delegate = json.loads(delegate_json)
     if delegate:
         return subprocess.run(delegate["command"], shell=True, input=raw).returncode
@@ -3409,6 +3419,14 @@ def main():
                              help="print the next unread entry or part for this role")
     read_required.add_argument("--part", type=int,
                                help="1-based part number for a file larger than the harness piece size")
+    session_effort = sub.add_parser(
+        "session-effort", help="report observed model and reasoning effort for one exact session")
+    session_effort.add_argument("--harness", choices=("claude", "codex"), required=True)
+    session_effort.add_argument("--session", required=True, help="canonical native session UUID")
+    codex_source = session_effort.add_mutually_exclusive_group()
+    codex_source.add_argument("--transcript", help="read one explicit Codex native transcript")
+    codex_source.add_argument("--codex-home", help="inspect exact-ID session files under this CODEX_HOME")
+    session_effort.add_argument("--state-dir", help="read Claude observations from this private state directory")
     handoff = sub.add_parser("handoff-check", help="read-only context, checkpoint, runtime, and evidence check for a successor")
     handoff.add_argument("--harness", choices=("claude", "codex"), required=True)
     handoff.add_argument("--session", required=True)
@@ -3564,6 +3582,16 @@ def main():
             return 0
         if args.command == "statusline":
             return statusline(args.delegate_json)
+        if args.command == "session-effort":
+            if args.harness == "claude" and (args.transcript or args.codex_home):
+                raise ValueError("--transcript and --codex-home apply only to Codex")
+            if args.harness == "codex" and args.state_dir:
+                raise ValueError("--state-dir applies only to Claude")
+            report = auxiliary("session_effort").read_session_effort(
+                args.harness, args.session, transcript=args.transcript,
+                state_dir=args.state_dir, codex_home=args.codex_home)
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            return 0
         if args.command == "compaction-settings":
             compaction_settings(args)
             return 0

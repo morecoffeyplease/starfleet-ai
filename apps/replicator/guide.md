@@ -157,6 +157,11 @@ Do not rewrite the goal, weaken required proof, expand repair authority, or add 
 
 ## Start a successor with the authorized command
 
+Use `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` to inspect observed model and reasoning effort for an exact Claude or Codex session.
+Reasoning effort is also called thought size or thought budget size, and the command does not report thinking tokens or remaining context.
+An unknown result stays advisory and does not add a handoff gate.
+See [Pattern Buffer's session effort guide](../pattern-buffer/guide.md#inspect-session-effort) for the source fields and unknown-state rules.
+
 Confirm the outgoing session's provider, model, effort, and effective permissions before launch.
 For model and effort, accept explicit user confirmation, the exact session's runtime report, or saved settings with launch arguments that show no override.
 Record the evidence in the existing handoff packet.

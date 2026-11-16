@@ -251,6 +251,25 @@ If an existing warning is disabled, its next action shows the supported `checkpo
 New Claude checkpoints default to 50 minutes, while existing checkpoints remain unchanged until their owner enables a warning.
 An armed timer is configuration evidence, not proof that its wake was received.
 
+## Inspect session effort
+
+Run `pattern-buffer session-effort --harness claude --session SESSION_UUID` or use `codex` for a Codex session.
+The command prints one JSON observation with the model, reasoning effort, evidence source, observation timestamp, age and state.
+Reasoning effort is also called thought size or thought budget size.
+The command does not report thinking tokens or remaining context.
+Claude reports only `model.id` and `effort.level` values observed in the exact session's statusline payload.
+Claude stores those allowlisted values in private local state, one file per exact session, and does not retain the raw payload.
+Codex reports the latest timestamped `turn_context.payload.model` and `turn_context.payload.effort` after `session_meta.payload.id` matches the requested UUID.
+It validates the file header and reads at most the most recent 8 MiB rather than rejecting a long transcript.
+Claude reports the session-selected level; Codex reports the observed turn, including any recorded turn-specific override.
+An unfinished, unsupported or absent recent record stays unknown, and an old observation does not guarantee the next turn uses that effort.
+Pass `--transcript PATH` to read one Codex transcript, or let the command search the exact UUID filename under `CODEX_HOME/sessions`.
+An unknown result means the command found no supported effort evidence for that session.
+The command does not infer effort from saved settings or model self-report.
+An unknown result does not add a handoff gate.
+Follow Replicator's existing model and effort evidence rule, including its human confirmation, exact runtime report, or saved settings with launch arguments that show no override.
+An unavailable live effort reading alone does not block launch or transfer.
+
 ## Shared recovery reminder
 
 Pattern Buffer appends the same short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
