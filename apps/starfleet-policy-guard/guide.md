@@ -52,6 +52,16 @@ From round three, prepare a fresh zoom-out for the actual upcoming repair batch 
 Before round four, obtain user approval for a specific next batch or explicit allowance.
 For an existing PR already beyond round three, apply this prospectively before the next unapproved batch; do not reset or retroactively approve its history.
 
+After the third unsuccessful repair batch, if deciding evidence still shows a material blocker, stop and ask the configured human authority whether they want one optional skeptical review of the exact next-step proposal.
+State the approved outcome, remaining blocker, attempts and outcomes, added complexity, and smallest safe next route.
+Count from the existing accepted repair history; never infer repair-round count from a Model Preferences review-cycle ordinal.
+The skeptical review is optional, uses the single reviewer saved in the active profile's adopted Model Preferences policy, and is scoped to the exact target, proposal, selection and worktree.
+See the [Model Preferences skeptical proposal review path](../model-preferences/README.md#request-an-optional-skeptical-proposal-review) for its explicit setup, approval and dispatch commands.
+If the human authority declines, no model launches, and the user may still make a separate bounded continuation, revert or defer decision under the existing rules.
+If the review runs, return its recommendation and unresolved disagreement to the human authority before asking for a separate bounded continuation decision.
+Approval to run the reviewer authorizes only that review and never authorizes the next repair batch.
+This optional review is not a readiness gate, and neither Model Preferences nor Policy Guard detects undeclared repair edits.
+
 The request for approval should state the approved outcome, remaining evidence-backed blocker, attempts and outcomes, added complexity, simplest safe route, and proposed bounded batch.
 One request may cover overlapping stop conditions, but approval applies only to its stated batch or allowance.
 Preserve stricter scope, mechanism, review, merge, safety, and human-approval rules.
@@ -100,6 +110,10 @@ Resolve an unknown required fact by investigating it or asking the configured hu
 Disclosing an unknown as an assumption or uncertainty does not complete a prerequisite or waive missing evidence, verification, scope or authority.
 The `uncertainty` list may still record honest tool-capability limits or future outcomes, such as a later authenticated comment read being unavailable.
 Do not claim future repair verification is complete.
+Keep actual repair rounds in the linked existing history, separately from Model Preferences review-cycle ordinals.
+Use existing `evidence_refs` for the exact skeptical proposal and review result when applicable.
+Keep `approval_evidence_ref` bound to the distinct authorization for the accepted repair batch; approval for a skeptical review is not that authorization.
+Do not add a second repair-round counter or claim that attestation records intercept undeclared work.
 
 Before recommending another repair, requesting approval, or dispatching implementation, complete the existing assessment of prior outcomes, premise, deciding observation, disposition, and applicable rules.
 After any required authorization, reuse this same assessment in the accepted repair-batch attestation without creating a second form or store.

@@ -360,6 +360,8 @@ Adopted ready/merge requires current evidence.
 **Repair rounds: don't spiral**
 - Record assessment, evidence and cumulative rounds in the PR/tracker before recommending, requesting approval or dispatching; reuse it in the attestation.
 From round three, prepare a fresh zoom-out before accepting or dispatching the batch.
+After three unsuccessful repair rounds, ask the configured human authority whether they want the profile's optional skeptical review of the exact next-step proposal; count actual repair history, not review-cycle ordinals.
+Review approval authorizes only that review; require a separate bounded batch decision before round four. A declined review still permits a separate approved continuation, revert, or defer decision.
 - Stop a chain when its fix causes another regression there; prefer reverting an isolatable failed repair.
 Do not blindly revert mixed changes or restore a serious vulnerability.
 - After two failed attempts on one finding, attack the premise and ask before a third.
