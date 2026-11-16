@@ -47,8 +47,8 @@ It does not print file paths, file contents, credentials, or native peer lists.
 The report includes separate checks for the exact native caller, Git worktree identity, context access, guidance access, model, effort, permissions, and explicit tool exclusions.
 The current CMUX snapshot provides caller identity and state, but no model, effort, or effective permission fields.
 Preflight therefore reports those settings as `unknown` today.
-Observe each setting through a supported native control scoped to the exact session before transferring custody.
-Do not infer settings from Model Preferences, launch arguments, environment overrides, or another session.
+Use the model and effort evidence described below when preflight cannot observe those settings.
+Keep native identity, permission, and custody checks separate from model and effort evidence.
 
 Preflight uses `cmux current --json --limit 200` and bounded read-only Git commands.
 It does not run tool doctors, start sessions, change files, enroll tools, or verify native delivery.
@@ -157,7 +157,14 @@ Do not rewrite the goal, weaken required proof, expand repair authority, or add 
 
 ## Start a successor with the authorized command
 
-Observe the outgoing session's actual provider, model, effort, and effective permissions before launch.
+Confirm the outgoing session's provider, model, effort, and effective permissions before launch.
+For model and effort, accept explicit user confirmation, the exact session's runtime report, or saved settings with launch arguments that show no override.
+Record the evidence in the existing handoff packet.
+If live effort is not exposed, record that limitation and continue using the available evidence.
+An unavailable live model or effort reading alone does not block launch or transfer.
+Resolve an actual conflict with the requested model or effort before the dependent action.
+Preserve the requested model and effort through the authorized launch route.
+These evidence choices do not relax native identity, permission, trust, or custody checks.
 Preserve the exact minimal launch command and working directory authorized by the user.
 For a terminal-based orchestrator, preserve its ordinary terminal launch route through the same installed entry point.
 Read `cmux new-surface --help` before creating the terminal tab.
@@ -176,7 +183,8 @@ cmux new-surface --type terminal --workspace WORKSPACE_ID --working-directory /w
 Replace the command placeholder with the same installed Claude or Codex entry point and approved launch options used by the outgoing orchestrator.
 Let the installed integration create a fresh session identity instead of copying the outgoing process's session ID or temporary settings arguments.
 The `agent-session` surface is a different interface and does not preserve this terminal launch route.
-Verify the successor's actual model, effort, and effective permissions through supported native controls before any transfer.
+Check the successor's model and effort using the evidence above before transfer.
+Verify its effective permissions through supported native controls.
 Do not invent CMUX lifecycle flags or switch to an unapproved provider-binary route.
 If an authorized terminal script is part of the command, invoke its installed wrapper or verified shell integration.
 Confirm that CMUX actually tracks the resulting native session before attempting owner enrollment.
@@ -185,14 +193,17 @@ Identify its role, the approved mission and safety boundaries, and the installed
 From a source checkout, use `python3 apps/replicator/replicator.py guide --print`.
 Let the successor discover the maintained procedure and independently inspect the handoff records.
 Keep private launch recipes and transcripts out of the procedure.
-After startup, inspect the actual native session and verify its provider, model, effort, and effective permissions.
+After startup, confirm the successor's native identity and provider.
+Check its model and effort using the evidence above and verify its effective permissions.
 Name the successor's tab using the outgoing orchestrator's established naming convention, preserving the lane and model identity and updating the session date when the convention includes one.
 Inspect flags added by the installed wrapper as well as the flags supplied by the caller.
 Resolve any difference from the user's authorized permission and trust policy before transferring ownership.
 Use the integration's normal permission dialogs when authorized.
-A saved Model Preferences choice, command flag, or registration is configuration evidence and does not prove runtime parity or delivery.
+A saved Model Preferences choice or registration alone does not prove the launched session uses that choice.
+Accepted model and effort evidence does not prove native delivery.
 Do not change shared profiles, settings, permissions, or another session to make parity appear to match.
-If the successor's actual configuration differs or remains unknown, hold the dependent transfer and retain the outgoing session.
+If the successor's configuration conflicts with the authorized settings, hold the dependent transfer and retain the outgoing session.
+Unknown required identity, permission, trust, or custody evidence still holds the dependent transition.
 Claude evidence does not qualify Codex, and Codex evidence does not qualify Claude.
 Observe a child's effective permission level in that exact child session.
 A parent's launch permission does not prove a child's permission level.
