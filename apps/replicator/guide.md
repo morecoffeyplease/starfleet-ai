@@ -94,6 +94,14 @@ python3 /path/to/installed/runtime/lane.py --cwd /worktree coverage --summary
 Replace every placeholder with a value observed for this handoff.
 Use `--harness claude` for Claude sessions and `--harness codex` for Codex sessions.
 Inspect the Policy Guard seat status for every attached checkout, then inspect coverage from each applicable checkout.
+Inspect the effective native hook configuration for every referenced Policy Guard seat and legacy lane.
+Record each route's runtime, checkout, exact owner, and current or removed attachments.
+One orchestrator can have several seats and legacy lanes with different owners.
+An omitted route remains unresolved until its ownership and required disposition are recorded.
+Keep legacy routes outside the authorized transfer unchanged, with their limitations recorded.
+If a retained route blocks a required action, ask for authorization for that exact action instead of deleting hooks or assuming ownership.
+For an older runtime, use the supported maintenance route in [Policy Guard's handoff and recovery guide](../starfleet-policy-guard/guide.md#inspect-hand-off-and-recover).
+Preserve the first refusal, runtime pins, and removed attachment history when following that route.
 Do not infer a native identity from a title, a parent session, a saved profile, or a worktree default.
 An empty result covers only the exact owner and scope queried.
 Preflight does not replace these tool-specific owner checks.
