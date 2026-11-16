@@ -2,7 +2,7 @@
 
 Policy Guard keeps delivery reports and their local history for a native orchestrator seat.
 It can refuse covered GitHub readiness and merge commands when an attached checkout or pull request has no valid report.
-It does not run audits or verification, classify prompts, grant readiness authority, or enforce fix rounds.
+It does not run audits or verification, classify prompts, grant readiness authority, automatically detect new repair batches, count rounds, or enforce repair decisions.
 
 ## Review and fix cycles
 
@@ -78,7 +78,8 @@ The guard continues to require its existing accepted and dismissed finding-ID co
 If the selected decision is `split out`, or `adds_scope` or `adds_mechanism` is true, the fixture guard stops and requires human approval.
 Policy Guard does not import or authenticate that approval.
 This guidance does not change the fixture schema, round counting, or delivery-seat behavior.
-The current delivery seat does not enforce fix rounds, and this guide does not claim automated enforcement.
+The delivery seat does not automatically detect new batches, count rounds, or enforce repair decisions.
+Its bounded repair-batch check validates declared assessment fields, required approval references, and whether the packet has an accepted repair disposition.
 
 ## Published guidance attestations
 
@@ -99,6 +100,83 @@ Resolve an unknown required fact by investigating it or asking the configured hu
 Disclosing an unknown as an assumption or uncertainty does not complete a prerequisite or waive missing evidence, verification, scope or authority.
 The `uncertainty` list may still record honest tool-capability limits or future outcomes, such as a later authenticated comment read being unavailable.
 Do not claim future repair verification is complete.
+
+Before recommending another repair, requesting approval, or dispatching implementation, complete the existing assessment of prior outcomes, premise, deciding observation, disposition, and applicable rules.
+After any required authorization, reuse this same assessment in the accepted repair-batch attestation without creating a second form or store.
+New repair-batch attestations also require `repair_assessment` in the same `guidance_attestation` object.
+It contains a nonempty `findings` list and an explicit `approval_required` boolean.
+Each finding requires `finding_ref`, an explicit `prior_attempts` list, `premise`, `deciding_observation`, `deciding_evidence_ref`, `disposition`, and a nonempty `applicable_rules` list.
+Each prior attempt requires an `attempt_ref` and an `outcome`.
+Each applicable rule requires a `reference` and `why_applicable` explanation.
+Use an empty `prior_attempts` list only when existing history confirms this is a first attempt.
+The validator checks required fields and their types, but it cannot prove that history is complete, the observation is true, the assessment preceded a recommendation, or the referenced approval was authored by the required person.
+If a required fact remains unknown, keep it in the existing `gaps` list and do not attest.
+
+Allowed finding dispositions are `fix here`, `revert`, `simplify`, `split out`, `defer`, `dismiss`, and `stop`.
+An accepted repair-batch attestation needs at least one `fix here`, `revert`, `simplify`, or `split out` disposition.
+Additional findings in the same batch may be deferred or dismissed.
+A `stop` disposition refuses rendering and start-checking until the existing stop is resolved and reassessed.
+An all-deferred or all-dismissed assessment describes no accepted repair batch and stays in the existing PR or tracker.
+If `approval_required` is true, `approval_evidence_ref` must link the existing approval evidence; if false, set `approval_evidence_ref` to `null`.
+A `split out` disposition requires the assessment to declare approval and link its evidence.
+These checks do not infer approval thresholds, decision quality, timing, or authorship.
+
+The renderer prints each declared finding assessment once under `Repair assessment`.
+The accepted repair-batch body records completed prerequisites and the approved batch before implementation; it does not claim final candidate verification is complete.
+Run the repository's canonical verification and record the resulting candidate through the existing report flow after the repair.
+
+### Repair assessment example
+
+Add this object inside the repair-batch `guidance_attestation` object.
+Keep `accepted_batch_ref` and `repair_history_ref` as the existing batch and history links.
+
+```json
+{
+  "repair_assessment": {
+    "findings": [
+      {
+        "finding_ref": "https://github.com/OWNER/REPO/issues/123#finding-1",
+        "prior_attempts": [
+          {
+            "attempt_ref": "https://github.com/OWNER/REPO/pull/123#issuecomment-98",
+            "outcome": "The same finding remained after the first attempt."
+          }
+        ],
+        "premise": "The remaining defect comes from the existing branch binding.",
+        "deciding_observation": "The supported path reproduces the defect when the branch binding is stale.",
+        "deciding_evidence_ref": "https://github.com/OWNER/REPO/pull/123#issuecomment-99",
+        "disposition": "simplify",
+        "applicable_rules": [
+          {
+            "reference": "https://github.com/OWNER/REPO/blob/FULL_COMMIT/apps/starfleet-policy-guard/guide.md#handle-repair-caused-regressions-and-count-attempts",
+            "why_applicable": "The prior attempt targeted this same underlying finding."
+          }
+        ]
+      },
+      {
+        "finding_ref": "https://github.com/OWNER/REPO/issues/123#finding-2",
+        "prior_attempts": [],
+        "premise": "The separate edge case does not block the approved outcome.",
+        "deciding_observation": "The common path succeeds and the edge case is not reproduced.",
+        "deciding_evidence_ref": "https://github.com/OWNER/REPO/pull/123#issuecomment-100",
+        "disposition": "defer",
+        "applicable_rules": [
+          {
+            "reference": "https://github.com/OWNER/REPO/blob/FULL_COMMIT/apps/starfleet-policy-guard/guide.md#triage-findings",
+            "why_applicable": "The issue is nonblocking and unrelated to the accepted repair."
+          }
+        ]
+      }
+    ],
+    "approval_required": false,
+    "approval_evidence_ref": null
+  }
+}
+```
+
+For a repair requiring approval under existing policy, set `approval_required` to `true` and provide its existing evidence reference.
+The validator requires the reference but does not authenticate its author or infer whether approval was required.
+Keep stop and no-work outcomes in the existing brief or tracker instead of publishing them as an accepted repair batch.
 
 ### Starfleet handoff acceptance
 
@@ -253,6 +331,38 @@ Existing immutable seats must first receive the reviewed source through the norm
 For each later PR, discover its current binding and validate its own published comment with the same command without `--enable`.
 Opening and repair-batch publications remain bound to their original owner and PR; after a supported owner handoff, successor validation creates a separate current-owner publication that links the exact predecessor.
 There is no disable or fallback flag.
+
+### Preserve an active legacy repair publication during upgrade
+
+The reviewed source upgrade preserves an already accepted repair publication as the current publication while its original packet and exact rendered comment still match the stored attestation and body hashes.
+This compatibility path exists only inside covered delivery validation for that exact current publication.
+It does not let `attestation-render` or `attestation-start-check` accept a new repair-batch packet without `repair_assessment`.
+The software cannot detect an undeclared new repair batch or prove that the assessment preceded a recommendation.
+After the owner accepts another repair batch, add its assessment to the existing packet, render a new body, publish it as a new PR comment, then run `attestation-start-check` without `--enable`.
+Do not edit or replace an earlier comment or rewrite prior attempt counts, repair history, or owner history.
+An all-deferred, all-dismissed, or stopped decision remains in the existing PR or tracker and cannot authorize implementation dispatch.
+
+For an active pinned seat, use the normal reviewed source upgrade before the next accepted batch.
+The upgrade updates active source pins and requires a fresh report for covered actions, while preserving the existing current publication for in-progress accepted work.
+Before the next batch starts, update the packet and publish a new exact comment through the same flow:
+
+```sh
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade-plan
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade \
+  --plan-sha256 REVIEWED_PLAN_SHA256
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree attestation-rereads
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree attestation-render \
+  --evidence /private/delivery-evidence.json --stage repair-batch > /tmp/repair-batch-attestation.md
+gh pr comment https://github.com/OWNER/REPO/pull/123 --body-file /tmp/repair-batch-attestation.md
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree attestation-start-check \
+  --evidence /private/delivery-evidence.json --stage repair-batch \
+  --comment-url 'https://github.com/OWNER/REPO/pull/123#issuecomment-NEW'
+```
+
+The reviewed source must be clean and committed as required by `upgrade-plan`.
+Preserve the existing batch/history references and required-read workflow, add the new assessment, and leave the prior comment intact.
+The repair-batch attestation is prerequisite evidence before work, not final candidate proof.
+After implementation, run canonical verification and record a fresh report for the resulting candidate before covered delivery.
 
 Under the published policy, an adopted target refuses covered ready or merge unless its current packet attestation, exact local reread bytes and per-PR publication reference match.
 Under that policy, each covered action reads the exact authenticated GitHub comment using the captured `gh` executable with a bounded timeout; unavailable, edited, deleted or mismatched comments fail closed.

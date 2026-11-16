@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import github_records as github
@@ -300,7 +301,101 @@ def require_required_read_receipts(report, packet, directory):
             'entries': context_entries}
 
 
-def guidance_attestation(packet, directory, pr_url, stage=None):
+def validate_repair_assessment(assessment):
+    try:
+        return _validate_repair_assessment(assessment)
+    except ValueError as error:
+        message = str(error).rstrip(' .')
+        guide_command = shlex.join([
+            sys.executable,
+            str(Path(__file__).resolve().with_name('lane.py')),
+            'guide', '--print'])
+        raise ValueError(
+            message + '. Print the installed runtime guide with `' + guide_command + '` and read the '
+            '"Repair assessment example" section.') from error
+
+
+def _validate_repair_assessment(assessment):
+    if not isinstance(assessment, dict):
+        raise ValueError(
+            'A new repair-batch attestation needs guidance_attestation.repair_assessment; assess the existing '
+            'repair history before recommending or accepting another batch')
+    findings = assessment.get('findings')
+    if not isinstance(findings, list) or not findings:
+        raise ValueError('repair_assessment.findings must be a nonempty list of assessed findings')
+
+    def required_text(record, key, path):
+        if not isinstance(record.get(key), str) or not record[key].strip():
+            raise ValueError(path + '.' + key + ' must be a nonempty string')
+        return record[key]
+
+    dispositions = set()
+    for index, finding in enumerate(findings):
+        prefix = 'repair_assessment.findings[' + str(index) + ']'
+        if not isinstance(finding, dict):
+            raise ValueError(prefix + ' must be an object')
+        required_text(finding, 'finding_ref', prefix)
+        attempts = finding.get('prior_attempts')
+        if not isinstance(attempts, list):
+            raise ValueError(
+                prefix + '.prior_attempts must be an explicit list; use [] only for a confirmed first attempt')
+        for attempt_index, attempt in enumerate(attempts):
+            attempt_prefix = prefix + '.prior_attempts[' + str(attempt_index) + ']'
+            if not isinstance(attempt, dict):
+                raise ValueError(attempt_prefix + ' must be an object with attempt_ref and outcome')
+            required_text(attempt, 'attempt_ref', attempt_prefix)
+            required_text(attempt, 'outcome', attempt_prefix)
+        required_text(finding, 'premise', prefix)
+        required_text(finding, 'deciding_observation', prefix)
+        required_text(finding, 'deciding_evidence_ref', prefix)
+        disposition = finding.get('disposition')
+        allowed = ('fix here', 'revert', 'simplify', 'split out', 'defer', 'dismiss', 'stop')
+        if disposition not in allowed:
+            raise ValueError(prefix + '.disposition must be one of: ' + ', '.join(allowed))
+        dispositions.add(disposition)
+        rules = finding.get('applicable_rules')
+        if not isinstance(rules, list) or not rules:
+            raise ValueError(prefix + '.applicable_rules must list each applicable rule reference and why it applies')
+        for rule_index, rule in enumerate(rules):
+            rule_prefix = prefix + '.applicable_rules[' + str(rule_index) + ']'
+            if not isinstance(rule, dict):
+                raise ValueError(rule_prefix + ' must be an object with reference and why_applicable')
+            required_text(rule, 'reference', rule_prefix)
+            required_text(rule, 'why_applicable', rule_prefix)
+
+    if 'stop' in dispositions:
+        raise ValueError(
+            'Repair assessment includes a stop disposition; do not render or publish an accepted repair batch or '
+            'dispatch work until the existing stop is resolved and reassessed')
+    if not dispositions.intersection(('fix here', 'revert', 'simplify', 'split out')):
+        raise ValueError(
+            'Repair assessment has no accepted repair action; defer or dismiss no-work outcomes in the existing '
+            'PR or tracker without a repair-batch publication')
+
+    approval_required = assessment.get('approval_required')
+    if type(approval_required) is not bool:
+        raise ValueError('repair_assessment.approval_required must be an explicit boolean')
+    if 'approval_evidence_ref' not in assessment:
+        raise ValueError('repair_assessment.approval_evidence_ref must be explicit; use null only when no approval is required')
+    approval_ref = assessment.get('approval_evidence_ref')
+    if approval_required:
+        if not isinstance(approval_ref, str) or not approval_ref.strip():
+            raise ValueError(
+                'repair_assessment.approval_evidence_ref is missing; stop before accepting or dispatching this '
+                'batch and link the existing approval record')
+    elif approval_ref is not None:
+        raise ValueError('repair_assessment.approval_evidence_ref must be null when approval_required is false')
+    if 'split out' in dispositions and not approval_required:
+        raise ValueError('A split out disposition requires its existing human approval; stop and add the approval evidence reference')
+    return assessment
+
+
+def guidance_attestation_sha256(record):
+    encoded = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def guidance_attestation(packet, directory, pr_url, stage=None, *, _allow_legacy_repair=False):
     """Validate the one human-authored stage attestation in an evidence packet."""
     record = packet.get('guidance_attestation')
     if not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1:
@@ -315,6 +410,10 @@ def guidance_attestation(packet, directory, pr_url, stage=None):
     if record['stage'] == 'repair_batch':
         text(record, 'accepted_batch_ref')
         text(record, 'repair_history_ref')
+        if _allow_legacy_repair and 'repair_assessment' not in record:
+            pass
+        else:
+            validate_repair_assessment(record.get('repair_assessment'))
     elif record['stage'] == 'successor_validation':
         if 'accepted_batch_ref' in record:
             raise ValueError('A successor validation cannot accept or create a repair batch')
@@ -374,9 +473,11 @@ def guidance_attestation(packet, directory, pr_url, stage=None):
     return record
 
 
-def render_guidance_attestation(packet, directory, pr_url, stage, report=None, receipt_context=None):
+def render_guidance_attestation(packet, directory, pr_url, stage, report=None, receipt_context=None,
+                                *, _allow_legacy_repair=False):
     """Render the approved stage ordering and return digests for the exact body."""
-    record = guidance_attestation(packet, directory, pr_url, stage)
+    record = guidance_attestation(packet, directory, pr_url, stage,
+                                  _allow_legacy_repair=_allow_legacy_repair)
     if stage in ('opening', 'successor_validation') and not opening_report_ready(report):
         label = 'Successor validation' if stage == 'successor_validation' else 'Opening attestation'
         raise ValueError(label + ' requires a current clean report with successful canonical verification')
@@ -408,6 +509,7 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None, r
             lines(record['evidence_refs']),
         ]
     elif stage == 'repair_batch':
+        assessment = record.get('repair_assessment')
         sections = [
             '# Accepted repair-batch attestation',
             GUIDANCE_ATTESTATION_STATEMENT,
@@ -415,10 +517,34 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None, r
             'Accepted batch: ' + record['accepted_batch_ref'],
             '## Prerequisites completed before work',
             'Prerequisites are complete; no gaps are recorded.',
+        ]
+        if assessment is not None:
+            assessment_lines = []
+            for finding in assessment['findings']:
+                assessment_lines.extend([
+                    'Finding: ' + finding['finding_ref'],
+                    'Prior attempts: ' + (
+                        '; '.join(attempt['attempt_ref'] + ' - ' + attempt['outcome']
+                                  for attempt in finding['prior_attempts'])
+                        if finding['prior_attempts'] else 'None declared for this first attempt'),
+                    'Premise: ' + finding['premise'],
+                    'Deciding observation: ' + finding['deciding_observation'],
+                    'Deciding evidence: ' + finding['deciding_evidence_ref'],
+                    'Disposition: ' + finding['disposition'],
+                    'Applicable rules: ' + '; '.join(
+                        rule['reference'] + ' - ' + rule['why_applicable']
+                        for rule in finding['applicable_rules']),
+                ])
+            approval_line = ('Required approval evidence: ' + assessment['approval_evidence_ref']
+                             if assessment['approval_required'] else
+                             'Required approval evidence: None required for this assessed batch.')
+            sections.append('## Repair assessment\n' + '\n'.join(
+                '- ' + line for line in assessment_lines + [approval_line]))
+        sections.extend([
             '## Approach',
             record['approach'] + '\n\nReason: ' + record['approach_reason'],
             'Guidance application: ' + record['guidance_application'],
-        ]
+        ])
     else:
         prior = record['prior_publication_ref']
         reconciliation = record['reconciliation']
@@ -477,10 +603,9 @@ def render_guidance_attestation(packet, directory, pr_url, stage, report=None, r
             GUIDANCE_ATTESTATION_STATEMENT,
         ])
     body = '\n\n'.join(sections).rstrip()
-    attestation_bytes = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
     rendered = {'stage': stage, 'body': body,
                 'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
-                'attestation_sha256': hashlib.sha256(attestation_bytes).hexdigest()}
+                'attestation_sha256': guidance_attestation_sha256(record)}
     if receipt_context is not None:
         rendered['required_reads'] = receipt_context
     return rendered

@@ -624,9 +624,15 @@ def require_guidance_attestation(state, cwd, *, local_inspection=False):
         prior, _same_owner_publication = successor_predecessor(state, packet)
         if published.get('prior_publication_ref') != prior:
             raise ValueError('Successor publication no longer links the exact inherited publication in its current packet')
+    record = packet.get('guidance_attestation') if isinstance(packet, dict) else None
+    legacy_repair_publication = (
+        published.get('stage') == 'repair_batch' and isinstance(record, dict) and
+        record.get('stage') == 'repair_batch' and 'repair_assessment' not in record and
+        delivery.guidance_attestation_sha256(record) == published.get('attestation_sha256'))
     rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
                                                     published.get('stage'), report=report,
-                                                    receipt_context=published.get('required_reads'))
+                                                    receipt_context=published.get('required_reads'),
+                                                    _allow_legacy_repair=legacy_repair_publication)
     if (published.get('body_sha256') != rendered['body_sha256'] or
             published.get('attestation_sha256') != rendered['attestation_sha256']):
         raise ValueError('Local guidance attestation changed after publication; render and publish the current stage again')

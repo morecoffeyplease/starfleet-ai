@@ -358,8 +358,8 @@ Adopted ready/merge requires current evidence.
 - Use Outcome, Playbook, Size and Facts in each implementer brief and the PR opening explanation.
 
 **Repair rounds: don't spiral**
-- Record dispositions, evidence and cumulative rounds in the existing PR or tracker.
-From round three, make a fresh zoom-out before accepting or dispatching another batch.
+- Record assessment, evidence and cumulative rounds in the PR/tracker before recommending, requesting approval or dispatching; reuse it in the attestation.
+From round three, prepare a fresh zoom-out before accepting or dispatching the batch.
 - Stop a chain when its fix causes another regression there; prefer reverting an isolatable failed repair.
 Do not blindly revert mixed changes or restore a serious vulnerability.
 - After two failed attempts on one finding, attack the premise and ask before a third.
