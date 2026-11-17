@@ -296,11 +296,6 @@ System and developer instructions take precedence. Follow the latest human instr
 Never invent values, infer scope or treat placeholders as approval.
 Stay within the user's authorized scope.
 
-**PStack guidance - do this now**
-- Use the installed PStack runtime and Poteto Mode.
-- After compaction, read the sections relevant to current work in full.
-- Do not assume you know what this guidance says.
-
 **Agents**
 - Before each launch, read saved active Model Preferences and resolve exact configured reviewer slots.
 Old summaries, pilots and your harness do not select the profile or count.
@@ -355,7 +350,7 @@ Update only changed facts in this lane's sections.
 Follow its owner rereads, source references/digests/application, resolved prerequisites, empty assumptions, opening evidence and exact draft-comment publication flow.
 Run `attestation-start-check` after publication and before repair work; use `--enable` only for first adoption.
 Adopted ready/merge requires current evidence.
-- Use Outcome, Playbook, Size and Facts in each implementer brief and the PR opening explanation.
+- Brief outcomes, bounds and checked facts; justify implementation constraints and follow PStack.
 
 **Repair rounds: don't spiral**
 - Record assessment, evidence and cumulative rounds in the PR/tracker before recommending, requesting approval or dispatching; reuse it in the attestation.
