@@ -100,6 +100,9 @@ The evidence packet may be authored manually before a PR exists, while the curre
 For each reread file, record its kind, name, actual source reference, local path and SHA-256 of its current bytes.
 Use navigable source references, such as a public file URL pinned to a commit, and record installed-only files by their actual path and digest.
 The validator checks the declared local bytes, packet fields, gaps and stage ordering; it cannot prove comprehension, sound judgment or that every applicable source was declared.
+Before attesting, inspect the evidence supporting each fact the approach relies on.
+A worker report or partial check does not establish more than its demonstrated coverage.
+Follow the [briefing and evidence acceptance guidance](../pattern-buffer/docs/implementer-dispatch.md#briefing-and-evidence-acceptance).
 
 Add one `guidance_attestation` object to the existing evidence packet.
 Use `stage: "opening"` for the opening comment and `stage: "repair_batch"` for an accepted repair batch.

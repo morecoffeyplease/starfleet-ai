@@ -121,6 +121,7 @@ The task owner can update or finish a task explicitly, and recovery never replay
 `dispatch --prepare-only`, normal `dispatch`, and OpenCode `prepare-dispatch` also report known upstream path overlaps with the task checkout.
 The advisory reads refs already in that checkout, stores warning deduplication in its private Git metadata, stays quiet when paths do not overlap, and does not block preparation when Git metadata is unavailable.
 The [implementer dispatch guide](docs/implementer-dispatch.md) documents the supported launch, update, recovery and ownership boundaries.
+Read its [briefing and evidence acceptance guidance](docs/implementer-dispatch.md#briefing-and-evidence-acceptance) when writing or accepting a helper assignment.
 See its [upstream overlap advisory section](docs/implementer-dispatch.md#upstream-overlap-advisory) for comparison limits.
 The [OpenCode adapter guide](docs/opencode.md) documents its versioned context hook, explicit two-phase task binding, opt-in setup and native delivery limits.
 Use a unique --receipt-file path when an immutable local snapshot is useful; a receipt is not live task status.

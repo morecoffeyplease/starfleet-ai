@@ -13,6 +13,31 @@ An assigned-item pointer may be updated only when the context owner has granted 
 The orchestrator supplies and explicitly updates task briefs within the work already authorized by the user.
 Task updates do not grant new scope or supersede later user instructions.
 
+## Briefing and evidence acceptance
+
+Use Outcome, Playbook, Size and Facts in an implementer brief.
+Outcome names the user result, affected path and observation that demonstrates success.
+Playbook names the applicable PStack playbook and first step.
+Size bounds the affected area, exclusions, stop conditions and granted file or repair-round budget.
+Facts lists checked facts with supporting artifacts and candidate identities.
+Keep hypotheses and unverified worker claims separate from Facts.
+Investigating a hypothesis is allowed; work that requires it to be true must wait until it is established or resolved with the owner.
+
+Explain prescribed implementation or commit constraints using the governing decision, rule or technical evidence.
+A chosen design, named data shape or deliberate commit sequence can be appropriate under PStack.
+Do not turn an untested mechanism or arbitrary packaging preference into a requirement.
+If a worker stops on a constraint, check its source before treating the stop as a product blocker.
+A worker must report a conflict rather than ignore the constraint or expand its assignment.
+
+Before reporting a pass or briefing work that depends on a change, inspect the supporting artifact, actual command, candidate, result and affected-path coverage.
+A worker report points to evidence; it does not replace that inspection.
+A mock, arithmetic calculation or in-memory experiment supports only the behavior it exercises.
+For example, a collector accepting an overlay does not prove acceptance of the complete edited file with its imports and consumers.
+Verify the changed behavior through the appropriate affected path before relying on it in dependent work.
+Reuse applicable evidence rather than rerunning every worker command, and let independent work continue within its existing authority.
+Report checks that ran separately from checks that were skipped, incomplete or only proposed.
+Preserve the repository's final-candidate verification and stronger repair or approval requirements.
+
 ## Parents with exact-session context
 
 An exact-session parent must not substitute a different worktree-default mission when dispatch refuses that source.
