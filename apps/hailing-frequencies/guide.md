@@ -7,7 +7,8 @@ Use `hailing-frequencies status` to inspect saved enrollment and `hailing-freque
 If health reports incomplete coverage, inspect `status` for targets whose inboxes could not be read.
 Neither establishes permission to start another worker; if worker availability is unclear, ask the existing owner or operator instead.
 
-The Hailing Frequencies installer also installs the `agent-notify` Discord conversation command and its skill.
+The default Hailing Frequencies install also installs the `agent-notify` Discord conversation command and its skill.
+From the Starfleet AI checkout, run `python3 apps/hailing-frequencies/install.py --skip-agent-notify` to install Hailing Frequencies and Temporal Beacon without changing an independent `agent-notify` command.
 Use `agent-notify guide --print` for private Discord setup, credentials, forum permissions, and a bounded reply-receipt check.
 Agent Notify uses the existing Discord Watch installation and worker when present; it does not start another worker.
 

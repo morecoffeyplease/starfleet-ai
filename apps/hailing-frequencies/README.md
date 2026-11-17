@@ -52,7 +52,21 @@ hailing-frequencies init
 hailing-frequencies status
 ```
 
-The installer copies the source, the read-only OpenCode session adapter, printable guides, and skills to an immutable SHA-256 directory under `~/.local/share/starfleet-ai/hailing-frequencies/` and writes the owned launchers `~/.local/bin/hailing-frequencies`, `~/.local/bin/temporal-beacon`, and `~/.local/bin/agent-notify`.
+If a working standalone `agent-notify` already occupies the selected bin directory, the default install refuses it before changing launchers.
+To update only Hailing Frequencies and Temporal Beacon in the default `~/.local/bin` directory, run:
+
+```sh
+python3 apps/hailing-frequencies/install.py --skip-agent-notify
+```
+
+This option leaves the `agent-notify` command path and its target untouched during install or uninstall.
+It does not activate an Agent Notify launcher and reports `agent_notify_skipped` in the installer result.
+The option does not restart a running worker, change Pattern Buffer files, or update commands that use other paths.
+Already running processes may keep code they imported before installation.
+
+The installer copies the source, the read-only OpenCode session adapter, printable guides, and skills to an immutable SHA-256 directory under `~/.local/share/starfleet-ai/hailing-frequencies/`.
+By default, it writes the owned launchers `~/.local/bin/hailing-frequencies`, `~/.local/bin/temporal-beacon`, and `~/.local/bin/agent-notify`.
+With `--skip-agent-notify`, it writes only the Hailing Frequencies and Temporal Beacon launchers.
 It prints immutable paths for the Temporal Beacon and Agent Notify skills.
 Follow [Temporal Beacon skill registration](temporal-beacon.md#enable-agent-discovery) or the Agent Notify guide to make the selected skill discoverable in a harness.
 Removing a development worktree therefore does not remove the installed runtime.
@@ -299,8 +313,11 @@ Escalation is separately deduplicated and sent only to a distinct enrolled coord
 hailing-frequencies status
 hailing-frequencies unenroll --session SESSION_UUID
 python3 apps/hailing-frequencies/install.py --uninstall
+python3 apps/hailing-frequencies/install.py --uninstall --skip-agent-notify
 ```
 
+Use `--skip-agent-notify` on uninstall to remove only the Hailing Frequencies and Temporal Beacon launchers.
+The standalone companion remains at its existing path.
 Remove the health watcher before uninstalling the launcher or replacing a runtime used by that watcher.
 Reinstall `health-service install` after a runtime update so its immutable runtime pointer follows the verified version.
 

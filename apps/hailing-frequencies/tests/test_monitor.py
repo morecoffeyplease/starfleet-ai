@@ -1124,6 +1124,7 @@ class InstallationTests(unittest.TestCase):
             expected = (source / "guide.md").read_text()
             self.assertIn("Retire stale checkpoint timers", expected)
             self.assertIn("retirement apply --timer-id TIMER_ID --confirm DIGEST_SHA256", expected)
+            self.assertIn("--skip-agent-notify", expected)
             agent_notify_guide = (source / "agent-notify-guide.md").read_text()
             with patch.object(install, "__file__", str(staged_installer)):
                 result = install.install(root / "runtime", root / "bin")
@@ -1170,6 +1171,106 @@ class InstallationTests(unittest.TestCase):
             self.assertFalse(agent_notify.exists())
             self.assertTrue(Path(result["runtime"]).is_dir())
 
+    def test_skip_agent_notify_updates_only_selected_launchers_and_preserves_it_on_uninstall(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bindir = root / "bin"
+            bindir.mkdir()
+            runtime_root = root / "runtime"
+            installer = Path(install.__file__).resolve()
+            hailing = bindir / "hailing-frequencies"
+            temporal = bindir / "temporal-beacon"
+            hailing.write_text("#!/bin/sh\n" + hf.INSTALL_MARKER + "\nexit 0\n")
+            temporal.write_text("#!/bin/sh\n" + install.BEACON_MARKER + "\nexit 0\n")
+            hailing.chmod(0o755)
+            temporal.chmod(0o755)
+            standalone_target = root / "standalone-agent-notify"
+            standalone_target.write_text("#!/bin/sh\nprintf 'standalone-active\\n'\n")
+            standalone_target.chmod(0o755)
+            agent_notify = bindir / "agent-notify"
+            agent_notify.symlink_to(standalone_target)
+
+            def metadata(path, follow=False):
+                info = path.stat() if follow else path.lstat()
+                return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                        info.st_mtime_ns, info.st_ctime_ns)
+
+            def companion_state():
+                return (agent_notify.readlink(), metadata(agent_notify), metadata(standalone_target, True),
+                        agent_notify.read_bytes(), standalone_target.read_bytes())
+
+            def selected_state(path):
+                info = path.lstat()
+                return (path.is_symlink(), path.readlink() if path.is_symlink() else path.read_bytes(),
+                        metadata(path))
+
+            old_launchers = {path: selected_state(path) for path in (hailing, temporal)}
+            companion_before = companion_state()
+
+            default = subprocess.run([sys.executable, str(installer), "--runtime-root", str(runtime_root),
+                                      "--bin-dir", str(bindir)], capture_output=True, text=True)
+            self.assertEqual(default.returncode, 1)
+            self.assertEqual(default.stdout, "")
+            self.assertIn("Refusing symlink agent-notify launcher", default.stderr)
+            self.assertEqual({path: selected_state(path) for path in (hailing, temporal)}, old_launchers)
+            self.assertEqual(companion_state(), companion_before)
+            self.assertFalse(runtime_root.exists())
+
+            installed = subprocess.run([sys.executable, str(installer), "--runtime-root", str(runtime_root),
+                                        "--bin-dir", str(bindir), "--skip-agent-notify"],
+                                       capture_output=True, text=True)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertEqual(installed.stderr, "")
+            result = json.loads(installed.stdout)
+            self.assertTrue(result["agent_notify_skipped"])
+            self.assertIsNone(result["agent_notify_command"])
+            runtime = Path(result["runtime"])
+            self.assertIn(str(runtime / "hailing_frequencies.py"), hailing.read_text())
+            self.assertIn(str(runtime / "hailing_frequencies.py"), temporal.read_text())
+            self.assertIn(" temporal", temporal.read_text())
+            self.assertTrue((runtime / "hailing_frequencies.py").is_file())
+            self.assertEqual(subprocess.run([str(hailing), "--help"], capture_output=True, text=True).returncode, 0)
+            self.assertEqual(subprocess.run([str(temporal), "--help"], capture_output=True, text=True).returncode, 0)
+            self.assertEqual(companion_state(), companion_before)
+
+            removed = subprocess.run([sys.executable, str(installer), "--runtime-root", str(runtime_root),
+                                      "--bin-dir", str(bindir), "--uninstall", "--skip-agent-notify"],
+                                     capture_output=True, text=True)
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertEqual(removed.stderr, "")
+            removal = json.loads(removed.stdout)
+            self.assertTrue(removal["agent_notify_skipped"])
+            self.assertIsNone(removal["agent_notify_removed"])
+            self.assertFalse(hailing.exists())
+            self.assertFalse(temporal.exists())
+            self.assertEqual(companion_state(), companion_before)
+            self.assertTrue(runtime.is_dir())
+
+    def test_skip_agent_notify_keeps_hf_and_temporal_ownership_checks(self):
+        for launcher_name in ("hailing-frequencies", "temporal-beacon"):
+            for shape in ("unowned", "symlink"):
+                with self.subTest(launcher=launcher_name, shape=shape), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    target = root / "foreign-target"
+                    target.write_text("foreign target")
+                    launcher = root / launcher_name
+                    if shape == "symlink":
+                        launcher.symlink_to(target)
+                    else:
+                        launcher.write_text("foreign")
+                    standalone_target = root / "standalone-agent-notify"
+                    standalone_target.write_text("standalone")
+                    companion = root / "agent-notify"
+                    companion.symlink_to(standalone_target)
+                    original_link = companion.readlink()
+                    original_target = standalone_target.read_bytes()
+                    with self.assertRaises(ValueError):
+                        install.install(root / "runtime", root, skip_agent_notify=True)
+                    self.assertTrue(launcher.is_symlink() if shape == "symlink" else launcher.read_text() == "foreign")
+                    self.assertEqual(companion.readlink(), original_link)
+                    self.assertEqual(standalone_target.read_bytes(), original_target)
+                    self.assertFalse((root / "runtime").exists())
+
     def test_foreign_launcher_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1181,6 +1282,8 @@ class InstallationTests(unittest.TestCase):
             (root / "agent-notify").write_text("foreign")
             with self.assertRaisesRegex(ValueError, "not owned"):
                 install.install(root / "runtime", root)
+            self.assertEqual((root / "agent-notify").read_text(), "foreign")
+            self.assertFalse((root / "runtime").exists())
 
 
 class ServiceTests(unittest.TestCase):

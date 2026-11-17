@@ -15,6 +15,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "pattern-buffer"))
 import hailing_frequencies as hf
+import install as hf_install
 import temporal_beacon as tb
 import pattern_buffer_checkpoint as pb_checkpoint
 
@@ -269,7 +270,46 @@ class TimerRetirementTests(unittest.TestCase):
         self.assertEqual(repeated["timer_ids"], [timer["id"]])
         self.assertEqual(self._retirement_tables(), (1, 1))
 
-    def test_preview_binds_nested_worktree_alias_and_blocks_source_pb_rearm(self):
+    def test_preview_binds_nested_worktree_alias_and_blocks_installed_pb_rearm(self):
+        source_app = Path(hf.__file__).resolve().parent
+        old_hailing = self.launcher_dir / "hailing-frequencies"
+        old_temporal = self.launcher_dir / "temporal-beacon"
+        old_hailing.write_text("#!/bin/sh\n" + hf.INSTALL_MARKER + "\nexit 0\n")
+        old_temporal.write_text("#!/bin/sh\n" + hf_install.BEACON_MARKER + "\nexit 0\n")
+        old_hailing.chmod(0o755)
+        old_temporal.chmod(0o755)
+        standalone_target = self.home / "standalone-agent-notify"
+        standalone_target.write_text("#!/bin/sh\nprintf 'standalone command remains active\\n'\n")
+        standalone_target.chmod(0o755)
+        standalone = self.launcher_dir / "agent-notify"
+        standalone.symlink_to(standalone_target)
+
+        def companion_snapshot():
+            link = standalone.lstat()
+            target_info = standalone_target.stat()
+            link_metadata = (link.st_dev, link.st_ino, link.st_mode, link.st_uid, link.st_gid,
+                             link.st_mtime_ns, link.st_ctime_ns)
+            target_metadata = (target_info.st_dev, target_info.st_ino, target_info.st_mode,
+                               target_info.st_uid, target_info.st_gid, target_info.st_mtime_ns,
+                               target_info.st_ctime_ns)
+            return standalone.readlink(), link_metadata, target_metadata, standalone.read_bytes()
+
+        companion_before = companion_snapshot()
+        runtime_root = self.home / ".local" / "share" / "starfleet-ai" / "hailing-frequencies"
+        install_run = subprocess.run(
+            [sys.executable, str(source_app / "install.py"), "--runtime-root", str(runtime_root),
+             "--bin-dir", str(self.launcher_dir), "--skip-agent-notify"],
+            capture_output=True, text=True, env={**os.environ, "HOME": str(self.home)}, timeout=15)
+        self.assertEqual(install_run.returncode, 0, install_run.stderr)
+        self.assertEqual(install_run.stderr, "")
+        installation = json.loads(install_run.stdout)
+        self.assertTrue(installation["agent_notify_skipped"])
+        self.assertIsNone(installation["agent_notify_command"])
+        runtime = Path(installation["runtime"])
+        self.assertIn(str(runtime / "hailing_frequencies.py"), old_hailing.read_text())
+        self.assertIn(str(runtime / "hailing_frequencies.py"), old_temporal.read_text())
+        self.assertEqual(companion_snapshot(), companion_before)
+
         alias = self.worktree / ".context-injector" / "checkpoints" / "historical-owner"
         alias.mkdir(parents=True)
         self._set_owner_worktree(self.old, alias)
@@ -368,6 +408,19 @@ class TimerRetirementTests(unittest.TestCase):
         self.assertEqual(self._timer_count(), count_before_refusal)
         self.assertEqual(state_path.read_bytes(), state_before)
         self.assertEqual(note_path.read_bytes(), note_before)
+        self.assertEqual(companion_snapshot(), companion_before)
+
+        unrelated = self._source_cli(
+            ["temporal", "set", "--after", "10m", "--message", "Unrelated timer",
+             "--request-id", str(uuid.uuid4()), "--replace-key", "unrelated"], self.old)
+        self.assertEqual(unrelated.returncode, 0, unrelated.stderr)
+        self.assertEqual(json.loads(unrelated.stdout)["timer"]["replacement_key"], "unrelated")
+        successor = self._source_cli(
+            ["temporal", "set", "--after-idle", "50m", "--message", "Successor checkpoint reminder",
+             "--request-id", str(uuid.uuid4()), "--replace-key", CHECKPOINT_IDLE_KEY], self.successor)
+        self.assertEqual(successor.returncode, 0, successor.stderr)
+        self.assertEqual(json.loads(successor.stdout)["timer"]["status"], "active")
+        self.assertEqual(companion_snapshot(), companion_before)
 
     def _timer_count(self):
         with contextlib.closing(self.beacon.database()) as db:
