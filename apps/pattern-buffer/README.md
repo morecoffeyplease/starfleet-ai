@@ -118,7 +118,10 @@ Unknown native or delivery evidence stays unknown and does not add a readiness g
 Dispatch enrolls an implementer worktree, binds a task brief to the owner and launches the selected Claude or Codex CLI.
 The CLI does not infer a broader sandbox, role, model or repository permission from the task file.
 The task owner can update or finish a task explicitly, and recovery never replays a changed or finished task implicitly.
+`dispatch --prepare-only`, normal `dispatch`, and OpenCode `prepare-dispatch` also report known upstream path overlaps with the task checkout.
+The advisory reads refs already in that checkout, stores warning deduplication in its private Git metadata, stays quiet when paths do not overlap, and does not block preparation when Git metadata is unavailable.
 The [implementer dispatch guide](docs/implementer-dispatch.md) documents the supported launch, update, recovery and ownership boundaries.
+See its [upstream overlap advisory section](docs/implementer-dispatch.md#upstream-overlap-advisory) for comparison limits.
 The [OpenCode adapter guide](docs/opencode.md) documents its versioned context hook, explicit two-phase task binding, opt-in setup and native delivery limits.
 Use a unique --receipt-file path when an immutable local snapshot is useful; a receipt is not live task status.
 OpenCode preparation and binding are separate from Claude and Codex launch dispatch, and never start an OpenCode process.
