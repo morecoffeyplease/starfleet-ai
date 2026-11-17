@@ -102,6 +102,21 @@ Both examples start a fresh session; they do not attach a new assignment to a ru
 This implementation supports the implementer role only for dispatch.
 Do not automatically migrate review sessions to this workflow merely because their command also uses `codex exec`.
 
+## Upstream overlap advisory
+
+Pattern Buffer runs this advisory while preparing a task through `dispatch --prepare-only`, normal `dispatch`, or OpenCode `prepare-dispatch`.
+It reads a known upstream `main` ref already present in the task checkout and never fetches.
+It compares committed task changes since their merge base, tracked task worktree edits or deletions, and upstream path changes.
+The comparison treats both old and new paths in a detected rename as changed paths.
+A detected overlap prints the examined ref and revision, fork revision, task head, concrete paths, and a `git -C TASK_WORKTREE diff --find-renames ...` command to stderr.
+Pattern Buffer stores warning deduplication in the task checkout's private Git metadata and can warn again for a new upstream path change or a newly overlapping path.
+No-overlap results stay quiet, and unavailable Git metadata is reported without refusing preparation.
+The advisory is informational and does not add a review step.
+It checks paths and does not analyze semantic dependencies.
+It excludes untracked files.
+It can miss nonoverlapping interface changes and upstream changes that arrive after preparation.
+It does not establish that the task checkout or product behavior is current.
+
 ## Enrollment and session binding
 
 Dispatch explicitly enrolls an unregistered child by storing its owner pointer in the child's private Git directory.

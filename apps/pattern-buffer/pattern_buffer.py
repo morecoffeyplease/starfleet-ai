@@ -764,7 +764,8 @@ def opencode_plugin_directory(runtime_dir=None):
     runtime = opencode_runtime_directory(runtime_dir) if runtime_dir else Path(__file__).resolve().parent
     return runtime / "opencode-plugin"
 
-RUNTIME_HELPERS = ("checkpoint", "enrollment", "sessions", "reliability", "required_reads")
+RUNTIME_HELPERS = ("checkpoint", "enrollment", "sessions", "reliability", "required_reads",
+                   "upstream_overlap")
 
 
 def runtime_bundle_paths(script):
@@ -906,6 +907,7 @@ def prepare_install(args):
         "sessions": bounded(auxiliary_source("sessions"), 256 * 1024),
         "reliability": bounded(auxiliary_source("reliability"), 256 * 1024),
         "required_reads": bounded(auxiliary_source("required_reads"), 256 * 1024),
+        "upstream_overlap": bounded(auxiliary_source("upstream_overlap"), 256 * 1024),
     }
     launcher_template = sources["launcher_template"]
     runtime_binding = "RUNTIME_DIR = None"
@@ -1133,6 +1135,7 @@ def configure_opencode(args):
                 runtime / "pattern_buffer.py": Path(__file__).resolve(),
                 runtime / "pattern_buffer_sessions.py": auxiliary_source("sessions"),
                 runtime / "pattern_buffer_reliability.py": auxiliary_source("reliability"),
+                runtime / "pattern_buffer_upstream_overlap.py": auxiliary_source("upstream_overlap"),
                 runtime / "pattern_buffer_checkpoint.py": checkpoint_source(),
                 runtime / "pattern_buffer_enrollment.py": enrollment_source(),
                 runtime / "guide.md": guide_source(),
@@ -1984,6 +1987,18 @@ def prepare_dispatch(root, gitdir, args):
             raise ValueError("task brief changed while preparing the dispatch")
         atomic(path, json.dumps(data, indent=2))
     return task_id
+
+
+def print_upstream_overlap_notice(root, gitdir):
+    try:
+        overlap = auxiliary("upstream_overlap")
+        observation = overlap.observe(root, gitdir, locked, atomic)
+        notice = overlap.format_notice(observation)
+    except Exception:
+        notice = ("Pattern Buffer upstream overlap check unavailable. "
+                  "No overlap conclusion is available. Task preparation continues.")
+    if notice:
+        print(notice, file=sys.stderr, flush=True)
 
 
 def preflight_dispatch_context(root, harness, task_id, task_data, brief, session=None):
@@ -3658,10 +3673,12 @@ def main():
                 print(f"Pattern Buffer receipt {receipt}: immutable dispatch snapshot, not live task state.\n"
                       f"Current task state: {saved_receipt['task_status_command']}", file=sys.stderr, flush=True)
             if args.prepare_only:
+                print_upstream_overlap_notice(root, gitdir)
                 print(json.dumps({"task_id": task_id, "environment": {DISPATCH_ENV: task_id}}))
             else:
                 task_data, brief = read_task(root, gitdir, task_id)
                 preflight_dispatch_context(root, args.harness, task_id, task_data, brief)
+                print_upstream_overlap_notice(root, gitdir)
                 print(f"Pattern Buffer dispatch {task_id}; task retained for explicit update/finish.", file=sys.stderr, flush=True)
                 snapshot = task_path(gitdir, task_id).parent / f"{hashlib.sha256(brief.encode()).hexdigest()}.txt"
                 with snapshot.open("rb") as handle:
@@ -3676,6 +3693,7 @@ def main():
                 raise ValueError("OpenCode task preparation requires a dedicated child worktree")
             task_id = prepare_dispatch(root, gitdir, args)
             saved_receipt = write_dispatch_receipt(receipt, root, gitdir, task_id)
+            print_upstream_overlap_notice(root, gitdir)
             result = {"task_id": task_id, "harness": "opencode", "role": args.role,
                       "status": "pending", "receipt_file": str(receipt),
                       "receipt_type": saved_receipt["receipt_type"]}
