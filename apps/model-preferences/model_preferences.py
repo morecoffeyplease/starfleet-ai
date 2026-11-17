@@ -272,7 +272,7 @@ def validate(config):
                     and all(isinstance(entry, dict) for entry in reviewers),
                     f"{name}/standard_review_policy requires two configured reviewers.")
             first, second = [models.get(entry.get("model"), {}) for entry in reviewers]
-            require(first.get("harness") == "codex" and first.get("slug") == "gpt-6.1-sol"
+            require(first.get("harness") == "codex" and first.get("slug") in ("gpt-6.1-sol", "gpt-6.2-sol")
                     and reviewers[0].get("effort") == "high"
                     and second.get("harness") == "claude" and second.get("slug") == "claude-opus-5-5"
                     and reviewers[1].get("effort") == "high",
@@ -472,7 +472,7 @@ class App(CmuxTransport):
                 "Caller needs one unambiguous active native owner; nothing changed.")
         return {**recipient, "session": agents[0]["session_id"], "harness": agents[0]["kind"]}
 
-    def notify(self, snapshot, policy, retry=False):
+    def notify(self, snapshot, policy, retry=False, exclusions=()):
         with locked(self.config_dir):
             require(selection(self.config())["selection"] == snapshot["selection"], "Profile changed; notify the current selection instead.")
             recipients = self.state("orchestrators", {})
@@ -480,7 +480,10 @@ class App(CmuxTransport):
             if not retry or notice.get("selection") != snapshot["selection"]:
                 notice = {"selection": snapshot["selection"], "profile": snapshot["profile"],
                           "orchestrators": policy, "recipients": {}, "created_at": now()}
+                if exclusions:
+                    notice["excluded_orchestrators"] = list(exclusions)
                 self.save_state("notification", notice)
+            excluded = set(notice.get("excluded_orchestrators", ()))
         try:
             current = self.current()
         except PreferenceError as exc:
@@ -488,6 +491,8 @@ class App(CmuxTransport):
             error = str(exc)
         results = {}
         for identity, recipient in recipients.items():
+            if identity in excluded:
+                continue
             if (retry and notice["recipients"].get(identity, {}).get("status") == "queued" and
                     same_recipient(notice["recipients"][identity].get("recipient"), recipient)):
                 previous = notice["recipients"][identity]
@@ -1937,6 +1942,8 @@ def parser():
     model.add_argument("--slug", required=True)
     model.add_argument("--efforts", nargs="+", required=True); model.add_argument("--source", required=True)
     model.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
+    model.add_argument("--exclude-orchestrator", action="append", default=[], metavar="NAME",
+                       help="Skip this enrolled name in future-only notices. Repeat for each name.")
     authority = sub.add_parser("authority-set"); authority.add_argument("label")
     authority.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
     enroll = sub.add_parser("enroll"); enroll.add_argument("name")
@@ -3122,6 +3129,11 @@ def execute(args):
                 require(args.profile in config["profiles"], "Unknown profile; create it with profile-put first.")
                 config["active"] = args.profile
             elif command == "model-set":
+                if args.exclude_orchestrator:
+                    require(args.orchestrators == "future-only",
+                            "Notification exclusions require --orchestrators future-only.")
+                    require(set(args.exclude_orchestrator) <= set(app.state("orchestrators", {})),
+                            "Every notification exclusion must name an enrolled orchestrator.")
                 require(args.family and not any(c.isspace() for c in args.family), "Model family must be a nonempty token.")
                 require((args.harness == "opencode") == bool(args.provider_id),
                         "Pass --provider-id for OpenCode models only.")
@@ -3617,7 +3629,8 @@ def execute(args):
     if command == "dispatch" and choice["harness"] == "opencode":
         return dispatch_opencode(app, args, config, choice, cwd, opencode_task)
     if command in ("activate", "model-set", "profile-put", "authority-set", "review-policy-migrate", "notify"):
-        notice = app.notify(after, args.orchestrators, retry=command == "notify")
+        notice = app.notify(after, args.orchestrators, retry=command == "notify",
+                            exclusions=getattr(args, "exclude_orchestrator", ()))
         if command == "review-policy-migrate":
             return {"profile": args.profile, "applied": True, "changed": True,
                     "active_selection_changed": True, "review_policy": proposed,

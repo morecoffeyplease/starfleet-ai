@@ -41,6 +41,8 @@ Use profile-put to save the reviewed profile.
     model-preferences activate team-default --orchestrators future-only
 
 When an activation or model update changes active launch choices, select future-only, ask or handoff to record how existing orchestrators should be notified.
+For a future-only model update, repeat `--exclude-orchestrator NAME` for each enrolled owner whose active preferences come from another registry.
+The exclusions apply to notification retries and leave the enrollments in place.
 The command never changes running sessions or starts a handoff by itself.
 Use startup --expect-profile NAME to compare a session's stated intent with the saved active selection without activating it.
 
@@ -123,6 +125,7 @@ Finished Pattern Buffer tasks can be abandoned but never resumed.
 
 The opt-in `claude-codex-light` profile keeps the Claude-Codex launch choices and advanced-review pair.
 A straightforward initial review uses Codex Sol high in slot 1 and Claude Opus high in slot 2.
+The saved Sol family can point to `gpt-6.1-sol` or `gpt-6.2-sol`.
 A complex initial review uses the adopted Astra plus Opus panel as the first target cycle, and that completed cycle counts as the initial review.
 Later ordinary cycles use only Codex Sol high in slot 1 after every required slot in the linked predecessor chain exits successfully.
 The cycle policy never changes the active profile or advances from a changed scope.
