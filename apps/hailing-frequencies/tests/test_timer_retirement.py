@@ -1,7 +1,6 @@
 import contextlib
 from datetime import datetime, timezone
 import fcntl
-import io
 import json
 import os
 from pathlib import Path
@@ -155,7 +154,8 @@ class TimerRetirementTests(unittest.TestCase):
         script.chmod(0o700)
 
     def _source_cli(self, arguments, target):
-        environment = {**os.environ, **self.environment(target), "HOME": str(self.home),
+        identity = target if "CMUX_AGENT_LAUNCH_KIND" in target else self.environment(target)
+        environment = {**os.environ, **identity, "HOME": str(self.home),
                        "PATH": str(self.cmux_bin) + os.pathsep + os.environ["PATH"]}
         with self._synthetic_worker():
             return subprocess.run([str(self.launcher_dir / "hailing-frequencies"), *arguments],
@@ -193,21 +193,30 @@ class TimerRetirementTests(unittest.TestCase):
             return self.beacon.set(after_idle="50m", continuation=continuation,
                                    request_id=str(uuid.uuid4()), replacement_key=replacement_key)["timer"]
 
-    def _cli(self, args, environment=None):
-        with patch.object(hf, "Cmux", return_value=self.native), patch.dict(
-                os.environ, environment or self.coordinator_env, clear=False):
-            return hf.main(["--state-dir", str(self.state), "temporal", *args])
-
-    def _plan(self, timer_ids, authorization_ref=AUTHORIZATION_REF, environment=None):
-        args = ["retirement", "plan"]
+    def _preview(self, timer_ids, authorization_ref=AUTHORIZATION_REF, environment=None):
+        args = ["temporal", "retirement", "preview"]
         for timer_id in timer_ids:
             args.extend(("--timer-id", timer_id))
         args.extend(("--authorization-ref", authorization_ref))
-        return self._cli(args, environment)
+        result = self._source_cli(args, environment or self.coordinator)
+        if result.returncode:
+            raise ValueError(json.loads(result.stderr)["error"])
+        if result.stderr:
+            raise AssertionError(result.stderr)
+        return json.loads(result.stdout)
 
-    def _apply(self, plan, authorization_ref=AUTHORIZATION_REF, confirmation=None):
-        return self._cli(["retirement", "apply", "--plan", plan["plan"], "--confirm",
-                          confirmation or plan["sha256"], "--authorization-ref", authorization_ref])
+    def _apply(self, preview, authorization_ref=AUTHORIZATION_REF, confirmation=None):
+        args = ["temporal", "retirement", "apply"]
+        for timer_id in preview["timer_ids"]:
+            args.extend(("--timer-id", timer_id))
+        args.extend(("--confirm", confirmation or preview["digest_sha256"],
+                     "--authorization-ref", authorization_ref))
+        result = self._source_cli(args, self.coordinator)
+        if result.returncode:
+            raise ValueError(json.loads(result.stderr)["error"])
+        if result.stderr:
+            raise AssertionError(result.stderr)
+        return json.loads(result.stdout)
 
     def _occurrence(self, timer_id, sequence, status):
         occurrence_id = str(uuid.uuid4())
@@ -236,14 +245,14 @@ class TimerRetirementTests(unittest.TestCase):
                                      (timer_id,)).fetchall()
         return timer, occurrences
 
-    def test_plan_apply_cancels_only_unsent_occurrences_and_retry_is_idempotent(self):
+    def test_preview_apply_cancels_only_unsent_occurrences_and_retry_is_idempotent(self):
         timer = self._set_timer()
         statuses = ["pending", "held", "submitted", "submitted", "uncertain", "received", "canceled", "expired"]
         for sequence, status in enumerate(statuses, 1):
             self._occurrence(timer["id"], sequence, status)
         before = self._statuses(timer["id"])[1]
-        plan = self._plan([timer["id"]])
-        result = self._apply(plan)
+        preview = self._preview([timer["id"]])
+        result = self._apply(preview)
         self.assertFalse(result["idempotent"])
         self.assertEqual(result["canceled_occurrences"], {"pending": 1, "held": 1})
         self.assertEqual(result["preserved_occurrences"], {"submitted": 2, "uncertain": 1,
@@ -255,12 +264,12 @@ class TimerRetirementTests(unittest.TestCase):
         self.assertEqual([row[1] for row in after], ["canceled", "canceled", *statuses[2:]])
         for index in range(2, len(statuses)):
             self.assertEqual(after[index][2:], before[index][2:])
-        repeated = self._apply(plan)
+        repeated = self._apply(preview)
         self.assertTrue(repeated["idempotent"])
         self.assertEqual(repeated["timer_ids"], [timer["id"]])
         self.assertEqual(self._retirement_tables(), (1, 1))
 
-    def test_plan_binds_nested_worktree_alias_and_blocks_source_pb_rearm(self):
+    def test_preview_binds_nested_worktree_alias_and_blocks_source_pb_rearm(self):
         alias = self.worktree / ".context-injector" / "checkpoints" / "historical-owner"
         alias.mkdir(parents=True)
         self._set_owner_worktree(self.old, alias)
@@ -310,29 +319,38 @@ class TimerRetirementTests(unittest.TestCase):
             active_ids = sorted(timer_id for timer_id, worktree in active_rows
                                 if self.beacon._git_identity(worktree)[0] == str(self.worktree.resolve()))
         self.assertEqual(active_ids, [timer_id])
-        plan_args = ["temporal", "retirement", "plan"]
+        preview_args = ["temporal", "retirement", "preview"]
         for active_id in active_ids:
-            plan_args.extend(("--timer-id", active_id))
-        plan_args.extend(("--authorization-ref", AUTHORIZATION_REF))
-        planned = self._source_cli(plan_args, self.coordinator)
+            preview_args.extend(("--timer-id", active_id))
+        preview_args.extend(("--authorization-ref", AUTHORIZATION_REF))
+        planned = self._source_cli(preview_args, self.coordinator)
         self.assertEqual(planned.returncode, 0, planned.stderr)
         self.assertEqual(planned.stderr, "")
-        plan = json.loads(planned.stdout)
-        document = json.loads(Path(plan["plan"]).read_text())
-        self.assertEqual([timer["id"] for timer in document["timers"]], active_ids)
-        self.assertEqual(document["timers"][0]["owner"]["canonical_worktree"], str(alias.resolve()))
-        self.assertEqual(document["timers"][0]["worktree_root"], str(self.worktree.resolve()))
-        self.assertNotIn(message, Path(plan["plan"]).read_text())
+        preview = json.loads(planned.stdout)
+        self.assertEqual(preview["timer_ids"], active_ids)
+        self.assertEqual(preview["timers"][0]["stored_worktree_alias"], str(alias.resolve()))
+        self.assertEqual(preview["timers"][0]["git"]["worktree_root"], str(self.worktree.resolve()))
+        self.assertNotIn(message, planned.stdout)
+        self.assertFalse((self.state / "retirement-plans").exists())
 
-        applied = self._source_cli(["temporal", "retirement", "apply", "--plan", plan["plan"],
-                                    "--confirm", plan["sha256"], "--authorization-ref", AUTHORIZATION_REF],
-                                   self.coordinator)
+        apply_args = ["temporal", "retirement", "apply"]
+        for active_id in active_ids:
+            apply_args.extend(("--timer-id", active_id))
+        apply_args.extend(("--confirm", preview["digest_sha256"],
+                           "--authorization-ref", AUTHORIZATION_REF))
+        applied = self._source_cli(apply_args, self.coordinator)
         self.assertEqual(applied.returncode, 0, applied.stderr)
         self.assertEqual(applied.stderr, "")
         result = json.loads(applied.stdout)
         self.assertEqual(result["timer_ids"], active_ids)
         self.assertFalse(result["idempotent"])
         self.assertEqual(self._statuses(timer_id)[0], "canceled")
+        retried = self._source_cli(apply_args, self.coordinator)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(retried.stderr, "")
+        retry_result = json.loads(retried.stdout)
+        self.assertTrue(retry_result["idempotent"])
+        self.assertEqual(retry_result["digest_sha256"], preview["digest_sha256"])
 
         self._set_owner_worktree(self.old, self.worktree)
         count_before_refusal = self._timer_count()
@@ -357,38 +375,57 @@ class TimerRetirementTests(unittest.TestCase):
 
     def test_coordinator_identity_and_authorization_reference_are_required(self):
         timer = self._set_timer()
-        with self.assertRaisesRegex(ValueError, "currently enrolled.*coordinator"):
-            self._plan([timer["id"]], environment=self.owner_env)
+        owner_preview = self._source_cli(
+            ["temporal", "retirement", "preview", "--timer-id", timer["id"],
+             "--authorization-ref", AUTHORIZATION_REF], self.old)
+        self.assertEqual(owner_preview.returncode, 1)
+        self.assertEqual(owner_preview.stdout, "")
+        self.assertIn("currently enrolled Hailing Frequencies coordinator", owner_preview.stderr)
         wrong_identity = {**self.coordinator_env, "CMUX_SURFACE_ID": str(uuid.uuid4()).upper()}
-        with self.assertRaisesRegex(ValueError, "Caller harness or surface differs"):
-            self._plan([timer["id"]], environment=wrong_identity)
-        plan = self._plan([timer["id"]])
-        with self.assertRaisesRegex(ValueError, "Authorization reference differs"):
-            self._apply(plan, authorization_ref="different-reference")
+        identity_preview = self._source_cli(
+            ["temporal", "retirement", "preview", "--timer-id", timer["id"],
+             "--authorization-ref", AUTHORIZATION_REF], wrong_identity)
+        self.assertEqual(identity_preview.returncode, 1)
+        self.assertEqual(identity_preview.stdout, "")
+        self.assertIn("Caller harness or surface differs", identity_preview.stderr)
+        preview = self._preview([timer["id"]])
+        wrong_reference = self._source_cli(
+            ["temporal", "retirement", "apply", "--timer-id", timer["id"],
+             "--confirm", preview["digest_sha256"], "--authorization-ref", "different-reference"],
+            self.coordinator)
+        self.assertEqual(wrong_reference.returncode, 1)
+        self.assertEqual(wrong_reference.stdout, "")
+        self.assertIn("changed after preview", wrong_reference.stderr)
         self.assertEqual(self._statuses(timer["id"])[0], "active")
         self.assertEqual(self._retirement_tables(), (0, 0))
-        with self.assertRaisesRegex(ValueError, "exact retirement plan SHA-256"):
-            self._apply(plan, confirmation="0" * 64)
+        invalid_digest = self._source_cli(
+            ["temporal", "retirement", "apply", "--timer-id", timer["id"],
+             "--confirm", "not-a-digest", "--authorization-ref", AUTHORIZATION_REF],
+            self.coordinator)
+        self.assertEqual(invalid_digest.returncode, 1)
+        self.assertEqual(invalid_digest.stdout, "")
+        self.assertIn("Confirm the exact preview digest", invalid_digest.stderr)
         self.assertEqual(self._statuses(timer["id"])[0], "active")
 
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            self._cli(["retirement", "apply", "--plan", plan["plan"],
-                       "--authorization-ref", AUTHORIZATION_REF])
+        missing_authorization = self._source_cli(
+            ["temporal", "retirement", "preview", "--timer-id", timer["id"]], self.coordinator)
+        self.assertEqual(missing_authorization.returncode, 2)
+        self.assertEqual(missing_authorization.stdout, "")
+        self.assertIn("--authorization-ref", missing_authorization.stderr)
         self.assertEqual(self._statuses(timer["id"])[0], "active")
 
-    def test_coordinator_identity_is_rechecked_under_the_timer_lock(self):
+    def test_apply_reads_current_coordinator_identity_inside_locks(self):
         timer = self._set_timer()
-        plan = self._plan([timer["id"]])
+        preview = self._preview([timer["id"]])
         with patch.dict(os.environ, self.coordinator_env, clear=False):
             coordinator = self.beacon._retirement_coordinator()
-        changed = tb.OwnerSnapshot(coordinator.harness, coordinator.session, coordinator.surface,
-                                   coordinator.workspace, coordinator.started_at + 1,
-                                   coordinator.owner_key, coordinator.canonical_worktree)
+        changed = {**coordinator, "started_at": coordinator["started_at"] + 1}
         with patch.object(tb.TemporalBeacon, "_retirement_coordinator",
-                          side_effect=[coordinator, changed]) as identity:
-            with self.assertRaisesRegex(ValueError, "Coordinator identity changed"):
-                self._apply(plan)
-        self.assertEqual(identity.call_count, 2)
+                          side_effect=[changed]) as identity:
+            with self.assertRaisesRegex(ValueError, "changed after preview"):
+                self.beacon.apply_retirement(preview["timer_ids"], preview["digest_sha256"],
+                                             AUTHORIZATION_REF)
+        self.assertEqual(identity.call_count, 1)
         self.assertEqual(self._statuses(timer["id"])[0], "active")
         self.assertEqual(self._retirement_tables(), (0, 0))
 
@@ -398,28 +435,28 @@ class TimerRetirementTests(unittest.TestCase):
         second_alias.mkdir(parents=True)
         self._set_owner_worktree(self.old, second_alias)
         second = self._set_timer()
-        plan = self._plan([first["id"], second["id"]])
+        preview = self._preview([first["id"], second["id"]])
         with contextlib.closing(self.beacon.database()) as db:
             db.execute("UPDATE timers SET due_at=due_at+1 WHERE id=?", (second["id"],))
-        with self.assertRaisesRegex(ValueError, "state changed after plan review"):
-            self._apply(plan)
+        with self.assertRaisesRegex(ValueError, "changed after preview"):
+            self._apply(preview)
         self.assertEqual(self._retirement_tables(), (0, 0))
         self.assertEqual(self._statuses(first["id"])[0], "active")
 
         owner_timer = self._set_timer(target=self.successor)
-        owner_plan = self._plan([owner_timer["id"]])
+        owner_preview = self._preview([owner_timer["id"]])
         with contextlib.closing(self.beacon.database()) as db:
             db.execute("UPDATE timers SET surface=? WHERE id=?",
                        (str(uuid.uuid4()).upper(), owner_timer["id"]))
         with self.assertRaisesRegex(ValueError, "owner snapshot does not match"):
-            self._apply(owner_plan)
+            self._apply(owner_preview)
 
         status_timer = self._set_timer(target=self.coordinator)
-        status_plan = self._plan([status_timer["id"]])
+        status_preview = self._preview([status_timer["id"]])
         with contextlib.closing(self.beacon.database()) as db:
             db.execute("UPDATE timers SET status='canceled' WHERE id=?", (status_timer["id"],))
-        with self.assertRaisesRegex(ValueError, "Timer or occurrence state changed"):
-            self._apply(status_plan)
+        with self.assertRaisesRegex(ValueError, "Only active Pattern Buffer"):
+            self._apply(status_preview)
         self.assertEqual(self._retirement_tables(), (0, 0))
         self.assertEqual(self._statuses(owner_timer["id"])[0], "active")
 
@@ -427,11 +464,11 @@ class TimerRetirementTests(unittest.TestCase):
         first = self._set_timer()
         second = self._set_timer(target=self.successor)
         occurrence_id = self._occurrence(first["id"], 1, "held")
-        plan = self._plan([first["id"], second["id"]])
+        preview = self._preview([first["id"], second["id"]])
         with contextlib.closing(self.beacon.database()) as db:
             db.execute("UPDATE timer_occurrences SET status='submitted' WHERE id=?", (occurrence_id,))
-        with self.assertRaisesRegex(ValueError, "Timer or occurrence state changed"):
-            self._apply(plan)
+        with self.assertRaisesRegex(ValueError, "changed after preview"):
+            self._apply(preview)
         self.assertEqual(self._retirement_tables(), (0, 0))
         self.assertEqual(self._statuses(first["id"])[0], "active")
         self.assertEqual(self._statuses(second["id"])[0], "active")
@@ -439,37 +476,35 @@ class TimerRetirementTests(unittest.TestCase):
 
     def test_changed_active_timer_set_refuses_all_mutation(self):
         timer = self._set_timer()
-        plan = self._plan([timer["id"]])
+        preview = self._preview([timer["id"]])
         replacement = self._set_timer()
-        with self.assertRaisesRegex(ValueError, "state changed after plan review"):
-            self._apply(plan)
+        with self.assertRaisesRegex(ValueError, "Only active Pattern Buffer"):
+            self._apply(preview)
         self.assertEqual(self._statuses(timer["id"])[0], "canceled")
         self.assertEqual(self._statuses(replacement["id"])[0], "active")
         self.assertEqual(self._retirement_tables(), (0, 0))
 
-    def test_changed_git_identity_and_plan_bytes_refuse_apply(self):
+    def test_changed_git_identity_and_confirmation_refuse_apply(self):
         timer = self._set_timer()
-        plan = self._plan([timer["id"]])
+        preview = self._preview([timer["id"]])
         old_repo = self.base / "repo-before-replacement"
         self.worktree.rename(old_repo)
         self.worktree.mkdir()
         subprocess.run(["git", "-C", str(self.worktree), "init", "-q"], check=True, capture_output=True)
-        with self.assertRaisesRegex(ValueError, "Timer or occurrence state changed"):
-            self._apply(plan)
+        with self.assertRaisesRegex(ValueError, "changed after preview"):
+            self._apply(preview)
         self.assertEqual(self._retirement_tables(), (0, 0))
 
         fresh = self._set_timer()
-        fresh_plan = self._plan([fresh["id"]])
-        plan_path = Path(fresh_plan["plan"])
-        plan_path.write_text(plan_path.read_text().replace(AUTHORIZATION_REF, "modified"))
-        with self.assertRaisesRegex(ValueError, "digest is invalid"):
-            self._apply(fresh_plan)
+        fresh_preview = self._preview([fresh["id"]])
+        with self.assertRaisesRegex(ValueError, "changed after preview"):
+            self._apply(fresh_preview, authorization_ref="modified-reference")
         self.assertEqual(self._statuses(fresh["id"])[0], "active")
 
     def test_retired_owner_cannot_rearm_pb_key_but_successor_and_other_keys_can(self):
         timer = self._set_timer()
-        plan = self._plan([timer["id"]])
-        self._apply(plan)
+        preview = self._preview([timer["id"]])
+        self._apply(preview)
         with patch.dict(os.environ, self.owner_env, clear=False), self.assertRaisesRegex(
                 ValueError, "retired the idle timer key"):
             self.beacon.set(after="10m", continuation="Retry the checkpoint reminder",
@@ -504,6 +539,24 @@ class TimerRetirementTests(unittest.TestCase):
                 ValueError, "outside its Git worktree"):
             self.beacon.set(after="10m", continuation="Invalid worktree scope",
                             request_id=str(uuid.uuid4()), replacement_key=CHECKPOINT_IDLE_KEY)
+        self.assertEqual(self._retirement_tables(), (0, 0))
+
+    def test_preview_refuses_a_recorded_path_outside_its_git_root(self):
+        timer = self._set_timer()
+        other_repo = self.base / "other-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "-C", str(other_repo), "init", "-q"], check=True, capture_output=True)
+        git_dir = subprocess.check_output(["git", "-C", str(other_repo), "rev-parse",
+                                           "--absolute-git-dir"], text=True).strip()
+        fake_bin = self.base / "fake-bin"
+        fake_bin.mkdir()
+        fake_git = fake_bin / "git"
+        fake_git.write_text(f"#!{sys.executable}\nprint({str(other_repo)!r})\nprint({git_dir!r})\n")
+        fake_git.chmod(0o700)
+        with patch.dict(os.environ, {"PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]}, clear=False):
+            with self.assertRaisesRegex(ValueError, "outside its Git worktree"):
+                self._preview([timer["id"]])
+        self.assertEqual(self._statuses(timer["id"])[0], "active")
         self.assertEqual(self._retirement_tables(), (0, 0))
 
 

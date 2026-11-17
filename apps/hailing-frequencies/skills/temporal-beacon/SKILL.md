@@ -47,10 +47,11 @@ Closing the worker terminal stops coverage until it is restarted.
 
 Use the retirement command only for explicitly authorized exact Pattern Buffer checkpoint idle timer IDs.
 Planning and applying require the currently configured coordinator's exact enrolled native identity.
-Plan with `temporal-beacon retirement plan --timer-id TIMER_ID --authorization-ref AUTHORIZATION_REFERENCE`, review the private plan, then apply with its SHA-256 and the same reference.
-If any owner, timer, occurrence, active timer set, or Git identity changes after planning, create and review a new plan.
+Preview with `temporal-beacon retirement preview --timer-id TIMER_ID --authorization-ref AUTHORIZATION_REFERENCE`, review the exact owner, Git scope, occurrences, and digest, then apply with the same IDs and reference using `--confirm DIGEST_SHA256`.
+Repeat `--timer-id` for each timer in the reviewed scope.
+If any owner, timer, occurrence, active timer set, or Git identity changes after preview, preview and review the changed state again.
 Retirement cancels selected active timers and pending or held occurrences while preserving submitted, uncertain, received, canceled, expired, and history records.
 Submitted input cannot be recalled, and a canceled timer's preserved submitted or uncertain continuation cannot be retrieved with `receive`.
 The exact retired native session generation and Git worktree cannot rearm the checkpoint timer key through Temporal Beacon.
 Retirement does not unenroll the owner or alter Pattern Buffer checkpoint state.
-Read the installed Temporal Beacon guide for the complete review and apply procedure.
+Read the complete [retirement procedure](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md#retire-stale-checkpoint-idle-timers) before use.

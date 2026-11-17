@@ -21,12 +21,14 @@ Run `temporal-beacon doctor` before relying on delivery and read [the timer guid
 
 ## Retire stale checkpoint timers
 
-Only the currently configured, exactly enrolled Hailing Frequencies coordinator can plan and apply an explicitly authorized retirement of named Pattern Buffer checkpoint idle timers.
-Use `temporal-beacon retirement plan --timer-id TIMER_ID --authorization-ref AUTHORIZATION_REFERENCE` and review the private plan before applying its SHA-256 with the same reference.
-Apply with `temporal-beacon retirement apply --plan PRIVATE_PLAN_PATH --confirm PLAN_SHA256 --authorization-ref AUTHORIZATION_REFERENCE`.
+Only the currently configured, exactly enrolled Hailing Frequencies coordinator can preview and apply an explicitly authorized retirement of named Pattern Buffer checkpoint idle timers.
+Run `temporal-beacon retirement preview --timer-id TIMER_ID --authorization-ref AUTHORIZATION_REFERENCE`, then review the returned exact owner, Git worktree, timer, occurrence counts, and digest.
+Apply with `temporal-beacon retirement apply --timer-id TIMER_ID --confirm DIGEST_SHA256 --authorization-ref AUTHORIZATION_REFERENCE`, repeating `--timer-id` for each reviewed timer and using the same authorization reference.
 Retirement cancels selected timers and pending or held occurrences, preserves submitted and historical rows, and blocks the exact retired owner and Git worktree from rearming the checkpoint timer key.
+Submitted or uncertain input may already have arrived, cannot be recalled, and remains unavailable from `receive` after cancellation.
+Retry an uncertain apply only with the same timer IDs, digest, authorization reference, and coordinator identity.
 It does not unenroll an owner or change Pattern Buffer checkpoint files.
-Read the [retirement instructions](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md#retire-stale-checkpoint-idle-timers) before using the command.
+If any reviewed timer, occurrence, owner, active timer set, or Git identity changes, apply refuses without mutation; read the [retirement instructions](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md#retire-stale-checkpoint-idle-timers) before using the command.
 
 ## Identify the exact session
 

@@ -1123,7 +1123,7 @@ class InstallationTests(unittest.TestCase):
             staged_installer.write_text("")
             expected = (source / "guide.md").read_text()
             self.assertIn("Retire stale checkpoint timers", expected)
-            self.assertIn("retirement apply --plan PRIVATE_PLAN_PATH", expected)
+            self.assertIn("retirement apply --timer-id TIMER_ID --confirm DIGEST_SHA256", expected)
             agent_notify_guide = (source / "agent-notify-guide.md").read_text()
             with patch.object(install, "__file__", str(staged_installer)):
                 result = install.install(root / "runtime", root / "bin")
