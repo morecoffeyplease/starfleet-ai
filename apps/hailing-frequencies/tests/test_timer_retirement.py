@@ -1,11 +1,10 @@
 import contextlib
 from datetime import datetime, timezone
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
-import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -57,10 +56,14 @@ class TimerRetirementTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
-        self.state = self.base / "hailing-state"
-        self.state.mkdir(mode=0o700)
         self.home = self.base / "home"
         self.home.mkdir(mode=0o700)
+        self.state = self.home / ".local" / "state" / "starfleet-ai" / "hailing-frequencies"
+        self.state.mkdir(parents=True, mode=0o700)
+        self.cmux_home = self.home / ".cmuxterm"
+        self.cmux_home.mkdir(mode=0o700)
+        self.cmux_bin = self.base / "bin"
+        self.cmux_bin.mkdir()
         self.worktree = self.base / "repo"
         self.worktree.mkdir()
         subprocess.run(["git", "-C", str(self.worktree), "init", "-q"], check=True, capture_output=True)
@@ -73,9 +76,14 @@ class TimerRetirementTests(unittest.TestCase):
                   "escalate_after": 900, "cooldown": 600, "interval": 5}
         hf.atomic_json(self.state / "config.json", config)
         sessions = {item["session"]: {"surfaceId": item["surface"], "workspaceId": item["workspace"],
-                                       "startedAt": item["started_at"], "cwd": str(self.worktree)}
+                                       "startedAt": item["started_at"], "cwd": str(self.worktree),
+                                       "agentLifecycle": "idle"}
                     for item in (self.old, self.coordinator, self.successor)}
-        hf.atomic_json(self.state / "claude-hook-sessions.json", {"sessions": sessions})
+        hook_store = {"sessions": sessions,
+                      "activeSessionsBySurface": {item["surface"]: {"sessionId": item["session"]}
+                                                  for item in (self.old, self.coordinator, self.successor)}}
+        hf.atomic_json(self.state / "claude-hook-sessions.json", hook_store)
+        hf.atomic_json(self.cmux_home / "claude-hook-sessions.json", hook_store)
         for name in ("supervisor.lock", "serve.lock"):
             (self.state / name).touch(mode=0o600)
         now = self.clock.value
@@ -91,6 +99,7 @@ class TimerRetirementTests(unittest.TestCase):
         self.successor_env = self.environment(self.successor)
         self.launcher_dir = self.home / ".local" / "bin"
         self.launcher_dir.mkdir(parents=True)
+        self._write_fake_cmux()
         self._write_source_launcher()
 
     def target(self, label, worktree):
@@ -108,33 +117,73 @@ class TimerRetirementTests(unittest.TestCase):
     def _write_source_launcher(self):
         source_root = Path(__file__).resolve().parents[1]
         script = self.launcher_dir / "hailing-frequencies"
+        source_cli = source_root / "hailing_frequencies.py"
         script.write_text("#!/usr/bin/env python3\n" +
-            "import json, os, sys\n" +
-            f"sys.path.insert(0, {str(source_root)!r})\n" +
-            "from pathlib import Path\n" +
-            "import hailing_frequencies as hf\n" +
-            "import temporal_beacon as tb\n" +
-            "tb.TemporalBeacon.worker_leases_held=lambda self: True\n" +
-            "class Native:\n" +
-            f" def __init__(self, executable='cmux', hook_directory=None): self.hook_directory=Path(hook_directory or {str(self.state)!r})\n" +
-            " def binding(self, target):\n" +
-            "  store=json.loads((self.hook_directory/(target['harness']+'-hook-sessions.json')).read_text())\n" +
-            "  record=next((value for key,value in store['sessions'].items() if key.upper()==target['session'].upper()),None)\n" +
-            "  if record is None or record.get('surfaceId','').upper()!=target['surface'] or record.get('workspaceId','').upper()!=target['workspace'] or record.get('startedAt')!=target['started_at']: raise ValueError('Synthetic exact-session binding changed')\n" +
-            "  return True\n" +
-            " def activity(self, target):\n" +
-            "  import datetime, time\n" +
-            "  at=datetime.datetime.fromtimestamp(time.time()-60,datetime.timezone.utc).isoformat()\n" +
-            "  return {'state':'idle','last_activity_at':at}\n" +
-            f"result=hf.main(['--state-dir', {str(self.state)!r}, *sys.argv[1:]])\n" +
-            "print(json.dumps(result))\n")
+            "import os, sys\n" +
+            f"os.execv({sys.executable!r}, [{sys.executable!r}, {str(source_cli)!r}, *sys.argv[1:]])\n")
         script.chmod(0o700)
+
+    def _write_fake_cmux(self):
+        targets = [self.old, self.coordinator, self.successor]
+        script = self.cmux_bin / "cmux"
+        script.write_text("#!/usr/bin/env python3\n" +
+            "from datetime import datetime, timedelta, timezone\n" +
+            "import json, sys\n" +
+            f"targets={targets!r}\n" +
+            "args=sys.argv[1:]\n" +
+            "if len(args) >= 2 and args[:2] == ['--json', 'current']:\n" +
+            " at=(datetime.now(timezone.utc)-timedelta(seconds=60)).isoformat()\n" +
+            " items=[{'placement':{'kind':'local'},'projections':[{'panel_id':t['surface'],'workspace_id':t['workspace']}],\n" +
+            "         'agents':[{'session_id':t['session'],'kind':t['harness'],'state':'idle','last_activity_at':at}]} for t in targets]\n" +
+            " print(json.dumps({'truncated':False,'owner_availability':{'agent_sessions':'available'},'items':items}))\n" +
+            "elif len(args) >= 4 and args[:2] == ['--json', 'rpc']:\n" +
+            " method=args[2]\n" +
+            " params=json.loads(args[3])\n" +
+            " if method == 'surface.input_state':\n" +
+            "  target=next(t for t in targets if t['surface']==params['surface_id'])\n" +
+            "  result={'surface_id':target['surface'],'workspace_id':target['workspace'],'agent':True,'terminal':True,\n" +
+            "          'state':'empty','blocks_typing':False,'waiting_on_human':False,'lifecycle':'idle'}\n" +
+            " elif method == 'agent.message.settings':\n" +
+            "  result={'messages_enabled':True,'receiving':True,'workspace_receiving':True}\n" +
+            " else:\n" +
+            "  print(json.dumps({'error':'Unsupported fake CMUX RPC'}),file=sys.stderr)\n" +
+            "  sys.exit(2)\n" +
+            " print(json.dumps(result))\n" +
+            "else:\n" +
+            " print(json.dumps({'error':'Unsupported fake CMUX command'}),file=sys.stderr)\n" +
+            " sys.exit(2)\n")
+        script.chmod(0o700)
+
+    def _source_cli(self, arguments, target):
+        environment = {**os.environ, **self.environment(target), "HOME": str(self.home),
+                       "PATH": str(self.cmux_bin) + os.pathsep + os.environ["PATH"]}
+        with self._synthetic_worker():
+            return subprocess.run([str(self.launcher_dir / "hailing-frequencies"), *arguments],
+                                  capture_output=True, text=True, env=environment, timeout=15)
+
+    @contextlib.contextmanager
+    def _synthetic_worker(self):
+        locks = []
+        try:
+            for name in ("supervisor.lock", "serve.lock"):
+                stream = (self.state / name).open("a")
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locks.append(stream)
+            yield
+        finally:
+            for stream in reversed(locks):
+                fcntl.flock(stream, fcntl.LOCK_UN)
+                stream.close()
 
     def _set_owner_worktree(self, target, path):
         source = self.state / "claude-hook-sessions.json"
         store = json.loads(source.read_text())
         store["sessions"][target["session"]]["cwd"] = str(path)
         hf.atomic_json(source, store)
+        cmux_source = self.cmux_home / "claude-hook-sessions.json"
+        cmux_store = json.loads(cmux_source.read_text())
+        cmux_store["sessions"][target["session"]]["cwd"] = str(path)
+        hf.atomic_json(cmux_source, cmux_store)
 
     def _set_timer(self, target=None, replacement_key=CHECKPOINT_IDLE_KEY, continuation="Checkpoint reminder"):
         target = target or self.old
@@ -215,15 +264,6 @@ class TimerRetirementTests(unittest.TestCase):
         alias = self.worktree / ".context-injector" / "checkpoints" / "historical-owner"
         alias.mkdir(parents=True)
         self._set_owner_worktree(self.old, alias)
-        timer = self._set_timer()
-        plan = self._plan([timer["id"]])
-        document = json.loads(Path(plan["plan"]).read_text())
-        self.assertEqual(document["timers"][0]["owner"]["canonical_worktree"], str(alias.resolve()))
-        self.assertEqual(document["timers"][0]["worktree_root"], str(self.worktree.resolve()))
-        self.assertNotIn("private continuation", Path(plan["plan"]).read_text())
-        self._apply(plan)
-        self._set_owner_worktree(self.old, self.worktree)
-
         gitdir = subprocess.check_output(["git", "-C", str(self.worktree), "rev-parse",
                                           "--absolute-git-dir"], text=True).strip()
         checkpoint = Path(gitdir) / "context-injector" / "checkpoints" / "historical-owner"
@@ -237,13 +277,83 @@ class TimerRetirementTests(unittest.TestCase):
         producer_state = {"idle_warning_minutes": 50, "enabled": True, "reminders": True,
                           "checkpoint_path": str(note_path), "draft_path": str(checkpoint / "draft.md"),
                           "identity": {"root": str(self.worktree)}}
-        home_env = {**self.owner_env, "HOME": str(self.home)}
-        with patch.dict(os.environ, home_env, clear=False):
+        home_env = {**self.owner_env, "HOME": str(self.home),
+                    "PATH": str(self.cmux_bin) + os.pathsep + os.environ["PATH"]}
+        with self._synthetic_worker(), patch.dict(os.environ, home_env, clear=False):
+            pb_checkpoint._arm_idle_timer(producer_state, "claude", self.old["session"], "prompt")
+        self.assertEqual(producer_state["idle_timer"]["status"], "armed",
+                         producer_state["idle_timer"].get("detail"))
+        timer_id = producer_state["idle_timer"]["timer_id"]
+        self.assertTrue(timer_id)
+        self.assertEqual(self._statuses(timer_id)[0], "active")
+
+        request_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                    f"pattern-buffer-idle:{self.old['session']}:prompt:50"))
+        message = (f"You have been idle for 50 minutes. Automatic compaction may occur in about five minutes; "
+                   "this timing is an estimate, and waking can reset the idle clock. "
+                   f"Review {producer_state['checkpoint_path']} and refresh {producer_state['draft_path']} now. "
+                   f"{pb_checkpoint.SNAPSHOT_PRUNING} Do not start product work merely to service this reminder.")
+        positive = self._source_cli(["temporal", "set", "--after-idle", "50m", "--message", message,
+                                     "--request-id", request_id, "--replace-key", CHECKPOINT_IDLE_KEY], self.old)
+        self.assertEqual(positive.returncode, 0, positive.stderr)
+        self.assertEqual(positive.stderr, "")
+        positive_result = json.loads(positive.stdout)
+        self.assertEqual(positive_result["timer"]["id"], timer_id)
+        self.assertTrue(positive_result["idempotent"])
+
+        with contextlib.closing(self.beacon.database()) as db:
+            active_rows = db.execute(
+                "SELECT id,canonical_worktree FROM timers WHERE harness=? AND session=? AND surface=? AND workspace=? "
+                "AND started_at=? AND replacement_key=? AND status='active'",
+                (self.old["harness"], self.old["session"], self.old["surface"], self.old["workspace"],
+                 self.old["started_at"], CHECKPOINT_IDLE_KEY)).fetchall()
+            active_ids = sorted(timer_id for timer_id, worktree in active_rows
+                                if self.beacon._git_identity(worktree)[0] == str(self.worktree.resolve()))
+        self.assertEqual(active_ids, [timer_id])
+        plan_args = ["temporal", "retirement", "plan"]
+        for active_id in active_ids:
+            plan_args.extend(("--timer-id", active_id))
+        plan_args.extend(("--authorization-ref", AUTHORIZATION_REF))
+        planned = self._source_cli(plan_args, self.coordinator)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        self.assertEqual(planned.stderr, "")
+        plan = json.loads(planned.stdout)
+        document = json.loads(Path(plan["plan"]).read_text())
+        self.assertEqual([timer["id"] for timer in document["timers"]], active_ids)
+        self.assertEqual(document["timers"][0]["owner"]["canonical_worktree"], str(alias.resolve()))
+        self.assertEqual(document["timers"][0]["worktree_root"], str(self.worktree.resolve()))
+        self.assertNotIn(message, Path(plan["plan"]).read_text())
+
+        applied = self._source_cli(["temporal", "retirement", "apply", "--plan", plan["plan"],
+                                    "--confirm", plan["sha256"], "--authorization-ref", AUTHORIZATION_REF],
+                                   self.coordinator)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(applied.stderr, "")
+        result = json.loads(applied.stdout)
+        self.assertEqual(result["timer_ids"], active_ids)
+        self.assertFalse(result["idempotent"])
+        self.assertEqual(self._statuses(timer_id)[0], "canceled")
+
+        self._set_owner_worktree(self.old, self.worktree)
+        count_before_refusal = self._timer_count()
+        refused = self._source_cli(["temporal", "set", "--after-idle", "50m", "--message", message,
+                                    "--request-id", request_id, "--replace-key", CHECKPOINT_IDLE_KEY],
+                                   self.old)
+        self.assertEqual(refused.returncode, 1)
+        self.assertEqual(refused.stdout, "")
+        self.assertEqual(json.loads(refused.stderr)["error"],
+                         "This exact checkpoint owner and Git worktree retired the idle timer key")
+        with self._synthetic_worker(), patch.dict(os.environ, home_env, clear=False):
             pb_checkpoint._arm_idle_timer(producer_state, "claude", self.old["session"], "prompt")
         self.assertEqual(producer_state["idle_timer"]["status"], "unavailable")
+        self.assertEqual(producer_state["idle_timer"]["pending_request_id"], request_id)
+        self.assertEqual(self._timer_count(), count_before_refusal)
         self.assertEqual(state_path.read_bytes(), state_before)
         self.assertEqual(note_path.read_bytes(), note_before)
-        self.assertEqual(self._statuses(timer["id"])[0], "canceled")
+
+    def _timer_count(self):
+        with contextlib.closing(self.beacon.database()) as db:
+            return db.execute("SELECT COUNT(*) FROM timers").fetchone()[0]
 
     def test_coordinator_identity_and_authorization_reference_are_required(self):
         timer = self._set_timer()
