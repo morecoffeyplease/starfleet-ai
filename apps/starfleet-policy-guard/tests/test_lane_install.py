@@ -3487,6 +3487,62 @@ class LaneInstallTest(unittest.TestCase):
         self.assertTrue(json.loads(repeat_apply.stdout)['already_retired'])
         self.assertEqual(state_path.read_bytes(), before_repeat)
 
+    def test_missing_seat_root_actual_cli_reproduction(self):
+        owner, owner_env = self.native_owner_fixture()
+        source = self.source_checkout('missing-seat-root-reproduction')
+        lane_args = ['--lane', '--host', 'fixture.invalid', '--owner-harness', 'claude',
+                     '--owner-session', owner_env['CLAUDE_CODE_SESSION_ID'],
+                     '--pr-url', self.url, '--base-ref', 'main']
+        initial_plan_result = self.call_source(source, '--session-root', owner, 'plan', *lane_args,
+                                               env=owner_env)
+        self.assertEqual(initial_plan_result.returncode, 0, initial_plan_result.stderr)
+        initial_plan = json.loads(initial_plan_result.stdout)
+        self.call_source(source, '--session-root', owner, 'install', *lane_args,
+                         '--plan-sha256', initial_plan['plan_sha256'], env=owner_env)
+        runtime = Path(initial_plan['seat_runtime_path'])
+        seat_id = initial_plan['seat_id']
+        recorded_gitdir = Path(initial_plan['lane_owner']['seat_gitdir'])
+
+        control_checkout = self.base / 'healthy-control-checkout'
+        control_checkout.mkdir()
+        control = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-b',
+                                  'feature/healthy-control', str(control_checkout)],
+                                 capture_output=True, text=True, env=owner_env)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        healthy_plan = self.call_source(runtime, '--session-root', owner, 'plan', *lane_args,
+                                        '--head-branch', 'feature/test', env=owner_env,
+                                        cwd=control_checkout)
+        self.assertEqual(healthy_plan.returncode, 0, healthy_plan.stderr)
+
+        removed = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'remove', '--force', str(owner)],
+                                 capture_output=True, text=True, env=owner_env)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(owner.exists())
+        self.assertFalse(recorded_gitdir.exists())
+        after_removal = self.fixture_snapshot()
+
+        inspection = self.call_source(runtime, '--seat-id', seat_id, 'recover', '--inspect', env=owner_env)
+        self.assertEqual(inspection.returncode, 0, inspection.stderr)
+        recovery_plan = self.call_source(runtime, '--seat-id', seat_id, 'recover', '--plan', env=owner_env)
+        self.assertEqual(recovery_plan.returncode, 0, recovery_plan.stderr)
+
+        failed_attach = self.call_source(runtime, '--session-root', owner, 'plan', *lane_args,
+                                         '--head-branch', 'feature/test', env=owner_env,
+                                         cwd=control_checkout, ok=False)
+        self.assertEqual(failed_attach.returncode, 2)
+        self.assertIn('fatal: cannot change to', failed_attach.stderr)
+
+        coverage = self.call_source(runtime, 'coverage', env=owner_env, cwd=self.repo)
+        self.assertEqual(coverage.returncode, 0, coverage.stderr)
+        coverage_value = json.loads(coverage.stdout)
+        self.assertEqual(coverage_value['binding']['state'], 'local-binding-current-pr-unconfirmed')
+        self.assertEqual(coverage_value['setup_guidance']['action'], 'none')
+        self.assertIn('Setup is intact', coverage_value['setup_guidance']['reason'])
+
+        recovery_value = json.loads(recovery_plan.stdout)
+        self.assertTrue(any(action['kind'] == 'restore-hooks' for action in recovery_value['actions']))
+        self.assertEqual(self.fixture_snapshot(), after_removal)
+
     def test_rebind_owner_accepts_matching_retired_source_pin_control(self):
         fixture = self.prepare_seat_with_retired_attachment('issue60-matching-retired')
         incoming_env = dict(fixture['owner_env'], CLAUDE_CODE_SESSION_ID='claude-incoming-matching')
