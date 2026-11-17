@@ -1657,6 +1657,18 @@ def parser():
     cancel.add_argument("timer_id")
     temporal_sub.add_parser("receive", help="Output the current continuation and record its receipt")
     temporal_sub.choices["receive"].add_argument("--timer-id")
+    retirement = temporal_sub.add_parser("retirement", help="Plan and apply an authorized checkpoint timer retirement")
+    retirement_sub = retirement.add_subparsers(dest="retirement_action", required=True)
+    retirement_plan = retirement_sub.add_parser("plan", help="Snapshot exact checkpoint idle timers for review")
+    retirement_plan.add_argument("--timer-id", action="append", required=True,
+                                 help="Exact timer ID to include; repeat for each timer")
+    retirement_plan.add_argument("--authorization-ref", required=True,
+                                 help="Short reference to the explicit authorization")
+    retirement_apply = retirement_sub.add_parser("apply", help="Apply a reviewed exact timer retirement plan")
+    retirement_apply.add_argument("--plan", type=Path, required=True)
+    retirement_apply.add_argument("--confirm", required=True, help="SHA-256 printed by retirement plan")
+    retirement_apply.add_argument("--authorization-ref", required=True,
+                                 help="The same authorization reference recorded in the plan")
     temporal_doctor = temporal_sub.add_parser("doctor", help="Diagnose timer worker and delivery state")
     temporal_doctor.add_argument("--starfleet-json", action="store_true",
                                  help="emit normalized read-only setup states for Starfleet Doctor")
@@ -1759,6 +1771,10 @@ def main(argv=None):
         if args.temporal_command == "set":
             return beacon.set(args.after, args.at, args.every, args.until, args.message,
                               args.request_id, args.replace_key, after_idle=args.after_idle)
+        if args.temporal_command == "retirement":
+            if args.retirement_action == "plan":
+                return beacon.prepare_retirement_plan(args.timer_id, args.authorization_ref)
+            return beacon.apply_retirement_plan(args.plan, args.confirm, args.authorization_ref)
         target, owner_key, _worktree = beacon.owner()
         if args.temporal_command == "list":
             return beacon.list(owner_key)

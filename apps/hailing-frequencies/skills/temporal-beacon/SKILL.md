@@ -42,3 +42,15 @@ Drafts and human-input obligations hold delivery until safe, subject to the time
 An uncertain submission may already have arrived: inspect the recipient and occurrence before retrying; creating another timer is not a safe retry.
 Canceling prevents future dispatch but cannot retract already submitted input.
 Closing the worker terminal stops coverage until it is restarted.
+
+## Retire stale checkpoint idle timers
+
+Use the retirement command only for explicitly authorized exact Pattern Buffer checkpoint idle timer IDs.
+Planning and applying require the currently configured coordinator's exact enrolled native identity.
+Plan with `temporal-beacon retirement plan --timer-id TIMER_ID --authorization-ref AUTHORIZATION_REFERENCE`, review the private plan, then apply with its SHA-256 and the same reference.
+If any owner, timer, occurrence, active timer set, or Git identity changes after planning, create and review a new plan.
+Retirement cancels selected active timers and pending or held occurrences while preserving submitted, uncertain, received, canceled, expired, and history records.
+Submitted input cannot be recalled, and a canceled timer's preserved submitted or uncertain continuation cannot be retrieved with `receive`.
+The exact retired native session generation and Git worktree cannot rearm the checkpoint timer key through Temporal Beacon.
+Retirement does not unenroll the owner or alter Pattern Buffer checkpoint state.
+Read the installed Temporal Beacon guide for the complete review and apply procedure.

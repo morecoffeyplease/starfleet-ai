@@ -11,7 +11,7 @@ The monitor does not own messages, mark another agent's messages read, poll Disc
 Fresh heartbeat evidence does not independently prove that a worker process is alive now.
 
 Temporal Beacon adds durable agent wake timers to this same worker.
-Read the [Temporal Beacon guide](temporal-beacon.md) for `--after`, `--at`, `--every`, time-based `--until`, receipt, installation, and diagnosis, or load its [agent skill](skills/temporal-beacon/SKILL.md).
+Read the [Temporal Beacon guide](temporal-beacon.md) for scheduling, receipt, installation, diagnosis, and the coordinator-only checkpoint timer retirement workflow, or load its [agent skill](skills/temporal-beacon/SKILL.md).
 Timer delivery uses the existing enrolled-session guards and opt-in send scope; unread-message reminder timing remains separate.
 
 The Hailing installer also installs the `agent-notify` Discord conversation command, its [setup guide](agent-notify-guide.md), and its [agent skill](skills/agent-notify/SKILL.md).

@@ -144,6 +144,46 @@ After sleep or worker downtime, missed intervals collapse into one catch-up noti
 An `--until` deadline also expires held recurring occurrences.
 Actual submission can be later than the due time because the worker is stopped, CMUX is unavailable, or input is held.
 
+## Retire stale checkpoint idle timers
+
+Use retirement only with explicit authorization for the named historical timers and while running as the currently configured Hailing Frequencies coordinator.
+The coordinator must be the exact currently enrolled native session, and the command rechecks its identity before applying a plan.
+This command accepts only explicit timer IDs for Pattern Buffer checkpoint idle timers.
+It refuses a timer when another active timer shares its exact owner, Git worktree root, and checkpoint replacement key unless every matching active timer is named.
+
+Create a private review plan by repeating `--timer-id` for each exact timer and recording a short authorization reference:
+
+```sh
+temporal-beacon retirement plan \
+  --timer-id TIMER_ID \
+  --timer-id ANOTHER_TIMER_ID \
+  --authorization-ref AUTHORIZATION_REFERENCE
+```
+
+Review the private plan file and the timer IDs, native owner snapshots, stored worktree aliases, normalized Git roots, schedule, and occurrence states it contains.
+The plan hashes continuation text without storing its contents.
+Apply only the reviewed file with its printed SHA-256 and the same authorization reference:
+
+```sh
+temporal-beacon retirement apply \
+  --plan PRIVATE_PLAN_PATH \
+  --confirm PLAN_SHA256 \
+  --authorization-ref AUTHORIZATION_REFERENCE
+```
+
+The command refuses the whole plan if any timer, occurrence, exact owner, active timer set, Git root, or Git directory identity changed after review.
+Create and review a new plan after any such refusal.
+The plan writes only under the existing private Hailing Frequencies state directory.
+
+Apply creates a narrow tombstone for each exact native owner generation, normalized Git root, and Pattern Buffer checkpoint idle replacement key.
+The existing `temporal-beacon set` boundary enforces that tombstone before accepting a future timer with the retired key for that exact owner and worktree.
+Successor native session generations and unrelated replacement keys remain outside that tombstone.
+Retirement cancels the selected active timers and their pending or held occurrences.
+Submitted, uncertain, received, canceled, and expired occurrence rows remain unchanged.
+Submitted input cannot be recalled, and preserved submitted or uncertain continuations cannot be retrieved after their timer is canceled.
+The apply result reports these limits and stores an idempotent receipt for a retry with the same plan.
+Retirement does not unenroll the owner, stop or restart the worker, or alter Pattern Buffer checkpoint files.
+
 ## Wake and receipt
 
 The wake prompt contains the timer identity and a command to retrieve the current continuation with `receive`.

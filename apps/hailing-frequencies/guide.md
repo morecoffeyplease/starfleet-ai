@@ -19,6 +19,15 @@ Activity postpones delivery, and receipt completes the timer; do not rearm it fr
 Unknown activity, human-input holds and replaced sessions prevent submission.
 Run `temporal-beacon doctor` before relying on delivery and read [the timer guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md) for details.
 
+## Retire stale checkpoint timers
+
+Only the currently configured, exactly enrolled Hailing Frequencies coordinator can plan and apply an explicitly authorized retirement of named Pattern Buffer checkpoint idle timers.
+Use `temporal-beacon retirement plan --timer-id TIMER_ID --authorization-ref AUTHORIZATION_REFERENCE` and review the private plan before applying its SHA-256 with the same reference.
+Apply with `temporal-beacon retirement apply --plan PRIVATE_PLAN_PATH --confirm PLAN_SHA256 --authorization-ref AUTHORIZATION_REFERENCE`.
+Retirement cancels selected timers and pending or held occurrences, preserves submitted and historical rows, and blocks the exact retired owner and Git worktree from rearming the checkpoint timer key.
+It does not unenroll an owner or change Pattern Buffer checkpoint files.
+Read the [retirement instructions](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md#retire-stale-checkpoint-idle-timers) before using the command.
+
 ## Identify the exact session
 
 Run `cmux current --json --limit 200` and `cmux --id-format both --json tree --all`.
