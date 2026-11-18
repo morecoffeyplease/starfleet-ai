@@ -4,6 +4,7 @@ Product Git directories are references only. Policy Guard state and runtime file
 live under the user's XDG state and data directories.
 """
 import contextlib
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import json
@@ -126,6 +127,43 @@ def load_seat(identifier):
     return value
 
 
+def operational_anchor(seat):
+    """Return the live Git/settings anchor without changing the immutable seat identity."""
+    if not isinstance(seat, dict) or not isinstance(seat.get('seat_root'), str):
+        raise ValueError('Policy Guard seat root metadata is malformed; preserve it and use recover --inspect')
+    value = seat.get('operational_anchor')
+    if value is None:
+        return {'state': 'active', 'root': seat['seat_root'], 'gitdir': seat.get('seat_gitdir'),
+                'common_gitdir': seat.get('seat_common_gitdir')}
+    if not isinstance(value, dict) or value.get('state') not in ('active', 'released'):
+        raise ValueError('Policy Guard operational anchor is malformed; preserve it and use recover --inspect')
+    if value['state'] == 'released':
+        if any(value.get(key) is not None for key in ('root', 'gitdir', 'common_gitdir')):
+            raise ValueError('Released Policy Guard anchor still names a live path; preserve it and inspect recovery')
+        return {'state': 'released', 'root': None, 'gitdir': None, 'common_gitdir': None}
+    for key in ('root', 'gitdir', 'common_gitdir'):
+        item = value.get(key)
+        if not isinstance(item, str) or not Path(item).is_absolute():
+            raise ValueError('Active Policy Guard anchor is incomplete; preserve it and inspect recovery')
+    return {'state': 'active', 'root': value['root'], 'gitdir': value['gitdir'],
+            'common_gitdir': value['common_gitdir']}
+
+
+def all_seats():
+    """Load every durable seat so destination-anchor uniqueness can fail closed."""
+    seats = state_root() / 'seats'
+    if not seats.exists():
+        return []
+    result = []
+    for path in sorted(seats.glob('*/seat.json')):
+        manifest = load_seat(path.parent.name)
+        if manifest is None:
+            raise ValueError('A Policy Guard seat registry changed during inspection; preserve state and retry')
+        operational_anchor(manifest)
+        result.append(manifest)
+    return result
+
+
 def save_seat(value):
     if not isinstance(value, dict) or value.get('schema') != SCHEMA:
         raise ValueError('Refusing unsupported Policy Guard seat registry')
@@ -147,6 +185,16 @@ def locked_seat(identifier):
                 if time.monotonic() >= deadline:
                     raise ValueError('Policy Guard seat is busy; retry at a safe boundary')
                 time.sleep(0.02)
+        yield
+
+
+@contextlib.contextmanager
+def locked_seats(identifiers):
+    """Lock a set of seats in stable identifier order for one cross-seat transaction."""
+    ordered = sorted(set(identifiers))
+    with ExitStack() as stack:
+        for identifier in ordered:
+            stack.enter_context(locked_seat(identifier))
         yield
 
 

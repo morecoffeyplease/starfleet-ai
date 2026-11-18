@@ -572,6 +572,42 @@ If an interrupted upgrade leaves a journal, use the reviewed source and same pro
 python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade-recover --rollback
 ```
 
+### Replace an absent permanent seat root
+
+`recover --inspect` reads the seat, while `recover --plan` can repair only its recorded runtime, adapter, or exact hook files.
+It does not move a Git worktree identity.
+Use `upgrade-plan --replacement-seat-root` only when the immutable birth root and recorded birth Gitdir are both absent.
+The transition preserves the source seat ID, birth root, birth Gitdir, owner history, PR history, and removed attachment states, then records a separate active operational anchor for live Git and settings checks.
+Same-repository proof comes from a retained attachment row for the birth root whose recorded Gitdir matches the immutable birth Gitdir and whose recorded common Git directory matches the replacement worktree's actual common directory.
+An owner match, remote URL, host label, or repository name cannot substitute for that recorded proof.
+Every active source attachment must exist and match its recorded worktree; review and apply the existing `retire-attachment` plan for each missing active attachment first.
+If another seat already owns the replacement root, its exact ID must be supplied with `--release-anchor-seat`.
+The destination seat must have no pending transition, an intact runtime and adapter pin, intact owned hooks, and only attachment rows already marked removed.
+An absent active destination attachment still blocks release until its owner retires it through `retire-attachment`.
+The transaction removes the destination seat's exact owned hook groups, adds the source seat's current groups when that harness manages hooks, upgrades the source seat, and leaves the released seat's runtime pin and history intact.
+The two seat IDs are never merged, and removed attachment state bytes are not rewritten.
+The normal upgrade receipt policy applies: prior receipts are archived and each active attachment needs a fresh report before covered actions can pass.
+
+Review and apply the operation from the clean source checkout and an active source-seat product attachment:
+
+```sh
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /product/worktree --seat-id SOURCE_SEAT_ID upgrade-plan \
+  --replacement-seat-root /worktrees/permanent-anchor \
+  --release-anchor-seat DESTINATION_SEAT_ID
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /product/worktree --seat-id SOURCE_SEAT_ID upgrade \
+  --replacement-seat-root /worktrees/permanent-anchor \
+  --release-anchor-seat DESTINATION_SEAT_ID --plan-sha256 REVIEWED_PLAN_SHA256
+```
+
+When no seat owns the replacement root, omit `--release-anchor-seat`.
+Future `plan` and `install` commands at the moved operational anchor must put global `--seat-id SOURCE_SEAT_ID` before the action so Policy Guard does not derive a new ID from the replacement path.
+The released destination remains available for read-only status and history inspection.
+An older pinned executable cannot understand a later release marker, so use a current supported source checkout for later state changes and do not treat the old binary as enforcing the marker.
+If an upgrade is interrupted, use `upgrade-recover --rollback` from the recorded product checkout while the replacement worktree still has the Git identity in the journal.
+Rollback restores the exact state, settings, adapter, settings backup, and both seat manifests without recreating the missing birth root.
+
 ## Inspect, hand off, and recover
 
 Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status` to inspect a permanent seat even when product checkouts are unavailable.
@@ -597,6 +633,7 @@ For a cross-harness handoff, the transaction adds or removes only the seat-owned
 Coordinate the existing single-writer settings checkpoint before a Claude settings change, and preserve native trust requirements.
 The settings change records configuration only and does not prove that the incoming native runtime loaded or trusted the hook.
 If the seat `gh` entrypoint, Claude hook or a non-CLI runtime file is missing while the installed `lane.py` is intact, run `recover --inspect`, review `recover --plan`, then apply its hash with `recover --apply --plan-sha256 PLAN_SHA256` through the installed runtime.
+Released history-only seats cannot use `recover --plan` or `recover --apply` to restore live hooks or adapters.
 If the installed runtime's `lane.py` or its entire directory is missing, use a clean current source checkout whose runtime fingerprint matches the seat's recorded version, then run those same recovery commands with that source `lane.py`.
 Recovery verifies the exact recorded file hashes before restoring missing files, and changed runtime files fail closed for inspection rather than being overwritten.
 If a legacy per-worktree source checkout or hook is missing, run `migrate-plan` and `migrate` from a clean current source checkout while the existing product Gitdir and state are available.

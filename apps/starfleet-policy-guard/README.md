@@ -116,6 +116,32 @@ It may correct a stale settings mode only when that checkout records the same se
 Review every `migration_metadata_recovery` entry and apply only its exact plan hash.
 For this metadata recovery path, changed settings content or mode, mismatched paths, invalid pins, and malformed runtime metadata continue to fail closed.
 
+## Replace a missing permanent seat root
+
+Use the reviewed `upgrade-plan` and `upgrade` flow with `--replacement-seat-root` only when the immutable birth root and its recorded Gitdir are both absent.
+The source seat ID, birth root, birth Gitdir, owner history, PR records, and removed checkout rows remain unchanged; the manifest records a separate active operational anchor for current Git and settings checks.
+The replacement must be in the same Git common directory proved by the retained birth-root attachment metadata; owner identity, repository origin, and host labels do not establish that proof.
+Every active source attachment must still exist and match its recorded worktree; retire missing active attachments through the existing `retire-attachment` route before planning.
+If the replacement root belongs to another seat, name that exact seat with `--release-anchor-seat` only after every destination attachment is already removed and its runtime, adapter, and installed hooks are intact.
+This operation releases the destination seat's operational anchor and owned hook groups without merging its seat ID, immutable runtime pin, or history into the source seat.
+The source seat upgrades normally, archives existing receipts, and requires fresh reports before covered actions can pass.
+A pending transaction can be rolled back with `upgrade-recover --rollback`; rollback verifies the replacement Git identity and restores both manifests, settings, backup, adapter, and checkout states without recreating the absent birth root.
+After recovery, future attachments at the operational anchor must select the source seat with global `--seat-id SOURCE_SEAT_ID` before `plan` or `install`.
+The released seat remains available for read-only history inspection; an older pinned runtime cannot enforce a release marker it does not understand, so use a current supported source for later state changes.
+
+For example, review and apply an explicit same-owner anchor release:
+
+```sh
+python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /worktrees/active-product --seat-id SOURCE_SEAT_ID upgrade-plan \
+  --replacement-seat-root /worktrees/permanent-anchor \
+  --release-anchor-seat DESTINATION_SEAT_ID
+python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /worktrees/active-product --seat-id SOURCE_SEAT_ID upgrade \
+  --replacement-seat-root /worktrees/permanent-anchor \
+  --release-anchor-seat DESTINATION_SEAT_ID --plan-sha256 REVIEWED_PLAN_SHA256
+```
+
 ## Retire a missing attachment
 
 An exact seat owner can retire a recorded attachment when its checkout path is gone or now belongs to a different Git repository or worktree.
