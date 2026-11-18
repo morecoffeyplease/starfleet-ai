@@ -1349,6 +1349,34 @@ class PreferencesTest(unittest.TestCase):
         self.activate("Claude-Codex")
         self.assertEqual(self.call("resolve", "--role", "implementer")["model"], "fixture-luna-99")
 
+    def test_light_profile_can_upgrade_sol_with_exact_reviewer_guards(self):
+        self.activate("claude-codex-light")
+        old = self.call("resolve", "--role", "standard_review", "--slot", "1")
+        self.assertEqual((old["model"], old["effort"]), ("gpt-6.1-sol", "high"))
+        original = self.app.config_path.read_bytes()
+        for harness, slug, efforts in [
+            ("codex", "gpt-6.2-astra", ["medium", "high"]),
+            ("claude", "gpt-6.2-sol", ["medium", "high"]),
+            ("codex", "gpt-6.2-sol", ["medium"]),
+        ]:
+            with self.subTest(harness=harness, slug=slug, efforts=efforts):
+                with self.assertRaises(mp.PreferenceError):
+                    self.call("model-set", "codex-sol", "--harness", harness, "--slug", slug,
+                              "--efforts", *efforts, "--source", "fixture", "--orchestrators", "future-only")
+                self.assertEqual(self.app.config_path.read_bytes(), original)
+
+        with patch.object(mp.App, "current", return_value={"items": [], "truncated": False}):
+            change = self.call("model-set", "codex-sol", "--harness", "codex", "--slug", "gpt-6.2-sol",
+                               "--efforts", "medium", "high", "--source", "fixture",
+                               "--orchestrators", "future-only")
+        self.call("validate")
+        sol = self.call("resolve", "--role", "standard_review", "--slot", "1")
+        opus = self.call("resolve", "--role", "standard_review", "--slot", "2")
+        self.assertEqual((sol["model"], sol["effort"]), ("gpt-6.2-sol", "high"))
+        self.assertEqual((opus["model"], opus["effort"]), ("claude-opus-5-5", "high"))
+        self.assertEqual(change["notification"]["orchestrators"], "future-only")
+        self.assertNotEqual(old["selection"], sol["selection"])
+
     def test_active_exact_model_update_requires_switch_intent(self):
         self.activate()
         before = self.app.config_path.read_bytes()
@@ -1417,6 +1445,40 @@ class PreferencesTest(unittest.TestCase):
             retried = self.call("notify", "--retry")
         self.assertEqual(sender.call_count, 1)
         self.assertTrue(all(r["status"] == "queued" for r in retried["notification"]["recipients"].values()))
+
+    def test_future_only_model_notice_keeps_scope_exclusions_on_retry(self):
+        scoped = dict(self.recipient, surface=str(uuid.uuid4()), session="scoped")
+        enrollments = {"shared": self.recipient, "uses-other-registry": scoped}
+        self.app.save_state("orchestrators", enrollments)
+        self.activate("Codex-only")
+        inventory = self.inventory()
+        inventory["items"].extend(self.inventory(scoped)["items"])
+        update = ("model-set", "codex-sol", "--harness", "codex", "--slug", "gpt-6.2-sol",
+                  "--efforts", "medium", "high", "--source", "fixture")
+        with patch.object(mp.App, "current", return_value=inventory), patch.object(mp, "run_json") as sender:
+            before = self.app.config_path.read_bytes()
+            with self.assertRaises(mp.PreferenceError):
+                self.call(*update, "--orchestrators", "ask", "--exclude-orchestrator", "uses-other-registry")
+            with self.assertRaises(mp.PreferenceError):
+                self.call(*update, "--orchestrators", "future-only", "--exclude-orchestrator", "typo")
+            self.assertEqual(self.app.config_path.read_bytes(), before)
+            sender.assert_not_called()
+
+            sender.side_effect = mp.PreferenceError("fixture send failed")
+            notice = self.call(*update, "--orchestrators", "future-only",
+                               "--exclude-orchestrator", "uses-other-registry")["notification"]
+            self.assertEqual(set(notice["recipients"]), {"shared"})
+            sender.assert_called_once()
+            self.assertEqual(sender.call_args.args[0][3], self.surface)
+
+            sender.reset_mock(side_effect=True)
+            sender.return_value = {"id": "queued"}
+            retried = self.call("notify", "--retry")["notification"]
+            sender.assert_called_once()
+            self.assertEqual(sender.call_args.args[0][3], self.surface)
+            self.assertEqual(retried["recipients"]["shared"]["status"], "queued")
+            self.assertEqual(retried["excluded_orchestrators"], ["uses-other-registry"])
+        self.assertEqual(self.app.state("orchestrators", {}), enrollments)
 
     def test_unknown_recipient_never_targeted(self):
         self.app.save_state("orchestrators", {"lane": dict(self.recipient, session="stale")})
