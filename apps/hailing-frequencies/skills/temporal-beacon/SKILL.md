@@ -42,3 +42,7 @@ Drafts and human-input obligations hold delivery until safe, subject to the time
 An uncertain submission may already have arrived: inspect the recipient and occurrence before retrying; creating another timer is not a safe retry.
 Canceling prevents future dispatch but cannot retract already submitted input.
 Closing the worker terminal stops coverage until it is restarted.
+
+To cancel another owner's exact timer with authorization, the current enrolled Hailing Frequencies coordinator runs `temporal-beacon cancel TIMER_ID --reason 'Reason for cancellation'`.
+The command records who canceled it and why and preserves occurrence history.
+A successor can create a new timer if needed.

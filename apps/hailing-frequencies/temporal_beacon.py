@@ -101,6 +101,10 @@ class TemporalBeacon:
         );
         CREATE INDEX IF NOT EXISTS timer_occurrences_current
           ON timer_occurrences(timer_id,sequence DESC);
+        CREATE TABLE IF NOT EXISTS timer_cancellations (
+          timer_id TEXT PRIMARY KEY REFERENCES timers(id), canceled_by_session TEXT NOT NULL,
+          canceled_by_owner_key TEXT NOT NULL, reason TEXT NOT NULL, canceled_at REAL NOT NULL
+        );
         """)
         columns = {row[1] for row in db.execute("PRAGMA table_info(timers)")}
         if "schedule_spec" not in columns:
@@ -384,20 +388,50 @@ class TemporalBeacon:
             timer = self._timer(db, timer_id)
             require(timer["owner_key"] == owner_key, "Timer belongs to another exact owner")
             rows = db.execute("SELECT id,timer_id,sequence,due_at,status,continuation,attempted_at,received_at,detail FROM timer_occurrences WHERE timer_id=? ORDER BY sequence", (timer_id,)).fetchall()
-            return {"timer": timer, "occurrences": [self._occurrence_dict(row) for row in rows]}
+            result = {"timer": timer, "occurrences": [self._occurrence_dict(row) for row in rows]}
+            cancellation = self._cancellation(db, timer_id)
+            if cancellation is not None:
+                result["coordinator_cancellation"] = cancellation
+            return result
 
-    def cancel(self, owner_key, timer_id):
-        now = self.clock()
-        with self.locked(), contextlib.closing(self.database()) as db:
+    @staticmethod
+    def _cancellation(db, timer_id):
+        columns = ("canceled_by_session", "reason", "canceled_at")
+        row = db.execute("SELECT canceled_by_session,reason,canceled_at FROM timer_cancellations WHERE timer_id=?",
+                         (timer_id,)).fetchone()
+        return dict(zip(columns, row)) if row is not None else None
+
+    def cancel(self, owner_key, timer_id, reason=None):
+        monitor_lock = contextlib.nullcontext() if reason is None else self.app.locked()
+        with monitor_lock, self.locked(), contextlib.closing(self.database()) as db:
             db.execute("BEGIN IMMEDIATE")
             timer = self._timer(db, timer_id)
-            require(timer["owner_key"] == owner_key, "Timer belongs to another exact owner")
-            if timer["status"] == "active":
+            coordinator = None
+            if timer["owner_key"] != owner_key:
+                require(reason is not None and reason.strip(),
+                        "Timer belongs to another exact owner; coordinator cancellation requires a nonblank --reason")
+                target, verified_key, _worktree = self.owner()
+                require(verified_key == owner_key and self.app.config().get("coordinator") == target["session"],
+                        "Only the currently enrolled Hailing Frequencies coordinator can cancel another owner's timer")
+                coordinator = target["session"]
+            status = timer["status"]
+            if status == "active":
+                now = self.clock()
                 db.execute("UPDATE timers SET status='canceled',updated_at=? WHERE id=? AND status='active'", (now, timer_id))
                 db.execute("UPDATE timer_occurrences SET status='canceled' WHERE timer_id=? AND status IN ('pending','held')", (timer_id,))
+                if coordinator is not None:
+                    db.execute(
+                        "INSERT INTO timer_cancellations(timer_id,canceled_by_session,canceled_by_owner_key,reason,canceled_at) "
+                        "VALUES(?,?,?,?,?)", (timer_id, coordinator, owner_key, reason.strip(), now),
+                    )
+                status = "canceled"
+            result = {"timer_id": timer_id, "status": status, "submitted_input_recallable": False}
+            if coordinator is not None:
+                cancellation = self._cancellation(db, timer_id)
+                if cancellation is not None:
+                    result["coordinator_cancellation"] = cancellation
             db.commit()
-            return {"timer_id": timer_id, "status": "canceled" if timer["status"] == "active" else timer["status"],
-                    "submitted_input_recallable": False}
+            return result
 
     def receive(self, owner_key, output, timer_id=None):
         target, _, _ = self.owner()

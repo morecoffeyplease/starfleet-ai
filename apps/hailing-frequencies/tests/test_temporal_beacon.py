@@ -563,6 +563,62 @@ class TemporalBeaconTests(unittest.TestCase):
                 canceled = hf.main(["--state-dir", str(self.root), "temporal", "cancel", timer_id])
                 self.assertEqual(canceled["status"], "completed")
 
+    def test_coordinator_cli_cancels_one_exact_foreign_timer_with_audited_reason(self):
+        timer_id = self.set_timer(after="10s")["timer"]["id"]
+        other_id = self.set_timer(after="20s")["timer"]["id"]
+        actor = dict(self.target, session=uid(), surface=uid(), label="coordinator")
+        actor_env = dict(self.env, CLAUDE_CODE_SESSION_ID=actor["session"], CMUX_SURFACE_ID=actor["surface"])
+        config = self.app.config()
+        config["targets"].append(actor)
+        config_path = self.root / "config.json"
+        hf.atomic_json(config_path, config)
+        store_path = self.root / "claude-hook-sessions.json"
+        store = json.loads(store_path.read_text())
+        store["sessions"][actor["session"]] = {"surfaceId": actor["surface"], "workspaceId": actor["workspace"],
+                                               "startedAt": actor["started_at"], "cwd": str(self.root)}
+        store["activeSessionsBySurface"][actor["surface"]] = {"sessionId": actor["session"]}
+        hf.atomic_json(store_path, store)
+        states = ["pending", "held", "submitted", "uncertain", "received", "canceled", "expired"]
+        with self.beacon.locked(), contextlib.closing(self.beacon.database()) as db:
+            with db:
+                db.executemany("INSERT INTO timer_occurrences(id,timer_id,sequence,due_at,status,continuation) "
+                               "VALUES(?,?,?,?,?,?)",
+                               [(uid(), timer_id, index, float(index), status, "Private continuation")
+                                for index, status in enumerate(states, 1)])
+        command = ["--state-dir", str(self.root), "temporal", "cancel", timer_id]
+        reason = "Idle reminder belongs to an ended session"
+        with patch.object(hf, "Cmux", return_value=self.host), patch.dict("os.environ", actor_env):
+            with self.assertRaisesRegex(ValueError, "currently enrolled Hailing Frequencies coordinator"):
+                hf.main([*command, "--reason", reason])
+            config["coordinator"] = actor["session"]
+            hf.atomic_json(config_path, config)
+            for args in ([], ["--reason", " 	"]):
+                with self.assertRaisesRegex(ValueError, "nonblank --reason"):
+                    hf.main([*command, *args])
+            self.host.hold = "Session generation changed"
+            with self.assertRaisesRegex(ValueError, "Session generation changed"):
+                hf.main([*command, "--reason", reason])
+            self.host.hold = None
+            with contextlib.closing(self.beacon.database()) as db:
+                self.assertEqual(db.execute("SELECT status FROM timers WHERE id=?", (timer_id,)).fetchone(),
+                                 ("active",))
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM timer_cancellations").fetchone(), (0,))
+            result = hf.main([*command, "--reason", reason])
+            self.assertEqual(result["status"], "canceled")
+            self.assertFalse(result["submitted_input_recallable"])
+            audit = result["coordinator_cancellation"]
+            self.assertEqual(audit["canceled_by_session"], actor["session"])
+            self.assertEqual(audit["reason"], reason)
+            self.assertEqual(hf.main([*command, "--reason", "Retry"])["coordinator_cancellation"], audit)
+        with patch.object(hf, "Cmux", return_value=self.host), patch.dict("os.environ", self.env):
+            inspection = hf.main(["--state-dir", str(self.root), "temporal", "inspect", timer_id])
+            self.assertEqual(inspection["coordinator_cancellation"], audit)
+            self.assertEqual([item["status"] for item in inspection["occurrences"]],
+                             ["canceled", "canceled", *states[2:]])
+            self.assertEqual(hf.main(["--state-dir", str(self.root), "temporal", "inspect", other_id])
+                             ["timer"]["status"], "active")
+            self.assertEqual(self.set_timer(after="30s")["timer"]["status"], "active")
+
     def test_installer_publishes_three_owned_commands_and_immutable_skills(self):
         import install
         app_dir = Path(__file__).resolve().parents[1]

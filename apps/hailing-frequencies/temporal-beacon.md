@@ -111,6 +111,22 @@ Use `--request-id` for a stable creation intent: retry the same request rather t
 Use `--replace-key` when a later timer should replace an earlier timer for the same purpose in the same session.
 Cancellation or replacement cannot recall input that has already been submitted.
 
+## Cancel a timer as the coordinator
+
+From the exact currently enrolled Hailing Frequencies coordinator session, provide the authorized timer ID and a nonblank reason.
+
+```sh
+temporal-beacon cancel TIMER_ID --reason 'Retire the idle reminder for an ended session'
+```
+
+Use `temporal-beacon cancel TIMER_ID` for your own timer.
+A coordinator cancel stops future wakes for the named timer and cancels its pending or held occurrences.
+It records the coordinator and reason, visible in the cancellation result and the timer owner's inspection.
+A repeat preserves the original cancellation record.
+Submitted, uncertain, received, and historical occurrences remain in the database.
+Cancellation cannot recall submitted input or make a canceled continuation receivable.
+A successor may create a new timer when needed.
+
 ## Scheduling semantics
 
 | Option | Meaning |

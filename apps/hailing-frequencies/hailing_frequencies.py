@@ -1655,6 +1655,7 @@ def parser():
     inspect.add_argument("timer_id")
     cancel = temporal_sub.add_parser("cancel", help="Cancel a timer and any held occurrence")
     cancel.add_argument("timer_id")
+    cancel.add_argument("--reason", help="Required when the enrolled coordinator cancels another owner's timer")
     temporal_sub.add_parser("receive", help="Output the current continuation and record its receipt")
     temporal_sub.choices["receive"].add_argument("--timer-id")
     temporal_doctor = temporal_sub.add_parser("doctor", help="Diagnose timer worker and delivery state")
@@ -1765,7 +1766,7 @@ def main(argv=None):
         if args.temporal_command == "inspect":
             return beacon.inspect(owner_key, args.timer_id)
         if args.temporal_command == "cancel":
-            return beacon.cancel(owner_key, args.timer_id)
+            return beacon.cancel(owner_key, args.timer_id, reason=args.reason)
         if args.temporal_command == "receive":
             receipt = beacon.receive(owner_key, sys.stdout, args.timer_id)
             print(json.dumps(receipt), file=sys.stderr)
