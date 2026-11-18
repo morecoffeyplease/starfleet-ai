@@ -81,6 +81,9 @@ It requires no worker restart or enrollment change and leaves local Agent Notify
 Discord Watch may report `remote_missing` for a deleted thread, which is separate from a credential failure or local retirement.
 See the [cleanup guide](discord-cleanup.md) for the date variables, private plan location, and recovery behavior.
 
+If a separately installed Agent Notify is already working, use `python3 apps/hailing-frequencies/install.py --skip-agent-notify`.
+The option leaves the Agent Notify command untouched during installation and uninstallation.
+
 ## Enroll exact sessions
 
 Run `cmux current --json --limit 200` and `cmux --id-format both --json tree --all` to observe the actual harness session, surface, and workspace.
@@ -293,11 +296,16 @@ Have the original sender issue a new message only after the operator reconciles 
 New messages can trigger another reminder after the cooldown; an already-attempted message cannot repeatedly interrupt its recipient.
 Escalation is separately deduplicated and sent only to a distinct enrolled coordinator.
 
+## Receive a handoff
+
+Follow the [incoming-owner workflow](guide.md#receive-an-authorized-handoff) for exact enrollment, transfer of named Discord Watch threads, reply receipt, and predecessor removal.
+The workflow uses existing commands and records progress in the same private handoff packet.
+
 ## Inspect and remove
 
 ```sh
 hailing-frequencies status
-hailing-frequencies unenroll --session SESSION_UUID
+hailing-frequencies unenroll --session OWN_SESSION_UUID
 python3 apps/hailing-frequencies/install.py --uninstall
 ```
 

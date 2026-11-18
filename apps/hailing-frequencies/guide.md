@@ -7,7 +7,8 @@ Use `hailing-frequencies status` to inspect saved enrollment and `hailing-freque
 If health reports incomplete coverage, inspect `status` for targets whose inboxes could not be read.
 Neither establishes permission to start another worker; if worker availability is unclear, ask the existing owner or operator instead.
 
-The Hailing Frequencies installer also installs the `agent-notify` Discord conversation command and its skill.
+The default Hailing Frequencies install includes the `agent-notify` Discord conversation command and its skill.
+Use `python3 apps/hailing-frequencies/install.py --skip-agent-notify` from a Starfleet AI checkout to keep a separate Agent Notify command.
 Use `agent-notify guide --print` for private Discord setup, credentials, forum permissions, and a bounded reply-receipt check.
 Agent Notify uses the existing Discord Watch installation and worker when present; it does not start another worker.
 
@@ -72,6 +73,38 @@ Passive API sessions without a current visible-TUI hook record, a session observ
 The default policy holds when CMUX reports OpenCode `surface.input_state` as `unknown`.
 The API does not expose composer drafts, and `api_sidechannel` is an explicit experimental choice to queue work without claiming that the composer is empty.
 The opt-in never bypasses missing or mismatched identities, dialogs, disabled receiving, active API work, or pending inbox, permission, or form state.
+
+## Receive an authorized handoff
+
+1. Read the private handoff packet and confirm the exact outgoing session, the threads you are authorized to receive, and any retained obligations.
+   From the incoming session, run `hailing-frequencies status` and follow [exact-session enrollment](#enroll-only-your-own-session) if needed.
+   Reuse a matching enrollment without changing its cutoff or receipts.
+   If the outgoing binding is still on the same surface and enrollment refuses, keep that binding and use a separate authorized incoming surface.
+2. Run `discord-watch status` to check the recorded owner and pending work for each named thread.
+   From the exact enrolled incoming session, transfer each authorized thread and verify the resulting owner.
+
+   ```sh
+   discord-watch transfer THREAD_ID --from-session OUTGOING_SESSION_UUID
+   discord-watch managed THREAD_ID
+   ```
+
+   For OpenCode, use the owning TUI and exact session as described in `discord-watch guide --print`.
+   If the thread already belongs to your verified current generation, keep it and use the recorded result.
+   If a transfer may have succeeded, check `managed THREAD_ID` and `status` before deciding whether another attempt is appropriate.
+   Use the existing thread and preserve queued replies and uncertain submissions.
+3. When a transferred reply is due, receive its exact group from the incoming session using the supplied Discord Watch command.
+   Record the receipt in the handoff packet.
+   If there is no reply to receive, record delivery as unobserved and keep the verified registration.
+   Leave the outgoing session's native CMUX messages and receipts with that session.
+4. Keep the outgoing Hailing Frequencies registration while it still supports a timer, pending reply, native inbox obligation, or other unresolved custody.
+   After those obligations settle, the outgoing owner can run `hailing-frequencies unenroll --session OWN_SESSION_UUID` and verify removal with `status`.
+   If that session is unavailable, a coordinator needs explicit authority and verified dispositions before removing the exact stored registration.
+   Record verified transfers, retained obligations, and any refusal in the existing packet.
+   Keep the last verified owner when a required check is unresolved.
+
+These steps can succeed independently.
+An enrollment, transfer, or submitted wake gives no evidence that the incoming owner saw a reply.
+Use `discord-watch guide --print` for receipt and recovery details.
 
 ## Checkpoint attention
 
