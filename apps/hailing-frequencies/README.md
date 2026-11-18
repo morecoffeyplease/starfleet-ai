@@ -11,7 +11,7 @@ The monitor does not own messages, mark another agent's messages read, poll Disc
 Fresh heartbeat evidence does not independently prove that a worker process is alive now.
 
 Temporal Beacon adds durable agent wake timers to this same worker.
-Read the [Temporal Beacon guide](temporal-beacon.md) for scheduling, receipt, installation, diagnosis, and the coordinator-only checkpoint timer retirement workflow, or load its [agent skill](skills/temporal-beacon/SKILL.md).
+Read the [Temporal Beacon guide](temporal-beacon.md) for `--after`, `--at`, `--every`, time-based `--until`, receipt, installation, and diagnosis, or load its [agent skill](skills/temporal-beacon/SKILL.md).
 Timer delivery uses the existing enrolled-session guards and opt-in send scope; unread-message reminder timing remains separate.
 
 The Hailing installer also installs the `agent-notify` Discord conversation command, its [setup guide](agent-notify-guide.md), and its [agent skill](skills/agent-notify/SKILL.md).
@@ -52,21 +52,7 @@ hailing-frequencies init
 hailing-frequencies status
 ```
 
-If a working standalone `agent-notify` already occupies the selected bin directory, the default install refuses it before changing launchers.
-To update only Hailing Frequencies and Temporal Beacon in the default `~/.local/bin` directory, run:
-
-```sh
-python3 apps/hailing-frequencies/install.py --skip-agent-notify
-```
-
-This option leaves the `agent-notify` command path and its target untouched during install or uninstall.
-It does not activate an Agent Notify launcher and reports `agent_notify_skipped` in the installer result.
-The option does not restart a running worker, change Pattern Buffer files, or update commands that use other paths.
-Already running processes may keep code they imported before installation.
-
-The installer copies the source, the read-only OpenCode session adapter, printable guides, and skills to an immutable SHA-256 directory under `~/.local/share/starfleet-ai/hailing-frequencies/`.
-By default, it writes the owned launchers `~/.local/bin/hailing-frequencies`, `~/.local/bin/temporal-beacon`, and `~/.local/bin/agent-notify`.
-With `--skip-agent-notify`, it writes only the Hailing Frequencies and Temporal Beacon launchers.
+The installer copies the source, the read-only OpenCode session adapter, printable guides, and skills to an immutable SHA-256 directory under `~/.local/share/starfleet-ai/hailing-frequencies/` and writes the owned launchers `~/.local/bin/hailing-frequencies`, `~/.local/bin/temporal-beacon`, and `~/.local/bin/agent-notify`.
 It prints immutable paths for the Temporal Beacon and Agent Notify skills.
 Follow [Temporal Beacon skill registration](temporal-beacon.md#enable-agent-discovery) or the Agent Notify guide to make the selected skill discoverable in a harness.
 Removing a development worktree therefore does not remove the installed runtime.
@@ -94,6 +80,9 @@ The command permanently removes whole Discord threads and their messages.
 It requires no worker restart or enrollment change and leaves local Agent Notify and Discord Watch history and subscriptions untouched.
 Discord Watch may report `remote_missing` for a deleted thread, which is separate from a credential failure or local retirement.
 See the [cleanup guide](discord-cleanup.md) for the date variables, private plan location, and recovery behavior.
+
+If a separately installed Agent Notify is already working, use `python3 apps/hailing-frequencies/install.py --skip-agent-notify`.
+The option leaves the Agent Notify command untouched during installation and uninstallation.
 
 ## Enroll exact sessions
 
@@ -307,17 +296,19 @@ Have the original sender issue a new message only after the operator reconciles 
 New messages can trigger another reminder after the cooldown; an already-attempted message cannot repeatedly interrupt its recipient.
 Escalation is separately deduplicated and sent only to a distinct enrolled coordinator.
 
+## Receive a handoff
+
+Follow the [incoming-owner workflow](guide.md#receive-an-authorized-handoff) for exact enrollment, transfer of named Discord Watch threads, reply receipt, and predecessor removal.
+The workflow uses existing commands and records progress in the same private handoff packet.
+
 ## Inspect and remove
 
 ```sh
 hailing-frequencies status
-hailing-frequencies unenroll --session SESSION_UUID
+hailing-frequencies unenroll --session OWN_SESSION_UUID
 python3 apps/hailing-frequencies/install.py --uninstall
-python3 apps/hailing-frequencies/install.py --uninstall --skip-agent-notify
 ```
 
-Use `--skip-agent-notify` on uninstall to remove only the Hailing Frequencies and Temporal Beacon launchers.
-The standalone companion remains at its existing path.
 Remove the health watcher before uninstalling the launcher or replacing a runtime used by that watcher.
 Reinstall `health-service install` after a runtime update so its immutable runtime pointer follows the verified version.
 

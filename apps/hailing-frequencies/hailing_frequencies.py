@@ -1655,21 +1655,9 @@ def parser():
     inspect.add_argument("timer_id")
     cancel = temporal_sub.add_parser("cancel", help="Cancel a timer and any held occurrence")
     cancel.add_argument("timer_id")
+    cancel.add_argument("--reason", help="Required when the enrolled coordinator cancels another owner's timer")
     temporal_sub.add_parser("receive", help="Output the current continuation and record its receipt")
     temporal_sub.choices["receive"].add_argument("--timer-id")
-    retirement = temporal_sub.add_parser("retirement", help="Preview and apply an authorized checkpoint timer retirement")
-    retirement_sub = retirement.add_subparsers(dest="retirement_action", required=True)
-    retirement_preview = retirement_sub.add_parser("preview", help="Preview exact checkpoint idle timers and confirmation digest")
-    retirement_preview.add_argument("--timer-id", action="append", required=True,
-                                    help="Exact timer ID to include; repeat for each timer")
-    retirement_preview.add_argument("--authorization-ref", required=True,
-                                    help="Short reference to the explicit authorization")
-    retirement_apply = retirement_sub.add_parser("apply", help="Apply a reviewed exact timer retirement digest")
-    retirement_apply.add_argument("--timer-id", action="append", required=True,
-                                  help="Repeat the exact timer IDs from preview")
-    retirement_apply.add_argument("--confirm", required=True, help="SHA-256 printed by retirement preview")
-    retirement_apply.add_argument("--authorization-ref", required=True,
-                                  help="The same authorization reference used for preview")
     temporal_doctor = temporal_sub.add_parser("doctor", help="Diagnose timer worker and delivery state")
     temporal_doctor.add_argument("--starfleet-json", action="store_true",
                                  help="emit normalized read-only setup states for Starfleet Doctor")
@@ -1772,17 +1760,13 @@ def main(argv=None):
         if args.temporal_command == "set":
             return beacon.set(args.after, args.at, args.every, args.until, args.message,
                               args.request_id, args.replace_key, after_idle=args.after_idle)
-        if args.temporal_command == "retirement":
-            if args.retirement_action == "preview":
-                return beacon.preview_retirement(args.timer_id, args.authorization_ref)
-            return beacon.apply_retirement(args.timer_id, args.confirm, args.authorization_ref)
         target, owner_key, _worktree = beacon.owner()
         if args.temporal_command == "list":
             return beacon.list(owner_key)
         if args.temporal_command == "inspect":
             return beacon.inspect(owner_key, args.timer_id)
         if args.temporal_command == "cancel":
-            return beacon.cancel(owner_key, args.timer_id)
+            return beacon.cancel(owner_key, args.timer_id, reason=args.reason)
         if args.temporal_command == "receive":
             receipt = beacon.receive(owner_key, sys.stdout, args.timer_id)
             print(json.dumps(receipt), file=sys.stderr)

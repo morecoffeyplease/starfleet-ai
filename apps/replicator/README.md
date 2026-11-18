@@ -1,8 +1,10 @@
 # Replicator
 
 Replicator packages a maintained guide and read-only preflight for an explicitly requested manual handoff between orchestrator sessions.
-The guide describes the handoff procedure, and preflight reports only the caller, worktree, and explicit input checks it can observe.
-Replicator does not start agents, workers, timers, or an automatic handoff trigger.
+The [handoff guide](guide.md) has a copyable start-handoff alert, one checkpoint template, and a short checklist for each owner.
+The person or agent initiating the authorized handoff sends the alert to the exact outgoing owner through native CMUX agent messaging.
+Both owners can use `starfleet doctor --json` for the aggregate inventory and the guide's component references for exact owner checks.
+Replicator does not send alerts, start agents or workers, schedule timers, or trigger handoffs.
 
 ## Print the guide
 
@@ -44,8 +46,9 @@ It reads the supplied context and guidance files without printing their paths or
 It does not query tool doctors, prove native delivery, accept custody, or complete predecessor cleanup.
 An unknown status means the required evidence is missing or ambiguous.
 Keep the predecessor while a required handoff check remains blocked or unknown.
-The current CMUX snapshot provides caller identity and state, but no model, effort, or effective permission fields.
-Preflight reports those settings as `unknown` until an exact-session native control provides evidence.
+The current CMUX snapshot provides caller identity and state.
+Preflight reports model, effort, and effective permissions as `unknown`.
+Use the handoff guide to verify the actual launch and native settings.
 
 ## Install the local launcher
 
@@ -61,15 +64,6 @@ The installer copies the CLI and guide into a content-addressed runtime and upda
 It refuses a symlink or unowned launcher and preserves immutable runtime files.
 It does not install a package globally, start a service, enroll a session, or alter CMUX configuration.
 Run `python3 apps/replicator/install.py --help` for the supported local path options.
-
-## Scope
-
-Read the [manual handoff guide](guide.md) before using its checklist.
-The guide keeps tool-specific custody checks in existing CMUX, Pattern Buffer, Hailing Frequencies, Temporal Beacon, Warp-drive, Discord Watch, Agent Notify, and Policy Guard controls.
-Preflight does not aggregate those tool checks or register tools.
-It does not qualify a Claude or Codex native pilot or prove that a successor received a handoff.
-Each same-harness route needs its own native evidence.
-An automatic activity-budget trigger remains a later increment that must use the same procedure.
 
 ## Verify
 

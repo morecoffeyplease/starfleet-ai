@@ -57,14 +57,9 @@ Leaving it empty preserves the legacy behavior of defaulting to the server owner
 ## Install or reuse the local command
 
 Run `command -v agent-notify` to inspect the current command path.
-If an independently installed `agent-notify` already works with the existing config and open threads, keep using it.
-From a Starfleet AI checkout, run `python3 apps/hailing-frequencies/install.py --skip-agent-notify` to update Hailing Frequencies and Temporal Beacon in the default `~/.local/bin` directory.
-The option leaves the standalone command path and target untouched during install or uninstall.
-It does not restart a running worker, change Pattern Buffer files, or update commands that use other paths.
-Already running processes may keep code they imported before installation.
-
-The default installer still refuses an unowned `agent-notify` file or symlink before replacing any launcher.
-Do not delete or rename that command to get around the refusal.
+If an independently installed `agent-notify` already works with the existing config and open threads, keep using it and skip reinstalling the companion.
+The Hailing installer preserves any launcher it does not own and refuses to replace an unowned file or symlink.
+Do not delete or rename that launcher to get around the refusal.
 
 To install the Starfleet launcher beside an independent one, use a separate bin directory and call its path explicitly:
 
@@ -84,8 +79,7 @@ python3 apps/hailing-frequencies/install.py
 agent-notify guide --print
 ```
 
-The default Hailing installer installs `agent-notify` beside `hailing-frequencies` and `temporal-beacon` under the selected `--bin-dir`.
-Use `--skip-agent-notify` to activate only the Hailing Frequencies and Temporal Beacon launchers while leaving an independent companion untouched.
+The Hailing installer installs `agent-notify` beside `hailing-frequencies` and `temporal-beacon` under the selected `--bin-dir`.
 It copies the command, this guide, and the maintained skill into the same immutable runtime.
 Installation does not initialize Discord configuration, alter existing thread cursors or routing records, start Discord Watch, or change CMUX settings.
 With the default installer options, the command is `~/.local/bin/agent-notify`; add `~/.local/bin` to `PATH` if it is not already there.

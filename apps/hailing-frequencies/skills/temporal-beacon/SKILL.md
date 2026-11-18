@@ -43,15 +43,6 @@ An uncertain submission may already have arrived: inspect the recipient and occu
 Canceling prevents future dispatch but cannot retract already submitted input.
 Closing the worker terminal stops coverage until it is restarted.
 
-## Retire stale checkpoint idle timers
-
-Use the retirement command only for explicitly authorized exact Pattern Buffer checkpoint idle timer IDs.
-Planning and applying require the currently configured coordinator's exact enrolled native identity.
-Preview with `temporal-beacon retirement preview --timer-id TIMER_ID --authorization-ref AUTHORIZATION_REFERENCE`, review the exact owner, Git scope, occurrences, and digest, then apply with the same IDs and reference using `--confirm DIGEST_SHA256`.
-Repeat `--timer-id` for each timer in the reviewed scope.
-If any owner, timer, occurrence, active timer set, or Git identity changes after preview, preview and review the changed state again.
-Retirement cancels selected active timers and pending or held occurrences while preserving submitted, uncertain, received, canceled, expired, and history records.
-Submitted input cannot be recalled, and a canceled timer's preserved submitted or uncertain continuation cannot be retrieved with `receive`.
-The exact retired native session generation and Git worktree cannot rearm the checkpoint timer key through Temporal Beacon.
-Retirement does not unenroll the owner or alter Pattern Buffer checkpoint state.
-Read the complete [retirement procedure](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md#retire-stale-checkpoint-idle-timers) before use.
+To cancel another owner's exact timer with authorization, the current enrolled Hailing Frequencies coordinator runs `temporal-beacon cancel TIMER_ID --reason 'Reason for cancellation'`.
+The command records who canceled it and why and preserves occurrence history.
+A successor can create a new timer if needed.

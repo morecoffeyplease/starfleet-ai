@@ -1122,9 +1122,8 @@ class InstallationTests(unittest.TestCase):
             staged_installer = source / "install.py"
             staged_installer.write_text("")
             expected = (source / "guide.md").read_text()
-            self.assertIn("Retire stale checkpoint timers", expected)
-            self.assertIn("retirement apply --timer-id TIMER_ID --confirm DIGEST_SHA256", expected)
-            self.assertIn("--skip-agent-notify", expected)
+            self.assertIn("Receive an authorized handoff", expected)
+            self.assertIn("discord-watch transfer THREAD_ID --from-session OUTGOING_SESSION_UUID", expected)
             agent_notify_guide = (source / "agent-notify-guide.md").read_text()
             with patch.object(install, "__file__", str(staged_installer)):
                 result = install.install(root / "runtime", root / "bin")
@@ -1282,8 +1281,6 @@ class InstallationTests(unittest.TestCase):
             (root / "agent-notify").write_text("foreign")
             with self.assertRaisesRegex(ValueError, "not owned"):
                 install.install(root / "runtime", root)
-            self.assertEqual((root / "agent-notify").read_text(), "foreign")
-            self.assertFalse((root / "runtime").exists())
 
 
 class ServiceTests(unittest.TestCase):

@@ -111,6 +111,22 @@ Use `--request-id` for a stable creation intent: retry the same request rather t
 Use `--replace-key` when a later timer should replace an earlier timer for the same purpose in the same session.
 Cancellation or replacement cannot recall input that has already been submitted.
 
+## Cancel a timer as the coordinator
+
+From the exact currently enrolled Hailing Frequencies coordinator session, provide the authorized timer ID and a nonblank reason.
+
+```sh
+temporal-beacon cancel TIMER_ID --reason 'Retire the idle reminder for an ended session'
+```
+
+Use `temporal-beacon cancel TIMER_ID` for your own timer.
+A coordinator cancel stops future wakes for the named timer and cancels its pending or held occurrences.
+It records the coordinator and reason, visible in the cancellation result and the timer owner's inspection.
+A repeat preserves the original cancellation record.
+Submitted, uncertain, received, and historical occurrences remain in the database.
+Cancellation cannot recall submitted input or make a canceled continuation receivable.
+A successor may create a new timer when needed.
+
 ## Scheduling semantics
 
 | Option | Meaning |
@@ -143,48 +159,6 @@ A recurring timer waits for receipt of its previous occurrence before advancing.
 After sleep or worker downtime, missed intervals collapse into one catch-up notification rather than a burst.
 An `--until` deadline also expires held recurring occurrences.
 Actual submission can be later than the due time because the worker is stopped, CMUX is unavailable, or input is held.
-
-## Retire stale checkpoint idle timers
-
-Use retirement only with explicit authorization for the named historical timers and while running as the currently configured Hailing Frequencies coordinator.
-The coordinator must be the exact currently enrolled native session.
-This command accepts only explicit timer IDs for Pattern Buffer checkpoint idle timers.
-It refuses a timer when another active timer shares its exact owner, Git worktree root, and checkpoint replacement key unless every matching active timer is named.
-
-Preview the exact timer IDs and record the returned digest and short authorization reference:
-
-```sh
-temporal-beacon retirement preview \
-  --timer-id TIMER_ID \
-  --timer-id ANOTHER_TIMER_ID \
-  --authorization-ref AUTHORIZATION_REFERENCE
-```
-
-Review the returned timer IDs, native owner snapshots, stored worktree aliases, normalized Git roots, schedules, occurrence counts, and digest.
-The preview hashes continuation text without exposing its contents.
-Apply with the exact same timer IDs and authorization reference:
-
-```sh
-temporal-beacon retirement apply \
-  --timer-id TIMER_ID \
-  --timer-id ANOTHER_TIMER_ID \
-  --confirm DIGEST_SHA256 \
-  --authorization-ref AUTHORIZATION_REFERENCE
-```
-
-Apply recomputes the full snapshot under the Hailing and timer locks and compares it with the confirmation digest before changing state.
-It refuses without mutation if any timer, occurrence, exact owner, active timer set, Git root, or Git directory identity changed after preview.
-Preview and review the changed state again after a refusal.
-No separate plan file is created.
-
-Apply creates a narrow tombstone for each exact native owner generation, normalized Git root, and Pattern Buffer checkpoint idle replacement key.
-The existing `temporal-beacon set` boundary enforces that tombstone before accepting a future timer with the retired key for that exact owner and worktree.
-Successor native session generations and unrelated replacement keys remain outside that tombstone.
-Retirement cancels the selected active timers and their pending or held occurrences.
-Submitted, uncertain, received, canceled, and expired occurrence rows remain unchanged.
-Submitted input cannot be recalled, and preserved submitted or uncertain continuations cannot be retrieved after their timer is canceled.
-The apply result reports these limits and stores an idempotent receipt for a retry with the same timer IDs, digest, authorization reference, and coordinator identity.
-Retirement does not unenroll the owner, stop or restart the worker, or alter Pattern Buffer checkpoint files.
 
 ## Wake and receipt
 

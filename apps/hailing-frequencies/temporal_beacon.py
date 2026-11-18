@@ -7,16 +7,11 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 import sqlite3
 import subprocess
 import time
 import uuid
-
-
-CHECKPOINT_IDLE_KEY = "pattern-buffer-checkpoint-idle"
-RETIREMENT_TIMER_LIMIT = 256
 
 
 def require(condition, message):
@@ -106,15 +101,9 @@ class TemporalBeacon:
         );
         CREATE INDEX IF NOT EXISTS timer_occurrences_current
           ON timer_occurrences(timer_id,sequence DESC);
-        CREATE TABLE IF NOT EXISTS retired_checkpoint_timer_keys (
-          harness TEXT NOT NULL, session TEXT NOT NULL, surface TEXT NOT NULL, workspace TEXT NOT NULL,
-          started_at REAL NOT NULL, worktree_root TEXT NOT NULL, replacement_key TEXT NOT NULL,
-          git_dir TEXT NOT NULL, plan_sha256 TEXT NOT NULL, retired_at REAL NOT NULL,
-          PRIMARY KEY(harness,session,surface,workspace,started_at,worktree_root,replacement_key)
-        );
-        CREATE TABLE IF NOT EXISTS timer_retirement_receipts (
-          plan_sha256 TEXT PRIMARY KEY, coordinator_owner_key TEXT NOT NULL,
-          authorization_ref TEXT NOT NULL, applied_at REAL NOT NULL, result_json TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS timer_cancellations (
+          timer_id TEXT PRIMARY KEY REFERENCES timers(id), canceled_by_session TEXT NOT NULL,
+          canceled_by_owner_key TEXT NOT NULL, reason TEXT NOT NULL, canceled_at REAL NOT NULL
         );
         """)
         columns = {row[1] for row in db.execute("PRAGMA table_info(timers)")}
@@ -211,270 +200,6 @@ class TemporalBeacon:
             self.binding(target, worktree)
         key = self.owner_key(target, worktree)
         return target, key, worktree
-
-    def _retirement_coordinator(self):
-        target, owner_key, worktree = self.owner()
-        config = self.app.config()
-        require(config.get("coordinator") == target["session"],
-                "Timer retirement requires the currently enrolled Hailing Frequencies coordinator")
-        return {"harness": target["harness"], "session": target["session"],
-                "surface": target["surface"], "workspace": target["workspace"],
-                "started_at": target["started_at"], "owner_key": owner_key,
-                "canonical_worktree": worktree}
-
-    @staticmethod
-    def _git_identity(worktree):
-        require(isinstance(worktree, str) and worktree,
-                "Checkpoint idle timer retirement requires a recorded Git worktree")
-        candidate = Path(worktree).expanduser()
-        require(candidate.is_absolute(), "Recorded checkpoint worktree is not absolute")
-        try:
-            resolved = candidate.resolve(strict=True)
-            require(resolved.is_dir(), "Recorded checkpoint worktree is not a directory")
-            result = subprocess.run(["git", "-C", str(resolved), "rev-parse",
-                                     "--show-toplevel", "--absolute-git-dir"],
-                                    capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError, RuntimeError):
-            raise ValueError("Cannot verify the recorded checkpoint Git worktree") from None
-        require(result.returncode == 0, "Cannot verify the recorded checkpoint Git worktree")
-        lines = result.stdout.splitlines()
-        require(len(lines) == 2 and all(lines), "Git returned an incomplete worktree identity")
-        try:
-            root = Path(lines[0]).resolve(strict=True)
-            git_dir = Path(lines[1]).resolve(strict=True)
-            contained = resolved == root or root in resolved.parents
-        except (OSError, RuntimeError):
-            raise ValueError("Recorded checkpoint Git identity changed") from None
-        require(root.is_dir() and git_dir.is_dir() and contained,
-                "Recorded checkpoint path is outside its Git worktree")
-        git_info = git_dir.stat()
-        return str(root), str(git_dir), git_info.st_dev, git_info.st_ino
-
-    @staticmethod
-    def _sha256_text(value):
-        require(isinstance(value, str), "Timer text metadata is malformed")
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-    def _retirement_timer(self, db, timer_id):
-        row = db.execute("SELECT * FROM timers WHERE id=?", (timer_id,)).fetchone()
-        require(row is not None, "A named timer no longer exists")
-        timer = self._timer_dict(row)
-        require(timer["harness"] == "claude" and timer["schedule"] == "idle"
-                and timer["replacement_key"] == CHECKPOINT_IDLE_KEY,
-                "Only Pattern Buffer checkpoint idle timers can be retired")
-        require(timer["status"] == "active",
-                "Only active Pattern Buffer checkpoint idle timers can be retired")
-        require(timer["canonical_worktree"], "Timer has no recorded Git worktree")
-        target = {key: timer[key] for key in ("harness", "session", "surface", "workspace", "started_at")}
-        expected_owner_key = self.owner_key(target, timer["canonical_worktree"])
-        require(timer["owner_key"] == expected_owner_key,
-                "Timer owner snapshot does not match its recorded fields")
-        worktree_root, git_dir, git_dir_device, git_dir_inode = self._git_identity(timer["canonical_worktree"])
-        occurrences = []
-        for item in db.execute(
-                "SELECT id,timer_id,sequence,due_at,status,continuation,attempted_at,received_at,detail "
-                "FROM timer_occurrences WHERE timer_id=? ORDER BY sequence", (timer_id,)).fetchall():
-            occurrence_id, _parent_id, sequence, due_at, status, continuation, attempted_at, received_at, detail = item
-            require(status in ("pending", "held", "submitted", "uncertain", "received", "canceled", "expired"),
-                    "Timer occurrence has an unknown state")
-            occurrences.append({"id": occurrence_id, "sequence": sequence, "due_at": due_at,
-                                "status": status, "attempted_at": attempted_at,
-                                "received_at": received_at,
-                                "continuation_sha256": self._sha256_text(continuation),
-                                "detail_sha256": self._sha256_text(detail) if detail is not None else None})
-        timer_row = {key: timer[key] for key in (
-            "id", "owner_key", "harness", "session", "surface", "workspace", "started_at",
-            "canonical_worktree", "schedule", "interval", "due_at", "until_at", "status",
-            "request_id", "replacement_key", "created_at", "updated_at")}
-        timer_row["continuation_sha256"] = self._sha256_text(timer["continuation"])
-        timer_row["schedule_spec_sha256"] = self._sha256_text(timer["schedule_spec"])
-        return {"timer": timer_row, "git": {"worktree_root": worktree_root, "git_dir": git_dir,
-                                            "git_dir_device": git_dir_device,
-                                            "git_dir_inode": git_dir_inode},
-                "occurrences": occurrences}
-
-    def _active_timer_ids_for_scope(self, db, scope):
-        harness, session, surface, workspace, started_at, worktree_root, replacement_key = scope
-        rows = db.execute(
-            "SELECT id,canonical_worktree FROM timers WHERE harness=? AND session=? AND surface=? "
-            "AND workspace=? AND started_at=? AND replacement_key=? AND status='active'",
-            (harness, session, surface, workspace, started_at, replacement_key)).fetchall()
-        active = set()
-        for timer_id, worktree in rows:
-            resolved_root, _git_dir, _git_dir_device, _git_dir_inode = self._git_identity(worktree)
-            if resolved_root == worktree_root:
-                active.add(timer_id)
-        return active
-
-    @staticmethod
-    def _authorization_ref(value):
-        require(isinstance(value, str) and value.strip(), "An explicit authorization reference is required")
-        value = value.strip()
-        require(len(value.encode("utf-8")) <= 512 and not any(ord(char) < 32 for char in value),
-                "Authorization reference must be one line of at most 512 UTF-8 bytes")
-        return value
-
-    @staticmethod
-    def _retirement_timer_ids(timer_ids):
-        require(isinstance(timer_ids, list) and 0 < len(timer_ids) <= RETIREMENT_TIMER_LIMIT
-                and all(isinstance(value, str) and value and value == value.strip() for value in timer_ids),
-                "Name between one and 256 exact timer IDs")
-        require(len(set(timer_ids)) == len(timer_ids), "Timer IDs must be unique")
-        return sorted(timer_ids)
-
-    def _retirement_snapshot(self, db, timer_ids, authorization_ref, coordinator):
-        timers = [self._retirement_timer(db, timer_id) for timer_id in timer_ids]
-        groups = {}
-        for entry in timers:
-            timer, git = entry["timer"], entry["git"]
-            scope = (timer["harness"], timer["session"], timer["surface"], timer["workspace"],
-                     timer["started_at"], git["worktree_root"], timer["replacement_key"])
-            groups.setdefault(scope, []).append(entry)
-
-        scopes = []
-        for scope, members in sorted(groups.items(), key=lambda item: json.dumps(item[0])):
-            harness, session, surface, workspace, started_at, worktree_root, replacement_key = scope
-            git_identities = {(entry["git"]["git_dir"], entry["git"]["git_dir_device"],
-                               entry["git"]["git_dir_inode"]) for entry in members}
-            require(len(git_identities) == 1, "Timer aliases resolve to different Git identities")
-            timer_ids_for_scope = sorted(entry["timer"]["id"] for entry in members)
-            active_ids = sorted(self._active_timer_ids_for_scope(db, scope))
-            require(active_ids == timer_ids_for_scope,
-                    "The exact active timer set changed; preview and name every matching timer")
-            git_dir, git_dir_device, git_dir_inode = next(iter(git_identities))
-            scopes.append({"harness": harness, "session": session, "surface": surface,
-                           "workspace": workspace, "started_at": started_at,
-                           "worktree_root": worktree_root, "replacement_key": replacement_key,
-                           "git_dir": git_dir, "git_dir_device": git_dir_device,
-                           "git_dir_inode": git_dir_inode, "active_timer_ids": active_ids})
-
-        return {"version": 1, "state_directory": str(self.directory.resolve()),
-                "authorization_ref": authorization_ref, "coordinator": coordinator,
-                "timer_ids": timer_ids, "scopes": scopes, "timers": timers}
-
-    @staticmethod
-    def _retirement_digest(snapshot):
-        raw = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                         allow_nan=False).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
-
-    @staticmethod
-    def _retirement_summary(snapshot, digest):
-        timers = []
-        occurrence_counts = {}
-        for entry in snapshot["timers"]:
-            timer = entry["timer"]
-            counts = {}
-            for occurrence in entry["occurrences"]:
-                status = occurrence["status"]
-                counts[status] = counts.get(status, 0) + 1
-                occurrence_counts[status] = occurrence_counts.get(status, 0) + 1
-            owner = {key: timer[key] for key in
-                     ("harness", "session", "surface", "workspace", "started_at", "owner_key")}
-            timers.append({"id": timer["id"], "owner": owner,
-                           "stored_worktree_alias": timer["canonical_worktree"],
-                           "git": entry["git"], "replacement_key": timer["replacement_key"],
-                           "schedule": timer["schedule"], "interval": timer["interval"],
-                           "due_at": timer["due_at"], "until_at": timer["until_at"],
-                           "occurrence_counts": counts})
-        cancelable = {status: count for status, count in occurrence_counts.items()
-                      if status in ("pending", "held")}
-        preserved = {status: count for status, count in occurrence_counts.items()
-                     if status not in ("pending", "held")}
-        return {"digest_sha256": digest, "state_directory": snapshot["state_directory"],
-                "authorization_ref": snapshot["authorization_ref"],
-                "coordinator": snapshot["coordinator"], "timer_ids": snapshot["timer_ids"],
-                "timer_count": len(timers), "scopes": snapshot["scopes"], "timers": timers,
-                "cancelable_occurrences": cancelable, "preserved_occurrences": preserved}
-
-    def preview_retirement(self, timer_ids, authorization_ref):
-        timer_ids = self._retirement_timer_ids(timer_ids)
-        authorization_ref = self._authorization_ref(authorization_ref)
-        with self.app.locked(), self.locked(), contextlib.closing(self.database()) as db:
-            coordinator = self._retirement_coordinator()
-            db.execute("BEGIN")
-            snapshot = self._retirement_snapshot(db, timer_ids, authorization_ref, coordinator)
-            db.commit()
-        return self._retirement_summary(snapshot, self._retirement_digest(snapshot))
-
-    def apply_retirement(self, timer_ids, confirmation, authorization_ref):
-        timer_ids = self._retirement_timer_ids(timer_ids)
-        authorization_ref = self._authorization_ref(authorization_ref)
-        require(isinstance(confirmation, str) and re.fullmatch(r"[0-9a-f]{64}", confirmation) is not None,
-                "Confirm the exact preview digest SHA-256")
-        state_directory = str(self.directory.resolve())
-        now = self.clock()
-        with self.app.locked(), self.locked(), contextlib.closing(self.database()) as db:
-            coordinator = self._retirement_coordinator()
-            db.execute("BEGIN IMMEDIATE")
-            prior = db.execute(
-                "SELECT coordinator_owner_key,authorization_ref,result_json "
-                "FROM timer_retirement_receipts WHERE plan_sha256=?", (confirmation,)).fetchone()
-            if prior is not None:
-                result = json.loads(prior[2])
-                require(prior[0] == coordinator["owner_key"] and prior[1] == authorization_ref
-                        and result.get("coordinator") == coordinator
-                        and result.get("state_directory") == state_directory
-                        and result.get("timer_ids") == timer_ids
-                        and result.get("digest_sha256") == confirmation,
-                        "Retirement receipt differs from this coordinator, authorization, or timer set")
-                db.commit()
-                return {**result, "idempotent": True}
-
-            snapshot = self._retirement_snapshot(db, timer_ids, authorization_ref, coordinator)
-            digest = self._retirement_digest(snapshot)
-            require(digest == confirmation,
-                    "Timer, occurrence, owner, or Git identity changed after preview; preview again")
-            for scope in snapshot["scopes"]:
-                existing = db.execute(
-                    "SELECT plan_sha256 FROM retired_checkpoint_timer_keys WHERE harness=? AND session=? "
-                    "AND surface=? AND workspace=? AND started_at=? AND worktree_root=? AND replacement_key=?",
-                    (scope["harness"], scope["session"], scope["surface"], scope["workspace"],
-                     scope["started_at"], scope["worktree_root"], scope["replacement_key"])).fetchone()
-                require(existing is None, "This exact checkpoint timer key already has a retirement tombstone")
-
-            for scope in snapshot["scopes"]:
-                db.execute(
-                    "INSERT INTO retired_checkpoint_timer_keys "
-                    "(harness,session,surface,workspace,started_at,worktree_root,replacement_key,git_dir,plan_sha256,retired_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (scope["harness"], scope["session"], scope["surface"], scope["workspace"],
-                     scope["started_at"], scope["worktree_root"], scope["replacement_key"],
-                     scope["git_dir"], confirmation, now))
-            canceled_occurrences = {"pending": 0, "held": 0}
-            preserved_occurrences = {}
-            for entry in snapshot["timers"]:
-                timer = entry["timer"]
-                updated = db.execute(
-                    "UPDATE timers SET status='canceled',updated_at=? WHERE id=? AND owner_key=? AND status='active'",
-                    (now, timer["id"], timer["owner_key"]))
-                require(updated.rowcount == 1, "A previewed timer changed before retirement")
-                for occurrence in entry["occurrences"]:
-                    status = occurrence["status"]
-                    if status in canceled_occurrences:
-                        changed = db.execute(
-                            "UPDATE timer_occurrences SET status='canceled' WHERE id=? AND timer_id=? AND status=?",
-                            (occurrence["id"], timer["id"], status))
-                        require(changed.rowcount == 1, "A previewed occurrence changed before retirement")
-                        canceled_occurrences[status] += 1
-                    else:
-                        preserved_occurrences[status] = preserved_occurrences.get(status, 0) + 1
-
-            result = {"digest_sha256": confirmation, "state_directory": state_directory,
-                      "coordinator": coordinator, "timer_ids": timer_ids,
-                      "retired_timer_count": len(timer_ids),
-                      "canceled_occurrences": canceled_occurrences,
-                      "preserved_occurrences": preserved_occurrences,
-                      "submitted_input_recallable": False,
-                      "preserved_submitted_occurrences_retrievable": False,
-                      "authorization_ref": authorization_ref}
-            db.execute(
-                "INSERT INTO timer_retirement_receipts "
-                "(plan_sha256,coordinator_owner_key,authorization_ref,applied_at,result_json) VALUES (?,?,?,?,?)",
-                (confirmation, coordinator["owner_key"], authorization_ref, now,
-                 json.dumps(result, sort_keys=True, separators=(",", ":"))))
-            db.commit()
-            return {**result, "idempotent": False}
 
     def _timer(self, db, timer_id):
         row = db.execute("SELECT * FROM timers WHERE id=?", (timer_id,)).fetchone()
@@ -615,8 +340,6 @@ class TemporalBeacon:
         replacement_key = replacement_key.strip() if replacement_key is not None else None
         require(request_id is None or bool(request_id), "Request ID cannot be empty")
         require(replacement_key is None or bool(replacement_key), "Replacement key cannot be empty")
-        checkpoint_git_identity = (self._git_identity(worktree)
-                                   if replacement_key == CHECKPOINT_IDLE_KEY else None)
         schedule_spec = json.dumps({"schedule": schedule, "value": schedule_value,
                                     "until_at": deadline, "continuation": continuation.strip()},
                                    sort_keys=True, separators=(",", ":"))
@@ -625,15 +348,6 @@ class TemporalBeacon:
                 request_id, replacement_key, schedule_spec)
         with self.locked(), contextlib.closing(self.database()) as db:
             db.execute("BEGIN IMMEDIATE")
-            if checkpoint_git_identity is not None:
-                worktree_root, _git_dir, _git_dir_device, _git_dir_inode = checkpoint_git_identity
-                retired = db.execute(
-                    "SELECT 1 FROM retired_checkpoint_timer_keys WHERE harness=? AND session=? AND surface=? "
-                    "AND workspace=? AND started_at=? AND worktree_root=? AND replacement_key=?",
-                    (target["harness"], target["session"], target["surface"], target["workspace"],
-                     target["started_at"], worktree_root, replacement_key)).fetchone()
-                require(retired is None,
-                        "This exact checkpoint owner and Git worktree retired the idle timer key")
             if request_id:
                 existing = db.execute("SELECT * FROM timers WHERE request_id=?", (request_id,)).fetchone()
                 if existing:
@@ -674,20 +388,50 @@ class TemporalBeacon:
             timer = self._timer(db, timer_id)
             require(timer["owner_key"] == owner_key, "Timer belongs to another exact owner")
             rows = db.execute("SELECT id,timer_id,sequence,due_at,status,continuation,attempted_at,received_at,detail FROM timer_occurrences WHERE timer_id=? ORDER BY sequence", (timer_id,)).fetchall()
-            return {"timer": timer, "occurrences": [self._occurrence_dict(row) for row in rows]}
+            result = {"timer": timer, "occurrences": [self._occurrence_dict(row) for row in rows]}
+            cancellation = self._cancellation(db, timer_id)
+            if cancellation is not None:
+                result["coordinator_cancellation"] = cancellation
+            return result
 
-    def cancel(self, owner_key, timer_id):
-        now = self.clock()
-        with self.locked(), contextlib.closing(self.database()) as db:
+    @staticmethod
+    def _cancellation(db, timer_id):
+        columns = ("canceled_by_session", "reason", "canceled_at")
+        row = db.execute("SELECT canceled_by_session,reason,canceled_at FROM timer_cancellations WHERE timer_id=?",
+                         (timer_id,)).fetchone()
+        return dict(zip(columns, row)) if row is not None else None
+
+    def cancel(self, owner_key, timer_id, reason=None):
+        monitor_lock = contextlib.nullcontext() if reason is None else self.app.locked()
+        with monitor_lock, self.locked(), contextlib.closing(self.database()) as db:
             db.execute("BEGIN IMMEDIATE")
             timer = self._timer(db, timer_id)
-            require(timer["owner_key"] == owner_key, "Timer belongs to another exact owner")
-            if timer["status"] == "active":
+            coordinator = None
+            if timer["owner_key"] != owner_key:
+                require(reason is not None and reason.strip(),
+                        "Timer belongs to another exact owner; coordinator cancellation requires a nonblank --reason")
+                target, verified_key, _worktree = self.owner()
+                require(verified_key == owner_key and self.app.config().get("coordinator") == target["session"],
+                        "Only the currently enrolled Hailing Frequencies coordinator can cancel another owner's timer")
+                coordinator = target["session"]
+            status = timer["status"]
+            if status == "active":
+                now = self.clock()
                 db.execute("UPDATE timers SET status='canceled',updated_at=? WHERE id=? AND status='active'", (now, timer_id))
                 db.execute("UPDATE timer_occurrences SET status='canceled' WHERE timer_id=? AND status IN ('pending','held')", (timer_id,))
+                if coordinator is not None:
+                    db.execute(
+                        "INSERT INTO timer_cancellations(timer_id,canceled_by_session,canceled_by_owner_key,reason,canceled_at) "
+                        "VALUES(?,?,?,?,?)", (timer_id, coordinator, owner_key, reason.strip(), now),
+                    )
+                status = "canceled"
+            result = {"timer_id": timer_id, "status": status, "submitted_input_recallable": False}
+            if coordinator is not None:
+                cancellation = self._cancellation(db, timer_id)
+                if cancellation is not None:
+                    result["coordinator_cancellation"] = cancellation
             db.commit()
-            return {"timer_id": timer_id, "status": "canceled" if timer["status"] == "active" else timer["status"],
-                    "submitted_input_recallable": False}
+            return result
 
     def receive(self, owner_key, output, timer_id=None):
         target, _, _ = self.owner()
