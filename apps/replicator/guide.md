@@ -4,12 +4,24 @@ Use this checklist for an authorized handoff.
 Keep the handoff in the existing private checkpoint or packet.
 Use the approved mission, next action, and holds throughout the handoff.
 
+## Notify the outgoing owner
+
+If you are initiating the authorized handoff, send this alert to the exact outgoing session through native CMUX agent messaging.
+
+```text
+Start the authorized handoff for <approved scope> at your next safe boundary.
+Run replicator guide --print and follow the outgoing checklist.
+Start diagnostics with starfleet doctor --json.
+Use the current component guides linked in Replicator for exact owner checks
+and transfer steps.
+```
+
 ## Outgoing owner
 
 1. Prepare the checkpoint below and find a safe boundary for the work you are handing over.
    Check the exact checkout and the owner records for live children, jobs, timers and occurrences, pending replies, and tool registrations.
    Use the authorized successor already open, or open one through the existing CMUX terminal route described below.
-   Send the cue below through native CMUX agent messaging to the exact incoming owner.
+   Send the private checkpoint path and a short orientation on the approved scope and holds to the exact incoming owner through native CMUX agent messaging.
 2. Before releasing work, stop starting new writes on that scope and recheck the checkout, owners, and obligations that could have changed.
    Use each tool's supported owner workflow and record its outcome in the checkpoint.
    Record your release to the exact successor once the work is ready for that owner to accept.
@@ -17,15 +29,6 @@ Use the approved mission, next action, and holds throughout the handoff.
 3. Settle any obligations you still own, then deregister your own exact binding from each service that still lists you.
    Keep any binding needed for a retained job, pending reply, or timer occurrence until that obligation is resolved.
    Confirm the remaining dispositions in the checkpoint and exit normally after verified acceptance and cleanup.
-
-### Copyable outgoing handoff cue
-
-```text
-Handoff for <approved scope>. Read <private checkpoint path> and run
-replicator guide --print. Start diagnostics with starfleet doctor --json.
-Use the current component guides linked in Replicator for applicable owner checks
-and transfer steps. Reply with any unresolved exception or decision.
-```
 
 ### Open a successor when needed
 

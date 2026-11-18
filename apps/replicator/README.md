@@ -1,8 +1,8 @@
 # Replicator
 
 Replicator packages a maintained guide and read-only preflight for an explicitly requested manual handoff between orchestrator sessions.
-The [handoff guide](guide.md) has a copyable outgoing cue, one checkpoint template, and a short checklist for each owner.
-The outgoing owner sends the cue through native CMUX agent messaging.
+The [handoff guide](guide.md) has a copyable start-handoff alert, one checkpoint template, and a short checklist for each owner.
+The person or agent initiating the authorized handoff sends the alert to the exact outgoing owner through native CMUX agent messaging.
 Both owners can use `starfleet doctor --json` for the aggregate inventory and the guide's component references for exact owner checks.
 Replicator does not send alerts, start agents or workers, schedule timers, or trigger handoffs.
 
