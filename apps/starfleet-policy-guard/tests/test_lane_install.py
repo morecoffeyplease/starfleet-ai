@@ -316,6 +316,71 @@ class LaneInstallTest(unittest.TestCase):
         return {'owner': owner, 'owner_env': owner_env, 'source': source, 'seat_id': seat_id,
                 'runtime': runtime, 'active': active, 'retired_state_path': state_path}
 
+    def prepare_missing_anchor_transition(self, label):
+        owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='claude',
+                         CLAUDE_CODE_SESSION_ID='claude-fixture-session')
+        owner_env.pop('CODEX_THREAD_ID', None)
+        source = self.source_checkout(label + '-old-runtime', marker_file='lane.py')
+        birth_root = self.base / (label + ' missing birth root')
+        birth_branch = 'feature/' + label + '-birth'
+        created = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-b', birth_branch,
+                                  str(birth_root)], capture_output=True, text=True, env=owner_env)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        first = self.attach_native_checkout(source, birth_root, birth_root, owner_env)
+        seat_id = first['seat_id']
+        runtime = Path(first['seat_runtime_path'])
+        active = self.attach_native_checkout(source, birth_root, self.repo, owner_env)
+        self.assertEqual(active['seat_id'], seat_id)
+        active_row = next(row for row in lane_runtime.session_store.all_checkouts(seat_id)
+                          if row['root'] == str(self.repo.resolve()))
+        target_row = next(row for row in lane_runtime.session_store.all_checkouts(seat_id)
+                          if row['root'] == str(birth_root.resolve()))
+        target_root_state_path = Path(target_row['checkout_dir']) / 'state.json'
+        active_state_path = Path(active_row['checkout_dir']) / 'state.json'
+        self.seed_attachment_pr_history(seat_id, active['checkout_id'], active_state_path)
+
+        removed_birth = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'remove', '--force',
+                                        str(birth_root)], capture_output=True, text=True, env=owner_env)
+        self.assertEqual(removed_birth.returncode, 0, removed_birth.stderr)
+        deleted_birth_branch = subprocess.run(['git', '-C', str(self.repo), 'branch', '-D', birth_branch],
+                                              capture_output=True, text=True, env=owner_env)
+        self.assertEqual(deleted_birth_branch.returncode, 0, deleted_birth_branch.stderr)
+        retirement_plan = json.loads(self.call_seat_retirement(
+            runtime, seat_id, birth_root, env=owner_env, cwd=self.repo).stdout)
+        self.call_seat_retirement(runtime, seat_id, birth_root, '--apply',
+                                  '--plan-sha256', retirement_plan['plan_sha256'],
+                                  env=owner_env, cwd=self.repo)
+        target_removed_bytes = target_root_state_path.read_bytes()
+
+        replacement_root = self.owner_seat()
+        release_checkout = self.base / (label + ' release checkout')
+        release_branch = 'feature/' + label + '-release-attachment'
+        release_source = self.source_checkout(label + '-release-runtime', marker_file='lane_scope.py')
+        release = self.add_native_seat_attachment(
+            release_source, replacement_root, release_checkout, owner_env, release_branch)
+        release_id = release['seat_id']
+        release_runtime = Path(release['seat_runtime_path'])
+        removed_release_checkout = subprocess.run(
+            ['git', '-C', str(self.repo), 'worktree', 'remove', '--force', str(release_checkout)],
+            capture_output=True, text=True, env=owner_env)
+        self.assertEqual(removed_release_checkout.returncode, 0, removed_release_checkout.stderr)
+        deleted_release_branch = subprocess.run(
+            ['git', '-C', str(self.repo), 'branch', '-D', release_branch],
+            capture_output=True, text=True, env=owner_env)
+        self.assertEqual(deleted_release_branch.returncode, 0, deleted_release_branch.stderr)
+        release_row = next(row for row in lane_runtime.session_store.all_checkouts(release_id)
+                           if row['root'] == str(release_checkout.resolve()))
+        return {'owner_env': owner_env, 'source': source, 'runtime': runtime,
+                'seat_id': seat_id, 'birth_root': birth_root,
+                'birth_gitdir': Path(first['lane_owner']['seat_gitdir']),
+                'target_root_state_path': target_root_state_path,
+                'target_root_state_bytes': target_removed_bytes,
+                'active_state_path': active_state_path,
+                'replacement_root': replacement_root,
+                'release_id': release_id, 'release_runtime': release_runtime,
+                'release_state_path': Path(release_row['checkout_dir']) / 'state.json',
+                'release_checkout': release_checkout}
+
     def native_owner_fixture(self):
         owner = self.owner_seat()
         owner_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='claude',
@@ -3486,6 +3551,331 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(repeat_apply.returncode, 0, repeat_apply.stderr)
         self.assertTrue(json.loads(repeat_apply.stdout)['already_retired'])
         self.assertEqual(state_path.read_bytes(), before_repeat)
+
+    def test_missing_seat_root_actual_cli_reproduction(self):
+        owner, owner_env = self.native_owner_fixture()
+        source = self.source_checkout('missing-seat-root-reproduction')
+        lane_args = ['--lane', '--host', 'fixture.invalid', '--owner-harness', 'claude',
+                     '--owner-session', owner_env['CLAUDE_CODE_SESSION_ID'],
+                     '--pr-url', self.url, '--base-ref', 'main']
+        initial_plan_result = self.call_source(source, '--session-root', owner, 'plan', *lane_args,
+                                               env=owner_env)
+        self.assertEqual(initial_plan_result.returncode, 0, initial_plan_result.stderr)
+        initial_plan = json.loads(initial_plan_result.stdout)
+        self.call_source(source, '--session-root', owner, 'install', *lane_args,
+                         '--plan-sha256', initial_plan['plan_sha256'], env=owner_env)
+        runtime = Path(initial_plan['seat_runtime_path'])
+        seat_id = initial_plan['seat_id']
+        recorded_gitdir = Path(initial_plan['lane_owner']['seat_gitdir'])
+
+        control_checkout = self.base / 'healthy-control-checkout'
+        control_checkout.mkdir()
+        control = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-b',
+                                  'feature/healthy-control', str(control_checkout)],
+                                 capture_output=True, text=True, env=owner_env)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        healthy_plan = self.call_source(runtime, '--session-root', owner, 'plan', *lane_args,
+                                        '--head-branch', 'feature/test', env=owner_env,
+                                        cwd=control_checkout)
+        self.assertEqual(healthy_plan.returncode, 0, healthy_plan.stderr)
+
+        healthy_coverage = self.call_source(runtime, 'coverage', env=owner_env, cwd=self.repo)
+        self.assertEqual(healthy_coverage.returncode, 0, healthy_coverage.stderr)
+        healthy_coverage_value = json.loads(healthy_coverage.stdout)
+        self.assertEqual(healthy_coverage_value['setup_guidance']['action'], 'none')
+        self.assertIn('Setup is intact', healthy_coverage_value['setup_guidance']['reason'])
+        self.assertEqual(healthy_coverage_value['delivery_report']['receipt']['state'], 'absent')
+
+        attachment = lane_runtime.session_store.lookup_checkout(self.repo)
+        state_path = Path(attachment['checkout_dir']) / 'state.json'
+        state_preimage = state_path.read_bytes()
+        changed_state = json.loads(state_preimage)
+        changed_state['lane_owner']['seat_gitdir'] = str(self.repo / '.git')
+        state_path.write_text(json.dumps(changed_state, indent=2) + '\n')
+        changed_gitdir_coverage = self.call_source(runtime, 'coverage', env=owner_env, cwd=self.repo)
+        self.assertEqual(changed_gitdir_coverage.returncode, 0, changed_gitdir_coverage.stderr)
+        changed_gitdir_value = json.loads(changed_gitdir_coverage.stdout)
+        self.assertEqual(changed_gitdir_value['setup_guidance']['action'], 'inspect')
+        self.assertIn('recorded permanent seat Gitdir changed',
+                      changed_gitdir_value['setup_guidance']['reason'])
+        state_path.write_bytes(state_preimage)
+        self.assertEqual(state_path.read_bytes(), state_preimage)
+
+        removed = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'remove', '--force', str(owner)],
+                                 capture_output=True, text=True, env=owner_env)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(owner.exists())
+        self.assertFalse(recorded_gitdir.exists())
+        after_removal = self.fixture_snapshot()
+
+        inspection = self.call_source(runtime, '--seat-id', seat_id, 'recover', '--inspect', env=owner_env)
+        self.assertEqual(inspection.returncode, 0, inspection.stderr)
+        recovery_plan = self.call_source(runtime, '--seat-id', seat_id, 'recover', '--plan',
+                                         env=owner_env, ok=False)
+        self.assertEqual(recovery_plan.returncode, 2)
+        self.assertIn('operational anchor no longer resolves', recovery_plan.stderr)
+
+        failed_attach = self.call_source(runtime, '--session-root', owner, 'plan', *lane_args,
+                                         '--head-branch', 'feature/test', env=owner_env,
+                                         cwd=control_checkout, ok=False)
+        self.assertEqual(failed_attach.returncode, 2)
+        self.assertIn('fatal: cannot change to', failed_attach.stderr)
+
+        wrong_owner_env = dict(owner_env, CLAUDE_CODE_SESSION_ID='claude-wrong-owner')
+        wrong_owner_coverage = self.call_source(runtime, 'coverage', env=wrong_owner_env, cwd=self.repo)
+        self.assertEqual(wrong_owner_coverage.returncode, 0, wrong_owner_coverage.stderr)
+        wrong_owner_value = json.loads(wrong_owner_coverage.stdout)
+        self.assertEqual(wrong_owner_value['setup_guidance']['action'], 'handoff')
+        self.assertIn('does not authorize transfer', wrong_owner_value['setup_guidance']['reason'])
+
+        coverage = self.call_source(runtime, 'coverage', env=owner_env, cwd=self.repo)
+        self.assertEqual(coverage.returncode, 0, coverage.stderr)
+        coverage_value = json.loads(coverage.stdout)
+        self.assertEqual(coverage_value['binding']['state'], 'local-binding-current-pr-unconfirmed')
+        self.assertEqual(coverage_value['setup_guidance']['action'], 'inspect')
+        self.assertIn('recorded permanent seat Git root is missing',
+                      coverage_value['setup_guidance']['reason'])
+        self.assertIn('recover --inspect', coverage_value['setup_guidance']['command'])
+        self.assertIn('both its root and Gitdir are absent', coverage_value['setup_guidance']['reason'])
+        self.assertIn('same Git common directory', coverage_value['setup_guidance']['reason'])
+        self.assertIn('requires fresh reports', coverage_value['setup_guidance']['reason'])
+
+        self.assertEqual(self.fixture_snapshot(), after_removal)
+
+    def test_replacement_anchor_upgrade_releases_exact_empty_seat_and_preserves_both_histories(self):
+        fixture = self.prepare_missing_anchor_transition('issue110-anchor-success')
+        new_source = self.source_checkout('issue110-anchor-new-source', marker_file='lane_scope.py')
+        plan_args = ['--seat-id', fixture['seat_id'], 'upgrade-plan',
+                     '--replacement-seat-root', fixture['replacement_root'],
+                     '--release-anchor-seat', fixture['release_id']]
+        upgrade_args = ['--seat-id', fixture['seat_id'], 'upgrade',
+                        '--replacement-seat-root', fixture['replacement_root'],
+                        '--release-anchor-seat', fixture['release_id']]
+        release_manifest_path = lane_runtime.session_store.seat_dir(fixture['release_id']) / 'seat.json'
+        target_manifest_path = lane_runtime.session_store.seat_dir(fixture['seat_id']) / 'seat.json'
+        release_manifest_before = release_manifest_path.read_bytes()
+        target_manifest_before = target_manifest_path.read_bytes()
+
+        wrong_owner_env = dict(fixture['owner_env'], CLAUDE_CODE_SESSION_ID='claude-wrong-owner')
+        wrong_owner = self.call_source(new_source, *plan_args, env=wrong_owner_env,
+                                       cwd=self.repo, ok=False)
+        self.assertEqual(wrong_owner.returncode, 2)
+        self.assertIn('belongs to another native session', wrong_owner.stderr)
+
+        active_destination = self.call_source(new_source, *plan_args, env=fixture['owner_env'],
+                                              cwd=self.repo, ok=False)
+        self.assertEqual(active_destination.returncode, 2)
+        self.assertIn('Every destination attachment must already be retired', active_destination.stderr)
+
+        release_retirement = json.loads(self.call_seat_retirement(
+            fixture['release_runtime'], fixture['release_id'], fixture['release_checkout'],
+            env=fixture['owner_env'], cwd=self.repo).stdout)
+        self.call_seat_retirement(fixture['release_runtime'], fixture['release_id'],
+                                  fixture['release_checkout'], '--apply',
+                                  '--plan-sha256', release_retirement['plan_sha256'],
+                                  env=fixture['owner_env'], cwd=self.repo)
+        release_checkout_state_before = fixture['release_state_path'].read_bytes()
+        target_root_state_before = fixture['target_root_state_path'].read_bytes()
+        active_state_before = fixture['active_state_path'].read_bytes()
+        settings_path = fixture['replacement_root'] / '.claude/settings.local.json'
+        settings_before = settings_path.read_bytes()
+        target_manifest = lane_runtime.session_store.load_seat(fixture['seat_id'])
+        target_manifest_original = target_manifest_path.read_bytes()
+
+        birth_row = next(row for row in target_manifest['checkouts'].values()
+                         if row['root'] == str(fixture['birth_root'].resolve()))
+        birth_row.pop('common_gitdir')
+        lane_runtime.session_store.save_seat(target_manifest)
+        missing_proof = self.call_source(new_source, *plan_args, env=fixture['owner_env'],
+                                         cwd=self.repo, ok=False)
+        self.assertEqual(missing_proof.returncode, 2)
+        self.assertIn('Same-repository proof is unavailable', missing_proof.stderr)
+        target_manifest_path.write_bytes(target_manifest_original)
+
+        release_runtime_file = fixture['release_runtime'] / 'lane.py'
+        release_runtime_mode = release_runtime_file.stat().st_mode & 0o777
+        release_runtime_bytes = release_runtime_file.read_bytes()
+        release_runtime_file.chmod(release_runtime_mode | 0o200)
+        release_runtime_file.write_bytes(release_runtime_bytes + b'\n# temporary fixture pin corruption\n')
+        release_runtime_file.chmod(release_runtime_mode)
+        corrupt_pin = self.call_source(new_source, *plan_args, env=fixture['owner_env'],
+                                       cwd=self.repo, ok=False)
+        self.assertEqual(corrupt_pin.returncode, 2)
+        self.assertIn('Permanent seat runtime is changed or unavailable', corrupt_pin.stderr)
+        release_runtime_file.chmod(release_runtime_mode | 0o200)
+        release_runtime_file.write_bytes(release_runtime_bytes)
+        release_runtime_file.chmod(release_runtime_mode)
+
+        stale_plan = json.loads(self.call_source(new_source, *plan_args,
+                                                  env=fixture['owner_env'], cwd=self.repo).stdout)
+        release_manifest = lane_runtime.session_store.load_seat(fixture['release_id'])
+        release_manifest['updated_at'] = release_manifest.get('updated_at', 0) + 1
+        lane_runtime.session_store.save_seat(release_manifest)
+        stale_apply = self.call_source(new_source, *upgrade_args, '--plan-sha256',
+                                       stale_plan['plan_sha256'], env=fixture['owner_env'],
+                                       cwd=self.repo, ok=False)
+        self.assertEqual(stale_apply.returncode, 2)
+        self.assertIn('plan or a bound preimage changed', stale_apply.stderr)
+        release_manifest_path.write_bytes(release_manifest_before)
+        self.assertEqual(settings_path.read_bytes(), settings_before)
+        self.assertEqual(fixture['active_state_path'].read_bytes(), active_state_before)
+
+        proposed = json.loads(self.call_source(new_source, *plan_args,
+                                               env=fixture['owner_env'], cwd=self.repo).stdout)
+        competing_plan = json.loads(self.call_source(new_source, *plan_args,
+                                                      env=fixture['owner_env'], cwd=self.repo).stdout)
+        self.assertEqual(competing_plan['plan_sha256'], proposed['plan_sha256'])
+        self.assertEqual(proposed['anchor_transition']['target_seat_id'], fixture['seat_id'])
+        self.assertEqual(proposed['anchor_transition']['released_seat_id'], fixture['release_id'])
+        self.assertEqual(proposed['anchor_transition']['birth_common_gitdir_proof'],
+                         proposed['anchor_transition']['replacement_git_identity']['common_gitdir'])
+        self.assertEqual(len(proposed['preimages']['states']), 1)
+        upgraded = self.call_source(new_source, *upgrade_args, '--plan-sha256',
+                                    proposed['plan_sha256'], env=fixture['owner_env'], cwd=self.repo)
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+        upgraded_value = json.loads(upgraded.stdout)
+        self.assertTrue(upgraded_value['operational_anchor_replaced'])
+        self.assertTrue(upgraded_value['fresh_report_required'])
+
+        target_after = lane_runtime.session_store.load_seat(fixture['seat_id'])
+        release_after = lane_runtime.session_store.load_seat(fixture['release_id'])
+        active_state_after = json.loads(fixture['active_state_path'].read_text())
+        self.assertEqual(target_after['seat_id'], fixture['seat_id'])
+        self.assertEqual(target_after['seat_root'], str(fixture['birth_root'].resolve()))
+        self.assertEqual(target_after['seat_gitdir'], proposed['anchor_transition']['immutable_birth_gitdir'])
+        self.assertEqual(target_after['checkouts'], json.loads(target_manifest_before)['checkouts'])
+        self.assertEqual(target_after['prs'], json.loads(target_manifest_before)['prs'])
+        self.assertEqual(lane_runtime.session_store.operational_anchor(target_after)['root'],
+                         str(fixture['replacement_root'].resolve()))
+        self.assertEqual(release_after['seat_id'], fixture['release_id'])
+        self.assertEqual(release_after['seat_root'], str(fixture['replacement_root'].resolve()))
+        self.assertEqual(lane_runtime.session_store.operational_anchor(release_after)['state'], 'released')
+        self.assertEqual(release_after['runtime'], json.loads(release_manifest_before)['runtime'])
+        release_before = json.loads(release_manifest_before)
+        self.assertEqual(release_after['owner'], release_before['owner'])
+        self.assertEqual(release_after.get('owner_history', []), release_before.get('owner_history', []))
+        self.assertEqual(release_after['checkouts'], release_before['checkouts'])
+        self.assertEqual(release_after['groups'], release_before['groups'])
+        self.assertEqual(release_after['settings'], release_before['settings'])
+        self.assertEqual(release_after['adapter_sha256'], release_before['adapter_sha256'])
+        self.assertEqual(release_after['real_gh'], release_before['real_gh'])
+        self.assertEqual(fixture['release_state_path'].read_bytes(), release_checkout_state_before)
+        self.assertEqual(fixture['target_root_state_path'].read_bytes(), target_root_state_before)
+        self.assertEqual(active_state_after['session_root'], str(fixture['replacement_root'].resolve()))
+        self.assertEqual(active_state_after['lane_owner']['seat_gitdir'],
+                         proposed['anchor_transition']['replacement_git_identity']['gitdir'])
+        self.assertEqual(active_state_after['history'][-1], json.loads(active_state_before)['receipt'])
+        self.assertNotIn('receipt', active_state_after)
+        self.assertFalse(fixture['birth_root'].exists())
+        self.assertFalse(fixture['birth_gitdir'].exists())
+
+        stale_second = self.call_source(new_source, *upgrade_args, '--plan-sha256',
+                                        competing_plan['plan_sha256'], env=fixture['owner_env'],
+                                        cwd=self.repo, ok=False)
+        self.assertEqual(stale_second.returncode, 2)
+        self.assertIn('unreleased immutable birth anchor', stale_second.stderr)
+
+        future_checkout = self.base / 'issue110 future attachment'
+        created_future = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-b',
+                                         'feature/issue110-future-attach', str(future_checkout)],
+                                        capture_output=True, text=True, env=fixture['owner_env'])
+        self.assertEqual(created_future.returncode, 0, created_future.stderr)
+        future = self.call_source(new_source, '--seat-id', fixture['seat_id'],
+                                  '--session-root', fixture['replacement_root'], 'plan', '--lane',
+                                  '--host', 'fixture.invalid', '--owner-harness', 'claude',
+                                  '--owner-session', fixture['owner_env']['CLAUDE_CODE_SESSION_ID'],
+                                  env=fixture['owner_env'], cwd=future_checkout)
+        self.assertEqual(future.returncode, 0, future.stderr)
+        self.assertEqual(json.loads(future.stdout)['seat_id'], fixture['seat_id'])
+        selectorless = self.call_source(new_source, '--session-root', fixture['replacement_root'],
+                                        'plan', '--lane', '--host', 'fixture.invalid',
+                                        '--owner-harness', 'claude', '--owner-session',
+                                        fixture['owner_env']['CLAUDE_CODE_SESSION_ID'],
+                                        env=fixture['owner_env'], cwd=future_checkout, ok=False)
+        self.assertEqual(selectorless.returncode, 2)
+        self.assertIn('history-only', selectorless.stderr)
+
+        future_plan = json.loads(future.stdout)
+        installed_future = self.call_source(new_source, '--seat-id', fixture['seat_id'],
+                                            '--session-root', fixture['replacement_root'], 'install',
+                                            '--lane', '--host', 'fixture.invalid',
+                                            '--owner-harness', 'claude', '--owner-session',
+                                            fixture['owner_env']['CLAUDE_CODE_SESSION_ID'],
+                                            '--plan-sha256', future_plan['plan_sha256'],
+                                            env=fixture['owner_env'], cwd=future_checkout)
+        self.assertEqual(installed_future.returncode, 0, installed_future.stderr)
+        self.assertEqual(json.loads(installed_future.stdout)['seat_id'], fixture['seat_id'])
+        self.assertEqual(lane_runtime.session_store.operational_anchor(
+            lane_runtime.session_store.load_seat(fixture['seat_id']))['root'],
+                         str(fixture['replacement_root'].resolve()))
+        self.assertEqual(lane_runtime.session_store.operational_anchor(
+            lane_runtime.session_store.load_seat(fixture['release_id']))['state'], 'released')
+
+    def test_replacement_anchor_interrupted_apply_rolls_back_both_seats_without_recreating_birth_root(self):
+        fixture = self.prepare_missing_anchor_transition('issue110-anchor-rollback')
+        release_retirement = json.loads(self.call_seat_retirement(
+            fixture['release_runtime'], fixture['release_id'], fixture['release_checkout'],
+            env=fixture['owner_env'], cwd=self.repo).stdout)
+        self.call_seat_retirement(fixture['release_runtime'], fixture['release_id'],
+                                  fixture['release_checkout'], '--apply',
+                                  '--plan-sha256', release_retirement['plan_sha256'],
+                                  env=fixture['owner_env'], cwd=self.repo)
+        new_source = self.source_checkout('issue110-anchor-rollback-source', marker_file='lane_scope.py')
+        plan_args = ['--seat-id', fixture['seat_id'], 'upgrade-plan',
+                     '--replacement-seat-root', fixture['replacement_root'],
+                     '--release-anchor-seat', fixture['release_id']]
+        proposed = json.loads(self.call_source(new_source, *plan_args,
+                                               env=fixture['owner_env'], cwd=self.repo).stdout)
+        target_manifest_path = lane_runtime.session_store.seat_dir(fixture['seat_id']) / 'seat.json'
+        release_manifest_path = lane_runtime.session_store.seat_dir(fixture['release_id']) / 'seat.json'
+        target_manifest_before = target_manifest_path.read_bytes()
+        release_manifest_before = release_manifest_path.read_bytes()
+        target_state_before = fixture['active_state_path'].read_bytes()
+        adapter_path = lane_runtime.session_store.seat_dir(fixture['seat_id']) / 'bin' / 'gh'
+        adapter_before = adapter_path.read_bytes()
+        settings_path = fixture['replacement_root'] / '.claude/settings.local.json'
+        settings_before = settings_path.read_bytes()
+        backup_path = (lane_runtime.session_store.seat_dir(fixture['seat_id']) /
+                       'settings-backups' /
+                       (proposed['anchor_transition']['settings_backup_sha256'] + '.json'))
+        self.assertFalse(backup_path.exists())
+
+        original_save = lane_runtime.session_store.save_seat
+
+        def interrupt_release_manifest(value):
+            if value.get('seat_id') == fixture['release_id'] and \
+                    lane_runtime.session_store.operational_anchor(value)['state'] == 'released':
+                raise OSError('fixture interruption after target manifest replacement')
+            return original_save(value)
+
+        with mock.patch.object(lane_runtime.session_store, 'save_seat', side_effect=interrupt_release_manifest), \
+                mock.patch.object(lane_runtime, 'APP', new_source), \
+                mock.patch.object(lane_runtime, 'SELF', new_source / 'lane.py'), \
+                mock.patch.dict(os.environ, fixture['owner_env']):
+            with self.assertRaises(ValueError) as interrupted:
+                lane_runtime.upgrade(SimpleNamespace(
+                    cwd=self.repo, plan_sha256=proposed['plan_sha256'],
+                    seat_id=fixture['seat_id'], replacement_seat_root=fixture['replacement_root'],
+                    release_anchor_seat=fixture['release_id']))
+
+        journal_path = lane_runtime.session_store.seat_dir(fixture['seat_id']) / lane_runtime.UPGRADE_JOURNAL
+        self.assertTrue(journal_path.exists(),
+                        'Injected release-manifest interruption did not leave its upgrade journal. '
+                        'Caught ValueError: ' + str(interrupted.exception))
+        recovered = self.call_source(new_source, '--seat-id', fixture['seat_id'],
+                                     'upgrade-recover', '--rollback', env=fixture['owner_env'],
+                                     cwd=self.repo)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertTrue(json.loads(recovered.stdout)['rolled_back'])
+        self.assertEqual(target_manifest_path.read_bytes(), target_manifest_before)
+        self.assertEqual(release_manifest_path.read_bytes(), release_manifest_before)
+        self.assertEqual(fixture['active_state_path'].read_bytes(), target_state_before)
+        self.assertEqual(adapter_path.read_bytes(), adapter_before)
+        self.assertEqual(settings_path.read_bytes(), settings_before)
+        self.assertFalse(backup_path.exists())
+        self.assertFalse(journal_path.exists())
+        self.assertFalse(fixture['birth_root'].exists())
+        self.assertFalse(fixture['birth_gitdir'].exists())
 
     def test_rebind_owner_accepts_matching_retired_source_pin_control(self):
         fixture = self.prepare_seat_with_retired_attachment('issue60-matching-retired')
