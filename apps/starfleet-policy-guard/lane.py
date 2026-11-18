@@ -3527,9 +3527,12 @@ def recorded_seat_root_problem(state):
     expected_gitdir = owner.get('seat_gitdir')
     if not isinstance(expected_root, str) or not Path(expected_root).is_absolute():
         return 'The durable lane has no valid recorded permanent seat Git root.'
-    if expected_root != anchor['root'] or expected_owner_root != anchor['root'] or expected_gitdir != anchor['gitdir']:
-        return ('The recorded permanent seat root differs between the checkout state and its owner binding: ' +
-                expected_root + ' versus ' + str(anchor['root']) + '.')
+    if expected_root != anchor['root'] or expected_owner_root != anchor['root']:
+        return ('The recorded permanent seat root differs from the durable seat: ' +
+                f"checkout {expected_root}, owner binding {expected_owner_root}, seat {anchor['root']}.")
+    if expected_gitdir != anchor['gitdir']:
+        return ('The recorded permanent seat Gitdir changed: ' +
+                f"owner binding {expected_gitdir}, durable seat {anchor['gitdir']}.")
     if not os.path.lexists(expected_root):
         return 'The recorded permanent seat Git root is missing at ' + expected_root + '.'
     root_path = Path(expected_root)
