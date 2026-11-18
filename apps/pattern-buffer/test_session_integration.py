@@ -183,6 +183,53 @@ print(json.dumps({"event_key":sys.argv[-1],"outcome":"submitted","attempted":Tru
         self.assertNotIn("continuation", json.dumps(receipts))
         self.assertEqual(database.read_bytes(), before)
 
+    def prepare_default_dispatch(self):
+        child = self.home / "child"
+        subprocess.run(["git", "-C", str(self.root), "worktree", "add", "--detach", str(child)],
+                       check=True, capture_output=True)
+        task = self.home / "task.md"
+        task.write_text("Bounded child task.")
+        return subprocess.run([sys.executable, str(SCRIPT), "--cwd", str(child), "dispatch",
+                               "--owner-worktree", str(self.root), "--harness", "codex",
+                               "--task-file", str(task), "--prepare-only"],
+                              env=self.env, capture_output=True, text=True)
+
+    def test_dispatch_uses_approved_default_with_unrelated_session_record(self):
+        binding = self.enroll(self.other, self.beta)
+        advisor = Path(binding["path"])
+        before = advisor.read_bytes()
+        result = self.prepare_default_dispatch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(advisor.read_bytes(), before)
+        child = self.home / "child"
+        child_session = str(uuid.uuid4())
+        dispatch_environment = json.loads(result.stdout)["environment"]
+        hook = subprocess.run([sys.executable, str(SCRIPT), "--cwd", str(child), "hook", "--harness", "codex"],
+                              env={**self.env, **dispatch_environment, "CODEX_THREAD_ID": child_session},
+                              input=json.dumps({"hook_event_name": "SessionStart", "source": "startup",
+                                                "cwd": str(child), "session_id": child_session}),
+                              capture_output=True, text=True)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        output = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("DEFAULT_MISSION", output)
+        self.assertNotIn("BETA_MISSION", output)
+
+    def test_dispatch_refuses_exact_parent_file_without_enrollment(self):
+        session_directory = self.root / ".context-injector" / "sessions"
+        session_directory.mkdir()
+        (session_directory / f"codex-{self.session}.md").write_text(self.context("PRIVATE_ORPHAN"))
+        result = self.prepare_default_dispatch()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exact parent context without a registered binding", result.stderr)
+
+    def test_dispatch_refuses_linked_session_directory(self):
+        outside = self.home / "outside-sessions"
+        outside.mkdir()
+        (self.root / ".context-injector" / "sessions").symlink_to(outside, target_is_directory=True)
+        result = self.prepare_default_dispatch()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("parent session directory safely", result.stderr)
+
     def test_dispatch_does_not_substitute_default_for_isolated_parent_mission(self):
         self.enroll()
         child = self.home / "child"

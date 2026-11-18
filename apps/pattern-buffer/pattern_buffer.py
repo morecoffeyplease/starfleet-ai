@@ -1918,11 +1918,29 @@ def prepare_dispatch(root, gitdir, args):
         parent_harness = "claude" if kind in ("claude", "claudeteams") else "codex" if kind == "codex" else None
         parent_session = os.environ.get("CLAUDE_CODE_SESSION_ID" if parent_harness == "claude" else "CODEX_THREAD_ID")
         parent = session_binding(owner_root, owner_gitdir, parent_harness, parent_session) if parent_harness else None
-        if parent is not None or session_files.exists() or session_files.is_symlink():
-            if (parent is None or parent.state != "active" or parent.file_status != "valid" or
-                    parent.source_sha256 != hashlib.sha256(bounded(source, FILE_LIMIT).encode()).hexdigest()):
-                raise ValueError("dispatch cannot substitute a worktree default for a session-specific parent mission; "
-                                 "use a dedicated --owner-worktree containing the parent's approved standing context")
+        if parent is not None and (
+                parent.state != "active" or parent.file_status != "valid" or
+                parent.source_sha256 != hashlib.sha256(bounded(source, FILE_LIMIT).encode()).hexdigest()):
+            raise ValueError("dispatch cannot substitute a worktree default for a session-specific parent mission; "
+                             "use a dedicated --owner-worktree containing the parent's approved standing context")
+        if parent is None:
+            try:
+                session_mode = session_files.lstat().st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISDIR(session_mode) or session_files.parent.is_symlink():
+                    raise ValueError("dispatch cannot read the parent session directory safely")
+                session_store = auxiliary("sessions")
+                exact_session = session_store._normalize_session(parent_session, strict=False)
+                if parent_harness is None or exact_session is None:
+                    raise ValueError("dispatch cannot confirm the exact parent in a worktree with session context")
+                try:
+                    session_store._session_path(owner_root, parent_harness, exact_session).lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ValueError("dispatch found exact parent context without a registered binding")
         parent_kind = parent_harness if parent is not None else "worktree"
         if getattr(args, "parent_task_id", None) is not None:
             raise ValueError("--parent-task-id is only valid for a verified OpenCode parent session")

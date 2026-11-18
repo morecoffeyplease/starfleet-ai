@@ -25,6 +25,8 @@ The session file completely replaces the worktree standing file for that exact p
 Unenrolled sessions retain the existing worktree behavior.
 Existing implementer replay continues to use its explicitly selected owner worktree.
 When a session-specific parent mission differs from that worktree's default, dispatch refuses to substitute the default; select a dedicated owner worktree containing that parent's approved standing context.
+An exact parent without a session binding can use the approved worktree default even when unrelated sessions have records there.
+Dispatch refuses fallback when the session directory is unsafe or the exact parent's context file has no registered binding.
 This release does not add automatic session-to-child context inheritance or transfer existing child-task ownership.
 The installer and existing hooks are reused; enrollment does not restart agents, alter trust or create a worker.
 
