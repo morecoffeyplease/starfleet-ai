@@ -1,6 +1,8 @@
 # Agent Notify setup guide
 
 Agent Notify opens and manages one Discord forum post per conversation for a configured Discord user.
+Use `--title` for the discussion topic; Agent Notify names the thread `<worktree short name>: <topic>`.
+Every new thread pings the configured user, including threads tagged FYI.
 It can route a short attention notice to the current CMUX chat when the optional Away Mode tool is available.
 When Discord Watch is installed, new posts register to the exact current Hailing-enrolled session for guarded reply delivery.
 An OpenCode session is labeled `OpenCode` when its exact `ses_` ID and CMUX surface and workspace are present, even if inherited Codex variables also exist.
@@ -202,7 +204,8 @@ Do not create per-thread listeners when `discord-watch managed THREAD_ID` confir
 
 ## Run a bounded delivery check
 
-From the enrolled owner session, open one low-urgency test post and record the printed thread ID:
+From the enrolled owner session, open one FYI test post and record the printed thread ID.
+The test opening pings the configured user.
 
 ```sh
 agent-notify open --delivery discord --urgency fyi --title 'Agent Notify setup check' <<'EOF'
