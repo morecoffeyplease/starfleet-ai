@@ -611,10 +611,28 @@ Rollback restores the exact state, settings, adapter, settings backup, and both 
 ## Inspect, hand off, and recover
 
 Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status` to inspect a permanent seat even when product checkouts are unavailable.
+Status reports the immutable birth root separately from the active operational anchor, the pinned runtime CLI, recorded or prospective Claude settings path, and each checkout's active, missing, changed, or retired worktree state.
+When run from an unbound permanent root, `permanent_seat_hint` identifies a unique registered seat only when its active root and recorded Gitdir match exactly.
+The accompanying `setup_guidance` still describes the current product checkout attachment, so do not create another seat when the hint says the permanent seat is already registered.
 Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID registrations` to inspect attached PR history without a product checkout.
 Run `coverage --summary` or `status` from an attached checkout to inspect local configuration and observations.
 Configured hooks and adapters are not proof that the native runtime loaded or used them.
-Use `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID rebind-owner --from-harness claude --from-session OUTGOING_SESSION_ID --confirm-handoff` only after an authorized transfer to the incoming actual native session.
+For a seat handoff, the outgoing owner prepares the exact seat ID, every active and retired attachment, covered PRs, pending work, and any missing worktree in the existing checkpoint.
+Record the authorized release to the exact incoming owner in the existing checkpoint, with the outgoing owner recording it when available.
+If the outgoing owner is unavailable, resolve the scope through the applicable existing authority process and hold the dependent handoff until that disposition is recorded.
+The incoming owner records acceptance of that same scope before the rebind.
+When `handoff.rebind_owner_command` is present, the current incoming native session should use that exact command.
+If the installed CLI is unavailable or outdated, the documented same-harness maintenance fallback below remains supported when its full runtime-pin checks pass.
+Run a rebind only after the authorized scope transfer is recorded and the incoming owner has accepted it.
+The status command is read-only and does not supply transfer authority or establish a new owner.
+The rebind receipt lists every changed and retained checkout by branch and PR, with retired history preserved and active missing worktrees identified without guessing at their owner.
+For cross-harness handoffs, review the exact Claude settings path, before and after hashes, and managed hook groups in `settings_receipt`.
+The rebind receipt archives prior reports where present and identifies active rebound checkouts with covered PRs that need a fresh report.
+After rebind, run each available command in `verification.coverage_commands` to inspect local coverage and report state.
+Use actual native tool output when a relevant action has occurred, but do not create a production action or restart solely to validate a handoff.
+If no native event occurred, record that interception remains unobserved; `verification.observed.state` is a static note about the rebind and does not update later.
+The supported explicit adapter probe is non-forwarding and does not prove native hook interception.
+If any custody, permission, trust, or checkout state is uncertain, keep the scope held and resolve it through the existing checkpoint process before rebind.
 If the installed CLI entrypoint is unavailable or outdated, a current source checkout can run this command for an existing permanent seat after an authorized same-harness transfer, provided the seat-recorded runtime remains present and intact:
 
 ```sh
