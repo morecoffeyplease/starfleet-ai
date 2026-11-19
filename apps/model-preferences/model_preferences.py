@@ -3356,6 +3356,12 @@ def execute(args):
         elif command == "resolve":
             active = selection(config)
             has_context = bool(args.review_target or args.review_cycle or args.review_plan)
+            if args.role == "standard_review" and not has_context and "review_policy" in active:
+                print(
+                    "Starting the first review of a PR? Run model-preferences review-plan --purpose initial "
+                    "against the candidate and its target base, then use the panel the plan selects.",
+                    file=sys.stderr,
+                )
             if args.role in POLICY_REVIEW_ROLES:
                 require(args.review_plan,
                         "Configured-purpose reviewer resolution requires its exact --review-plan.")

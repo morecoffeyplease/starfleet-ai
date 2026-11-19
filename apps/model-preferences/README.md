@@ -80,6 +80,8 @@ Advanced review needs an authorization record matching both the current review s
 ### Initial complexity and the adopted review policy
 
 `review-plan` records `purpose`, `classification` and the concrete classification reasons from the explicit facts and maintained money, time-zone and file-count rules.
+With an adopted review policy, `resolve --role standard_review` without a review plan, target or cycle prints a first-review planning hint to stderr.
+The JSON on stdout keeps its existing format.
 Use `--purpose initial` for a new initial review; this is the default when no later-cycle predecessor is supplied.
 A complex initial plan in one of the four reserved profiles uses that profile's saved `complex_initial` choices without a per-plan approval.
 Straightforward initial plans keep the saved `standard_review` group.
