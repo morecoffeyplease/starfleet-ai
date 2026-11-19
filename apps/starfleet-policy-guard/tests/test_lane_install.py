@@ -515,6 +515,38 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(json.loads(plan.stdout)['lane_owner']['session_id'], owner_session)
         self.assertFalse((self.repo / '.git/starfleet-delivery-lane').exists())
 
+    def test_issue121_unbound_status_finds_unique_legacy_anchor_without_common_gitdir(self):
+        owner, owner_env = self.native_owner_fixture()
+        source = self.source_checkout('issue121-legacy-anchor-status')
+        attached = self.attach_native_checkout(source, owner, self.repo, owner_env)
+        seat = lane_runtime.session_store.load_seat(attached['seat_id'])
+        seat['seat_common_gitdir'] = None
+        lane_runtime.session_store.save_seat(seat)
+
+        status_result = self.call_source(source, 'status', env=owner_env, cwd=owner)
+
+        self.assertEqual(status_result.returncode, 0, status_result.stderr)
+        value = json.loads(status_result.stdout)
+        hint = value['permanent_seat_hint']
+        self.assertEqual(hint['seat_id'], attached['seat_id'])
+        self.assertEqual(hint['operational_anchor']['root'], str(owner.resolve()))
+        self.assertEqual(hint['operational_anchor']['gitdir'], attached['lane_owner']['seat_gitdir'])
+        self.assertIsNone(hint['operational_anchor']['common_gitdir'])
+        self.assertEqual(hint['settings']['path'], str(owner / '.claude/settings.local.json'))
+        self.assertEqual(hint['settings']['path_source'], 'recorded')
+        self.assertIsNone(hint['handoff']['rebind_owner_command'])
+        self.assertIn('already registered', value['permanent_seat_hint_notice'])
+        self.assertIn('only the current product checkout attachment', value['permanent_seat_hint_notice'])
+
+        other_root = self.base / 'issue121-same-repository-other-anchor'
+        created = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-b',
+                                  'feature/issue121-other-anchor', str(other_root)],
+                                 capture_output=True, text=True, env=owner_env)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        other_status = self.call_source(source, 'status', env=owner_env, cwd=other_root)
+        self.assertEqual(other_status.returncode, 0, other_status.stderr)
+        self.assertNotIn('permanent_seat_hint', json.loads(other_status.stdout))
+
     def test_setup_guidance_help_and_printable_guide_explain_limits(self):
         status_help = self.call('status', '--help').stdout
         coverage_help = self.call('coverage', '--help').stdout
@@ -3769,6 +3801,35 @@ class LaneInstallTest(unittest.TestCase):
         self.assertFalse(fixture['birth_root'].exists())
         self.assertFalse(fixture['birth_gitdir'].exists())
 
+        status_result = self.call_source(new_source, '--seat-id', fixture['seat_id'], 'status',
+                                         env=fixture['owner_env'], cwd=self.repo)
+        self.assertEqual(status_result.returncode, 0, status_result.stderr)
+        status_value = json.loads(status_result.stdout)
+        self.assertEqual(status_value['birth_root'], str(fixture['birth_root'].resolve()))
+        self.assertEqual(status_value['operational_anchor']['root'],
+                         str(fixture['replacement_root'].resolve()))
+        self.assertEqual(status_value['runtime_cli'], str(Path(target_after['runtime']['path']) / 'lane.py'))
+        self.assertEqual(status_value['settings']['path'],
+                         str(fixture['replacement_root'] / '.claude/settings.local.json'))
+        birth_status = next(row for row in status_value['checkouts']
+                            if row['root'] == str(fixture['birth_root'].resolve()))
+        active_status = next(row for row in status_value['checkouts']
+                             if row['root'] == str(self.repo.resolve()))
+        self.assertEqual(birth_status['worktree_availability'], 'retired')
+        self.assertEqual(active_status['worktree_availability'], 'present')
+
+        incoming_env = dict(fixture['owner_env'], CLAUDE_CODE_SESSION_ID='claude-issue121-incoming')
+        incoming_status = self.call_source(new_source, '--seat-id', fixture['seat_id'], 'status',
+                                           env=incoming_env, cwd=self.repo)
+        self.assertEqual(incoming_status.returncode, 0, incoming_status.stderr)
+        offered = json.loads(incoming_status.stdout)['handoff']['rebind_owner_command']
+        self.assertIsNotNone(offered)
+        self.assertEqual(shlex.split(offered), [sys.executable, str(Path(target_after['runtime']['path']) / 'lane.py'),
+            '--seat-id', fixture['seat_id'], 'rebind-owner', '--from-harness', 'claude',
+            '--from-session', fixture['owner_env']['CLAUDE_CODE_SESSION_ID'], '--confirm-handoff'])
+        self.assertIn('does not establish transfer authority',
+                      json.loads(incoming_status.stdout)['handoff']['command_condition'])
+
         stale_second = self.call_source(new_source, *upgrade_args, '--plan-sha256',
                                         competing_plan['plan_sha256'], env=fixture['owner_env'],
                                         cwd=self.repo, ok=False)
@@ -3810,6 +3871,28 @@ class LaneInstallTest(unittest.TestCase):
                          str(fixture['replacement_root'].resolve()))
         self.assertEqual(lane_runtime.session_store.operational_anchor(
             lane_runtime.session_store.load_seat(fixture['release_id']))['state'], 'released')
+        future_status = self.call_source(new_source, '--seat-id', fixture['seat_id'], 'status',
+                                         env=fixture['owner_env'], cwd=self.repo)
+        self.assertEqual(future_status.returncode, 0, future_status.stderr)
+        future_row = next(row for row in json.loads(future_status.stdout)['checkouts']
+                          if row['root'] == str(future_checkout.resolve()))
+        self.assertEqual(future_row['phase'], 'active')
+        self.assertEqual(future_row['worktree_availability'], 'present')
+        removed_future = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'remove', '--force',
+                                         str(future_checkout)], capture_output=True, text=True,
+                                        env=fixture['owner_env'])
+        self.assertEqual(removed_future.returncode, 0, removed_future.stderr)
+        deleted_future_branch = subprocess.run(['git', '-C', str(self.repo), 'branch', '-D',
+                                                'feature/issue110-future-attach'],
+                                               capture_output=True, text=True, env=fixture['owner_env'])
+        self.assertEqual(deleted_future_branch.returncode, 0, deleted_future_branch.stderr)
+        missing_future_status = self.call_source(new_source, '--seat-id', fixture['seat_id'], 'status',
+                                                 env=fixture['owner_env'], cwd=self.repo)
+        self.assertEqual(missing_future_status.returncode, 0, missing_future_status.stderr)
+        missing_future_row = next(row for row in json.loads(missing_future_status.stdout)['checkouts']
+                                  if row['root'] == str(future_checkout.resolve()))
+        self.assertEqual(missing_future_row['phase'], 'active')
+        self.assertEqual(missing_future_row['worktree_availability'], 'missing')
 
     def test_replacement_anchor_interrupted_apply_rolls_back_both_seats_without_recreating_birth_root(self):
         fixture = self.prepare_missing_anchor_transition('issue110-anchor-rollback')
@@ -3876,6 +3959,77 @@ class LaneInstallTest(unittest.TestCase):
         self.assertFalse(journal_path.exists())
         self.assertFalse(fixture['birth_root'].exists())
         self.assertFalse(fixture['birth_gitdir'].exists())
+
+    def test_issue121_cross_harness_rebind_reports_exact_changes_and_retained_history(self):
+        owner, owner_env = self.native_owner_fixture()
+        source = self.source_checkout_same_fingerprints('issue121-cross-harness')
+        active = self.add_native_seat_attachment(source, owner, self.repo, owner_env)
+        seat_id = active['seat_id']
+        runtime = Path(active['seat_runtime_path'])
+        active_row = next(row for row in lane_runtime.session_store.all_checkouts(seat_id)
+                          if row['root'] == str(self.repo.resolve()))
+        active_state_path = Path(active_row['checkout_dir']) / 'state.json'
+        active_state = self.seed_attachment_pr_history(seat_id, active['checkout_id'], active_state_path)
+
+        retired_path = self.base / 'issue121 retired attachment'
+        retired_branch = 'feature/issue121-retired'
+        retired = self.add_native_seat_attachment(source, owner, retired_path, owner_env, retired_branch)
+        retired_row = next(row for row in lane_runtime.session_store.all_checkouts(seat_id)
+                           if row['root'] == str(retired_path.resolve()))
+        retired_state_path = Path(retired_row['checkout_dir']) / 'state.json'
+        self.seed_attachment_pr_history(seat_id, retired['checkout_id'], retired_state_path)
+        removed = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'remove', '--force',
+                                  str(retired_path)], capture_output=True, text=True, env=owner_env)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        deleted = subprocess.run(['git', '-C', str(self.repo), 'branch', '-D', retired_branch],
+                                 capture_output=True, text=True, env=owner_env)
+        self.assertEqual(deleted.returncode, 0, deleted.stderr)
+        retirement = json.loads(self.call_seat_retirement(
+            runtime, seat_id, retired_path, env=owner_env, cwd=self.repo).stdout)
+        self.call_seat_retirement(runtime, seat_id, retired_path, '--apply',
+                                  '--plan-sha256', retirement['plan_sha256'],
+                                  env=owner_env, cwd=self.repo)
+
+        settings_path = owner / '.claude/settings.local.json'
+        settings_before = settings_path.read_bytes()
+        retired_state_before = retired_state_path.read_bytes()
+        incoming_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex',
+                            CODEX_THREAD_ID='codex-issue121-incoming')
+        incoming_env.pop('CLAUDE_CODE_SESSION_ID', None)
+        handoff = self.call_seat_rebind(source, seat_id, 'claude',
+                                        owner_env['CLAUDE_CODE_SESSION_ID'], incoming_env, ok=False)
+
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
+        value = json.loads(handoff.stdout)
+        receipt = value['settings_receipt']
+        self.assertEqual(receipt['path'], str(settings_path))
+        self.assertTrue(receipt['changed'])
+        self.assertEqual(receipt['before_sha256'], hashlib.sha256(settings_before).hexdigest())
+        self.assertEqual(receipt['after_sha256'], hashlib.sha256(settings_path.read_bytes()).hexdigest())
+        self.assertEqual(receipt['hook_events_before'], ['PreToolUse', 'SessionStart'])
+        self.assertEqual(receipt['hook_events_after'], [])
+        self.assertEqual(receipt['hook_groups_after'], {})
+        self.assertEqual(json.loads(settings_path.read_text())['permissions'], self.original['permissions'])
+
+        self.assertEqual(len(value['changed_attachments']), 1)
+        changed = value['changed_attachments'][0]
+        self.assertEqual(changed['checkout_id'], active_row['checkout_id'])
+        self.assertEqual(changed['branch'], active_state['branch'])
+        self.assertEqual(changed['pr_refs'], sorted(active_state['pr_bindings']))
+        self.assertEqual(changed['disposition'], 'rebound')
+        self.assertEqual(len(value['retained_attachments']), 1)
+        retained = value['retained_attachments'][0]
+        self.assertEqual(retained['checkout_id'], retired_row['checkout_id'])
+        self.assertEqual(retained['branch'], json.loads(retired_state_before)['branch'])
+        self.assertEqual(retained['disposition'], 'retained')
+        self.assertEqual(retained['reason'], 'retired-history-preserved')
+        self.assertEqual(retired_state_path.read_bytes(), retired_state_before)
+        self.assertEqual(value['fresh_report']['checkouts'], [active_row['checkout_id']])
+        self.assertEqual(value['verification']['configured']['hooks_installed'], False)
+        self.assertEqual(value['verification']['observed']['state'], 'not-observed-by-rebind')
+        self.assertEqual(len(value['verification']['coverage_commands']), 1)
+        self.assertEqual(value['verification']['coverage_commands'][0]['root'], str(self.repo.resolve()))
+        self.assertEqual(json.loads(active_state_path.read_text())['lane_owner']['harness'], 'codex')
 
     def test_rebind_owner_accepts_matching_retired_source_pin_control(self):
         fixture = self.prepare_seat_with_retired_attachment('issue60-matching-retired')

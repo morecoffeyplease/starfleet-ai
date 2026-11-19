@@ -129,6 +129,30 @@ A Policy Guard seat transfer may affect multiple attachments.
 Check every applicable seat and legacy route before moving custody.
 Use established installations and preserve concurrent work, history, and shared services.
 
+### Policy Guard seat handoff
+
+Inspect the exact permanent seat and its attachments with the installed pinned CLI before changing custody:
+
+```sh
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status
+```
+
+Record the seat ID, birth root, operational anchor, exact owner, every active or retired attachment, covered PR, and any missing or changed worktree in the existing checkpoint.
+Record the authorized release of the approved scope to the exact incoming owner in the existing checkpoint, with the outgoing owner recording it when available.
+If that owner is unavailable, use the applicable existing authority process to record the disposition and hold the scope until it is resolved.
+The incoming owner verifies their exact native identity, runtime and hook trust, and accepts the same scope in the checkpoint before rebind.
+When status supplies `handoff.rebind_owner_command`, the incoming actual native session should use that exact command.
+If the installed CLI is unavailable or outdated, the documented same-harness maintenance fallback remains supported when its full runtime-pin checks pass.
+The incoming owner becomes the only writer after acceptance and the authorized rebind.
+The command updates active attachment ownership and source pins together, while preserving retired rows and their histories.
+For cross-harness transfers, review the receipt's exact Claude settings path, before and after hashes, and owned hook groups.
+Review changed and retained checkout dispositions by branch and PR, then run each available command in `verification.coverage_commands` to inspect local coverage and report state.
+Use actual native tool output when a relevant action has occurred, but do not create a production action or restart solely to validate a handoff.
+If no native event occurred, record that interception remains unobserved; `verification.observed.state` is a static note about the rebind and does not update later.
+The supported explicit adapter probe is non-forwarding and does not prove native hook interception.
+Prior reports are archived where present, so a fresh report is required for each rebound active checkout with a covered PR.
+Do not declare sole custody while an attachment, owner, permission, or trust state is unresolved.
+
 ## Handle exceptions
 
 If a launch, receipt, or transfer is uncertain, inspect the exact record before any retry.

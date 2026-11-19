@@ -952,10 +952,18 @@ def rebind_owner(args):
                                  else source_versions(previous['harness']))
             for item in checkout_rows:
                 state = item.get('state')
+                if state is not None and not isinstance(state,dict):
+                    raise ValueError('Checkout state is malformed; preserve its history and inspect status before transfer')
                 if not state:
                     continue
                 if state.get('phase') == 'removed':
                     continue
+                pr_bindings=state.get('pr_bindings',{})
+                if (not isinstance(pr_bindings,dict) or
+                        any(not isinstance(url,str) or not isinstance(binding,dict)
+                            for url,binding in pr_bindings.items()) or
+                        (state.get('pr_url') is not None and not isinstance(state.get('pr_url'),str))):
+                    raise ValueError('Checkout PR history map is malformed; preserve it and inspect status before transfer')
                 state_owner = state.get('lane_owner')
                 if (not isinstance(state_owner, dict) or
                         {key: state_owner.get(key) for key in ('harness', 'session_id')} != previous):
@@ -964,6 +972,33 @@ def rebind_owner(args):
                     raise ValueError('Pinned delivery adapter source changed; restore the reviewed source')
             incoming_versions = (runtime_source_versions(runtime, identity['harness']) if same_harness
                                  else permanent_handoff_source_versions(seat, identity['harness']))
+            changed_attachments=[]
+            retained_attachments=[]
+            path_state_by_checkout={}
+            for item in checkout_rows:
+                state=item.get('state') or {}
+                path_state=checkout_path_availability(item)
+                path_state_by_checkout[item.get('checkout_id')]=path_state
+                bindings=state.get('pr_bindings')
+                pr_refs=sorted((set(bindings) if isinstance(bindings,dict) else set()) |
+                               ({state['pr_url']} if isinstance(state.get('pr_url'),str) else set()))
+                pr_history_intact=('pr_bindings' not in state or (isinstance(bindings,dict) and
+                    all(isinstance(url,str) and isinstance(binding,dict)
+                        for url,binding in bindings.items())))
+                disposition={'checkout_id':item.get('checkout_id'),'root':item.get('root'),
+                             'phase':state.get('phase','missing-or-malformed-state'),
+                             'branch':state.get('branch'),'pr_refs':pr_refs,
+                             'pr_history_state':'intact' if pr_history_intact else 'malformed-preserved',
+                             'worktree_path_state':path_state}
+                if not item.get('state'):
+                    retained_attachments.append({**disposition,'disposition':'retained',
+                                                 'reason':'state-unavailable'})
+                elif state.get('phase') == 'removed':
+                    retained_attachments.append({**disposition,'disposition':'retained',
+                                                 'reason':'retired-history-preserved'})
+                else:
+                    changed_attachments.append({**disposition,'disposition':'rebound',
+                                                'reason':'owner-and-source-pin-updated'})
             target_groups=copy.deepcopy(seat.get('groups',{}))
             target_hooks_installed=bool(seat.get('hooks_installed'))
             target_settings=copy.deepcopy(seat.get('settings'))
@@ -1055,6 +1090,40 @@ def rebind_owner(args):
                     'preimage_sha256':hashlib.sha256(preimage.encode()).hexdigest(),
                     'postimage':postimage,'postimage_sha256':hashlib.sha256(postimage.encode()).hexdigest()})
             seat_preimage=copy.deepcopy(seat)
+            changed=len(state_changes)
+            settings_receipt={'path':(settings_change['path'] if settings_change else
+                                      (target_settings or {}).get('path')),
+                'changed':bool(settings_change),
+                'before_sha256':settings_change.get('preimage_sha256') if settings_change else None,
+                'after_sha256':settings_change.get('updated_sha256') if settings_change else None,
+                'before_exists':settings_change.get('preimage_exists') if settings_change else None,
+                'after_exists':True if settings_change else None,
+                'mode':settings_change.get('mode') if settings_change else (target_settings or {}).get('mode'),
+                'hook_events_before':sorted((seat_preimage.get('groups') or {}).keys()),
+                'hook_events_after':sorted(target_groups.keys()),
+                'hook_groups_before':copy.deepcopy(seat_preimage.get('groups') or {}),
+                'hook_groups_after':copy.deepcopy(target_groups),
+                'notice':('Hashes cover the exact settings bytes before and after this handoff.'
+                          if settings_change else
+                          'No settings write occurred; the recorded baseline hash is not a current-content observation.')}
+            coverage_commands=[]
+            for item in checkout_rows:
+                state=item.get('state') or {}
+                if (state.get('phase') != 'active' or
+                        path_state_by_checkout.get(item.get('checkout_id')) != 'present'):
+                    continue
+                coverage_commands.append({'checkout_id':item.get('checkout_id'),'root':item.get('root'),
+                    'command':shlex.join([sys.executable,str(Path(runtime['path'])/'lane.py'),
+                                          '--cwd',item['root'],'coverage','--summary'])})
+            fresh_report={'required':True,'checkouts':[row['checkout_id'] for row in changed_attachments
+                    if row['phase'] == 'active' and row['pr_refs']],
+                'reason':'Prior receipts were archived where present; each active rebound checkout with a covered PR needs a fresh report before covered actions can pass.'}
+            verification_receipt={'configured':{'hooks_installed':target_hooks_installed,
+                    'settings_path':settings_receipt['path'],'hook_events':sorted(target_groups.keys()),
+                    'adapter_path':seat_preimage.get('adapter')},
+                'observed':{'state':'not-observed-by-rebind',
+                    'notice':'Rebind records local configuration only; it does not show that the incoming native runtime loaded or intercepted a hook.'},
+                'coverage_commands':coverage_commands}
             seat['handoff_journal']={'kind':'owner-handoff','from':previous,'to':identity,
                 'seat_preimage':seat_preimage,'state_changes':state_changes,
                 'settings_change':settings_change,'target_groups':target_groups,
@@ -1081,11 +1150,12 @@ def rebind_owner(args):
             seat['hooks_installed']=target_hooks_installed
             seat['settings']=target_settings
             seat.pop('handoff_journal',None)
-            changed=len(state_changes)
             seat['updated_at']=time.time()
             session_store.save_seat(seat)
         return {'rebound':True,'owner':identity,'history_preserved':True,'report_required':True,
-                'checkouts_rebound':changed,
+                'checkouts_rebound':changed,'changed_attachments':changed_attachments,
+                'retained_attachments':retained_attachments,'settings_receipt':settings_receipt,
+                'fresh_report':fresh_report,'verification':verification_receipt,
                 'notice':'Explicit seat-wide handoff from the permanent seat registry. Deleted product Git directories were not read.'}
     current=read(args.cwd) or {}
     if current.get('seat_id'):
@@ -3469,6 +3539,35 @@ def valid_recorded_owner(owner):
                 isinstance(directory, str) and Path(directory).is_absolute())
 
 
+def rebind_route_ready(owner, actual, runtime, checkout_rows):
+    try:
+        outgoing_versions=runtime_source_versions(runtime, owner['harness'])
+        runtime_source_versions(runtime, actual['harness'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    for item in checkout_rows:
+        state=item.get('state')
+        if state is None:
+            continue
+        if not isinstance(state,dict):
+            return False
+        if not state or state.get('phase') == 'removed':
+            continue
+        bindings=state.get('pr_bindings',{})
+        if (not isinstance(bindings,dict) or
+                any(not isinstance(url,str) or not isinstance(binding,dict)
+                    for url,binding in bindings.items()) or
+                (state.get('pr_url') is not None and not isinstance(state.get('pr_url'),str))):
+            return False
+        state_owner=state.get('lane_owner')
+        if (not isinstance(state_owner, dict) or
+                {key:state_owner.get(key) for key in ('harness','session_id')} !=
+                {key:owner.get(key) for key in ('harness','session_id')} or
+                state.get('source_versions') != outgoing_versions):
+            return False
+    return True
+
+
 def managed_adapter_status(state):
     path_value = state.get('adapter') if isinstance(state, dict) else None
     expected = state.get('adapter_sha256') if isinstance(state, dict) else None
@@ -3872,6 +3971,12 @@ def status(cwd, session_id=None, state=None, native_context=None):
                             if isinstance(entries, list) else []),
         }
     result['setup_guidance'] = setup_guidance(cwd, state, result)
+    if state is None:
+        permanent_seat = permanent_seat_status_for_anchor(cwd)
+        if permanent_seat is not None:
+            result['permanent_seat_hint'] = permanent_seat
+            result['permanent_seat_hint_notice'] = (
+                'This exact permanent seat is already registered. setup_guidance above describes only the current product checkout attachment.' )
     return result
 
 
@@ -3938,6 +4043,66 @@ def coverage(cwd, pr_url=None):
                   'The declared PR is caller input. Preserve manual zoom-out reminders and repository delivery rules.'}
 
 
+def checkout_path_availability(item):
+    state = item.get('state') or {}
+    if state.get('phase') == 'removed':
+        return 'retired' if isinstance(state.get('retirement_receipt'), dict) else 'inactive'
+    if state.get('phase') != 'active':
+        return 'unavailable' if not state else 'inactive'
+    path = item.get('root')
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        return 'unavailable'
+    if not os.path.lexists(path):
+        return 'missing'
+    if Path(path).is_symlink() or not Path(path).is_dir():
+        return 'changed'
+    return 'present'
+
+
+def checkout_worktree_availability(item):
+    availability = checkout_path_availability(item)
+    if availability != 'present':
+        return availability
+    state = item.get('state') or {}
+    path = item.get('root')
+    try:
+        observed_root = str(root(path))
+        observed_identity = git_path_identity(path)
+        observed_branch = branch(path)
+    except (OSError, ValueError):
+        return 'changed'
+    expected_common = item.get('common_gitdir')
+    if (observed_root != path or observed_identity['gitdir'] != item.get('gitdir') or
+            (expected_common is not None and observed_identity['common_gitdir'] != expected_common) or
+            observed_branch != state.get('branch')):
+        return 'changed'
+    return 'present'
+
+
+def permanent_seat_status_for_anchor(cwd):
+    """Return one seat only when its active Git anchor exactly matches this unbound root."""
+    try:
+        checkout_root = str(root(cwd))
+        checkout_identity = git_path_identity(cwd)
+        seats = session_store.all_seats()
+    except (OSError, TypeError, ValueError):
+        return None
+    matches = []
+    for seat in seats:
+        try:
+            anchor = session_store.operational_anchor(seat)
+        except (TypeError, ValueError):
+            return None
+        if (anchor['state'] == 'active' and anchor['root'] == checkout_root and
+                anchor['gitdir'] == checkout_identity['gitdir'] and
+                (anchor.get('common_gitdir') is None or
+                 anchor['common_gitdir'] == checkout_identity['common_gitdir'])):
+            matches.append(seat['seat_id'])
+    if len(matches) != 1:
+        return None
+    return seat_status(matches[0])
+
+
 def seat_status(identifier):
     seat=session_store.load_seat(identifier)
     if not seat:
@@ -3973,28 +4138,77 @@ def seat_status(identifier):
     for item in checkout_rows:
         state=item.get('state') or {}
         retirement = retired_by_id.get(item['checkout_id'])
+        bindings=state.get('pr_bindings')
+        bindings_valid=(('pr_bindings' not in state or (isinstance(bindings,dict) and
+            all(isinstance(url,str) and isinstance(binding,dict) for url,binding in bindings.items()))) and
+            (state.get('pr_url') is None or isinstance(state.get('pr_url'),str)))
+        known_prs=set(bindings) if isinstance(bindings,dict) else set()
+        if isinstance(state.get('pr_url'),str):
+            known_prs.add(state['pr_url'])
         checkouts.append({'checkout_id':item['checkout_id'],'root':item.get('root'),
             'repository':item.get('repository'),'host':item.get('host'),
             'phase':state.get('phase','missing-or-malformed-state'),'branch':state.get('branch'),
             'attachment_state': 'retired' if retirement else state.get('phase','missing-or-malformed-state'),
-            'current_pr':state.get('pr_url'),'known_prs':sorted(set(state.get('pr_bindings',{})) |
-                ({state['pr_url']} if state.get('pr_url') else set())),
+            'worktree_availability': checkout_worktree_availability(item),
+            'current_pr':state.get('pr_url'),'known_prs':sorted(known_prs),
+            'pr_history_state':'intact' if bindings_valid else 'malformed-preserve-and-inspect',
             'pr_records': retirement['pr_records'] if retirement else [],
             'retirement_receipt': copy.deepcopy(state.get('retirement_receipt')),
             'last_updated_at':state.get('updated_at')})
-    return {'seat_id':identifier,'seat_root':seat['seat_root'],
-        'operational_anchor':session_store.operational_anchor(seat),'owner':seat['owner'],
+    runtime_cli = runtime_path / 'lane.py'
+    recorded_owner = seat.get('owner')
+    anchor = session_store.operational_anchor(seat)
+    upgrade_journal = session_store.seat_dir(identifier)/UPGRADE_JOURNAL
+    pending_transition = bool(seat.get('install_journal') or seat.get('migration_journal') or
+        seat.get('handoff_journal') or upgrade_journal.exists() or upgrade_journal.is_symlink())
+    complete_runtime_pin = bool(isinstance(runtime.get('version'), str) and
+                                isinstance(runtime.get('path'), str) and Path(runtime['path']).is_absolute() and
+                                isinstance(runtime.get('files'), dict) and runtime.get('files') and
+                                'lane.py' in runtime.get('files', {}) and runtime_files and
+                                all(row['state'] == 'intact' for row in runtime_files.values()) and
+                                runtime_files.get('lane.py', {}).get('state') == 'intact')
+    can_offer_rebind = (actual is not None and not owner_matches and anchor['state'] == 'active' and
+                        not pending_transition and valid_recorded_owner(recorded_owner) and
+                        complete_runtime_pin and adapter_status.get('state') == 'intact' and
+                        rebind_route_ready(recorded_owner, actual, runtime, checkout_rows))
+    rebind_command = (shlex.join([sys.executable, str(runtime_cli), '--seat-id', identifier,
+                                  'rebind-owner', '--from-harness', recorded_owner['harness'],
+                                  '--from-session', recorded_owner['session_id'], '--confirm-handoff'])
+                      if can_offer_rebind else None)
+    settings_info = seat.get('settings') if isinstance(seat.get('settings'), dict) else {}
+    prospective_settings_path = (str(Path(anchor['root'])/'.claude/settings.local.json')
+                                 if anchor['state'] == 'active' else None)
+    recorded_settings_path = settings_info.get('path')
+    settings_path = recorded_settings_path or prospective_settings_path
+    settings_path_source = 'recorded' if recorded_settings_path else (
+        'prospective' if prospective_settings_path else 'unavailable')
+    settings_state = ('installed' if recorded_settings_path and seat.get('hooks_installed') else
+                      'recorded-inactive' if recorded_settings_path else
+                      'prospective' if prospective_settings_path else 'unavailable')
+    return {'seat_id':identifier,'seat_root':seat['seat_root'],'birth_root':seat['seat_root'],
+        'operational_anchor':anchor,'owner':seat['owner'],
         'owner_context':seat.get('owner_context',{}),'actual_native_identity':actual,
         'actual_session_context':actual_context,'owner_matches':owner_matches,'identity_error':identity_error,
         'hooks_installed':bool(seat.get('hooks_installed')),'adapter':seat.get('adapter'),
         'adapter_state':adapter_status['state'],'adapter_integrity':adapter_status,
+            'runtime_cli':str(runtime_cli),
+            'settings':{'path':settings_path,'path_source':settings_path_source,'state':settings_state,
+                'recorded_path':recorded_settings_path,'prospective_path':prospective_settings_path,
+                'hooks_installed':bool(seat.get('hooks_installed')),
+                'recorded_baseline_sha256':settings_info.get('sha256'),
+                'baseline_hash_notice':'This is the install-time baseline, not a current settings-content observation.',
+                'mode':settings_info.get('mode')},
+            'handoff':{'rebind_owner_command':rebind_command,
+                'command_condition':'Use only after the authorized scope transfer is recorded and the incoming owner has accepted it. Status does not establish transfer authority.'},
+            'verification':{'configured':{'hooks_installed':bool(seat.get('hooks_installed')),
+                    'settings_path':settings_path,'settings_path_state':settings_state,
+                    'adapter_path':seat.get('adapter')},
+                'observed':{'state':'not-observed-by-seat-status',
+                    'notice':'Use coverage from each active checkout to inspect local events; configured hooks and adapter probes do not prove native interception.'}},
             'runtime':{'version':runtime.get('version'),
             'path':str(runtime_path),'files':runtime_files},'checkouts':checkouts,
         'retired_attachments': retired,
-        'pr_records':len(seat.get('prs',{})),'pending_transition':bool(seat.get('install_journal') or
-            seat.get('migration_journal') or seat.get('handoff_journal') or
-            (session_store.seat_dir(identifier)/UPGRADE_JOURNAL).exists() or
-            (session_store.seat_dir(identifier)/UPGRADE_JOURNAL).is_symlink()),
+        'pr_records':len(seat.get('prs',{})),'pending_transition':pending_transition,
         'notice':'Read-only permanent-seat inspection. It remains available without product Git directories and does not prove native hook loading or delivery interception.'}
 
 
