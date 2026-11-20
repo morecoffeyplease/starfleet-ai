@@ -247,10 +247,10 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stderr)
         return plan
 
-    def seed_attachment_pr_history(self, seat_id, checkout_id, state_path):
+    def seed_attachment_pr_history(self, seat_id, checkout_id, state_path, first_pr=901):
         state = json.loads(state_path.read_text())
-        first_url = self.url
-        second_url = self.url.replace('/901', '/902')
+        first_url = self.url.replace('/901', f'/{first_pr}')
+        second_url = self.url.replace('/901', f'/{first_pr + 1}')
         bindings = {}
         for index, url in enumerate((first_url, second_url), start=1):
             rows = [{'count': index * 10 + offset, 'fixture': f'preserved-{index}-{offset}'}
@@ -280,6 +280,92 @@ class LaneInstallTest(unittest.TestCase):
         return self.call_source(source, '--seat-id', seat_id, 'rebind-owner',
                                 '--from-harness', from_harness, '--from-session', from_session,
                                 '--confirm-handoff', env=env, ok=ok)
+
+    def call_seat_retire(self, source, seat_id, owner, operator_env, *args, ok=True):
+        operator = lane_runtime.lane_scope.native_identity(operator_env)
+        command = ['--seat-id', seat_id, 'retire-seat',
+                   '--expected-owner-harness', owner['harness'],
+                   '--expected-owner-session', owner['session_id'],
+                   '--expected-operator-harness', operator['harness'],
+                   '--expected-operator-session', operator['session_id'],
+                   '--authorization-ref', 'fixture-existing-authorization',
+                   '--confirm-retirement', *map(str, args)]
+        return self.call_source(source, *command, env=operator_env, ok=ok)
+
+    def prepare_drained_seat(self, label, attachment_count=3, include_other_active=True):
+        owner, owner_env = self.native_owner_fixture()
+        settings_path = owner / '.claude/settings.local.json'
+        settings_path.chmod(0o600)
+        source = self.source_checkout(label + '-source')
+        attachments = []
+        for index in range(attachment_count):
+            checkout = self.base / f'{label} retired product {index}'
+            branch_name = f'feature/{label}-retired-{index}'
+            created = self.git('worktree', 'add', '-b', branch_name, checkout)
+            self.assertEqual(created.returncode, 0, created.stderr)
+            attached = self.attach_native_checkout(source, owner, checkout, owner_env)
+            if index == 0:
+                seat_id = attached['seat_id']
+                runtime = Path(attached['seat_runtime_path'])
+            else:
+                self.assertEqual(attached['seat_id'], seat_id)
+            row = next(item for item in lane_runtime.session_store.all_checkouts(seat_id)
+                       if item['root'] == str(checkout.resolve()))
+            state_path = Path(row['checkout_dir']) / 'state.json'
+            self.seed_attachment_pr_history(seat_id, row['checkout_id'], state_path,
+                                            first_pr=901 + 2 * index)
+            removed = self.git('worktree', 'remove', '--force', checkout)
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            deleted = self.git('branch', '-D', branch_name)
+            self.assertEqual(deleted.returncode, 0, deleted.stderr)
+            plan = json.loads(self.call_seat_retirement(runtime, seat_id, checkout,
+                                                       env=owner_env, cwd=self.base).stdout)
+            applied = self.call_seat_retirement(runtime, seat_id, checkout, '--apply',
+                                                '--plan-sha256', plan['plan_sha256'],
+                                                env=owner_env, cwd=self.base)
+            self.assertTrue(json.loads(applied.stdout)['retired'])
+            attachments.append({'checkout_id': row['checkout_id'], 'path': checkout,
+                                'state_path': state_path, 'state_bytes': state_path.read_bytes()})
+        seat = lane_runtime.session_store.load_seat(seat_id)
+        seat.pop('operational_anchor', None)
+        seat['seat_common_gitdir'] = None
+        lane_runtime.session_store.save_seat(seat)
+        other = None
+        if include_other_active:
+            other_owner = self.base / (label + ' other owner')
+            other_branch = f'owner/{label}-other'
+            created = self.git('worktree', 'add', '-b', other_branch, other_owner)
+            self.assertEqual(created.returncode, 0, created.stderr)
+            (other_owner / '.claude').mkdir()
+            other_settings = other_owner / '.claude/settings.local.json'
+            other_settings.write_text(self.original_raw)
+            other_settings.chmod(0o600)
+            other_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='claude',
+                             CLAUDE_CODE_SESSION_ID=f'claude-{label}-other')
+            other_env.pop('CODEX_THREAD_ID', None)
+            other_checkout = self.base / (label + ' other active product')
+            other_product_branch = f'feature/{label}-other-active'
+            created = self.git('worktree', 'add', '-b', other_product_branch, other_checkout)
+            self.assertEqual(created.returncode, 0, created.stderr)
+            attached_other = self.attach_native_checkout(source, other_owner, other_checkout, other_env)
+            other_id = attached_other['seat_id']
+            other_seat = lane_runtime.session_store.load_seat(other_id)
+            other_row = next(item for item in lane_runtime.session_store.all_checkouts(other_id)
+                             if item['root'] == str(other_checkout.resolve()))
+            other = {'seat_id': other_id, 'owner': other_owner, 'owner_env': other_env,
+                     'runtime': Path(attached_other['seat_runtime_path']),
+                     'manifest': copy.deepcopy(other_seat),
+                     'manifest_path': lane_runtime.session_store.seat_dir(other_id) / 'seat.json',
+                     'adapter_path': Path(other_seat['adapter']),
+                     'adapter_bytes': Path(other_seat['adapter']).read_bytes(),
+                     'settings_path': other_settings, 'settings_bytes': other_settings.read_bytes(),
+                     'state_path': Path(other_row['checkout_dir']) / 'state.json',
+                     'state_bytes': (Path(other_row['checkout_dir']) / 'state.json').read_bytes()}
+        return {'owner': owner, 'owner_env': owner_env, 'source': source, 'runtime': runtime,
+                'seat_id': seat_id, 'manifest': seat,
+                'manifest_path': lane_runtime.session_store.seat_dir(seat_id) / 'seat.json',
+                'adapter_path': Path(seat['adapter']), 'settings_path': settings_path,
+                'attachments': attachments, 'other': other}
 
     def prepare_seat_with_retired_attachment(self, label):
         owner, owner_env = self.native_owner_fixture()
@@ -559,6 +645,8 @@ class LaneInstallTest(unittest.TestCase):
         self.assertIn('proof-only work do not need enrollment', guide)
         self.assertIn('does not authorize transfer', guide)
         self.assertIn('separate from setup', guide)
+        self.assertIn('retire-seat', guide)
+        self.assertIn('does not prove that a running native host refreshed', guide)
 
     def test_coverage_separates_old_pr_and_current_binding_without_writes(self):
         source = self.source_checkout('coverage-guidance')
@@ -3488,6 +3576,197 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(first['head_branch'], 'published/first')
         self.assertEqual(second['head_branch'], 'published/second')
         self.assertEqual(upgraded['owner_history'], state['owner_history'])
+
+    def test_issue125_drained_seat_retirement_is_exact_and_preserves_other_seats(self):
+        fixture = self.prepare_drained_seat('issue125-success')
+        seat_id = fixture['seat_id']
+        owner = {'harness': 'claude', 'session_id': fixture['owner_env']['CLAUDE_CODE_SESSION_ID']}
+        operator_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex',
+                            CODEX_THREAD_ID='codex-retirement-operator')
+        operator_env.pop('CLAUDE_CODE_SESSION_ID', None)
+        target_before = lane_runtime.session_store.load_seat(seat_id)
+        other = fixture['other']
+        self.assertIsNotNone(other)
+        self.assertNotIn('operational_anchor', target_before)
+        self.assertIsNone(target_before.get('seat_common_gitdir'))
+        self.assertNotEqual(owner, lane_runtime.lane_scope.native_identity(operator_env))
+
+        before_plan = self.fixture_snapshot()
+        plan_result = self.call_seat_retire(fixture['runtime'], seat_id, owner, operator_env)
+        self.assertEqual(self.fixture_snapshot(), before_plan)
+        plan = json.loads(plan_result.stdout)
+        self.assertEqual(plan['historical_owner'], owner)
+        self.assertEqual(plan['actual_operator'], {'harness': 'codex', 'session_id': 'codex-retirement-operator'})
+        self.assertEqual(plan['operational_anchor']['state'], 'active')
+        self.assertEqual(len(plan['attachments']), 3)
+        self.assertTrue(all(item['phase'] == 'removed' for item in plan['attachments']))
+        self.assertNotIn('EXISTING_FLAG', plan_result.stdout)
+        self.assertNotIn('existing-cpu-hook', plan_result.stdout)
+        before_drained_status = self.fixture_snapshot()
+        drained_status = json.loads(self.call_source(fixture['runtime'], '--seat-id', seat_id, 'status',
+                                                    env=operator_env).stdout)
+        self.assertEqual(self.fixture_snapshot(), before_drained_status)
+        self.assertEqual(drained_status['seat_retirement']['state'], 'drained-hook-retained')
+        self.assertEqual(drained_status['seat_retirement']['retained_hook_condition'], 'retained-active')
+        self.assertIn('--authorization-ref EXISTING_AUTHORIZATION_REFERENCE',
+                      drained_status['seat_retirement']['command'])
+
+        wrong_owner = {'harness': 'claude', 'session_id': 'different-historical-owner'}
+        denied_owner = self.call_seat_retire(fixture['runtime'], seat_id, wrong_owner,
+                                             operator_env, ok=False)
+        self.assertEqual(denied_owner.returncode, 2)
+        self.assertIn('Expected historical owner flags', denied_owner.stderr)
+        wrong_operator = self.call_source(
+            fixture['runtime'], '--seat-id', seat_id, 'retire-seat',
+            '--expected-owner-harness', owner['harness'], '--expected-owner-session', owner['session_id'],
+            '--expected-operator-harness', 'codex', '--expected-operator-session', 'some-other-operator',
+            '--authorization-ref', 'fixture-existing-authorization', '--confirm-retirement',
+            env=operator_env, ok=False)
+        self.assertEqual(wrong_operator.returncode, 2)
+        self.assertIn('Expected operator flags', wrong_operator.stderr)
+
+        other_owner = {'harness': 'claude', 'session_id': other['owner_env']['CLAUDE_CODE_SESSION_ID']}
+        active_refusal = self.call_seat_retire(other['runtime'], other['seat_id'], other_owner,
+                                               operator_env, ok=False)
+        self.assertEqual(active_refusal.returncode, 2)
+        self.assertIn('Every registered attachment must have an exact terminal removed identity',
+                      active_refusal.stderr)
+
+        owned_event, owned_group = next(iter(target_before['groups'].items()))
+        settings_before = fixture['settings_path'].read_bytes()
+        changed_settings = json.loads(settings_before)
+        changed_settings['hooks'][owned_event].append(copy.deepcopy(owned_group))
+        fixture['settings_path'].write_text(json.dumps(changed_settings, indent=2) + '\n')
+        duplicate_refusal = self.call_seat_retire(fixture['runtime'], seat_id, owner,
+                                                  operator_env, ok=False)
+        self.assertEqual(duplicate_refusal.returncode, 2)
+        self.assertIn('present exactly once', duplicate_refusal.stderr)
+        fixture['settings_path'].write_bytes(settings_before)
+        fixture['settings_path'].chmod(0o600)
+
+        attachment_path = fixture['attachments'][0]['state_path']
+        attachment_before = attachment_path.read_bytes()
+        malformed = json.loads(attachment_before)
+        malformed['root'] = str(self.base / 'wrong-attachment-root')
+        attachment_path.write_text(json.dumps(malformed, indent=2) + '\n')
+        malformed_refusal = self.call_seat_retire(fixture['runtime'], seat_id, owner,
+                                                  operator_env, ok=False)
+        self.assertEqual(malformed_refusal.returncode, 2)
+        self.assertIn('terminal removed identity', malformed_refusal.stderr)
+        attachment_path.write_bytes(attachment_before)
+
+        seat_before_journal = lane_runtime.session_store.load_seat(seat_id)
+        seat_before_journal['handoff_journal'] = {'fixture': 'pending'}
+        lane_runtime.session_store.save_seat(seat_before_journal)
+        pending_refusal = self.call_seat_retire(fixture['runtime'], seat_id, owner,
+                                                operator_env, ok=False)
+        self.assertEqual(pending_refusal.returncode, 2)
+        self.assertIn('seat installation, migration, or handoff is incomplete', pending_refusal.stderr)
+        seat_before_journal.pop('handoff_journal')
+        lane_runtime.session_store.save_seat(seat_before_journal)
+
+        stale_plan = json.loads(self.call_seat_retire(fixture['runtime'], seat_id, owner, operator_env).stdout)
+        stale_settings = json.loads(fixture['settings_path'].read_text())
+        stale_settings['unrelated_private_value'] = 'must never appear in a plan'
+        fixture['settings_path'].write_text(json.dumps(stale_settings, indent=2) + '\n')
+        stale_apply = self.call_seat_retire(fixture['runtime'], seat_id, owner, operator_env,
+                                            '--apply', '--plan-sha256', stale_plan['plan_sha256'], ok=False)
+        self.assertEqual(stale_apply.returncode, 2)
+        self.assertIn('plan or a bound preimage changed', stale_apply.stderr)
+        self.assertFalse((fixture['manifest_path'].parent / lane_runtime.SEAT_RETIREMENT_JOURNAL).exists())
+        fixture['settings_path'].write_bytes(settings_before)
+        fixture['settings_path'].chmod(0o600)
+
+        reviewed = json.loads(self.call_seat_retire(fixture['runtime'], seat_id, owner, operator_env).stdout)
+        pre_apply_snapshot = self.fixture_snapshot()
+        applied_result = self.call_seat_retire(fixture['runtime'], seat_id, owner, operator_env,
+                                               '--apply', '--plan-sha256', reviewed['plan_sha256'])
+        self.assertEqual(applied_result.returncode, 0, applied_result.stderr)
+        applied = json.loads(applied_result.stdout)
+        self.assertTrue(applied['retired'])
+        self.assertEqual(applied['retirement_receipt']['operator']['harness'], 'codex')
+        self.assertEqual(applied['retirement_receipt']['historical_owner'], owner)
+        self.assertTrue(applied['retirement_receipt']['history_preserved'])
+        self.assertFalse(fixture['adapter_path'].exists())
+        self.assertFalse((fixture['manifest_path'].parent / lane_runtime.SEAT_RETIREMENT_JOURNAL).exists())
+        retired_seat = lane_runtime.session_store.load_seat(seat_id)
+        self.assertEqual(retired_seat['owner'], target_before['owner'])
+        self.assertEqual(retired_seat.get('owner_context'), target_before.get('owner_context'))
+        self.assertEqual(retired_seat.get('owner_history', []), target_before.get('owner_history', []))
+        self.assertEqual(retired_seat['checkouts'], target_before['checkouts'])
+        self.assertEqual(retired_seat.get('prs', {}), target_before.get('prs', {}))
+        self.assertEqual(retired_seat['runtime'], target_before['runtime'])
+        self.assertEqual(lane_runtime.session_store.operational_anchor(retired_seat)['state'], 'released')
+        self.assertFalse(retired_seat['hooks_installed'])
+        self.assertEqual(retired_seat['groups'], {})
+        for attachment in fixture['attachments']:
+            self.assertEqual(attachment['state_path'].read_bytes(), attachment['state_bytes'])
+        after_settings = json.loads(fixture['settings_path'].read_text())
+        self.assertEqual(after_settings['permissions'], self.original['permissions'])
+        self.assertEqual(after_settings['env'], self.original['env'])
+        for event, groups in self.original['hooks'].items():
+            self.assertEqual(after_settings['hooks'][event], groups)
+        self.assertEqual(fixture['settings_path'].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(other['manifest_path'].read_bytes(),
+                         json.dumps(other['manifest'], indent=2, sort_keys=True).encode() + b'\n')
+        self.assertEqual(other['adapter_path'].read_bytes(), other['adapter_bytes'])
+        self.assertEqual(other['settings_path'].read_bytes(), other['settings_bytes'])
+        self.assertEqual(other['state_path'].read_bytes(), other['state_bytes'])
+        self.assertNotEqual(self.fixture_snapshot(), pre_apply_snapshot)
+
+        before_status = self.fixture_snapshot()
+        status = json.loads(self.call_source(fixture['runtime'], '--seat-id', seat_id, 'status',
+                                             env=operator_env).stdout)
+        self.assertEqual(status['seat_retirement']['state'], 'retired-on-disk')
+        self.assertEqual(status['seat_retirement']['adapter_state'], 'removed-on-disk')
+        self.assertEqual(status['seat_retirement']['retained_hook_condition'], 'removed-on-disk')
+        self.assertFalse(status['seat_retirement']['native_refresh_observed'])
+        self.assertIn('does not prove native detachment', status['seat_retirement']['next_action'])
+        self.assertEqual(self.fixture_snapshot(), before_status)
+
+    def test_issue125_interrupted_seat_retirement_rolls_back_exact_preimages(self):
+        fixture = self.prepare_drained_seat('issue125-rollback', attachment_count=1,
+                                            include_other_active=False)
+        operator_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex',
+                            CODEX_THREAD_ID='codex-retirement-rollback-operator')
+        operator_env.pop('CLAUDE_CODE_SESSION_ID', None)
+        owner = {'harness': 'claude', 'session_id': fixture['owner_env']['CLAUDE_CODE_SESSION_ID']}
+        plan = json.loads(self.call_seat_retire(fixture['runtime'], fixture['seat_id'], owner,
+                                               operator_env).stdout)
+        seat_before = fixture['manifest_path'].read_bytes()
+        adapter_before = fixture['adapter_path'].read_bytes()
+        settings_before = fixture['settings_path'].read_bytes()
+        journal_path = fixture['manifest_path'].parent / lane_runtime.SEAT_RETIREMENT_JOURNAL
+        args = SimpleNamespace(seat_id=fixture['seat_id'], cwd=self.base, apply=True,
+                               plan_sha256=plan['plan_sha256'],
+                               expected_owner_harness=owner['harness'],
+                               expected_owner_session=owner['session_id'],
+                               expected_operator_harness='codex',
+                               expected_operator_session='codex-retirement-rollback-operator',
+                               authorization_ref='fixture-existing-authorization',
+                               confirm_retirement=True)
+        original_write = lane_runtime.write
+
+        def interrupt_after_manifest(path, content, mode=0o600):
+            result = original_write(path, content, mode)
+            if Path(path) == fixture['manifest_path']:
+                raise RuntimeError('fixture interruption after manifest replacement')
+            return result
+
+        with mock.patch.dict(os.environ, operator_env, clear=True), \
+                mock.patch.object(lane_runtime, 'write', side_effect=interrupt_after_manifest):
+            with self.assertRaisesRegex(RuntimeError, 'fixture interruption'):
+                lane_runtime.retire_seat(args)
+        self.assertTrue(journal_path.exists())
+        self.assertFalse(fixture['adapter_path'].exists())
+        rolled_back = self.call_source(fixture['runtime'], '--seat-id', fixture['seat_id'],
+                                       'recover', '--rollback', env=operator_env)
+        self.assertEqual(rolled_back.returncode, 0, rolled_back.stderr)
+        self.assertEqual(json.loads(rolled_back.stdout)['kind'], 'seat-retirement')
+        self.assertEqual(fixture['manifest_path'].read_bytes(), seat_before)
+        self.assertEqual(fixture['adapter_path'].read_bytes(), adapter_before)
+        self.assertEqual(fixture['settings_path'].read_bytes(), settings_before)
+        self.assertFalse(journal_path.exists())
 
     def test_missing_attachment_retirement_preserves_pr_history_and_allows_upgrade(self):
         owner, owner_env = self.native_owner_fixture()
