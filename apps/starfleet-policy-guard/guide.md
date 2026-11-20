@@ -608,6 +608,43 @@ An older pinned executable cannot understand a later release marker, so use a cu
 If an upgrade is interrupted, use `upgrade-recover --rollback` from the recorded product checkout while the replacement worktree still has the Git identity in the journal.
 Rollback restores the exact state, settings, adapter, settings backup, and both seat manifests without recreating the missing birth root.
 
+### Retire a drained durable seat
+
+Use `retire-seat` only after every recorded attachment is already removed and an existing explicit authorization names this local seat cleanup.
+The command requires the exact historical seat owner and separately checks the actual native operator running it.
+The operator may differ from the historical owner, and neither identity is rewritten by this operation.
+The authorization reference is recorded for review but is not authenticated by Policy Guard.
+`--seat-id SEAT_ID status` reports a drained seat whose adapter or managed hook groups remain installed and gives the conditional next action.
+The read-only plan binds the active Git anchor, complete runtime pin, captured `gh` identity, adapter bytes and mode, current settings bytes and mode, exact owned hook groups, every removed attachment receipt, and the expected operator.
+It reports settings paths and hashes without printing unrelated settings content.
+Review the plan, then apply only the exact digest:
+
+```sh
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID retire-seat \
+  --expected-owner-harness claude --expected-owner-session HISTORICAL_SESSION_ID \
+  --expected-operator-harness codex --expected-operator-session OPERATOR_SESSION_ID \
+  --authorization-ref EXISTING_AUTHORIZATION_REFERENCE --confirm-retirement
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID retire-seat \
+  --expected-owner-harness claude --expected-owner-session HISTORICAL_SESSION_ID \
+  --expected-operator-harness codex --expected-operator-session OPERATOR_SESSION_ID \
+  --authorization-ref EXISTING_AUTHORIZATION_REFERENCE --confirm-retirement \
+  --apply --plan-sha256 REVIEWED_PLAN_SHA256
+```
+
+The apply removes only the selected seat's exact adapter file and owned hook groups that appear once in its recorded active settings path.
+It releases that seat's operational anchor and preserves its owner, immutable runtime pin, attachment rows, PR records, and report history.
+It does not change product Git checkouts, branches, or upstream PRs.
+If the operation is interrupted, `recover --inspect` shows the private retirement journal and `recover --rollback` restores the exact manifest, settings, and adapter preimages for the native operator that began the operation.
+
+```sh
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID recover --inspect
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID recover --rollback
+```
+
+The receipt proves only the local file changes.
+It does not prove that a running native host refreshed its hook configuration or stopped invoking a cached hook.
+Use real receiving evidence or a supported owner reload at a safe boundary to confirm native refresh, and do not force a restart.
+
 ## Inspect, hand off, and recover
 
 Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status` to inspect a permanent seat even when product checkouts are unavailable.
@@ -625,6 +662,8 @@ When `handoff.rebind_owner_command` is present, the current incoming native sess
 If the installed CLI is unavailable or outdated, the documented same-harness maintenance fallback below remains supported when its full runtime-pin checks pass.
 Run a rebind only after the authorized scope transfer is recorded and the incoming owner has accepted it.
 The status command is read-only and does not supply transfer authority or establish a new owner.
+For a drained seat, `seat_retirement` reports whether the old hook and adapter remain on disk and gives a conditional plan command only when the exact owner, actual operator, runtime pin, and anchor are available.
+Retirement removes local files only; a cached native hook can remain active until a supported host reload or real receiving evidence confirms refresh.
 The rebind receipt lists every changed and retained checkout by branch and PR, with retired history preserved and active missing worktrees identified without guessing at their owner.
 For cross-harness handoffs, review the exact Claude settings path, before and after hashes, and managed hook groups in `settings_receipt`.
 The rebind receipt archives prior reports where present and identifies active rebound checkouts with covered PRs that need a fresh report.

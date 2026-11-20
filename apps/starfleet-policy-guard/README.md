@@ -142,6 +142,16 @@ python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
   --release-anchor-seat DESTINATION_SEAT_ID --plan-sha256 REVIEWED_PLAN_SHA256
 ```
 
+## Retire a drained durable seat
+
+Use `retire-seat` after every recorded attachment is removed and an existing explicit authorization names the local cleanup.
+The read-only plan binds the historical seat owner separately from the actual native operator, plus the anchor, immutable runtime pin, captured `gh`, adapter, exact hooks, settings hashes and attachment receipts.
+The required authorization reference is recorded but not authenticated, and the historical owner and attachment history remain unchanged.
+Apply only the reviewed `--plan-sha256`; the operation removes only this seat's adapter and exact managed hook groups, releases its operational anchor and preserves PR history.
+An interrupted operation can be inspected and rolled back through `recover --inspect` and `recover --rollback` from the native operator that began it.
+The receipt proves local file changes only and does not prove that a running native host refreshed or stopped invoking a cached hook.
+See [the printable guide](guide.md#retire-a-drained-durable-seat) for the exact command sequence and limits.
+
 ## Retire a missing attachment
 
 An exact seat owner can retire a recorded attachment when its checkout path is gone or now belongs to a different Git repository or worktree.
