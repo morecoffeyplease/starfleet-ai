@@ -175,6 +175,37 @@ class PreferencesTest(unittest.TestCase):
             self.call("resolve", "--role", "standard_review", "--slot", "2", "--review-target", target,
                       "--review-cycle", next_cycle["id"], "--review-plan", second["id"])
 
+    def test_unplanned_standard_resolution_prints_initial_review_hint_to_stderr(self):
+        self.activate()
+        selection = self.call("status")["active"]["selection"]
+        env = dict(os.environ)
+        hint = "model-preferences review-plan --purpose initial"
+
+        unplanned = self.run_cli(env, "resolve", "--role", "standard_review", "--slot", "1")
+        self.assertEqual(unplanned.returncode, 0, unplanned.stderr)
+        self.assertEqual(json.loads(unplanned.stdout), {
+            "profile": "Claude-Codex", "selection": selection, "role": "standard_review",
+            "family": "codex-sol", "harness": "codex", "model": "gpt-6.1-sol", "effort": "high",
+            "contributor_mode": False,
+        })
+        self.assertIn(hint, unplanned.stderr)
+
+        missing_slot = self.run_cli(env, "resolve", "--role", "standard_review")
+        self.assertEqual(missing_slot.returncode, 1)
+        self.assertEqual(missing_slot.stdout, "")
+        self.assertIn("Select reviewer --slot", missing_slot.stderr)
+        self.assertIn(hint, missing_slot.stderr)
+
+        plan = self.initial_plan(self.repo())
+        planned = self.run_cli(env, "resolve", "--role", "standard_review", "--slot", "1",
+                               "--review-plan", plan["id"])
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        self.assertNotIn(hint, planned.stderr)
+
+        other = self.run_cli(env, "resolve", "--role", "implementer")
+        self.assertEqual(other.returncode, 0, other.stderr)
+        self.assertNotIn(hint, other.stderr)
+
     def test_initial_policy_plan_resolve_dispatch_paths_for_each_supported_profile(self):
         cases = (
             ("Codex-only", ["gpt-6.1-sol"], "complex_initial_review", ["gpt-6-astra"]),
