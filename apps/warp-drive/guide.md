@@ -254,6 +254,11 @@ Unavailable delivery stays pending for a later sending scheduler pass after enro
 If a queue attempt is uncertain, inspect the recorded event and do not send a duplicate manually.
 
 For a launched reservation whose helper stopped before recording completion, use `warp-drive reconcile REQUEST_ID --harness claude --session SESSION_UUID --surface SURFACE_UUID --outcome unknown --evidence "what was observed"` to preserve the uncertainty.
+An unknown reservation keeps its capacity claim while workload liveness is ambiguous.
+Tell the current owner and use the existing Reliability incident for that claim while other eligible work continues within available capacity.
+If the current owner verifies the exact workload and its descendants or containers have stopped, use the same command with `--stopped-generation GENERATION` from `inspect` and record the affirmative stop evidence.
+The command checks the observed generation, expired heartbeat and inactive lease before releasing capacity.
+It preserves launch history and the unknown exit result, prevents replay, and queues the standard exact-owner notification without waiting for acknowledgment.
 Use `--outcome succeeded` or `--outcome failed` only after obtaining owner evidence for that result.
 Record an engineer investigation with `warp-drive incident INCIDENT_ID --evidence "source" --action "what was done" --outcome "observed result"`.
 Resolve it only after the observed condition has cleared, by adding `--resolve` to that command.

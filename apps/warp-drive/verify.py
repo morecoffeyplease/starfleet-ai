@@ -3477,6 +3477,89 @@ def test_ignored_sigchld_preserves_child_exit(temp):
           "helper did not reset inherited SIGCHLD=SIG_IGN before launching its child")
 
 
+def test_stopped_unknown_release(temp):
+    state = temp / "stopped-unknown-state"
+    worktree = temp / "stopped-unknown-worktree"
+    worktree.mkdir()
+    next_worktree = temp / "stopped-unknown-next-worktree"
+    next_worktree.mkdir()
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    args = owner_args(owner)
+
+    def submit(path, key):
+        return parse_json(run_cli(state, "submit", "--key", key, *args, "--size", "light",
+            "--family", "test", "--workers", "1", "--expected-runtime", "30",
+            "--repo", path, "--worktree", path, "--", sys.executable, "-c", "pass"))["request_id"]
+
+    request = submit(worktree, "stopped")
+    waiting = submit(next_worktree, "next")
+    evidence_args = ("--outcome", "unknown", "--evidence",
+                     "fixture workload and descendants observed stopped")
+    reconcile = ("reconcile", request, *args, *evidence_args)
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        sample = {"at": time.time(), "logical_cpus": 8, "cpu_busy": 0.05,
+                  "memory_pressure": "warning"}
+        with warp_drive.immediate_transaction(db):
+            _, generation, _ = warp_drive.attach_helper(db, request, owner, "old-helper")
+            warp_drive.host_sample(db, source="fixture", fixture=sample)
+            check(warp_drive.scheduler_pass(db, sample=sample)["granted"] == request,
+                  "warning fixture did not reserve the light slot")
+        release = (*reconcile, "--stopped-generation", str(generation))
+        check("launched reservation" in run_cli(state, *release, ok=False).stderr,
+              "unstarted claim was eligible for stopped-workload reconciliation")
+        claim, _, _ = warp_drive.claim_launch(db, request, "old-helper", generation)
+        warp_drive.mark_started(db, request, claim)
+        check("expired unknown claim" in run_cli(state, *release, ok=False).stderr,
+              "a live lease was eligible for stopped-workload reconciliation")
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET heartbeat_at=? WHERE id=?",
+                       (time.time() - warp_drive.HELPER_STALE_SECONDS - 1, request))
+            warp_drive.monitor_reservations(db)
+            warp_drive.attach_helper(db, waiting, owner, "next-helper")
+            check(warp_drive.scheduler_pass(db, sample=sample)["granted"] is None,
+                  "an uncertain launch did not retain its warning-mode slot")
+        run_cli(state, *reconcile)
+        candidate = parse_json(run_cli(state, "inspect", waiting))
+        check(candidate["admission"]["request_context"]["wait_reason"] ==
+              "memory warning light reservation limit reached",
+              "an unverified unknown claim stopped consuming capacity")
+        check("Helper generation changed" in run_cli(state, *reconcile, "--stopped-generation",
+              str(generation + 1), ok=False).stderr, "wrong generation could release the claim")
+        foreign_owner = {**owner, "session": uuid_text()}
+        check("Only the current owner" in run_cli(state, "reconcile", request,
+              *owner_args(foreign_owner), *evidence_args, "--stopped-generation", str(generation),
+              ok=False).stderr,
+              "a foreign owner could release the claim")
+        observed = warp_drive.current_request(db, request)
+        released = parse_json(run_cli(state, *release))
+        check(released["state"] == "finished" and released["wake_status"] == "pending",
+              "verified stop did not release capacity and queue a wake")
+        ended = warp_drive.current_request(db, request)
+        check(ended["outcome"] == "unknown" and ended["exit_code"] is None and ended["ended_at"] is None
+              and ended["launch_intent_at"] == observed["launch_intent_at"]
+              and ended["reservation_claim"] == claim, "release altered the unknown result or launch history")
+        run_cli(state, *release, ok=False)
+        replay = run_cli(state, "attach", request, *args, ok=False)
+        check(parse_json(replay)["outcome"] == "unknown", "attach did not return the existing unknown result")
+        with warp_drive.immediate_transaction(db):
+            sample["at"] = time.time()
+            warp_drive.host_sample(db, source="fixture", fixture=sample)
+            check(warp_drive.scheduler_pass(db, sample=sample)["granted"] == waiting,
+                  "next light request did not receive an ordinary warning-mode grant")
+        sender, route = uuid_text(), [owner]
+        with patch.object(warp_drive.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as send:
+            warp_drive.dispatch_pending_completions(state, route, "fake-cmux", sender)
+            warp_drive.dispatch_pending_completions(state, route, "fake-cmux", sender)
+        send.assert_called_once()
+        command = send.call_args.args[0]
+        check(command[3] == owner["surface"] and "exit result is unknown" in command[4],
+              "stopped-workload wake did not preserve the exact owner and the unknown result")
+        inspected = parse_json(run_cli(state, "inspect", request))
+        check(sum(event["kind"] == "stopped_workload_released" for event in inspected["events"]) == 1
+              and sum(event["kind"] == "launch_intent" for event in inspected["events"]) == 1,
+              "retry changed the release or launch history")
+
+
 def test_transferred_completion_wake(temp):
     state = temp / "transfer-state"
     old_owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
@@ -4114,6 +4197,7 @@ def main():
             test_helper_diagnostics_cli(temp)
             test_spawn_failure_accounting_provenance(temp)
             test_ignored_sigchld_preserves_child_exit(temp)
+            test_stopped_unknown_release(temp)
             test_transferred_completion_wake(temp)
             test_missing_owner_completion_route_diagnostics_and_recovery(temp)
             test_completion_backlog_connection_bound(temp)
