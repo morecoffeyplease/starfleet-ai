@@ -188,7 +188,7 @@ assert_eq "$(line_count "$THREAD_LOG")" 0
 [ ! -f "$TMP/config/state/$back_id.post.json" ] || fail 'closed attention metadata was not removed'
 
 subject_repo="$TMP/subject-budget-fixture-repository"
-subject_worktree="$TMP/linked-worktree-with-a-deliberately-long-name-for-subject-budget"
+subject_worktree="$TMP/trip-planner-1"
 mkdir -p "$subject_repo"
 git -C "$subject_repo" init -q
 git -C "$subject_repo" config user.name 'Agent Notify Fixture'
@@ -202,8 +202,8 @@ assert_eq "$away_id" 900000000000000003
 assert_eq "$(line_count "$OPEN_LOG")" 3
 away_payload="$(sed -n '3p' "$OPEN_LOG")"
 away_subject="$(jq -r .thread_name <<<"$away_payload")"
-assert_contains "$away_subject" "$SECRET_TITLE"
-assert_eq "$(printf '%s' "$away_subject" | wc -m | tr -d ' ')" 100
+assert_eq "$away_subject" "trip-planner-1: $SECRET_TITLE"
+assert_contains "$(jq -r .content <<<"$away_payload")" '<@600000000000000001>'
 assert_contains "$away_payload" "$SECRET_ISSUE"
 assert_contains "$away_payload" "$SECRET_BODY"
 assert_contains "$away_payload" '#842'
@@ -214,18 +214,29 @@ export PRESENCE_MODE=back
 "$TOOL" reply "$away_id" --body 'Keep this in its original Discord thread.'
 assert_eq "$(line_count "$THREAD_LOG")" 1
 assert_contains "$(sed -n '1p' "$THREAD_LOG")" 'Keep this in its original Discord thread.'
+assert_not_contains "$(sed -n '1p' "$THREAD_LOG")" '<@600000000000000001>'
 
 away_calls_before="$(line_count "$AWAY_LOG")"
-explicit_id="$("$TOOL" open --delivery discord --kind Agent --title "$SECRET_TITLE" --body "$SECRET_BODY" 2>"$TMP/explicit.err")"
+explicit_id="$("$TOOL" open --delivery discord --urgency fyi --kind Agent --title "$SECRET_TITLE" --body "$SECRET_BODY" 2>"$TMP/explicit.err")"
 assert_eq "$explicit_id" 900000000000000004
 assert_eq "$(line_count "$AWAY_LOG")" "$away_calls_before"
 assert_contains "$(sed -n '4p' "$OPEN_LOG")" "$SECRET_BODY"
+if ! sed -n '4p' "$OPEN_LOG" | jq -e '
+  .flags == 0 and
+  (.content | contains("<@600000000000000001>")) and
+  .allowed_mentions.users == ["600000000000000001"] and
+  .applied_tags == ["1", "5"]' >/dev/null; then
+  fail 'expected an FYI thread to ping the configured user with its FYI tag'
+fi
 
 export AWAY_RESULT=fail
-fallback_id="$("$TOOL" open --kind Agent --title "$SECRET_TITLE" --body "$SECRET_BODY" 2>"$TMP/fallback.err")"
+long_title="$(printf '%.0sX' {1..110})"
+fallback_id="$(cd "$subject_worktree" && "$TOOL" open --kind Agent --title "$long_title" --body "$SECRET_BODY" 2>"$TMP/fallback.err")"
 assert_eq "$fallback_id" 900000000000000005
 assert_contains "$(cat "$TMP/fallback.err")" 'presence context unavailable'
 assert_contains "$(sed -n '5p' "$OPEN_LOG")" "$SECRET_BODY"
+fallback_subject="$(sed -n '5p' "$OPEN_LOG" | jq -r .thread_name)"
+assert_eq "$fallback_subject" "trip-planner-1: ${long_title:0:81}..."
 assert_eq "$(jq -r '.delivery' "$TMP/config/state/$fallback_id.post.json")" discord
 
 export AWAY_RESULT=mismatch
@@ -301,7 +312,7 @@ export CODEX_THREAD_ID=stale-codex-thread-id
 export AGENT_NOTIFY_KIND=Codex
 opencode_id="$("$TOOL" open --delivery discord --title 'OpenCode managed owner' --body 'Fixture only' 2>"$TMP/opencode-open.err")"
 assert_eq "$opencode_id" 900000000000000010
-assert_contains "$(sed -n '10p' "$OPEN_LOG")" '[OpenCode]'
+assert_contains "$(sed -n '10p' "$OPEN_LOG" | jq -r .content)" '-# OpenCode |'
 assert_contains "$(cat "$MANAGED_LOG")" "register $opencode_id --session $OPENCODE_SESSION_ID"
 "$TOOL" watch "$opencode_id" 2>"$TMP/opencode-watch.err"
 assert_contains "$(cat "$MANAGED_LOG")" "managed $opencode_id --session $OPENCODE_SESSION_ID"

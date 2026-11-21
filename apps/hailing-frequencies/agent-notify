@@ -14,9 +14,9 @@
 # <post> is the id (or discord.com URL) printed by `open`. Body is read from
 # stdin when --body is omitted and stdin is not a terminal.
 #
-# `open` builds the subject line itself, so --title is only the decision or
-# the reason for the contact:
-#   [Claude] example-repo/feature-branch #42 Formatting differs: which version should ship?
+# Pass only the discussion topic to --title. `open` prefixes the worktree short
+# name and pings the configured user on every new thread.
+#   trip-planner-1: Roadmap alignment
 # The agent kind is detected (Claude, Codex, OpenCode, else Agent; override with --kind),
 # repo and worktree come from git, and --issue N looks the title up with `gh`
 # (pass --issue-title when `gh` cannot see it).
@@ -142,45 +142,18 @@ agent_name() {
   printf '%s - %s' "$(agent_kind)" "$(where_label)" | cut -c1-80
 }
 
-# subject KIND WHERE ISSUE ISSUE_TITLE TITLE
-#   [Claude] example-repo/feature-branch #42 Formatting differs: which version should ship?
-# Discord caps a post title at 100 characters, so the issue title and location
-# may be shortened before the requested title is truncated.
+# Use the worktree basename and keep the topic visible within Discord's title limit.
 subject() {
-  local kind="$1" where="$2" issue="$3" ititle="$4" title="$5"
-  local kind_prefix="[$kind]" issue_suffix="" prefix room where_room title_room
-  prefix="$kind_prefix $where"
-  if [ -n "$issue" ]; then
-    issue_suffix=" #$issue"
-    prefix="$prefix$issue_suffix"
-    room=$(( 100 - ${#prefix} - ${#title} - 3 ))
-    if [ -n "$ititle" ] && [ "$room" -ge 12 ]; then
-      [ "${#ititle}" -le "$room" ] || ititle="${ititle:0:$((room - 3))}..."
-      prefix="$prefix $ititle"
-    fi
+  local name="${1##*/}" topic="$2" room
+  name="${name:-$1}"
+  if [ $(( ${#name} + 2 + ${#topic} )) -gt 100 ] && [ "${#name}" -gt 48 ]; then
+    name="${name:0:45}..."
   fi
-  if [ $(( ${#prefix} + 2 + ${#title} )) -gt 100 ]; then
-    # Keep the requested title readable by shortening optional project context first.
-    prefix="$kind_prefix$issue_suffix"
-    title_room=$(( 100 - ${#prefix} - 2 ))
-    if [ "${#title}" -gt "$title_room" ]; then
-      if [ "$title_room" -ge 3 ]; then
-        title="${title:0:$((title_room - 3))}..."
-      else
-        title="${title:0:$title_room}"
-      fi
-    fi
-    where_room=$(( 100 - ${#kind_prefix} - 1 - ${#issue_suffix} - 2 - ${#title} ))
-    if [ "${#where}" -gt "$where_room" ]; then
-      if [ "$where_room" -ge 3 ]; then
-        where="${where:0:$((where_room - 3))}..."
-      else
-        where="${where:0:$where_room}"
-      fi
-    fi
-    prefix="$kind_prefix${where:+ $where}$issue_suffix"
+  room=$(( 100 - ${#name} - 2 ))
+  if [ "${#topic}" -gt "$room" ]; then
+    topic="${topic:0:$((room - 3))}..."
   fi
-  printf '%s: %s' "$prefix" "$title" | cut -c1-100
+  printf '%s: %s' "$name" "$topic"
 }
 
 read_body() {
@@ -410,7 +383,7 @@ cmd_open() {
   fi
   header="-# $kind | $where"
   if [ "$route" = "attention" ]; then
-    remote_title="$(subject "$kind" "$where" "" "" "Needs attention in CMUX")"
+    remote_title="$(subject "$where" "Needs attention in CMUX")"
     body="Your attention is needed in CMUX.
 Workspace: $(jq -r '.workspace' <<<"$context")
 Window: $(jq -r '.window' <<<"$context")
@@ -419,19 +392,16 @@ Please open that chat."
   else
     body="$(read_body "$original_body")"
     [ -z "$issue" ] || header="$header | #$issue${ititle:+ $ititle}"
-    title="$(subject "$kind" "$where" "$issue" "$ititle" "$title")"
+    title="$(subject "$where" "$title")"
   fi
 
-  local user flags=0 payload res id guild
+  local user payload res id guild
   user="$(cached .user)"
-  # Questions (urgent, normal) mention the configured user. FYI posts
-  # are sent silently and carry no mention.
-  if [ "$urgency" = "fyi" ]; then flags=4096; else body="<@$user> $body"; fi
-  body="$header"$'\n'"$body"
+  body="$header"$'\n'"<@$user> $body"
   payload="$(jq -n --arg name "$title" --arg content "$body" --arg agent "$agent" \
     --arg open "$(cached .tags.open)" --arg urg "$(cached ".tags.$urgency")" \
-    --arg user "$user" --argjson flags "$flags" \
-    '{thread_name: $name, content: $content, username: $agent, flags: $flags,
+    --arg user "$user" \
+    '{thread_name: $name, content: $content, username: $agent, flags: 0,
       applied_tags: [$open, $urg], allowed_mentions: {users: [$user]}}')"
   res="$(http POST "$DISCORD_WEBHOOK_URL?wait=true" "$payload")"
   id="$(jq -r .channel_id <<<"$res")"

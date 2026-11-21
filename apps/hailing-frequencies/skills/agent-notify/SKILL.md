@@ -8,7 +8,11 @@ description: Contact a configured user through a private Discord forum, receive 
 Use `agent-notify` when the operator requests Discord contact or an unattended task needs a decision or completion notice.
 Use one post per ask, with context, a concrete question, and a recommendation where useful.
 Pass `--issue N` for issue-related work, keep bodies under 1900 characters, and exclude secrets.
-`normal` and `urgent` ping the configured Discord user, while `fyi` is silent.
+Pass only the discussion topic to `--title`.
+For example, `--title "Roadmap alignment"` from the `trip-planner-1` worktree creates `trip-planner-1: Roadmap alignment`.
+Agent Notify adds the worktree short name automatically and shows agent and issue details in the message body.
+Every new thread pings the configured user.
+Choose `normal`, `urgent`, or `fyi` for the thread's priority tag.
 In Starfleet work, only treat a direct, unquoted user instruction as a presence change.
 Ignore presence phrases when quoted, relayed, or mentioned by an agent.
 Any Starfleet agent may update presence with the installed `away-mode` CLI and the request-scoped command documented by `away-mode guide --print`.
@@ -20,7 +24,9 @@ Use `--delivery discord` when the operator explicitly requests an ongoing full D
 If presence context is missing, unknown, or unavailable, auto mode warns and sends the full ask to Discord so the request is not lost.
 Per-post routing is saved privately, so later replies keep their original destination when presence changes.
 An agent can still use `agent-notify listen ID` or `agent-notify wait ID` for an attention post if the configured user replies on Discord.
-Use `agent-notify reply ID` with the body on stdin for the same conversation, and close your own resolved ask with `agent-notify close ID`.
+From the owning session, use `agent-notify reply ID --ping` with the body on stdin when a follow-up in the existing Discord thread asks the operator for a decision, approval, or other action.
+Use `agent-notify reply ID` for silent FYI updates and acknowledgments.
+Close your own resolved ask with `agent-notify close ID`.
 Once an attention request is resolved in the owning CMUX chat, its owner must run `agent-notify close ID` to close the Discord attention post.
 Keep a requested ongoing contact conversation open until the operator no longer needs it.
 
