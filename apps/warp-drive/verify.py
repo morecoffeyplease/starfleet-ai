@@ -3496,6 +3496,7 @@ def test_stopped_unknown_release(temp):
     evidence_args = ("--outcome", "unknown", "--evidence",
                      "fixture workload and descendants observed stopped")
     reconcile = ("reconcile", request, *args, *evidence_args)
+    operator = parse_json(run_cli(state, "init"))["operator"]
     with contextlib.closing(warp_drive.connect(state)) as db:
         sample = {"at": time.time(), "logical_cpus": 8, "cpu_busy": 0.05,
                   "memory_pressure": "warning"}
@@ -3530,8 +3531,15 @@ def test_stopped_unknown_release(temp):
               *owner_args(foreign_owner), *evidence_args, "--stopped-generation", str(generation),
               ok=False).stderr,
               "a foreign owner could release the claim")
+        check("recorded owner changed" in run_cli(state, "reconcile", request,
+              *owner_args(foreign_owner), *evidence_args, "--stopped-generation", str(generation),
+              "--actor", operator, ok=False).stderr, "operator could act on stale owner identity")
+        check("not the configured operator" in run_cli(state, *release,
+              "--actor", "unconfigured-actor", ok=False).stderr, "an unconfigured operator could release the claim")
+        check("--actor requires --stopped-generation" in run_cli(state, *reconcile,
+              "--actor", operator, ok=False).stderr, "operator bypassed the verified stop requirement")
         observed = warp_drive.current_request(db, request)
-        released = parse_json(run_cli(state, *release))
+        released = parse_json(run_cli(state, *release, "--actor", operator))
         check(released["state"] == "finished" and released["wake_status"] == "pending",
               "verified stop did not release capacity and queue a wake")
         ended = warp_drive.current_request(db, request)
@@ -3555,7 +3563,8 @@ def test_stopped_unknown_release(temp):
         check(command[3] == owner["surface"] and "exit result is unknown" in command[4],
               "stopped-workload wake did not preserve the exact owner and the unknown result")
         inspected = parse_json(run_cli(state, "inspect", request))
-        check(sum(event["kind"] == "stopped_workload_released" for event in inspected["events"]) == 1
+        releases = [event for event in inspected["events"] if event["kind"] == "stopped_workload_released"]
+        check(len(releases) == 1 and releases[0]["data"]["actor"] == operator
               and sum(event["kind"] == "launch_intent" for event in inspected["events"]) == 1,
               "retry changed the release or launch history")
 

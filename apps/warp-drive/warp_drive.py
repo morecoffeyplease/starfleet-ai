@@ -1636,7 +1636,7 @@ def deliver_completion_wake(db, state_dir, row, target, cmux, sender_surface):
             f"Inspect it with: warp-drive --state-dir {shlex.quote(str(state_dir))} inspect {request_id}")
     if row["outcome"] == "unknown":
         body = (f"Warp-drive completion {event_key}: reservation {request_id} released capacity "
-                "after the owner verified that the workload stopped. The exit result is unknown. "
+                "after the workload was verified stopped. The exit result is unknown. "
                 f"Inspect it with: warp-drive --state-dir {shlex.quote(str(state_dir))} inspect {request_id}")
     with immediate_transaction(db):
         current = current_request(db, request_id)
@@ -2480,6 +2480,7 @@ def build_parser():
     reconcile.add_argument("--exit-code", type=int)
     reconcile.add_argument("--stopped-generation", type=int,
                            help="release an unknown reservation after verifying its exact workload stopped")
+    reconcile.add_argument("--actor", help="configured operator or delegate for a verified stop")
     return parser
 
 
@@ -2606,12 +2607,16 @@ def _main(argv, product_umask):
         elif args.command_name == "reconcile":
             owner = owner_from_args(args)
             stopped = args.stopped_generation is not None
+            require(args.actor is None or stopped, "--actor requires --stopped-generation")
             if stopped:
                 require(args.outcome == "unknown" and args.exit_code is None and args.evidence.strip(),
                         "Stopped-workload reconciliation requires unknown outcome and stop evidence, with no exit code")
             with immediate_transaction(db):
                 row = current_request(db, args.request_id)
-                require(owner_matches(row, owner), "Only the current owner may reconcile this reservation")
+                require(owner_matches(row, owner), "Only the current owner may reconcile this reservation"
+                        if args.actor is None else "The recorded owner changed; inspect the reservation again")
+                if args.actor is not None:
+                    resolve_actor(db, args.actor)
                 require(row["state"] == "reserved" and row["launch_intent_at"] is not None,
                         "Only a launched reservation can be reconciled")
                 if stopped:
@@ -2632,7 +2637,7 @@ def _main(argv, product_umask):
                 event(db, "stopped_workload_released" if stopped else "owner_reconciled",
                       row["id"], outcome=args.outcome,
                       exit_code=args.exit_code, evidence=args.evidence,
-                      **({"helper_generation": args.stopped_generation} if stopped else {}),
+                      **({"helper_generation": args.stopped_generation, "actor": args.actor} if stopped else {}),
                       **child_accounting_unavailable(
                           "owner reconciliation has no helper-observed wait4 sample"))
                 finished = stopped or args.outcome != "unknown"

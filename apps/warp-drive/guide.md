@@ -257,6 +257,7 @@ For a launched reservation whose helper stopped before recording completion, use
 An unknown reservation keeps its capacity claim while workload liveness is ambiguous.
 Tell the current owner and use the existing Reliability incident for that claim while other eligible work continues within available capacity.
 If the current owner verifies the exact workload and its descendants or containers have stopped, use the same command with `--stopped-generation GENERATION` from `inspect` and record the affirmative stop evidence.
+The configured operator or a delegate can record a verified stop by adding `--actor OPERATOR_ID` and passing the reservation's exact current owner arguments.
 The command checks the observed generation, expired heartbeat and inactive lease before releasing capacity.
 It preserves launch history and the unknown exit result, prevents replay, and queues the standard exact-owner notification without waiting for acknowledgment.
 Use `--outcome succeeded` or `--outcome failed` only after obtaining owner evidence for that result.

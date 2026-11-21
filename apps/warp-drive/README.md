@@ -57,7 +57,7 @@ Legacy generic `pressure` samples remain unknown and block new work until a fres
 During warning, Warp-drive allows up to the configured number of reserved heavy claims and at most one reserved light claim.
 The default heavy limit is one, and the light limit is always one.
 Warp-drive counts every reserved row, including unstarted claims and uncertain claims with inactive leases.
-After the current owner verifies the exact workload has stopped, explicit reconciliation can release its capacity while preserving the unknown exit result and launch history.
+After the current owner or configured operator verifies the exact workload has stopped, explicit reconciliation can release its capacity while preserving the unknown exit result and launch history.
 The two classes have separate limits, so one heavy and one light claim can coexist under the default setting.
 The scheduler still requires fresh host samples and CPU headroom for every grant.
 Use `warp-drive config warning-heavy-limit 0 --actor OPERATOR_ID` to block all new heavy claims during warning.
