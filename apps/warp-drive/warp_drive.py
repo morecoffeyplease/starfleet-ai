@@ -1634,6 +1634,10 @@ def deliver_completion_wake(db, state_dir, row, target, cmux, sender_surface):
     body = (f"Warp-drive completion {event_key}: reservation {request_id} finished "
             f"with outcome {row['outcome']} and exit code {row['exit_code']}. "
             f"Inspect it with: warp-drive --state-dir {shlex.quote(str(state_dir))} inspect {request_id}")
+    if row["outcome"] == "unknown":
+        body = (f"Warp-drive completion {event_key}: reservation {request_id} released capacity "
+                "after the workload was verified stopped. The exit result is unknown. "
+                f"Inspect it with: warp-drive --state-dir {shlex.quote(str(state_dir))} inspect {request_id}")
     with immediate_transaction(db):
         current = current_request(db, request_id)
         if current["state"] != "finished" or current["wake_status"] not in (None, "pending", "unavailable"):
@@ -2474,6 +2478,9 @@ def build_parser():
     reconcile.add_argument("--outcome", choices=("unknown", "succeeded", "failed"), required=True)
     reconcile.add_argument("--evidence", required=True)
     reconcile.add_argument("--exit-code", type=int)
+    reconcile.add_argument("--stopped-generation", type=int,
+                           help="release an unknown reservation after verifying its exact workload stopped")
+    reconcile.add_argument("--actor", help="configured operator or delegate for a verified stop")
     return parser
 
 
@@ -2599,28 +2606,48 @@ def _main(argv, product_umask):
             print(json.dumps(value, indent=2, default=str))
         elif args.command_name == "reconcile":
             owner = owner_from_args(args)
+            stopped = args.stopped_generation is not None
+            require(args.actor is None or stopped, "--actor requires --stopped-generation")
+            if stopped:
+                require(args.outcome == "unknown" and args.exit_code is None and args.evidence.strip(),
+                        "Stopped-workload reconciliation requires unknown outcome and stop evidence, with no exit code")
             with immediate_transaction(db):
                 row = current_request(db, args.request_id)
-                require(owner_matches(row, owner), "Only the current owner may reconcile this reservation")
+                require(owner_matches(row, owner), "Only the current owner may reconcile this reservation"
+                        if args.actor is None else "The recorded owner changed; inspect the reservation again")
+                if args.actor is not None:
+                    resolve_actor(db, args.actor)
                 require(row["state"] == "reserved" and row["launch_intent_at"] is not None,
                         "Only a launched reservation can be reconciled")
-                if args.outcome == "unknown":
+                if stopped:
+                    require(row["helper_generation"] == args.stopped_generation,
+                            "Helper generation changed; inspect the workload again")
+                    require(row["outcome"] == "unknown" and not row["lease_active"] and
+                            row["heartbeat_at"] is not None and now() - row["heartbeat_at"] > HELPER_STALE_SECONDS and
+                            row["exit_code"] is None and row["ended_at"] is None,
+                            "Stopped-workload reconciliation requires an expired unknown claim without an exit receipt")
+                    db.execute("""UPDATE reservations SET state='finished',wake_status='pending',wake_detail=NULL
+                        WHERE id=?""", (row["id"],))
+                elif args.outcome == "unknown":
                     db.execute("UPDATE reservations SET outcome='unknown',lease_active=0 WHERE id=?",
                                (row["id"],))
                 else:
                     db.execute("UPDATE reservations SET state='finished',outcome=?,exit_code=?,ended_at=?,lease_active=0,wake_status='pending' WHERE id=?",
                                (args.outcome, args.exit_code, now(), row["id"]))
-                event(db, "owner_reconciled", row["id"], outcome=args.outcome,
+                event(db, "stopped_workload_released" if stopped else "owner_reconciled",
+                      row["id"], outcome=args.outcome,
                       exit_code=args.exit_code, evidence=args.evidence,
+                      **({"helper_generation": args.stopped_generation, "actor": args.actor} if stopped else {}),
                       **child_accounting_unavailable(
                           "owner reconciliation has no helper-observed wait4 sample"))
-                if args.outcome != "unknown":
+                finished = stopped or args.outcome != "unknown"
+                if finished:
                     resolve_incident(db, f"command-uncertain:{row['id']}")
                     resolve_incident(db, f"runtime-overdue:{row['id']}")
             print(json.dumps({"request_id": row["id"], "outcome": args.outcome,
-                              "state": "finished" if args.outcome != "unknown" else "reserved",
+                              "state": "finished" if finished else "reserved",
                               "evidence_recorded": True,
-                              "wake_status": "pending" if args.outcome != "unknown" else None}, indent=2))
+                              "wake_status": "pending" if finished else None}, indent=2))
         elif args.command_name == "cancel":
             with immediate_transaction(db):
                 row = current_request(db, args.request_id)
