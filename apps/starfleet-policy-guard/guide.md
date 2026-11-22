@@ -12,6 +12,10 @@ Repeated repairs can add risk and delay, so choose the smallest safe route that 
 
 ### Triage findings
 
+Decide what belongs in the round without making any assumptions about what is broken, what proof is missing, or what the approved scope covers.
+Use the approved PR outcome, the applicable fix guidance, and concrete evidence to decide whether an item belongs in the batch.
+If an item’s necessity is still uncertain, keep it out of the batch and investigate it separately.
+
 Use existing evidence to establish the concrete harm, likely path, and connection to the approved outcome.
 Bot names, security labels, and agreement do not supply independent proof.
 
