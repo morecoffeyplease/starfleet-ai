@@ -34,7 +34,8 @@ NATIVE_PROMPT_READINESS = "native_prompt"
 DISCORD_REPLY_READINESS = "discord_reply"
 CMUX_READINESS_POLICIES = frozenset((NATIVE_PROMPT_READINESS, DISCORD_REPLY_READINESS))
 INSTALL_MARKER = "# starfleet-hailing-frequencies:v1"
-RUNTIME_SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py", "guide.md",
+RUNTIME_SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py",
+                        "quota_alert.py", "replacement_custody.py", "guide.md",
                         "agent-notify", "agent-notify-guide.md", "discord_cleanup.py",
                         "discord-cleanup.md", "opencode_adapter.py")
 RUNTIME_SKILL_NAMES = ("skills/temporal-beacon/SKILL.md", "skills/agent-notify/SKILL.md")
@@ -1721,6 +1722,12 @@ def parser():
     set_timer.add_argument("--request-id")
     set_timer.add_argument("--replace-key")
     temporal_sub.add_parser("list", help="List this exact owner's timers")
+    quota_watch = temporal_sub.add_parser("quota-watch", help="Wake on a Claude weekly quota change")
+    quota_watch.add_argument("--message", required=True, help="Continuation to retrieve when woken")
+    quota_watch.add_argument("--at-or-below", type=float, metavar="PERCENT",
+                             help="wake at or below this remaining percentage, once per reset")
+    temporal_sub.add_parser("quota-status", help="Inspect this exact owner's quota watch and cache")
+    temporal_sub.add_parser("quota-stop", help="Stop this exact owner's quota watch")
     inspect = temporal_sub.add_parser("inspect", help="Inspect a timer and its occurrence history")
     inspect.add_argument("timer_id")
     cancel = temporal_sub.add_parser("cancel", help="Cancel a timer and any held occurrence")
@@ -1830,6 +1837,12 @@ def main(argv=None):
         if args.temporal_command == "set":
             return beacon.set(args.after, args.at, args.every, args.until, args.message,
                               args.request_id, args.replace_key, after_idle=args.after_idle)
+        if args.temporal_command == "quota-watch":
+            return beacon.quota_watch(args.message, args.at_or_below)
+        if args.temporal_command == "quota-status":
+            return beacon.quota_status()
+        if args.temporal_command == "quota-stop":
+            return beacon.quota_stop()
         target, owner_key, _worktree = beacon.owner()
         if args.temporal_command == "list":
             return beacon.list(owner_key)

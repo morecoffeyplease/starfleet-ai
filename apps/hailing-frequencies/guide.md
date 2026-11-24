@@ -20,6 +20,15 @@ Activity postpones delivery, and receipt completes the timer; do not rearm it fr
 Unknown activity, human-input holds and replaced sessions prevent submission.
 Run `temporal-beacon doctor` before relying on delivery and read [the timer guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md) for details.
 
+## Claude Code weekly quota alerts
+
+From your exact enrolled Claude or Codex session, use `temporal-beacon quota-watch --message 'Review the new Claude weekly quota reading.'` to wake on changes in the local weekly allowance.
+Add `--at-or-below 3` for one alert per reset at 3% remaining or less.
+Use `temporal-beacon quota-status` to check the source and alert state, and `temporal-beacon quota-stop` to end the watch.
+The existing Hailing worker needs send coverage for your session and a fresh Claude Code status-line cache.
+Receive a quota alert with the command in its wake and apply only the operator's approved continuation.
+See [quota watch setup](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md#watch-claude-code-weekly-quota).
+
 ## Identify the exact session
 
 Run `cmux current --json --limit 200` and `cmux --id-format both --json tree --all`.

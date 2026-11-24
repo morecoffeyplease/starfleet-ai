@@ -14,6 +14,9 @@ Temporal Beacon adds durable agent wake timers to this same worker.
 Read the [Temporal Beacon guide](temporal-beacon.md) for `--after`, `--at`, `--every`, time-based `--until`, receipt, installation, and diagnosis, or load its [agent skill](skills/temporal-beacon/SKILL.md).
 Timer delivery uses the existing enrolled-session guards and opt-in send scope; unread-message reminder timing remains separate.
 
+The same worker can send a guarded wake when the local Claude Code weekly allowance changes or reaches a configured threshold.
+Set up a [Claude Code weekly quota watch](temporal-beacon.md#watch-claude-code-weekly-quota) from the exact enrolled session that should receive it.
+
 The Hailing installer also installs the `agent-notify` Discord conversation command, its [setup guide](agent-notify-guide.md), and its [agent skill](skills/agent-notify/SKILL.md).
 Print its setup instructions with `agent-notify guide --print` before creating Discord configuration or a worker.
 Agent Notify keeps its existing private configuration and thread routing state, and registers posts with the existing Discord Watch worker when available.

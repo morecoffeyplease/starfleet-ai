@@ -563,57 +563,12 @@ class MonitorTests(unittest.TestCase):
 
     def test_prompt_uses_owned_installed_launcher_only_for_matching_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
-            home = Path(temporary) / "home with spaces"
+            home = Path(temporary).resolve() / "home with spaces"
             runtime_root = home / ".local/share/starfleet-ai/hailing-frequencies"
-            staging = Path(temporary) / "staging"
-            staging.mkdir()
-            staged_script = staging / "hailing_frequencies.py"
-            staged_service = staging / "service.py"
-            staged_temporal = staging / "temporal_beacon.py"
-            staged_guide = staging / "guide.md"
-            staged_agent_notify = staging / "agent-notify"
-            staged_agent_notify_guide = staging / "agent-notify-guide.md"
-            staged_discord_cleanup = staging / "discord_cleanup.py"
-            staged_discord_cleanup_guide = staging / "discord-cleanup.md"
-            staged_opencode_adapter = staging / "opencode_adapter.py"
-            staged_script.write_bytes(b"immutable runtime script")
-            staged_service.write_bytes(b"immutable runtime service")
-            source_app = Path(__file__).resolve().parents[1]
-            staged_temporal.write_bytes((source_app / "temporal_beacon.py").read_bytes())
-            staged_guide.write_bytes((source_app / "guide.md").read_bytes())
-            staged_agent_notify.write_bytes((source_app / "agent-notify").read_bytes())
-            staged_agent_notify_guide.write_bytes((source_app / "agent-notify-guide.md").read_bytes())
-            staged_discord_cleanup.write_bytes((source_app / "discord_cleanup.py").read_bytes())
-            staged_discord_cleanup_guide.write_bytes((source_app / "discord-cleanup.md").read_bytes())
-            staged_opencode_adapter.write_bytes(
-                (source_app.parent / "opencode-adapter" / "opencode_adapter.py").read_bytes())
-            skill_source = source_app / "skills/temporal-beacon/SKILL.md"
-            agent_notify_skill_source = source_app / "skills/agent-notify/SKILL.md"
-            sources = {"hailing_frequencies.py": staged_script.read_bytes(), "service.py": staged_service.read_bytes(),
-                       "temporal_beacon.py": staged_temporal.read_bytes(), "guide.md": staged_guide.read_bytes(),
-                       "agent-notify": staged_agent_notify.read_bytes(),
-                       "agent-notify-guide.md": staged_agent_notify_guide.read_bytes(),
-                       "discord_cleanup.py": staged_discord_cleanup.read_bytes(),
-                       "discord-cleanup.md": staged_discord_cleanup_guide.read_bytes(),
-                       "opencode_adapter.py": staged_opencode_adapter.read_bytes(),
-                       "skills/temporal-beacon/SKILL.md": skill_source.read_bytes(),
-                       "skills/agent-notify/SKILL.md": agent_notify_skill_source.read_bytes()}
-            digest = hashlib.sha256(b"".join(name.encode() + b"\0" + content
-                                              for name, content in sources.items())).hexdigest()
-            runtime = runtime_root / digest
-            runtime.mkdir(parents=True)
+            installation = install.install(runtime_root, home / ".local/bin")
+            runtime = Path(installation["runtime"])
             script = runtime / "hailing_frequencies.py"
-            service_path = runtime / "service.py"
-            for name, content in sources.items():
-                target = runtime / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(content)
-            hf.atomic_json(runtime / "installation.json", {"sha256": digest, "python": sys.executable})
-            launcher = home / ".local/bin/hailing-frequencies"
-            launcher.parent.mkdir(parents=True)
-            launcher.write_text("#!/bin/sh\n" + hf.INSTALL_MARKER + "\nexec " + shlex.quote(sys.executable) + " " +
-                                shlex.quote(str(script.resolve())) + ' "$@"\n')
-            launcher.chmod(0o755)
+            launcher = Path(installation["command"])
             default_state = home / ".local/state/starfleet-ai/hailing-frequencies"
             app = hf.Monitor(default_state, self.host)
             message_id = uid()
