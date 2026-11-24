@@ -642,6 +642,70 @@ class Monitor:
                 "WHERE session=? AND started_at=? AND event_key=?",
                 (target["session"], target["started_at"], event_key)).fetchone()
 
+    def native_enrollment_target(self, args):
+        surface, session = identity(args.surface), identity(args.session)
+        store = json.loads((self.cmux.hook_directory / (args.harness + "-hook-sessions.json")).read_text())
+        record = next((value for key, value in store["sessions"].items() if key.upper() == session), None)
+        require(record is not None, "Exact successor hook record is unavailable")
+        return {"surface": surface, "workspace": identity(record["workspaceId"]), "session": session,
+                "harness": args.harness, "label": args.label, "started_at": record["startedAt"],
+                "cutoff": record["startedAt"] if getattr(args, "include_existing", False) else self.clock()}
+
+    def replace_enrollment(self, config, args):
+        from replacement_custody import clear_predecessor
+
+        target = self.native_enrollment_target(args)
+        predecessor_id = identity(args.from_session)
+        require(predecessor_id != target["session"], "Choose a different predecessor session")
+        require(os.environ.get("CMUX_SURFACE_ID") and identity(os.environ["CMUX_SURFACE_ID"]) == target["surface"],
+                "Run replacement from the exact successor CMUX surface")
+        require(os.environ.get("CMUX_WORKSPACE_ID") and identity(os.environ["CMUX_WORKSPACE_ID"]) == target["workspace"],
+                "Run replacement from the exact successor CMUX workspace")
+        launch_kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").casefold()
+        require(launch_kind in (("claude", "claudeteams") if target["harness"] == "claude" else ("codex",)),
+                "Run replacement from the successor harness")
+        session_env = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID"}[target["harness"]]
+        if target["harness"] == "codex":
+            require(os.environ.get(session_env), "Run replacement from the exact Codex session")
+        if os.environ.get(session_env):
+            require(identity(os.environ[session_env]) == target["session"],
+                    "Caller session does not match the proposed successor")
+        require(target["label"].strip(), "Enrollment label is required")
+        self.cmux.binding(target)
+        target["replaced_session"] = predecessor_id
+        receipt = {"replaced": predecessor_id, "enrolled": target, "receipts_preserved": True}
+        current = next((item for item in config["targets"] if item["surface"] == target["surface"]), None)
+        if current and current["session"] == target["session"]:
+            require(current == {**target, "cutoff": current["cutoff"]},
+                    "Successor enrollment does not match this replacement request")
+            return {**receipt, "enrolled": current}
+
+        require(current and current["session"] == predecessor_id,
+                "Expected predecessor is not enrolled on this surface")
+        require(current["workspace"] == target["workspace"] and current["harness"] == target["harness"],
+                "Replacement requires the same workspace and harness")
+        require(target["started_at"] > current["started_at"], "Successor must be a newer session generation")
+        require(config["coordinator"] != predecessor_id, "Coordinator enrollment requires an explicit handoff")
+        require(not any(item["session"] == target["session"] for item in config["targets"]),
+                "Successor is already enrolled on another surface")
+        require(self.cmux.activity(current)["state"] == "ended", "CMUX has not confirmed the predecessor ended")
+        rows = self.cmux.messages(current)
+        sources = [message for message in self.source_messages(current, rows)
+                   if message["created_at"] < target["started_at"]]
+        replies = [message for message in rows if type(message.get("created_at")) in (int, float)
+                   and message["created_at"] < target["started_at"]]
+        acknowledgements = self.reply_acknowledgements(current, sources, replies)
+        for message in sources:
+            if message.get("state") in ("queued", "delivered") and message.get("read_at") is None:
+                require(identity(message["id"]) in acknowledgements,
+                        "Predecessor has unread native CMUX messages; reconcile the inbox before replacing")
+        self.cmux.binding(target)
+        with clear_predecessor(self, current):
+            target["cutoff"] = self.clock()
+            config["targets"][config["targets"].index(current)] = target
+            atomic_json(self.directory / "config.json", self.config(config))
+        return receipt
+
     def attention_result(self, outcome, attempted, detail, event_key):
         return {"outcome": outcome, "attempted": bool(attempted),
                 "detail": str(detail)[:500], "event_key": str(event_key)[:128]}
@@ -1590,6 +1654,12 @@ def parser():
     enroll.add_argument("--label", required=True)
     enroll.add_argument("--include-existing", action="store_true", help="Include this session's existing messages")
     enroll.add_argument("--coordinator", action="store_true", help="Receive escalation prompts")
+    replace = sub.add_parser("replace", help="Replace an ended enrollment from its exact successor on the same surface")
+    replace.add_argument("--from-session", required=True)
+    replace.add_argument("--surface", required=True)
+    replace.add_argument("--session", required=True)
+    replace.add_argument("--harness", choices=("claude", "codex"), required=True)
+    replace.add_argument("--label", required=True)
     opencode_enroll = sub.add_parser("opencode-enroll",
                                      help="Self-enroll one exact OpenCode session from a private binding manifest")
     opencode_enroll.add_argument("--manifest", type=Path, required=True)
@@ -1788,15 +1858,15 @@ def main(argv=None):
         if args.command == "ack":
             return {"acknowledgments": [app.acknowledge(args.session, mid, os.environ.get("CMUX_SURFACE_ID"))
                                          for mid in args.message]}
+        if args.command == "replace":
+            return app.replace_enrollment(config, args)
         if args.command == "enroll":
-            surface, session = identity(args.surface), identity(args.session)
-            store = json.loads((app.cmux.hook_directory / (args.harness + "-hook-sessions.json")).read_text())
-            record = next((v for k, v in store["sessions"].items() if k.upper() == session), {})
-            target = {"surface": surface, "workspace": identity(record["workspaceId"]), "session": session,
-                      "harness": args.harness, "label": args.label, "started_at": record["startedAt"],
-                      "cutoff": record["startedAt"] if args.include_existing else app.clock()}
+            target = app.native_enrollment_target(args)
+            surface, session = target["surface"], target["session"]
             app.cmux.binding(target)
             existing = next((t for t in config["targets"] if t["session"] == session), None)
+            if existing and "replaced_session" in existing:
+                target["replaced_session"] = existing["replaced_session"]
             require(existing is None or existing == {**target, "cutoff": existing["cutoff"]},
                     "Session enrollment differs; unenroll explicitly before changing it")
             require(not any(t["surface"] == surface and t["session"] != session for t in config["targets"]),

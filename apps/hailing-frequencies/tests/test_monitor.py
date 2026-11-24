@@ -987,6 +987,77 @@ class BindingTests(unittest.TestCase):
     def save(self):
         Path(self.temp.name, self.t["harness"] + "-hook-sessions.json").write_text(json.dumps(self.store))
 
+    def prepare_replacement(self, harness="claude"):
+        self.t["harness"] = harness
+        successor = {**self.t, "session": uid(), "started_at": 10}
+        persisted = dict(version=1, targets=[self.t, target("other")], coordinator=None,
+                         remind_after=5, escalate_after=10, cooldown=5, interval=5)
+        directory = Path(self.temp.name)
+        hf.atomic_json(directory / "config.json", persisted)
+        self.store["sessions"] = {successor["session"]: dict(
+            surfaceId=successor["surface"], workspaceId=successor["workspace"],
+            agentLifecycle="running", startedAt=10)}
+        self.store["activeSessionsBySurface"][self.t["surface"]]["sessionId"] = successor["session"]
+        self.save()
+        self.current["items"][0]["agents"] = [
+            dict(session_id=self.t["session"], kind=harness, state="ended"),
+            dict(session_id=successor["session"], kind=harness, state="working")]
+        args = hf.parser().parse_args([
+            "--state-dir", str(directory), "replace", "--from-session", self.t["session"],
+            "--surface", successor["surface"], "--session", successor["session"],
+            "--harness", harness, "--label", successor["label"]])
+        for patcher in (patch.dict("os.environ", {"CMUX_SURFACE_ID": successor["surface"],
+                                                  "CMUX_WORKSPACE_ID": successor["workspace"],
+                                                  "CMUX_AGENT_LAUNCH_KIND": harness,
+                                                  "CLAUDE_CODE_SESSION_ID": successor["session"],
+                                                  "CODEX_THREAD_ID": successor["session"]}),
+                        patch("replacement_custody.Path.home", return_value=directory)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.cmux.messages = lambda target: []
+        return hf.Monitor(directory, self.cmux, clock=lambda: 20), args, persisted
+
+    def test_same_surface_replacement_preserves_history_and_retry_cutoff(self):
+        app, args, original = self.prepare_replacement("codex")
+        with closing(app.database()) as db, db:
+            db.execute("INSERT INTO acknowledgements VALUES (?,?,?,?)", (self.t["session"], uid(), 1, "inbox"))
+        with patch.object(hf, "Cmux", return_value=self.cmux), patch.object(hf, "Monitor", return_value=app):
+            receipt = hf.main(["--state-dir", str(app.directory), "replace", "--from-session", args.from_session,
+                               "--surface", args.surface, "--session", args.session, "--harness", args.harness,
+                               "--label", args.label])
+        self.assertEqual(receipt["replaced"], self.t["session"])
+        self.assertEqual(receipt["enrolled"]["cutoff"], 20)
+        self.assertEqual(app.config()["targets"], [receipt["enrolled"], original["targets"][1]])
+        app.clock = lambda: 30
+        with app.locked():
+            self.assertEqual(app.replace_enrollment(app.config(), args), receipt)
+        with closing(app.database()) as db:
+            self.assertEqual(db.execute("SELECT session FROM acknowledgements").fetchall(), [(self.t["session"],)])
+
+    def test_replacement_refusals_leave_enrollments_unchanged(self):
+        app, args, original = self.prepare_replacement()
+        agents = self.current["items"][0]["agents"]
+        predecessor = agents[0]
+        for state in ("idle", "working", "unknown"):
+            with self.subTest(state=state):
+                predecessor["state"] = state
+                with self.assertRaisesRegex(ValueError, "predecessor ended"):
+                    app.replace_enrollment(app.config(), args)
+        agents.pop(0)
+        with self.assertRaisesRegex(ValueError, "activity is unavailable"):
+            app.replace_enrollment(app.config(), args)
+        predecessor["state"] = "ended"
+        agents.append(predecessor)
+        with patch.dict("os.environ", {"CMUX_SURFACE_ID": uid()}):
+            with self.assertRaisesRegex(ValueError, "exact successor CMUX surface"):
+                app.replace_enrollment(app.config(), args)
+        with self.assertRaisesRegex(ValueError, "Coordinator enrollment"):
+            app.replace_enrollment({**app.config(), "coordinator": self.t["session"]}, args)
+        self.cmux.messages = lambda target: [message(target, at=5)]
+        with self.assertRaisesRegex(ValueError, "unread native CMUX messages"):
+            app.replace_enrollment(app.config(), args)
+        self.assertEqual(app.config(), original)
+
     def test_exact_current_binding_and_single_agent_aware_submit(self):
         self.cmux.submit(self.t, "Monitor\nRead queue")
         pastes = [args for args in self.calls if args[0] == "paste"]
