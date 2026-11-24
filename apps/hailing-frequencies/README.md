@@ -124,8 +124,24 @@ UUIDs above are placeholders for observed identities.
 Enrollment normally covers only messages created after enrollment.
 Use `--include-existing` to include an enrolled session's existing backlog; messages older than that session's recorded start are always excluded.
 Re-enrollment of an unchanged identity preserves its original cutoff and receipts.
-Session replacement never transfers enrollment or pending prompts automatically.
-Unenroll the old session explicitly, inspect the replacement, then enroll it separately.
+
+### Replace your ended session on the same pane
+
+From the current Claude or Codex session on the same CMUX pane, run:
+
+```sh
+hailing-frequencies replace --harness claude --surface YOUR_SURFACE_UUID --session YOUR_SESSION_UUID --from-session ENROLLED_PREDECESSOR_UUID --label YOUR_LABEL
+```
+
+Use the exact session and pane shown by CMUX, and use `--harness codex` for Codex.
+CMUX must explicitly report the enrolled predecessor as ended and confirm the current session as the native owner in the same workspace and harness.
+The command holds on coordinator enrollments, unresolved predecessor inbox messages, active timers, and open or unresolved managed Discord replies.
+It checks Temporal Beacon in the selected Hailing state and Discord Watch in its standard local state directory.
+Deployments using a custom Discord Watch state directory need the explicit operator handoff so that directory can be reconciled.
+The command replaces the registration in one write, starts a fresh message cutoff, and preserves old receipts and history.
+An identical retry returns the original cutoff.
+Check saved enrollment with `hailing-frequencies status`, and run `warp-drive owner-args` from the successor when using Warp.
+If a required check fails, keep the existing registration and follow the [explicit handoff](guide.md#receive-an-authorized-handoff).
 
 To receive escalation prompts, designate one exact enrolled coordinator using `enroll ... --coordinator`.
 Only one coordinator is selected in a state directory.

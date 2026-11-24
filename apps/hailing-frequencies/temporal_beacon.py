@@ -347,6 +347,8 @@ class TemporalBeacon:
                 target["started_at"], worktree, continuation.strip(), schedule, interval, due, deadline,
                 request_id, replacement_key, schedule_spec)
         with self.locked(), contextlib.closing(self.database()) as db:
+            require(target in self.app.config()["targets"],
+                    "Timer owner enrollment changed before creation")
             db.execute("BEGIN IMMEDIATE")
             if request_id:
                 existing = db.execute("SELECT * FROM timers WHERE request_id=?", (request_id,)).fetchone()

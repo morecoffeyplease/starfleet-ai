@@ -47,6 +47,21 @@ If the session is already enrolled unchanged, keep its existing cutoff and recei
 After enrollment, run `hailing-frequencies status` to confirm that the exact session is listed.
 Enrollment confirms saved configuration only; it does not prove a reminder reached or was read by the agent.
 
+### Replace an ended session on your pane
+
+For Claude or Codex on the same CMUX pane and workspace, use the exact enrolled predecessor from `hailing-frequencies status` and the exact current identity from CMUX.
+
+```sh
+hailing-frequencies replace --harness claude --surface YOUR_SURFACE_UUID --session YOUR_SESSION_UUID --from-session ENROLLED_PREDECESSOR_UUID --label YOUR_LABEL
+```
+
+Select your actual harness and run this from the successor.
+CMUX must positively identify the predecessor as ended and the successor as the current owner.
+The replacement starts a fresh cutoff and preserves the predecessor's history.
+Active timers, unresolved native inbox messages, open or unresolved Discord Watch conversations, and coordinator registrations require an explicit handoff.
+Use the explicit handoff for nonstandard Discord Watch state locations.
+Confirm the new registration with `hailing-frequencies status` and check `warp-drive owner-args` from the successor when using Warp.
+
 ### OpenCode self-enrollment
 
 OpenCode uses `hailing-frequencies opencode-enroll` with a private binding manifest supplied by the Model Preferences worker.
@@ -79,7 +94,8 @@ The opt-in never bypasses missing or mismatched identities, dialogs, disabled re
 1. Read the private handoff packet and confirm the exact outgoing session, the threads you are authorized to receive, and any retained obligations.
    From the incoming session, run `hailing-frequencies status` and follow [exact-session enrollment](#enroll-only-your-own-session) if needed.
    Reuse a matching enrollment without changing its cutoff or receipts.
-   If the outgoing binding is still on the same surface and enrollment refuses, keep that binding and use a separate authorized incoming surface.
+   If the outgoing binding is still on the same surface, use the [self-service replacement](#replace-an-ended-session-on-your-pane) only after its custody checks pass.
+   If obligations still need transfer, keep the outgoing binding and use a separate authorized incoming surface.
 2. Run `discord-watch status` to check the recorded owner and pending work for each named thread.
    From the exact enrolled incoming session, transfer each authorized thread and verify the resulting owner.
 

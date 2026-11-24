@@ -13,7 +13,7 @@ from hailing_frequencies import atomic_json, require
 MARKER = "# starfleet-hailing-frequencies:v1"
 BEACON_MARKER = "# starfleet-temporal-beacon:v1"
 AGENT_NOTIFY_MARKER = "# starfleet-agent-notify:v1"
-SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py", "guide.md",
+SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py", "replacement_custody.py", "guide.md",
                 "agent-notify", "agent-notify-guide.md", "discord_cleanup.py",
                 "discord-cleanup.md", "opencode_adapter.py")
 SKILL_NAME = "skills/temporal-beacon/SKILL.md"

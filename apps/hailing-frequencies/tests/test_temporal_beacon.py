@@ -122,6 +122,23 @@ class TemporalBeaconTests(unittest.TestCase):
         self.beacon.tick()
         self.assertEqual(len(self.host.sent), 1)
 
+    def test_timer_creation_holds_if_enrollment_changes_before_lock(self):
+        lock = self.beacon.locked
+
+        @contextlib.contextmanager
+        def changed_enrollment():
+            config = self.app.config()
+            config["targets"] = []
+            hf.atomic_json(self.root / "config.json", config)
+            with lock():
+                yield
+
+        with patch.object(self.beacon, "locked", changed_enrollment):
+            with self.assertRaisesRegex(ValueError, "owner enrollment changed"):
+                self.set_timer(after="1m")
+        with contextlib.closing(self.beacon.database()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM timers").fetchone()[0], 0)
+
     def test_activity_reader_matches_exact_session_and_rejects_incomplete_snapshot(self):
         current = {"truncated": False, "owner_availability": {"agent_sessions": "available"}, "items": [
             {"placement": {"kind": "local"}, "projections": [{"panel_id": self.target["surface"],
