@@ -30,6 +30,12 @@ Receipt completes it; the reminder's own response must not automatically create 
 Unknown activity and human-input holds prevent submission; a timer cannot guarantee when Claude will compact.
 There is no condition-evaluating `--when`; check the condition when woken and cancel when satisfied.
 
+For Claude Code weekly allowance, opt in from the exact enrolled recipient with `temporal-beacon quota-watch --message 'Review the new Claude weekly quota reading.'`.
+Add `--at-or-below 3` for one wake per weekly reset at 3% remaining or less.
+Use `temporal-beacon quota-status` to check the local reading and alert state, and `temporal-beacon quota-stop` to end the watch.
+The existing Hailing worker checks the status-line cache on its scan interval and treats missing or stale observations as unavailable.
+Confirm a real quota wake and receipt before retiring an existing quota reminder.
+
 On wake, follow the supplied `receive` command to retrieve the current continuation and record receipt.
 Receipt means the continuation was output, not that its task completed.
 Act only on the current timer generation and within existing task authority.
