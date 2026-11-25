@@ -452,10 +452,14 @@ cmd_reply() {
     fi
   fi
   [ -n "$agent" ] || agent="$(agent_name)"
-  user="$(cached .user)"
-  [ "$ping" = 1 ] && body="<@$user> $body"
+  user=""
+  if [ "$ping" = 1 ]; then
+    user="$(cached .user)"
+    body="<@$user> $body"
+  fi
   payload="$(jq -n --arg content "$body" --arg agent "$agent" --arg user "$user" \
-    '{content: $content, username: $agent, allowed_mentions: {users: [$user]}}')"
+    '{content: $content, username: $agent,
+      allowed_mentions: (if $user == "" then {parse: []} else {users: [$user]} end)}')"
   http POST "$DISCORD_WEBHOOK_URL?wait=true&thread_id=$id" "$payload" >/dev/null
 }
 

@@ -335,4 +335,18 @@ assert_eq "$unscoped_opencode_id" 900000000000000011
 assert_contains "$(cat "$TMP/opencode-unscoped.err")" 'OpenCode managed-thread registration requires an exact ses_ identity and CMUX workspace/surface scope'
 if grep -Eq "^register $unscoped_opencode_id([[:space:]]|$)" "$MANAGED_LOG"; then fail 'unscoped OpenCode owner attempted managed registration'; fi
 
+# A plain reply can quote raw mention syntax without notifying the user.
+"$TOOL" reply "$away_id" --body 'Quoted reference: <@600000000000000001>'
+if ! tail -1 "$THREAD_LOG" | jq -e '
+  .content == "Quoted reference: <@600000000000000001>" and
+  .allowed_mentions == {parse: []}' >/dev/null; then
+  fail 'plain replies must suppress quoted mentions'
+fi
+"$TOOL" reply "$away_id" --ping --body 'Please confirm.'
+if ! tail -1 "$THREAD_LOG" | jq -e '
+  .content == "<@600000000000000001> Please confirm." and
+  .allowed_mentions == {users: ["600000000000000001"]}' >/dev/null; then
+  fail 'pinged replies must allow only the configured user'
+fi
+
 printf '%s\n' 'agent-notify routing tests passed'
