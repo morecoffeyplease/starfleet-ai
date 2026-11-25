@@ -253,24 +253,14 @@ An armed timer is configuration evidence, not proof that its wake was received.
 
 ## Inspect session effort
 
-Run `pattern-buffer session-effort --harness claude --session SESSION_UUID` or use `codex` for a Codex session.
-The command prints one JSON observation with the model, reasoning effort, evidence source, observation timestamp, age and state.
-Reasoning effort is also called thought size or thought budget size.
-The command does not report thinking tokens or remaining context.
-Claude reports only `model.id` and `effort.level` values observed in the exact session's statusline payload.
-Claude capture uses Pattern Buffer's installed checkpoint-enabled status line independently of checkpoint enrollment.
-Claude stores those allowlisted values in private local state, one file per exact session, and does not retain the raw payload.
-Codex reports the latest timestamped `turn_context.payload.model` and `turn_context.payload.effort` after `session_meta.payload.id` matches the requested UUID.
-It validates the file header and reads at most the most recent 8 MiB rather than rejecting a long transcript.
-A Codex transcript window containing records for more than one session identity reports unknown.
-Claude reports the session-selected level; Codex reports the observed turn, including any recorded turn-specific override.
-An unfinished, unsupported or absent recent record stays unknown, and an old observation does not guarantee the next turn uses that effort.
-Pass `--transcript PATH` to read one Codex transcript, or let the command search the exact UUID filename under `CODEX_HOME/sessions`.
-An unknown result means the command found no supported effort evidence for that session.
-The command does not infer effort from saved settings or model self-report.
-An unknown result does not add a handoff gate.
-Follow Replicator's existing model and effort evidence rule, including its human confirmation, exact runtime report, or saved settings with launch arguments that show no override.
-An unavailable live effort reading alone does not block launch or transfer.
+Run `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` with `claude` or `codex`.
+The JSON reports model, reasoning effort (thought size or thought budget size), evidence source, timestamp, age and state.
+Claude captures allowlisted model and effort fields from its installed checkpoint-enabled status line without requiring checkpoint enrollment.
+Codex validates the exact native session and observes its latest recorded turn, including any recorded override, in a bounded 8 MiB window.
+Use `--transcript PATH` for an explicit Codex transcript or allow exact UUID discovery under `CODEX_HOME/sessions`.
+Incomplete, unsupported or ambiguous native evidence returns unknown.
+The observation provides no estimate of thinking tokens or remaining context and no guarantee about the next turn.
+If the reading is unavailable, follow [Replicator's other evidence options](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/replicator/guide.md#verify-model-and-reasoning-effort).
 
 ## Shared recovery reminder
 
