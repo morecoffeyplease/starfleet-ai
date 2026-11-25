@@ -17,6 +17,14 @@ Use `python3 apps/hailing-frequencies/install.py --skip-agent-notify` from a Sta
 Use `agent-notify guide --print` for private Discord setup, credentials, forum permissions, and a bounded reply-receipt check.
 Agent Notify uses the existing Discord Watch installation and worker when present; it does not start another worker.
 
+## Recover after a hook generation change
+
+When the same native session and pane have a new hook start, preserve the existing enrollment and any outstanding receipts.
+If an operator approves adoption of specific retained Discord Watch threads or Temporal Beacon timers, follow `discord-watch guide --print` under **Explicit current-generation custody adoption**.
+Use its exact preview, prepare, accept and apply commands from the owning session.
+The plan preserves the original Hailing cutoff and receipt history and identifies the selected obligations.
+Wait for the completed adoption receipt, then verify actual delivery by receiving an exact message or timer from that session.
+
 ## Idle continuation timers
 
 Temporal Beacon shares this existing worker and exact-session enrollment.

@@ -140,6 +140,7 @@ Follow Replicator's existing model and effort evidence rule, and continue when a
 Dispatch enrolls an implementer worktree, binds a task brief to the owner and launches the selected Claude or Codex CLI.
 The CLI does not infer a broader sandbox, role, model or repository permission from the task file.
 The task owner can update or finish a task explicitly, and recovery never replays a changed or finished task implicitly.
+Use the orchestrator template’s [PR overlap check](guide.md#check-for-overlapping-prs) at work and fix-round boundaries to spot merges into the candidate base and newly opened drafts.
 `dispatch --prepare-only`, normal `dispatch`, and OpenCode `prepare-dispatch` also report known upstream path overlaps with the task checkout.
 The advisory reads refs already in that checkout, stores warning deduplication in its private Git metadata, stays quiet when paths do not overlap, and does not block preparation when Git metadata is unavailable.
 The [implementer dispatch guide](docs/implementer-dispatch.md) documents the supported launch, update, recovery and ownership boundaries.

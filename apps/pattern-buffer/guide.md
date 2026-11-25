@@ -208,6 +208,24 @@ The owner runs the override from an interactive terminal outside every harness s
 The override belongs only to that session's current generation and ends when it expires or the generation changes.
 An override does not repair a changed manifest or missing required file.
 
+### Check for overlapping PRs
+
+Before starting or resuming a work slice or dispatching a fix round, check for merges into the candidate's base and new open drafts in its repository.
+From the repository checkout, set `base` to the candidate's actual base branch and `since` to the date of your previous check.
+
+```sh
+base=main
+since=2026-01-15
+gh pr list --state merged --base "$base" --search "merged:>=$since" --limit 100
+gh pr list --state open --draft --search "created:>=$since" --limit 100
+```
+
+On the first check, use a recent date that covers the work since the slice was last scoped.
+If either list reaches the limit, narrow the date range or raise the limit.
+Inspect relevant PRs for dependency or file overlap and coordinate with their owners when the overlap changes your next step.
+Reuse a current check for an unchanged rerun.
+The results inform your work plan and leave rebase, proof and approval decisions to their existing owners and requirements.
+
 ### Compose rules and mission
 
 Use `compose` to combine reviewed project rules with a per-worktree mission.
