@@ -198,6 +198,14 @@ Notification presentation depends on macOS notification settings; a requested no
 A failed latest scan is unhealthy immediately.
 Partial scans record a fresh heartbeat and list targets with incomplete inbox coverage.
 Health remains unhealthy until every enrolled inbox can be listed successfully.
+Run `starfleet doctor --json` from an enrolled session to see worker freshness and that session's intended delivery separately.
+A fresh partial scan can still support intended delivery for an exact covered session.
+Doctor checks the session, harness, surface, workspace, generation, send scope, and latest complete inbox result without sending anything.
+A known hold, an incomplete inbox for that session, or missing exact scan evidence blocks intended delivery.
+After updating the worker, allow it to complete a fresh scan before relying on the new exact-session evidence.
+Use `hailing-frequencies health` for the fleet-wide warning and `hailing-frequencies status` for the failed target rows.
+An actual scan failure, including inbox saturation, still blocks worker readiness.
+Intended delivery is setup evidence; use the actual message or timer receipt to confirm delivery.
 The scan report's `inbox_status` describes inbox coverage, not prompt delivery or recipient acknowledgment.
 Notifications repeat at most hourly per unhealthy episode; recovery permits the next failure to notify again.
 The watcher cannot access CMUX, send prompts, restart a closed terminal, or establish coverage after reboot.

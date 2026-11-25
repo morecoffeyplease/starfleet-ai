@@ -3393,7 +3393,8 @@ def test_helper_diagnostics_cli(temp):
           uncertain_status["evidence"]["lease_active"] is False and
           uncertain_status["evidence"]["outcome"] == "unknown" and
           uncertain_status["recovery_command"] is None and
-          "reconcile only after confirming" in uncertain_status["next_action"],
+          "--outcome unknown --stopped-generation" in uncertain_status["next_action"] and
+          "An inactive lease alone cannot establish a stop" in uncertain_inspect["next_action"],
           "stale post-launch helper was not kept uncertain with no replay command")
     with contextlib.closing(warp_drive.connect(state)) as db:
         with warp_drive.immediate_transaction(db):
@@ -3563,6 +3564,11 @@ def test_stopped_unknown_release(temp):
         check(command[3] == owner["surface"] and "exit result is unknown" in command[4],
               "stopped-workload wake did not preserve the exact owner and the unknown result")
         inspected = parse_json(run_cli(state, "inspect", request))
+        diagnostic = inspected["reservation"]["helper_diagnostic"]
+        check(diagnostic["classification"] == "finished" and
+              "preserve the unknown exit result" in diagnostic["next_action"] and
+              "accepted enrolled successor" in diagnostic["next_action"],
+              "finished unknown claim omitted retirement guidance")
         releases = [event for event in inspected["events"] if event["kind"] == "stopped_workload_released"]
         check(len(releases) == 1 and releases[0]["data"]["actor"] == operator
               and sum(event["kind"] == "launch_intent" for event in inspected["events"]) == 1,

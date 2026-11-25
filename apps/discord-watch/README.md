@@ -113,6 +113,24 @@ Unsealed messages can be assigned to the new generation, and a group never combi
 An unexplained generation change without the matching ownership-event chain holds its groups.
 An uncertain send stays uncertain across transfer.
 
+### Recover a moved native session
+
+If CMUX moved your Claude or Codex session to a different pane, first verify that Hailing Frequencies lists your exact new pane and workspace with the same session and hook start.
+From that session, run:
+
+```sh
+discord-watch recover THREAD_ID
+discord-watch managed THREAD_ID
+```
+
+`recover` verifies the explicit native session ID and its current CMUX projection, hook record, generation, and receiving settings.
+A workspace ID inherited from the old pane does not override that live evidence.
+The command preserves the thread's cursor, open or closed state, queued replies, group receipts, and earlier submissions.
+Running it again on the already current binding makes no changes.
+A changed native generation or different session needs separate ownership reconciliation.
+If recovery reports a per-thread REST catch-up hold, run `discord-watch scan --only-thread THREAD_ID` to reconcile that thread without submitting a wake.
+Confirm delivery by receiving an actual reply.
+
 ## Commands
 
 Global path options go before the command:
@@ -121,7 +139,7 @@ Global path options go before the command:
 discord-watch --state-dir PATH --notify-home PATH --hailing-state PATH --cmux PATH status
 ```
 
-The main commands are `register`, `managed`, `receive`, `close`, `transfer`, `status`, `doctor`, `scan`, `serve`, and `supervise`.
+The main commands are `register`, `managed`, `receive`, `close`, `transfer`, `recover`, `status`, `doctor`, `scan`, `serve`, and `supervise`.
 `scan` is observe-only unless `--send` is supplied.
 `serve` runs one Gateway, REST, and sender topology, while `supervise` owns a separate supervisor lock and restarts a crashed worker with bounded backoff.
 Both accept `--send` and `--only-thread THREAD`.
