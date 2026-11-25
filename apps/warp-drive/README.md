@@ -155,6 +155,10 @@ The turn context shows current round, each ready worktree's manual order and ser
 The snapshot is not a FIFO rank, reservation promise or ETA, and a later sample or scheduler pass may change it.
 Status and doctor list completed request IDs whose owners lack an exact Hailing route and show the supported enrollment or owner-authorized transfer action.
 Pending completion events remain durable for the existing sending scheduler to retry after route recovery.
+For an outgoing session with an uncertain launch, [verify the exact workload stopped and reconcile the reservation](guide.md#completion-and-exceptional-outcomes) before treating the capacity claim as settled.
+An inactive lease alone does not establish that the workload stopped.
+A verified stop can finish the reservation while preserving its unknown exit result.
+Use explicit transfer to route a pending completion for that same reservation to the accepted enrolled successor before retiring the outgoing session.
 
 For exceptional incidents, the same `scheduler --send` process may queue one native CMUX inbox message to the exact enrolled `warp-drive-engineer` Hailing target.
 Each scheduler pass attempts at most one completion and one engineer incident message, so recovered backlogs drain at the sampling cadence.
