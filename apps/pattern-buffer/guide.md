@@ -272,14 +272,11 @@ An armed timer is configuration evidence, not proof that its wake was received.
 ## Inspect session effort
 
 Run `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` with `claude` or `codex`.
-The JSON reports model, reasoning effort (thought size or thought budget size), evidence source, timestamp, age and state.
-Claude captures allowlisted model and effort fields from its installed checkpoint-enabled status line without requiring checkpoint enrollment.
-Codex validates the exact native session and observes its latest recorded turn, including any recorded override, in a bounded 8 MiB window.
-Use `--transcript PATH` for an explicit Codex transcript or allow exact UUID discovery under `CODEX_HOME/sessions`.
-Incomplete, unsupported or ambiguous native evidence returns unknown.
-Forked Codex rollouts report unknown because the bounded reading cannot distinguish all inherited turns.
-The observation provides no estimate of thinking tokens or remaining context and no guarantee about the next turn.
-If the reading is unavailable, follow [Replicator's other evidence options](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/replicator/guide.md#verify-model-and-reasoning-effort).
+The JSON gives model, reasoning effort (thought size or thought budget size), source, timestamp, age and state.
+Claude uses the installed checkpoint-enabled status line without requiring enrollment.
+Codex reads the exact session's latest recorded turn within an 8 MiB window.
+Missing, ambiguous or inherited effort evidence reports unknown.
+See the [README](https://github.com/morecoffeyplease/starfleet-ai/tree/main/apps/pattern-buffer#inspect-session-effort) for evidence limits and Replicator's fallback when a live reading is unavailable.
 
 ## Shared recovery reminder
 
