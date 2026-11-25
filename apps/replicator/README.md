@@ -50,6 +50,20 @@ The current CMUX snapshot provides caller identity and state.
 Preflight reports model, effort, and effective permissions as `unknown`.
 Use the handoff guide to verify the actual launch and native settings.
 
+## Review an outgoing handoff
+
+Add `--handoff-file /path/to/handoff-evidence.json` to preflight to report checkout acceptance and session retirement separately.
+Use the [handoff evidence example](guide.md#review-checkout-acceptance-and-outgoing-retirement) to supply the exact checkout, acceptance receipt, and remaining resource dependencies.
+The report lists each resource's affected actions and prints supported inspection commands where it can scope them to an exact ID.
+An unknown Warp exit can appear as historical when the owner records evidence that neither action depends on it.
+A live job can hold retirement while the checkout remains accepted.
+
+The input file contains owner-supplied assertions and evidence references.
+Copy references from verified records and keep them private.
+Replicator reads the explicit file alongside its existing live CMUX and Git checks.
+It does not fetch the referenced records, run component commands, or establish receipt, custody, or a safe exit.
+The optional advisory report does not change the existing preflight exit codes.
+
 ## Install the local launcher
 
 Run the source installer only when you want the `replicator` command in your local command directory:

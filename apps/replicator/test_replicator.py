@@ -314,6 +314,69 @@ class ReplicatorCliTests(unittest.TestCase):
         self.assertNotIn("EPERM sandbox refusal", result.stdout.decode())
         self.assertNotIn("EPERM sandbox refusal", result.stderr.decode())
 
+    def test_installed_handoff_report_keeps_retirement_separate(self):
+        repo = self.init_repo(self.root / "target-worktree")
+        installation, environment = self.install_test_environment(self.cmux_fixture(repo), repo)
+        handoff_file = self.root / "evidence.json"
+        old_request = {
+            "tool": "warp-drive", "id": "11111111-2222-4333-8444-555555555555",
+            "state": "unknown", "affects": [],
+            "evidence": "Verified stop and no remaining dependent work or delivery",
+        }
+        reply = {
+            "tool": "discord-watch", "id": "1234567890123456789",
+            "state": "pending", "affects": ["outgoing_retirement"],
+            "evidence": "Exact thread reports a pending reply",
+        }
+        record = {
+            "checkout": {"worktree": str(repo), "head": "a" * 40, "acceptance": "accepted",
+                         "evidence": "Exact incoming acceptance receipt"},
+            "resources_complete": True,
+            "resources": [old_request, reply],
+        }
+
+        def run_report(*args):
+            return subprocess.run(
+                [installation["command"], "preflight", "--handoff-file", str(handoff_file), *args],
+                cwd=repo, env=environment, capture_output=True, check=False,
+            )
+
+        handoff_file.write_text(json.dumps(record), encoding="utf-8")
+        before = self.tree_snapshot()
+        result = run_report("--json")
+        payload = json.loads(result.stdout)
+        report = payload["handoff"]
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(payload["operational_readiness"], "unknown")
+        self.assertEqual(payload["custody_acceptance"], "not_assessed")
+        self.assertEqual(report["source"], "explicit_owner_record")
+        self.assertEqual(report["checkout_acceptance"]["status"], "recorded_accepted")
+        self.assertEqual(report["outgoing_retirement"]["status"], "blocked")
+        self.assertTrue(report["resources"][0]["historical_unknown"])
+        self.assertEqual(report["resources"][1]["inspect_command"], "discord-watch managed " + reply["id"])
+        self.assertIn(b"Outgoing retirement: blocked", run_report().stdout)
+        self.assertEqual(before, self.tree_snapshot())
+
+        record["resources"] = [old_request]
+        handoff_file.write_text(json.dumps(record), encoding="utf-8")
+        report = json.loads(run_report("--json").stdout)["handoff"]
+        self.assertEqual(report["checkout_acceptance"]["status"], "recorded_accepted")
+        self.assertEqual(report["outgoing_retirement"]["status"], "review")
+
+        old_request["affects"] = ["outgoing_retirement"]
+        del old_request["evidence"]
+        handoff_file.write_text(json.dumps(record), encoding="utf-8")
+        report = json.loads(run_report("--json").stdout)["handoff"]
+        self.assertEqual(report["checkout_acceptance"]["status"], "recorded_accepted")
+        self.assertEqual(report["outgoing_retirement"]["status"], "unknown")
+        self.assertFalse(report["resources"][0]["historical_unknown"])
+
+        old_request["affects"] = []
+        handoff_file.write_text(json.dumps(record), encoding="utf-8")
+        result = run_report("--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"Handoff evidence references must be nonempty", result.stderr)
+
     def test_preflight_marks_missing_context_unknown(self):
         repo = self.init_repo(self.root / "missing-context-worktree")
         installation, environment = self.install_test_environment(self.cmux_fixture(repo), repo)
