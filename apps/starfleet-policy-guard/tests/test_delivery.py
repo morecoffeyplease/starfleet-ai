@@ -70,11 +70,27 @@ class DeliveryTest(unittest.TestCase):
 
     def guidance_attestation(self, stage='opening'):
         accepted = ({'accepted_batch_ref': 'https://github.com/example/repo/issues/37#accepted-batch-2',
-                     'repair_history_ref': 'https://github.com/example/repo/pull/1#issuecomment-9'}
+                     'repair_history_ref': 'https://github.com/example/repo/pull/1#repair-history'}
                     if stage == 'repair_batch' else {})
+        assessment = ({'repair_assessment': {
+            'findings': [{
+                'finding_ref': 'https://github.com/example/repo/issues/37#finding-1',
+                'prior_attempts': [],
+                'premise': 'The current finding blocks the approved outcome.',
+                'deciding_observation': 'The supported path reproduces the reported failure.',
+                'deciding_evidence_ref': 'https://github.com/example/repo/pull/1#issuecomment-8',
+                'disposition': 'fix here',
+                'applicable_rules': [{
+                    'reference': 'https://github.com/example/repo/blob/abc/guide.md#review-and-fix-cycles',
+                    'why_applicable': 'The finding is a material regression in this repair batch.',
+                }],
+            }],
+            'approval_required': False,
+            'approval_evidence_ref': None,
+        }} if stage == 'repair_batch' else {})
         return {
             'version': 1, 'stage': stage, 'issue_ref': 'https://github.com/example/repo/issues/37',
-            **accepted, 'prerequisites_complete': True, 'gaps': [],
+            **accepted, **assessment, 'prerequisites_complete': True, 'gaps': [],
             'reread': [{'kind': 'playbook', 'name': 'Feature playbook',
                         'source_ref': 'https://github.com/example/repo/blob/abc/playbook.md',
                         **self.artifact('guidance.md', 'Current reviewed guidance')}],
@@ -310,7 +326,126 @@ class DeliveryTest(unittest.TestCase):
         self.assertTrue(rendered['body'].startswith('# Accepted repair-batch attestation\n\n' +
                                                      delivery.GUIDANCE_ATTESTATION_STATEMENT))
         self.assertIn('Accepted batch: https://github.com/example/repo/issues/37#accepted-batch-2', rendered['body'])
+        self.assertIn('## Repair assessment', rendered['body'])
+        self.assertLess(rendered['body'].index('## Prerequisites completed before work'),
+                        rendered['body'].index('## Repair assessment'))
+        self.assertLess(rendered['body'].index('## Repair assessment'),
+                        rendered['body'].index('## Approach'))
+        self.assertIn('Prior attempts: None declared for this first attempt', rendered['body'])
+        self.assertIn('Required approval evidence: None required for this assessed batch.', rendered['body'])
         self.assertNotIn('repair verification passed', rendered['body'].casefold())
+
+    def test_repair_assessment_repeated_attempts_multi_finding_and_approval_render_once(self):
+        attestation = self.guidance_attestation('repair_batch')
+        attestation['repair_assessment'] = {
+            'findings': [
+                {
+                    'finding_ref': 'https://github.com/example/repo/issues/37#finding-1',
+                    'prior_attempts': [
+                        {'attempt_ref': 'https://github.com/example/repo/pull/1#issuecomment-3',
+                         'outcome': 'The same finding remained after the first attempt.'},
+                        {'attempt_ref': 'https://github.com/example/repo/pull/1#issuecomment-5',
+                         'outcome': 'The second attempt left the deciding failure in place.'},
+                    ],
+                    'premise': 'The failure comes from the existing branch binding.',
+                    'deciding_observation': 'The end-to-end path fails when the branch binding is stale.',
+                    'deciding_evidence_ref': 'https://github.com/example/repo/pull/1#issuecomment-9',
+                    'disposition': 'simplify',
+                    'applicable_rules': [{
+                        'reference': 'https://github.com/example/repo/blob/abc/guide.md#review-and-fix-cycles',
+                        'why_applicable': 'Two attempts on this same finding make premise review required.',
+                    }],
+                },
+                {
+                    'finding_ref': 'https://github.com/example/repo/issues/37#finding-2',
+                    'prior_attempts': [],
+                    'premise': 'The separate edge case does not block the approved outcome.',
+                    'deciding_observation': 'The common path succeeds and the edge case is not reproduced.',
+                    'deciding_evidence_ref': 'https://github.com/example/repo/pull/1#issuecomment-10',
+                    'disposition': 'defer',
+                    'applicable_rules': [{
+                        'reference': 'https://github.com/example/repo/blob/abc/guide.md#triage-findings',
+                        'why_applicable': 'The issue is nonblocking and unrelated to the accepted repair.',
+                    }],
+                },
+            ],
+            'approval_required': True,
+            'approval_evidence_ref': 'https://github.com/example/repo/issues/37#approval-2',
+        }
+        packet = {'guidance_attestation': attestation}
+        rendered = delivery.render_guidance_attestation(packet, self.root, self.url, 'repair_batch')
+        for value in (
+            'The same finding remained after the first attempt.',
+            'The second attempt left the deciding failure in place.',
+            'The failure comes from the existing branch binding.',
+            'The end-to-end path fails when the branch binding is stale.',
+            'https://github.com/example/repo/pull/1#issuecomment-9',
+            'Two attempts on this same finding make premise review required.',
+            'https://github.com/example/repo/issues/37#approval-2',
+        ):
+            self.assertEqual(rendered['body'].count(value), 1, value)
+        self.assertIn('Disposition: simplify', rendered['body'])
+        self.assertIn('Disposition: defer', rendered['body'])
+        self.assertIn('Required approval evidence: https://github.com/example/repo/issues/37#approval-2',
+                      rendered['body'])
+
+        split_out = json.loads(json.dumps(attestation))
+        split_out['repair_assessment']['findings'][0]['disposition'] = 'split out'
+        split_rendered = delivery.render_guidance_attestation(
+            {'guidance_attestation': split_out}, self.root, self.url, 'repair_batch')
+        self.assertIn('Disposition: split out', split_rendered['body'])
+
+        revert = json.loads(json.dumps(attestation))
+        revert['repair_assessment']['findings'][0]['disposition'] = 'revert'
+        revert_rendered = delivery.render_guidance_attestation(
+            {'guidance_attestation': revert}, self.root, self.url, 'repair_batch')
+        self.assertIn('Disposition: revert', revert_rendered['body'])
+
+    def test_repair_assessment_rejects_missing_malformed_stop_and_unresolved_approval(self):
+        base = self.guidance_attestation('repair_batch')
+        cases = (
+            ('missing', lambda value: value.pop('repair_assessment'), 'needs guidance_attestation.repair_assessment'),
+            ('missing attempts', lambda value: value['repair_assessment']['findings'][0].pop('prior_attempts'),
+             'prior_attempts must be an explicit list'),
+            ('missing outcome', lambda value: value['repair_assessment']['findings'][0].__setitem__(
+                'prior_attempts', [{'attempt_ref': 'https://example.invalid/attempt/1', 'outcome': ' '}]),
+             r'prior_attempts\[0\]\.outcome must be a nonempty string'),
+            ('missing premise', lambda value: value['repair_assessment']['findings'][0].pop('premise'),
+             r'findings\[0\]\.premise must be a nonempty string'),
+            ('missing observation', lambda value: value['repair_assessment']['findings'][0].pop(
+                'deciding_observation'), r'findings\[0\]\.deciding_observation must be a nonempty string'),
+            ('missing deciding evidence', lambda value: value['repair_assessment']['findings'][0].pop(
+                'deciding_evidence_ref'), r'findings\[0\]\.deciding_evidence_ref must be a nonempty string'),
+            ('missing disposition', lambda value: value['repair_assessment']['findings'][0].__setitem__(
+                'disposition', 'unknown'), 'disposition must be one of'),
+            ('missing rule', lambda value: value['repair_assessment']['findings'][0].__setitem__(
+                'applicable_rules', []), 'applicable_rules must list'),
+            ('stop', lambda value: value['repair_assessment']['findings'][0].__setitem__(
+                'disposition', 'stop'), 'includes a stop disposition'),
+            ('no work', lambda value: value['repair_assessment']['findings'][0].__setitem__(
+                'disposition', 'dismiss'), 'has no accepted repair action'),
+            ('missing approval', lambda value: value['repair_assessment'].__setitem__(
+                'approval_required', True), 'approval_evidence_ref is missing'),
+            ('split without approval', lambda value: value['repair_assessment']['findings'][0].__setitem__(
+                'disposition', 'split out'), 'split out disposition requires its existing human approval'),
+            ('approval ref without requirement', lambda value: value['repair_assessment'].__setitem__(
+                'approval_evidence_ref', 'https://example.invalid/approval/1'),
+             'must be null when approval_required is false'),
+        )
+        for name, mutate, message in cases:
+            attestation = json.loads(json.dumps(base))
+            mutate(attestation)
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                delivery.guidance_attestation({'guidance_attestation': attestation}, self.root, self.url)
+
+    def test_repair_assessment_requires_no_unresolved_facts_and_is_repair_stage_only(self):
+        attestation = self.guidance_attestation('repair_batch')
+        attestation['gaps'] = ['Required attempt outcome remains unknown']
+        with self.assertRaisesRegex(ValueError, 'unresolved prerequisite gaps'):
+            delivery.guidance_attestation({'guidance_attestation': attestation}, self.root, self.url)
+
+        opening = self.guidance_attestation('opening')
+        delivery.guidance_attestation({'guidance_attestation': opening}, self.root, self.url, 'opening')
 
     def test_assumptions_must_be_explicitly_empty_and_render_as_none(self):
         self.data['guidance_attestation'] = self.guidance_attestation()

@@ -1,8 +1,10 @@
 # Replicator
 
 Replicator packages a maintained guide and read-only preflight for an explicitly requested manual handoff between orchestrator sessions.
-The guide describes the handoff procedure, and preflight reports only the caller, worktree, and explicit input checks it can observe.
-Replicator does not start agents, workers, timers, or an automatic handoff trigger.
+The [handoff guide](guide.md) has a copyable start-handoff alert, one checkpoint template, and a short checklist for each owner.
+The person or agent initiating the authorized handoff sends the alert to the exact outgoing owner through native CMUX agent messaging.
+Both owners can use `starfleet doctor --json` for the aggregate inventory and the guide's component references for exact owner checks.
+Replicator does not send alerts, start agents or workers, schedule timers, or trigger handoffs.
 
 ## Print the guide
 
@@ -44,14 +46,25 @@ It reads the supplied context and guidance files without printing their paths or
 It does not query tool doctors, prove native delivery, accept custody, or complete predecessor cleanup.
 An unknown status means the required evidence is missing or ambiguous.
 Keep the predecessor while a required handoff check remains blocked or unknown.
-The current CMUX snapshot provides caller identity and state, but no model, effort, or effective permission fields.
-Preflight reports those settings as `unknown` because the snapshot does not expose them.
-Use the [guide's model and effort evidence](guide.md#start-a-successor-with-the-authorized-command) outside preflight.
-A supported read-only `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` command reports native model and reasoning effort when the exact session exposes it.
-Its unknown result does not add a handoff gate or replace the existing evidence choices.
-See [Pattern Buffer's session effort guide](../pattern-buffer/guide.md#inspect-session-effort) for output fields and evidence limits.
-A missing live effort reading alone does not block handoff.
-Native identity, permission, trust, and custody requirements remain unchanged.
+The current CMUX snapshot provides caller identity and state.
+Preflight reports model, effort, and effective permissions as `unknown`.
+Use the [handoff guide](guide.md#verify-model-and-reasoning-effort) to verify the actual launch and native settings.
+Run the read-only `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` when the exact native session exposes a model and reasoning effort observation.
+If the result is unknown, use the other evidence choices in the handoff guide.
+
+## Review an outgoing handoff
+
+Add `--handoff-file /path/to/handoff-evidence.json` to preflight to report checkout acceptance and session retirement separately.
+Use the [handoff evidence example](guide.md#review-checkout-acceptance-and-outgoing-retirement) to supply the exact checkout, acceptance receipt, and remaining resource dependencies.
+The report lists each resource's affected actions and prints supported inspection commands where it can scope them to an exact ID.
+An unknown Warp exit can appear as historical when the owner records evidence that neither action depends on it.
+A live job can hold retirement while the checkout remains accepted.
+
+The input file contains owner-supplied assertions and evidence references.
+Copy references from verified records and keep them private.
+Replicator reads the explicit file alongside its existing live CMUX and Git checks.
+It does not fetch the referenced records, run component commands, or establish receipt, custody, or a safe exit.
+The optional advisory report does not change the existing preflight exit codes.
 
 ## Install the local launcher
 
@@ -67,15 +80,6 @@ The installer copies the CLI and guide into a content-addressed runtime and upda
 It refuses a symlink or unowned launcher and preserves immutable runtime files.
 It does not install a package globally, start a service, enroll a session, or alter CMUX configuration.
 Run `python3 apps/replicator/install.py --help` for the supported local path options.
-
-## Scope
-
-Read the [manual handoff guide](guide.md) before using its checklist.
-The guide keeps tool-specific custody checks in existing CMUX, Pattern Buffer, Hailing Frequencies, Temporal Beacon, Warp-drive, Discord Watch, Agent Notify, and Policy Guard controls.
-Preflight does not aggregate those tool checks or register tools.
-It does not qualify a Claude or Codex native pilot or prove that a successor received a handoff.
-Each same-harness route needs its own native evidence.
-An automatic activity-budget trigger remains a later increment that must use the same procedure.
 
 ## Verify
 

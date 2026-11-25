@@ -76,7 +76,12 @@ class PreferencesTest(unittest.TestCase):
         return p
 
     def plan(self, repo, **changes):
-        return self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(self.facts(**changes)))
+        return self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(self.facts(**changes)),
+                         "--purpose", "later")
+
+    def initial_plan(self, repo, **changes):
+        return self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(self.facts(**changes)),
+                         "--purpose", "initial")
 
     def fake_native_provider(self, harness):
         provider_bin = self.root / "fake-native-bin"
@@ -118,10 +123,11 @@ class PreferencesTest(unittest.TestCase):
             args.extend(("--previous-cycle", previous))
         return self.call(*args)
 
-    def dispatch_light_review(self, repo, target, cycle, plan, slot, exit_code=0, retry=False, brief_text=None):
+    def dispatch_light_review(self, repo, target, cycle, plan, slot, exit_code=0, retry=False, brief_text=None,
+                              role="standard_review"):
         brief = self.root / f"light-review-{slot}.txt"
         brief.write_text(brief_text or f"Review slot {slot} for the saved plan.")
-        args = ["dispatch", "--role", "standard_review", "--slot", str(slot), "--cwd", str(repo),
+        args = ["dispatch", "--role", role, "--slot", str(slot), "--cwd", str(repo),
                 "--task-file", str(brief), "--review-plan", plan, "--review-target", target,
                 "--review-cycle", cycle]
         if retry:
@@ -168,6 +174,380 @@ class PreferencesTest(unittest.TestCase):
         with self.assertRaisesRegex(mp.PreferenceError, "slot|unavailable|required"):
             self.call("resolve", "--role", "standard_review", "--slot", "2", "--review-target", target,
                       "--review-cycle", next_cycle["id"], "--review-plan", second["id"])
+
+    def test_unplanned_standard_resolution_prints_initial_review_hint_to_stderr(self):
+        self.activate()
+        selection = self.call("status")["active"]["selection"]
+        env = dict(os.environ)
+        hint = "model-preferences review-plan --purpose initial"
+
+        unplanned = self.run_cli(env, "resolve", "--role", "standard_review", "--slot", "1")
+        self.assertEqual(unplanned.returncode, 0, unplanned.stderr)
+        self.assertEqual(json.loads(unplanned.stdout), {
+            "profile": "Claude-Codex", "selection": selection, "role": "standard_review",
+            "family": "codex-sol", "harness": "codex", "model": "gpt-6.1-sol", "effort": "high",
+            "contributor_mode": False,
+        })
+        self.assertIn(hint, unplanned.stderr)
+
+        missing_slot = self.run_cli(env, "resolve", "--role", "standard_review")
+        self.assertEqual(missing_slot.returncode, 1)
+        self.assertEqual(missing_slot.stdout, "")
+        self.assertIn("Select reviewer --slot", missing_slot.stderr)
+        self.assertIn(hint, missing_slot.stderr)
+
+        plan = self.initial_plan(self.repo())
+        planned = self.run_cli(env, "resolve", "--role", "standard_review", "--slot", "1",
+                               "--review-plan", plan["id"])
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        self.assertNotIn(hint, planned.stderr)
+
+        other = self.run_cli(env, "resolve", "--role", "implementer")
+        self.assertEqual(other.returncode, 0, other.stderr)
+        self.assertNotIn(hint, other.stderr)
+
+    def test_initial_policy_plan_resolve_dispatch_paths_for_each_supported_profile(self):
+        cases = (
+            ("Codex-only", ["gpt-6.1-sol"], "complex_initial_review", ["gpt-6-astra"]),
+            ("Claude-only", ["claude-opus-5-5"], "complex_initial_review", ["claude-fable-5-1"]),
+            ("Claude-Codex", ["gpt-6.1-sol", "claude-opus-5-5"], "complex_initial_review",
+             ["gpt-6-astra", "claude-opus-5-5"]),
+            ("claude-codex-light", ["gpt-6.1-sol", "claude-opus-5-5"], "complex_initial_review",
+             ["gpt-6-astra", "claude-opus-5-5"]),
+        )
+        repo = self.repo()
+        for profile, simple_models, complex_role, complex_models in cases:
+            with self.subTest(profile=profile):
+                self.activate(profile)
+
+                def plan_for(kind, facts):
+                    target = (self.create_review_target(repo, str(uuid.uuid4()))["id"]
+                              if profile == "claude-codex-light" else None)
+                    command = ["review-plan", "--cwd", str(repo), "--base", "HEAD",
+                               "--facts", str(self.facts(**facts)), "--purpose", "initial"]
+                    if target:
+                        command.extend(("--target", target, "--cycle-key", f"{profile}-{kind}"))
+                    result = self.run_cli(dict(os.environ), *command)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    plan = json.loads(result.stdout)
+                    plan["test_target"] = target
+                    return plan
+
+                simple = plan_for("simple", {})
+                self.assertEqual((simple["purpose"], simple["classification"], simple["role"]),
+                                 ("initial", "straightforward", "standard_review"))
+                self.assertEqual([slot["model"] for slot in simple["review_guidance"]["review_slots"]],
+                                 simple_models)
+                complex_plan = plan_for("complex", {"new_design": True})
+                self.assertEqual((complex_plan["purpose"], complex_plan["classification"], complex_plan["role"]),
+                                 ("initial", "complex", complex_role))
+                self.assertFalse(complex_plan["review_guidance"]["approval_required"])
+                self.assertEqual([slot["model"] for slot in complex_plan["review_guidance"]["review_slots"]],
+                                 complex_models)
+
+                for plan, role, models in ((simple, "standard_review", simple_models),
+                                           (complex_plan, complex_role, complex_models)):
+                    cycle_id = plan.get("review_cycle")
+                    plan_target = plan["test_target"]
+                    for slot, expected_model in enumerate(models, 1):
+                        resolve_args = ["resolve", "--role", role, "--slot", str(slot),
+                                        "--review-plan", plan["id"]]
+                        dispatch_args = ["dispatch", "--role", role, "--slot", str(slot),
+                                         "--cwd", str(repo), "--task-file"]
+                        brief = self.root / f"{profile}-{role}-{slot}.txt"
+                        brief.write_text(f"Approved initial {role} slot {slot} for {profile}.")
+                        dispatch_args.append(str(brief))
+                        dispatch_args.extend(("--review-plan", plan["id"]))
+                        if plan_target:
+                            resolve_args.extend(("--review-target", plan_target, "--review-cycle", cycle_id))
+                            dispatch_args.extend(("--review-target", plan_target, "--review-cycle", cycle_id))
+                        resolved = self.run_cli(dict(os.environ), *resolve_args)
+                        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+                        resolved_choice = json.loads(resolved.stdout)
+                        self.assertEqual(resolved_choice["model"], expected_model)
+                        capture, env = self.fake_native_provider(resolved_choice["harness"])
+                        dispatched = self.run_cli(env, *dispatch_args)
+                        self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
+                        result = json.loads(dispatched.stdout)
+                        launch = self.app.state(f"launches/{result['launch']}", None)
+                        self.assertEqual(launch["choice"], {key: resolved_choice[key] for key in
+                                         ("profile", "selection", "role", "family", "harness", "model",
+                                          "effort", "contributor_mode")})
+                        self.assertEqual(launch["choice"]["model"], expected_model)
+                        received = json.loads(capture.read_text())
+                        self.assertIn("Reviewer judgment guidance", received["prompt"])
+                        if role == "skeptical_review":
+                            self.assertIn("Skeptical continuation proposal review", received["prompt"])
+                        self.assertTrue(received["prompt"].endswith(brief.read_text()))
+
+    def test_completed_light_complex_initial_cycle_leads_to_one_sol_later_cycle(self):
+        self.activate("claude-codex-light")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        facts = self.facts(new_design=True)
+        first_cli = self.run_cli(dict(os.environ), "review-plan", "--cwd", str(repo), "--base", "HEAD",
+                                 "--facts", str(facts), "--purpose", "initial", "--target", target,
+                                 "--cycle-key", "complex-initial")
+        self.assertEqual(first_cli.returncode, 0, first_cli.stderr)
+        first = json.loads(first_cli.stdout)
+        cycle = self.target_state(target)["cycles"][0]
+        self.assertEqual((cycle["purpose"], cycle["classification"]), ("initial", "complex"))
+        self.assertEqual([slot["choice"]["model"] for slot in cycle["slots"]],
+                         ["gpt-6-astra", "claude-opus-5-5"])
+        for slot in (1, 2):
+            role = "complex_initial_review"
+            brief = self.root / f"complex-initial-{slot}.txt"
+            brief.write_text(f"Review complex initial slot {slot}.")
+            choice = cycle["slots"][slot - 1]["choice"]
+            capture, env = self.fake_native_provider(choice["harness"])
+            result = self.run_cli(env, "dispatch", "--role", role, "--slot", str(slot), "--cwd", str(repo),
+                                  "--task-file", str(brief), "--review-plan", first["id"],
+                                  "--review-target", target, "--review-cycle", cycle["id"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            launch = self.app.state(f"launches/{json.loads(result.stdout)['launch']}", None)
+            self.assertEqual(launch["review_cycle"]["cycle_id"], cycle["id"])
+            self.assertEqual(launch["choice"], choice)
+            self.assertIn("Reviewer judgment guidance", json.loads(capture.read_text())["prompt"])
+
+        later_cli = self.run_cli(dict(os.environ), "review-plan", "--cwd", str(repo), "--base", "HEAD",
+                                 "--facts", str(self.facts()), "--target", target,
+                                 "--cycle-key", "later-ordinary", "--previous-cycle", cycle["id"])
+        self.assertEqual(later_cli.returncode, 0, later_cli.stderr)
+        later = json.loads(later_cli.stdout)
+        later_cycle = self.target_state(target)["cycles"][1]
+        self.assertEqual((later["purpose"], later["classification"], later["role"]),
+                         ("later", "straightforward", "standard_review"))
+        self.assertEqual([slot["number"] for slot in later_cycle["slots"]], [1])
+        self.assertEqual(later_cycle["slots"][0]["choice"]["model"], "gpt-6.1-sol")
+        resolved = self.run_cli(dict(os.environ), "resolve", "--role", "standard_review", "--slot", "1",
+                                "--review-target", target, "--review-cycle", later_cycle["id"],
+                                "--review-plan", later["id"])
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(json.loads(resolved.stdout)["model"], "gpt-6.1-sol")
+        brief = self.root / "later-light-review.txt"
+        brief.write_text("Review the ordinary later cycle.")
+        capture, env = self.fake_native_provider("codex")
+        dispatched = self.run_cli(env, "dispatch", "--role", "standard_review", "--slot", "1",
+                                  "--cwd", str(repo), "--task-file", str(brief), "--review-plan", later["id"],
+                                  "--review-target", target, "--review-cycle", later_cycle["id"])
+        self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
+        launch = self.app.state(f"launches/{json.loads(dispatched.stdout)['launch']}", None)
+        self.assertEqual(launch["choice"]["model"], "gpt-6.1-sol")
+
+    def test_review_policy_migration_is_explicit_and_preserves_saved_families_efforts_and_other_profiles(self):
+        config = self.app.config()
+        config["profiles"]["Codex-only"].pop("review_policy")
+        config["profiles"]["Codex-only"]["advanced_review"] = [{"model": "codex-luna", "effort": "xhigh"}]
+        config["profiles"]["Codex-only"]["standard_review"] = [{"model": "codex-sol", "effort": "medium"}]
+        other_profiles = json.loads(json.dumps({key: value for key, value in config["profiles"].items()
+                                                if key != "Codex-only"}))
+        mp.write(self.app.config_path, config)
+        before = self.app.config_path.read_bytes()
+        preview = self.call("review-policy-migrate", "Codex-only")
+        self.assertFalse(preview["applied"])
+        self.assertFalse(preview["already_configured"])
+        self.assertEqual(preview["review_policy"]["complex_initial"],
+                         [{"model": "codex-luna", "effort": "xhigh"}])
+        self.assertEqual(preview["review_policy"]["skeptical_proposal"],
+                         [{"model": "codex-luna", "effort": "xhigh"}])
+        self.assertEqual(before, self.app.config_path.read_bytes())
+        result = self.call("review-policy-migrate", "Codex-only", "--apply",
+                           "--policy-sha256", preview["policy_sha256"])
+        self.assertTrue(result["applied"])
+        saved = self.app.config()["profiles"]
+        self.assertEqual(saved["Codex-only"]["review_policy"], preview["review_policy"])
+        self.assertEqual({key: value for key, value in saved.items() if key != "Codex-only"}, other_profiles)
+
+    def test_review_policy_validation_and_missing_adoption_fail_without_fallback(self):
+        for mutate in (
+            lambda policy: policy.update(version=99),
+            lambda policy: policy.update(complex_initial=[{"model": "missing-family", "effort": "high"}]),
+            lambda policy: policy.update(skeptical_proposal=[
+                {"model": "codex-astra", "effort": "high"}, {"model": "codex-astra", "effort": "high"}]),
+        ):
+            config = mp.example_config()
+            policy = config["profiles"]["Codex-only"]["review_policy"]
+            mutate(policy)
+            with self.assertRaises(mp.PreferenceError):
+                mp.validate(config)
+
+        self.activate("Codex-only")
+        repo = self.repo()
+        config = self.app.config()
+        config["profiles"]["Codex-only"].pop("review_policy")
+        mp.write(self.app.config_path, config)
+        with self.assertRaisesRegex(mp.PreferenceError, "explicit review policy|review-policy-migrate"):
+            self.initial_plan(repo, new_design=True)
+        self.assertFalse((self.state_dir / "launches").exists())
+        self.assertNotIn("review_policy", self.call("status")["active"])
+
+        self.activate("Codex-Qwen")
+        unchanged = self.initial_plan(repo, new_design=True)
+        self.assertEqual(unchanged["role"], "advanced_review")
+        self.assertNotIn("review_policy", self.call("status")["active"])
+
+    def test_complex_initial_scope_staleness_and_uncertain_launch_prevent_fallback_or_duplicate(self):
+        self.activate("Codex-only")
+        repo = self.repo()
+        plan = self.initial_plan(repo, new_design=True)
+        self.assertEqual(plan["role"], "complex_initial_review")
+        brief = self.root / "complex-initial-boundary.txt"
+        brief.write_text("Review the configured complex initial panel.")
+        capture, env = self.fake_native_provider("codex")
+        args = ["dispatch", "--role", "complex_initial_review", "--slot", "1", "--cwd", str(repo),
+                "--task-file", str(brief), "--review-plan", plan["id"]]
+        first = self.run_cli(env, *args)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        launch_id = json.loads(first.stdout)["launch"]
+        launch = self.app.state(f"launches/{launch_id}", None)
+        launch.update(status="uncertain", exit_code=None)
+        self.app.save_state(f"launches/{launch_id}", launch)
+        capture.unlink()
+        duplicate = self.run_cli(env, *args)
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn("active or uncertain", duplicate.stderr)
+        self.assertFalse(capture.exists())
+        self.assertEqual(len(list((self.state_dir / "launches").glob("*.json"))), 1)
+
+        self.activate("Claude-Codex")
+        stale_plan = self.initial_plan(repo, new_design=True)
+        self.activate("Codex-only")
+        (repo / "app.py").write_text("scope changed after planning\n")
+        stale_capture, stale_env = self.fake_native_provider("codex")
+        stale = self.run_cli(stale_env, "dispatch", "--role", "complex_initial_review", "--slot", "1",
+                             "--cwd", str(repo), "--task-file", str(brief), "--review-plan", stale_plan["id"])
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("Review scope/profile changed", stale.stderr)
+        self.assertFalse(stale_capture.exists())
+
+    def test_active_review_policy_migration_requires_reviewed_notification_choice_and_preserves_launches(self):
+        self.activate("Codex-only")
+        config = self.app.config()
+        config["profiles"]["Codex-only"].pop("review_policy")
+        mp.write(self.app.config_path, config)
+        launch_id = uuid.uuid4().hex
+        fake_launch = {"id": launch_id, "choice": {"profile": "Codex-only", "model": "saved-job"},
+                       "status": "exited", "exit_code": 0}
+        self.app.save_state(f"launches/{launch_id}", fake_launch)
+        preview = self.call("review-policy-migrate", "Codex-only")
+        before = self.app.config_path.read_bytes()
+        with self.assertRaisesRegex(mp.PreferenceError, "Active review choices change"):
+            self.call("review-policy-migrate", "Codex-only", "--apply",
+                      "--policy-sha256", preview["policy_sha256"])
+        self.assertEqual(before, self.app.config_path.read_bytes())
+        with patch.object(mp.App, "current", return_value={"items": [], "truncated": False}):
+            result = self.call("review-policy-migrate", "Codex-only", "--apply",
+                               "--policy-sha256", preview["policy_sha256"],
+                               "--orchestrators", "future-only")
+        self.assertTrue(result["active_selection_changed"])
+        self.assertEqual(self.app.state(f"launches/{launch_id}", None), fake_launch)
+
+    def test_skeptical_review_requires_exact_opt_in_and_distinct_bounded_continuation(self):
+        self.activate("Claude-Codex")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        proposal = self.root / "proposal.md"
+        proposal.write_text("Continue one bounded attempt that changes only the retry state transition.\n")
+        plan_cli = self.run_cli(dict(os.environ), "review-plan", "--cwd", str(repo), "--base", "HEAD",
+                                "--facts", str(self.facts(repairing_previous_fix=True)),
+                                "--purpose", "skeptical_proposal", "--target", target,
+                                "--proposal-file", str(proposal))
+        self.assertEqual(plan_cli.returncode, 0, plan_cli.stderr)
+        plan = json.loads(plan_cli.stdout)
+        self.assertEqual((plan["purpose"], plan["role"], plan["proposal_sha256"] != None),
+                         ("skeptical_proposal", "skeptical_review", True))
+        self.assertEqual([slot["model"] for slot in plan["review_guidance"]["review_slots"]],
+                         ["claude-fable-5-1"])
+        self.assertTrue(plan["review_guidance"]["approval_required"])
+
+        task = self.root / "skeptical-review-task.md"
+        task.write_text("Three repair rounds have not resolved the work. Review the bound continuation proposal.")
+        capture, env = self.fake_native_provider("claude")
+        dispatch = ["dispatch", "--role", "skeptical_review", "--slot", "1", "--cwd", str(repo),
+                    "--task-file", str(task), "--review-plan", plan["id"], "--review-target", target,
+                    "--proposal-file", str(proposal)]
+        no_approval = self.run_cli(env, *dispatch)
+        self.assertNotEqual(no_approval.returncode, 0)
+        self.assertFalse(capture.exists())
+
+        initial = self.initial_plan(repo, new_design=True)
+        self.assertEqual(initial["role"], "complex_initial_review")
+        with self.assertRaisesRegex(mp.PreferenceError, "Advanced review plan required"):
+            self.call("approve-review", initial["id"], "--authorization", "Initial policy is standing default.")
+        later_advanced = self.plan(repo, new_design=True)
+        generic = self.call("approve-review", later_advanced["id"], "--authorization", "Generic advanced review grant.")
+        wrong_approval = self.run_cli(env, *dispatch, "--approval", generic["id"])
+        self.assertNotEqual(wrong_approval.returncode, 0)
+        self.assertIn("does not match this exact review plan", wrong_approval.stderr)
+        self.assertFalse(capture.exists())
+
+        approved = self.call("approve-review", plan["id"], "--authorization", "Tyler approved this exact skeptical review.")
+        with self.assertRaisesRegex(mp.PreferenceError, "launch to exit successfully"):
+            self.call("approve-review", plan["id"], "--continue-repair", "--authorization", "Separate continuation decision.",
+                      "--continuation-batch-file", str(proposal), "--review-result-file", str(proposal))
+        proposal.write_text("Changed proposal bytes after approval.\n")
+        changed = self.run_cli(env, *dispatch, "--approval", approved["id"])
+        self.assertNotEqual(changed.returncode, 0)
+        self.assertIn("Proposal bytes changed", changed.stderr)
+        self.assertFalse(capture.exists())
+
+        proposal.write_text("Continue one bounded attempt that changes only the retry state transition.\n")
+        dispatched = self.run_cli(env, *dispatch, "--approval", approved["id"])
+        self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
+        launch = self.app.state(f"launches/{json.loads(dispatched.stdout)['launch']}", None)
+        self.assertEqual(launch["choice"]["model"], "claude-fable-5-1")
+        received = json.loads(capture.read_text())
+        self.assertIn("Skeptical continuation proposal review", received["prompt"])
+        self.assertIn("Three repair rounds have not resolved the work.", received["prompt"])
+        self.assertIn("Exact continuation proposal under review", received["prompt"])
+        self.assertTrue(received["prompt"].endswith(task.read_text()))
+        self.assertLess(received["prompt"].index(proposal.read_text()),
+                        received["prompt"].index(task.read_text()))
+        after_review = self.call("review-inspect", plan["id"])["review_guidance"]
+        self.assertEqual(after_review["approval_status"], "review_complete")
+        self.assertEqual(after_review["continuation_status"], "missing")
+        self.assertIn("distinct bounded continuation decision", after_review["next_action"])
+
+        result_file = self.root / "skeptical-review-result.md"
+        result_file.write_text("Reviewer recommends one bounded attempt and records unresolved uncertainty.\n")
+        batch_file = self.root / "bounded-repair-batch.md"
+        batch_file.write_text("Edit only retry-state transition; add focused regression test; stop if invariant fails.\n")
+        continuation = self.call("approve-review", plan["id"], "--continue-repair",
+                                 "--authorization", "Tyler approved the exact bounded repair batch.",
+                                 "--review-result-file", str(result_file),
+                                 "--continuation-batch-file", str(batch_file))
+        self.assertEqual(continuation["role"], "repair_continuation")
+        self.assertEqual(continuation["review_result_sha256"], mp.hashlib.sha256(result_file.read_bytes()).hexdigest())
+        self.assertEqual(continuation["continuation_batch_sha256"], mp.hashlib.sha256(batch_file.read_bytes()).hexdigest())
+        final = self.call("review-inspect", plan["id"])["review_guidance"]
+        self.assertEqual(final["approval_status"], "continuation_approved")
+        self.assertEqual(final["continuation_status"], "approved")
+
+    def test_declined_skeptical_review_launches_no_model_and_keeps_separate_route_decision(self):
+        self.activate("Codex-only")
+        repo = self.repo()
+        target = self.create_review_target(repo)["id"]
+        proposal = self.root / "declined-proposal.md"
+        proposal.write_text("Proposed next step after round three.\n")
+        plan = self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(self.facts()),
+                         "--purpose", "skeptical_proposal", "--target", target,
+                         "--proposal-file", str(proposal))
+        capture, env = self.fake_native_provider("codex")
+        declined = self.call("approve-review", plan["id"], "--decline-skeptical",
+                             "--authorization", "Tyler declined the optional review.")
+        self.assertEqual(declined["role"], "skeptical_review_declined")
+        self.assertFalse(capture.exists())
+        status = self.call("review-inspect", plan["id"])["review_guidance"]
+        self.assertEqual(status["approval_status"], "declined")
+        self.assertIsNone(status["next_action_command"])
+        route = self.call("approve-review", plan["id"], "--route", "defer",
+                          "--authorization", "Tyler separately chose to defer.")
+        self.assertEqual(route["route"], "defer")
+        with self.assertRaisesRegex(mp.PreferenceError, "requires a prior skeptical-review decline|revert or defer route"):
+            self.call("approve-review", plan["id"], "--continue-repair",
+                      "--authorization", "Conflicting continuation.",
+                      "--continuation-batch-file", str(proposal))
+        self.assertFalse((self.state_dir / "launches").exists())
 
     def test_light_cycle_refresh_keeps_pair_and_old_scope_launches_do_not_complete_new_plan(self):
         self.activate("claude-codex-light")
@@ -658,8 +1038,12 @@ class PreferencesTest(unittest.TestCase):
         config = mp.example_config()
         custom = json.loads(json.dumps(config["profiles"]["Codex-only"]))
         custom["implementer"]["model"] = "claude-opus"
+        custom.pop("review_policy")
         config["profiles"]["team-default"] = custom
         mp.validate(config)
+        custom["review_policy"] = json.loads(json.dumps(config["profiles"]["Codex-only"]["review_policy"]))
+        with self.assertRaisesRegex(mp.PreferenceError, "supported only for"):
+            mp.validate(config)
 
     def assert_single_advanced_review_requires_permission(self, profile):
         self.activate(profile); repo = self.repo(); plan = self.plan(repo, money=True)
@@ -707,7 +1091,8 @@ class PreferencesTest(unittest.TestCase):
 
         def make_plan(**changes):
             facts = self.facts(**changes)
-            return cli("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(facts))
+            return cli("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(facts),
+                       "--purpose", "later")
 
         def inspect_readonly(plan_id, full=False):
             def snapshot(directory):
@@ -800,7 +1185,7 @@ class PreferencesTest(unittest.TestCase):
             return json.loads(result.stdout)
 
         plan = cli("review-plan", "--cwd", str(repo), "--base", "HEAD",
-                   "--facts", str(self.facts(money=True)))
+                   "--facts", str(self.facts(money=True)), "--purpose", "later")
         approvals = self.state_dir / "approvals"
         approvals.mkdir(exist_ok=True)
 
@@ -974,7 +1359,9 @@ class PreferencesTest(unittest.TestCase):
         self.assertEqual(before, self.app.config_path.read_bytes())
 
     def test_create_profile(self):
-        p = self.root / "new.json"; p.write_text(json.dumps(self.call("show", "Claude-Codex")))
+        profile = self.call("show", "Claude-Codex")
+        profile.pop("review_policy")
+        p = self.root / "new.json"; p.write_text(json.dumps(profile))
         self.call("profile-put", "My-profile", "--file", str(p))
         self.activate("My-profile")
         self.assertEqual(self.call("status")["active"]["profile"], "My-profile")
@@ -992,6 +1379,34 @@ class PreferencesTest(unittest.TestCase):
         self.assertEqual(self.call("resolve", "--role", "implementer")["model"], "fixture-luna-99")
         self.activate("Claude-Codex")
         self.assertEqual(self.call("resolve", "--role", "implementer")["model"], "fixture-luna-99")
+
+    def test_light_profile_can_upgrade_sol_with_exact_reviewer_guards(self):
+        self.activate("claude-codex-light")
+        old = self.call("resolve", "--role", "standard_review", "--slot", "1")
+        self.assertEqual((old["model"], old["effort"]), ("gpt-6.1-sol", "high"))
+        original = self.app.config_path.read_bytes()
+        for harness, slug, efforts in [
+            ("codex", "gpt-6.2-astra", ["medium", "high"]),
+            ("claude", "gpt-6.2-sol", ["medium", "high"]),
+            ("codex", "gpt-6.2-sol", ["medium"]),
+        ]:
+            with self.subTest(harness=harness, slug=slug, efforts=efforts):
+                with self.assertRaises(mp.PreferenceError):
+                    self.call("model-set", "codex-sol", "--harness", harness, "--slug", slug,
+                              "--efforts", *efforts, "--source", "fixture", "--orchestrators", "future-only")
+                self.assertEqual(self.app.config_path.read_bytes(), original)
+
+        with patch.object(mp.App, "current", return_value={"items": [], "truncated": False}):
+            change = self.call("model-set", "codex-sol", "--harness", "codex", "--slug", "gpt-6.2-sol",
+                               "--efforts", "medium", "high", "--source", "fixture",
+                               "--orchestrators", "future-only")
+        self.call("validate")
+        sol = self.call("resolve", "--role", "standard_review", "--slot", "1")
+        opus = self.call("resolve", "--role", "standard_review", "--slot", "2")
+        self.assertEqual((sol["model"], sol["effort"]), ("gpt-6.2-sol", "high"))
+        self.assertEqual((opus["model"], opus["effort"]), ("claude-opus-5-5", "high"))
+        self.assertEqual(change["notification"]["orchestrators"], "future-only")
+        self.assertNotEqual(old["selection"], sol["selection"])
 
     def test_active_exact_model_update_requires_switch_intent(self):
         self.activate()
@@ -1061,6 +1476,40 @@ class PreferencesTest(unittest.TestCase):
             retried = self.call("notify", "--retry")
         self.assertEqual(sender.call_count, 1)
         self.assertTrue(all(r["status"] == "queued" for r in retried["notification"]["recipients"].values()))
+
+    def test_future_only_model_notice_keeps_scope_exclusions_on_retry(self):
+        scoped = dict(self.recipient, surface=str(uuid.uuid4()), session="scoped")
+        enrollments = {"shared": self.recipient, "uses-other-registry": scoped}
+        self.app.save_state("orchestrators", enrollments)
+        self.activate("Codex-only")
+        inventory = self.inventory()
+        inventory["items"].extend(self.inventory(scoped)["items"])
+        update = ("model-set", "codex-sol", "--harness", "codex", "--slug", "gpt-6.2-sol",
+                  "--efforts", "medium", "high", "--source", "fixture")
+        with patch.object(mp.App, "current", return_value=inventory), patch.object(mp, "run_json") as sender:
+            before = self.app.config_path.read_bytes()
+            with self.assertRaises(mp.PreferenceError):
+                self.call(*update, "--orchestrators", "ask", "--exclude-orchestrator", "uses-other-registry")
+            with self.assertRaises(mp.PreferenceError):
+                self.call(*update, "--orchestrators", "future-only", "--exclude-orchestrator", "typo")
+            self.assertEqual(self.app.config_path.read_bytes(), before)
+            sender.assert_not_called()
+
+            sender.side_effect = mp.PreferenceError("fixture send failed")
+            notice = self.call(*update, "--orchestrators", "future-only",
+                               "--exclude-orchestrator", "uses-other-registry")["notification"]
+            self.assertEqual(set(notice["recipients"]), {"shared"})
+            sender.assert_called_once()
+            self.assertEqual(sender.call_args.args[0][3], self.surface)
+
+            sender.reset_mock(side_effect=True)
+            sender.return_value = {"id": "queued"}
+            retried = self.call("notify", "--retry")["notification"]
+            sender.assert_called_once()
+            self.assertEqual(sender.call_args.args[0][3], self.surface)
+            self.assertEqual(retried["recipients"]["shared"]["status"], "queued")
+            self.assertEqual(retried["excluded_orchestrators"], ["uses-other-registry"])
+        self.assertEqual(self.app.state("orchestrators", {}), enrollments)
 
     def test_unknown_recipient_never_targeted(self):
         self.app.save_state("orchestrators", {"lane": dict(self.recipient, session="stale")})
@@ -1160,6 +1609,7 @@ class PreferencesTest(unittest.TestCase):
         repo = self.repo()
         config = self.app.config()
         muse_profile = json.loads(json.dumps(config["profiles"]["Codex-only"]))
+        muse_profile.pop("review_policy")
         for role in ("standard_review", "advanced_review"):
             muse_profile[role] = [{"model": "muse-spark", "effort": "high"}]
         config["profiles"]["Muse-review"] = muse_profile
@@ -1278,6 +1728,7 @@ class PreferencesTest(unittest.TestCase):
             "harness": "opencode", "provider_id": "fixture-provider", "slug": "fixture-review-model",
             "efforts": ["max"], "source": "synthetic unsupported-review route fixture"}
         opencode_profile = json.loads(json.dumps(config["profiles"]["Codex-only"]))
+        opencode_profile.pop("review_policy")
         opencode_profile["standard_review"] = [{"model": "opencode-review", "effort": "max"}]
         opencode_profile["advanced_review"] = [{"model": "opencode-review", "effort": "max"}]
         config["profiles"]["OpenCode-review"] = opencode_profile

@@ -83,6 +83,9 @@ Compose to a private path, then use the reviewed `session-enroll --reviewed-upda
 Use assign for a persistent worktree role or session-enroll for an exact native session that needs a private standing file.
 Session enrollment replaces the worktree context for that exact identity and fails closed when required context is missing or invalid.
 Use the [session enrollment guide](docs/session-enrollments.md) for replacement handoffs, identity checks, trust limits and recovery.
+The exact pending successor can inspect its binding with `enrollment-status` and run `enrollment-adopt` while standing context is pending, including when an existing checkpoint or required reads already hold ordinary tools.
+The hook admits this one recovery operation only when it matches the explicit safe release.
+After adoption, any outstanding read and checkpoint gates still apply.
 Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery notes, pressure reminders and Hailing Frequencies idle receipts.
 For enrolled Claude and Codex sessions, the standard recovery hook also gates ordinary tools until the latest published checkpoint is delivered in complete framed parts after an observed compaction.
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.
@@ -123,6 +126,7 @@ Missing or unsupported evidence stays unknown and is never inferred from saved s
 Claude observations store only allowlisted fields in private local state, one record per exact session, and an unknown read creates no state.
 Codex reads the exact session's native `turn_context` record after validating its `session_meta` identity.
 It validates identity from the file header and reads at most the most recent 8 MiB, so long transcripts remain usable.
+A Codex transcript window containing records for more than one session identity reports unknown.
 Claude reports the session-selected level; Codex reports the observed turn, which can include a turn-specific override.
 A report describes the recorded observation, not a guarantee about a later turn.
 Use `--transcript PATH` to read one Codex transcript directly, or let the command look under `CODEX_HOME/sessions` for an exact UUID match.
@@ -134,7 +138,11 @@ Follow Replicator's existing model and effort evidence rule, and continue when a
 Dispatch enrolls an implementer worktree, binds a task brief to the owner and launches the selected Claude or Codex CLI.
 The CLI does not infer a broader sandbox, role, model or repository permission from the task file.
 The task owner can update or finish a task explicitly, and recovery never replays a changed or finished task implicitly.
+`dispatch --prepare-only`, normal `dispatch`, and OpenCode `prepare-dispatch` also report known upstream path overlaps with the task checkout.
+The advisory reads refs already in that checkout, stores warning deduplication in its private Git metadata, stays quiet when paths do not overlap, and does not block preparation when Git metadata is unavailable.
 The [implementer dispatch guide](docs/implementer-dispatch.md) documents the supported launch, update, recovery and ownership boundaries.
+Read its [briefing and evidence acceptance guidance](docs/implementer-dispatch.md#briefing-and-evidence-acceptance) when writing or accepting a helper assignment.
+See its [upstream overlap advisory section](docs/implementer-dispatch.md#upstream-overlap-advisory) for comparison limits.
 The [OpenCode adapter guide](docs/opencode.md) documents its versioned context hook, explicit two-phase task binding, opt-in setup and native delivery limits.
 Use a unique --receipt-file path when an immutable local snapshot is useful; a receipt is not live task status.
 OpenCode preparation and binding are separate from Claude and Codex launch dispatch, and never start an OpenCode process.

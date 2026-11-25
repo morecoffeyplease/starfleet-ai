@@ -111,6 +111,22 @@ Use `--request-id` for a stable creation intent: retry the same request rather t
 Use `--replace-key` when a later timer should replace an earlier timer for the same purpose in the same session.
 Cancellation or replacement cannot recall input that has already been submitted.
 
+## Cancel a timer as the coordinator
+
+From the exact currently enrolled Hailing Frequencies coordinator session, provide the authorized timer ID and a nonblank reason.
+
+```sh
+temporal-beacon cancel TIMER_ID --reason 'Retire the idle reminder for an ended session'
+```
+
+Use `temporal-beacon cancel TIMER_ID` for your own timer.
+A coordinator cancel stops future wakes for the named timer and cancels its pending or held occurrences.
+It records the coordinator and reason, visible in the cancellation result and the timer owner's inspection.
+A repeat preserves the original cancellation record.
+Submitted, uncertain, received, and historical occurrences remain in the database.
+Cancellation cannot recall submitted input or make a canceled continuation receivable.
+A successor may create a new timer when needed.
+
 ## Scheduling semantics
 
 | Option | Meaning |
@@ -143,6 +159,47 @@ A recurring timer waits for receipt of its previous occurrence before advancing.
 After sleep or worker downtime, missed intervals collapse into one catch-up notification rather than a burst.
 An `--until` deadline also expires held recurring occurrences.
 Actual submission can be later than the due time because the worker is stopped, CMUX is unavailable, or input is held.
+
+## Watch Claude Code weekly quota
+
+Run the watch commands from the Claude or Codex session that should receive the wake.
+Enroll that exact session in Hailing Frequencies and confirm the existing worker's send scope covers it.
+Check `delivery_capability.currently_covered` in `quota-status` to verify a live quota-capable worker covers your session.
+To make an existing supervisor use an updated immutable runtime, coordinate a restart with its owner.
+
+```sh
+temporal-beacon quota-watch --message 'Review the new Claude weekly quota reading.'
+temporal-beacon quota-status
+```
+
+The first valid reading establishes a baseline.
+A later change in the remaining percentage or weekly reset queues an alert.
+For one alert per reset when the remaining allowance is at or below a threshold, use `--at-or-below`.
+
+```sh
+temporal-beacon quota-stop
+temporal-beacon quota-watch --at-or-below 3 --message 'Follow the approved low-quota handoff plan.'
+```
+
+Threshold mode can alert on the first valid reading if it already meets the threshold.
+The worker checks the local cache on its existing scan interval, normally 30 seconds.
+The optional Claude Code status-line cache is `~/.claude/cache/rate-limits.json`.
+The cache must be a regular file owned by the current user, smaller than 64 KiB, and writable only by the owner.
+The reading needs a valid `rate_limits.seven_day` entry and an observation at most 180 seconds old.
+The worker reads the cache and treats missing, stale, or invalid readings as unavailable.
+Freshness describes the local observation time.
+The watch reports Claude Code usage, and the cache supplies no account identity.
+
+The worker stores at most one outstanding alert per watch.
+While an alert waits for receipt, intermediate updates can be missed.
+Read the saved observation and continuation with the normal `receive` command when woken.
+An observed threshold can remain queued across a human-input hold, so check current quota before acting on a delayed wake.
+Use `quota-status` to inspect the source and alert state.
+Wait for a real guarded wake and receipt before retiring an existing quota reminder.
+Use `quota-stop` to stop the watch.
+An already submitted or uncertain wake remains available for normal receipt.
+A watch stays with its exact owner generation.
+Register a new watch from the successor after a session change.
 
 ## Wake and receipt
 

@@ -15,11 +15,6 @@ System and developer instructions take precedence. Follow the latest human instr
 Never invent values, infer scope or treat placeholders as approval.
 Stay within the user's authorized scope.
 
-**PStack guidance - do this now**
-- Use the installed PStack runtime and Poteto Mode.
-- After compaction, read the sections relevant to current work in full.
-- Do not assume you know what this guidance says.
-
 **Agents**
 - Before each launch, read saved active Model Preferences and resolve exact configured reviewer slots.
 Old summaries, pilots and your harness do not select the profile or count.
@@ -74,11 +69,13 @@ Update only changed facts in this lane's sections.
 Follow its owner rereads, source references/digests/application, resolved prerequisites, empty assumptions, opening evidence and exact draft-comment publication flow.
 Run `attestation-start-check` after publication and before repair work; use `--enable` only for first adoption.
 Adopted ready/merge requires current evidence.
-- Use Outcome, Playbook, Size and Facts in each implementer brief and the PR opening explanation.
+- Brief outcomes, bounds and checked facts; justify implementation constraints and follow PStack.
 
 **Repair rounds: don't spiral**
-- Record dispositions, evidence and cumulative rounds in the existing PR or tracker.
-From round three, make a fresh zoom-out before accepting or dispatching another batch.
+- Record assessment, evidence and cumulative rounds in the PR/tracker before recommending, requesting approval or dispatching; reuse it in the attestation.
+From round three, prepare a fresh zoom-out before accepting or dispatching the batch.
+After three unsuccessful repair rounds, ask the configured human authority whether they want the profile's optional skeptical review of the exact next-step proposal; count actual repair history, not review-cycle ordinals.
+Review approval authorizes only that review; require a separate bounded batch decision before round four. A declined review still permits a separate approved continuation, revert, or defer decision.
 - Stop a chain when its fix causes another regression there; prefer reverting an isolatable failed repair.
 Do not blindly revert mixed changes or restore a serious vulnerability.
 - After two failed attempts on one finding, attack the premise and ask before a third.

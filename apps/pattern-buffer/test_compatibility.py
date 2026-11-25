@@ -49,6 +49,9 @@ class RenameCompatibilityTests(unittest.TestCase):
                 "context_injector_codex_enrollment.py", "pattern_buffer_codex_enrollment.py",
                 "context_injector_codex_sessions.py", "pattern_buffer_codex_sessions.py",
                 "context_injector_codex_reliability.py", "pattern_buffer_codex_reliability.py",
+                "context_injector_codex_required_reads.py", "pattern_buffer_codex_required_reads.py",
+                "context_injector_codex_upstream_overlap.py", "pattern_buffer_codex_upstream_overlap.py",
+
                 "context_injector_codex_session_effort.py", "pattern_buffer_codex_session_effort.py")]
             for path in owned:
                 path.write_bytes(path.read_bytes() + b"\n# controlled older runtime\n")
@@ -71,6 +74,8 @@ class RenameCompatibilityTests(unittest.TestCase):
                 "pattern_buffer_codex_reliability.py": CURRENT_CLI.with_name("pattern_buffer_reliability.py"),
                 "context_injector_codex_required_reads.py": CURRENT_CLI.with_name("pattern_buffer_required_reads.py"),
                 "pattern_buffer_codex_required_reads.py": CURRENT_CLI.with_name("pattern_buffer_required_reads.py"),
+                "context_injector_codex_upstream_overlap.py": CURRENT_CLI.with_name("pattern_buffer_upstream_overlap.py"),
+                "pattern_buffer_codex_upstream_overlap.py": CURRENT_CLI.with_name("pattern_buffer_upstream_overlap.py"),
                 "context_injector_codex_session_effort.py": CURRENT_CLI.with_name("pattern_buffer_session_effort.py"),
                 "pattern_buffer_codex_session_effort.py": CURRENT_CLI.with_name("pattern_buffer_session_effort.py"),
             }
@@ -96,7 +101,8 @@ class RenameCompatibilityTests(unittest.TestCase):
             for path in runtime.glob("pattern_buffer_codex*.py"):
                 path.unlink()
             for name in ("context_injector_codex_sessions.py", "context_injector_codex_reliability.py",
-                         "context_injector_codex_required_reads.py", "context_injector_codex_session_effort.py"):
+                         "context_injector_codex_required_reads.py", "context_injector_codex_upstream_overlap.py",
+                         "context_injector_codex_session_effort.py"):
                 (runtime / name).unlink()
             checkpoint = runtime / "context_injector_codex_checkpoint.py"
             checkpoint.write_text(checkpoint.read_text().replace(
@@ -125,6 +131,8 @@ class RenameCompatibilityTests(unittest.TestCase):
                 "pattern_buffer_codex_reliability.py": CURRENT_CLI.with_name("pattern_buffer_reliability.py"),
                 "context_injector_codex_required_reads.py": CURRENT_CLI.with_name("pattern_buffer_required_reads.py"),
                 "pattern_buffer_codex_required_reads.py": CURRENT_CLI.with_name("pattern_buffer_required_reads.py"),
+                "context_injector_codex_upstream_overlap.py": CURRENT_CLI.with_name("pattern_buffer_upstream_overlap.py"),
+                "pattern_buffer_codex_upstream_overlap.py": CURRENT_CLI.with_name("pattern_buffer_upstream_overlap.py"),
                 "context_injector_codex_session_effort.py": CURRENT_CLI.with_name("pattern_buffer_session_effort.py"),
                 "pattern_buffer_codex_session_effort.py": CURRENT_CLI.with_name("pattern_buffer_session_effort.py"),
             }
