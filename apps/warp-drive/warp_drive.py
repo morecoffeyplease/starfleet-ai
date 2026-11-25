@@ -2079,7 +2079,12 @@ def helper_diagnostic(row, attachment_evidence, state_dir, hailing_snapshot, at=
     recovery_command = None
     if state == "finished":
         classification = "finished"
-        next_action = f"The command finished with recorded outcome {row.get('outcome') or 'unknown'}; inspect its result."
+        if row.get("outcome") == "unknown":
+            next_action = ("Inspect the stop evidence and preserve the unknown exit result. "
+                           "If the owner is retiring and delivery is still pending, transfer the same reservation "
+                           "to the accepted enrolled successor.")
+        else:
+            next_action = f"The command finished with recorded outcome {row.get('outcome') or 'unknown'}; inspect its result."
     elif state == "cancelled":
         classification = "cancelled"
         next_action = "This reservation was cancelled. Inspect its recorded event history."
@@ -2092,7 +2097,10 @@ def helper_diagnostic(row, attachment_evidence, state_dir, hailing_snapshot, at=
             next_action = "The launch intent, active lease, and fresh helper heartbeat indicate current command handling. Continue observing with inspect; do not attach or replay."
         elif state == "reserved":
             classification = "uncertain_after_launch"
-            next_action = "The launch intent exists but the helper or lease is no longer current. Inspect and obtain owner evidence; reconcile only after confirming the outcome. Do not attach or replay."
+            next_action = ("Inspect the exact workload and obtain owner evidence. "
+                           "If the workload and its descendants have stopped, reconcile with "
+                           "--outcome unknown --stopped-generation and record the stop evidence. "
+                           "An inactive lease alone cannot establish a stop. Keep the request for inspection without replaying it.")
         else:
             classification = "unknown_after_launch"
             next_action = "A launch intent exists in an unexpected reservation state. Inspect and obtain owner evidence; do not attach or replay."
