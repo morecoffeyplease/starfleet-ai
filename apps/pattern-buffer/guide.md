@@ -208,6 +208,24 @@ The owner runs the override from an interactive terminal outside every harness s
 The override belongs only to that session's current generation and ends when it expires or the generation changes.
 An override does not repair a changed manifest or missing required file.
 
+### Check for overlapping PRs
+
+Before starting or resuming a work slice or dispatching a fix round, check for merges into the candidate's base and new open drafts in its repository.
+From the repository checkout, set `base` to the candidate's actual base branch and `since` to the date of your previous check.
+
+```sh
+base=main
+since=2026-01-15
+gh pr list --state merged --base "$base" --search "merged:>=$since" --limit 100
+gh pr list --state open --draft --search "created:>=$since" --limit 100
+```
+
+On the first check, use a recent date that covers the work since the slice was last scoped.
+If either list reaches the limit, narrow the date range or raise the limit.
+Inspect relevant PRs for dependency or file overlap and coordinate with their owners when the overlap changes your next step.
+Reuse a current check for an unchanged rerun.
+The results inform your work plan and leave rebase, proof and approval decisions to their existing owners and requirements.
+
 ### Compose rules and mission
 
 Use `compose` to combine reviewed project rules with a per-worktree mission.
@@ -250,6 +268,15 @@ For an exact Claude checkpoint owner it also reports the existing idle-warning m
 If an existing warning is disabled, its next action shows the supported `checkpoint-config` command without changing state.
 New Claude checkpoints default to 50 minutes, while existing checkpoints remain unchanged until their owner enables a warning.
 An armed timer is configuration evidence, not proof that its wake was received.
+
+## Inspect session effort
+
+Run `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` with `claude` or `codex`.
+The JSON gives model, reasoning effort (thought size or thought budget size), source, timestamp, age and state.
+Claude uses the installed checkpoint-enabled status line without requiring enrollment.
+Codex reads the exact session's latest recorded turn within an 8 MiB window.
+Missing, ambiguous or inherited effort evidence reports unknown.
+See the [README](https://github.com/morecoffeyplease/starfleet-ai/tree/main/apps/pattern-buffer#inspect-session-effort) for evidence limits and Replicator's fallback when a live reading is unavailable.
 
 ## Shared recovery reminder
 

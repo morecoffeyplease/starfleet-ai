@@ -496,8 +496,9 @@ else:
         self.assertIn('Track ownership', self.event().stdout)
 
     def test_claude_statusline_preserves_display_and_follows_changed_limit(self):
-        self.enroll('claude')
-        self.save('claude')
+        session = '33333333-3333-4333-8333-333333333333'
+        self.enroll('claude', session)
+        self.save('claude', session)
         settings = self.root.parent / 'claude.json'
         prior = {'type': 'command', 'command': "printf 'EXISTING-DISPLAY'", 'padding': 3}
         settings.write_text(json.dumps({'statusLine': prior, 'env': {'KEPT': 'yes'}}))
@@ -505,23 +506,25 @@ else:
         self.cli('install', '--harness', 'claude', '--settings', str(settings), '--runtime-dir', str(runtime), '--checkpoints')
         installed = json.loads(settings.read_text())
         command = installed['statusLine']['command']
-        data = {'session_id': 'pilot', 'cwd': str(self.root), 'model': {'id': 'fixture'},
+        data = {'session_id': session, 'cwd': str(self.root), 'model': {'id': 'fixture'},
+                'effort': {'level': 'medium'},
                 'context_window': {'used_percentage': 56, 'context_window_size': 200000}}
-        env = {**os.environ, 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE': '60'}
+        env = {**os.environ, 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE': '60',
+               'XDG_STATE_HOME': 'invalid-relative-state-home'}
         r = subprocess.run(command, shell=True, input=json.dumps(data), text=True, capture_output=True, env=env)
         self.assertEqual(r.stdout, 'EXISTING-DISPLAY')
-        warning = self.event(name='PostToolUse', harness='claude')
+        warning = self.event(name='PostToolUse', harness='claude', session=session)
         self.assert_pressure_warning(warning)
         self.assertIn('55.0%', warning.stdout)
         data['context_window']['used_percentage'] = 60
         subprocess.run(command, shell=True, input=json.dumps(data), text=True, capture_output=True, env=env, check=True)
-        self.assertEqual(self.event(name='PostToolUse', harness='claude').stdout, '')
+        self.assertEqual(self.event(name='PostToolUse', harness='claude', session=session).stdout, '')
         data['context_window']['used_percentage'] = 50
         subprocess.run(command, shell=True, input=json.dumps(data), text=True, capture_output=True, env=env, check=True)
-        self.assertEqual(self.event(name='PostToolUse', harness='claude').stdout, '')
+        self.assertEqual(self.event(name='PostToolUse', harness='claude', session=session).stdout, '')
         data['context_window']['used_percentage'] = 56
         subprocess.run(command, shell=True, input=json.dumps(data), text=True, capture_output=True, env=env, check=True)
-        self.assert_pressure_warning(self.event(name='PostToolUse', harness='claude'))
+        self.assert_pressure_warning(self.event(name='PostToolUse', harness='claude', session=session))
         self.cli('compaction-settings', '--compact-at', '70', '--settings', str(settings))
         self.assertEqual(json.loads(settings.read_text())['env']['KEPT'], 'yes')
         self.assertEqual(json.loads(settings.read_text())['env']['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'], '70.0')

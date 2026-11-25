@@ -48,7 +48,9 @@ An unknown status means the required evidence is missing or ambiguous.
 Keep the predecessor while a required handoff check remains blocked or unknown.
 The current CMUX snapshot provides caller identity and state.
 Preflight reports model, effort, and effective permissions as `unknown`.
-Use the handoff guide to verify the actual launch and native settings.
+Use the [handoff guide](guide.md#verify-model-and-reasoning-effort) to verify the actual launch and native settings.
+Run the read-only `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` when the exact native session exposes a model and reasoning effort observation.
+If the result is unknown, use the other evidence choices in the handoff guide.
 
 ## Review an outgoing handoff
 

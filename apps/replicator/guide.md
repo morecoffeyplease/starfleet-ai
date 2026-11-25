@@ -48,8 +48,7 @@ If launch or binding is uncertain, inspect the exact candidate before attempting
 1. Read the checkpoint, approved mission and tracker, repository guidance, and applicable component guides yourself.
    Verify your exact native session, CMUX surface and workspace, worktree, model and effort, effective permissions, and hook trust.
    Check the tool's recorded generation when it binds an owner by generation.
-   Use the exact session's runtime report, user confirmation, or saved model and effort settings with launch arguments that show no override for model and effort evidence.
-   Record any unavailable live reading and resolve actual conflicts before the dependent transition.
+   Use the [model and reasoning effort evidence](#verify-model-and-reasoning-effort) below.
 2. Register your exact session with all applicable Starfleet owner tools.
    Adopt existing resources through their documented routes.
    Where adoption is unavailable, create and verify an equivalent own binding only when the tool supports it and it preserves obligations without duplicate work or notices.
@@ -60,6 +59,16 @@ If launch or binding is uncertain, inspect the exact candidate before attempting
 3. After the outgoing owner settles its resources and exits normally, verify the exact native process has ended.
    Close only the verified outgoing CMUX tab if it remains open.
    An unresolved resource or uncertain exit holds dependent cleanup.
+
+### Verify model and reasoning effort
+
+Reasoning effort is also called thought size or thought budget size.
+For Claude and Codex, inspect the exact session with `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID`.
+See the [Pattern Buffer guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/pattern-buffer/guide.md#inspect-session-effort) for the observation's source, age, and limits.
+The result describes recorded evidence and can be unknown.
+Use the exact session's runtime report, user confirmation, or saved model and effort settings with launch arguments that show no override.
+Record any unavailable live reading and resolve actual conflicts before the dependent transition.
+Verify native identity, effective permissions, hook trust, and custody through their own checks.
 
 ## Copy into the existing private checkpoint
 

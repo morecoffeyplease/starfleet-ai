@@ -149,6 +149,14 @@ An identical retry returns the original cutoff.
 Check saved enrollment with `hailing-frequencies status`, and run `warp-drive owner-args` from the successor when using Warp.
 If a required check fails, keep the existing registration and follow the [explicit handoff](guide.md#receive-an-authorized-handoff).
 
+An explicit current-generation custody adoption is a separate operation exposed by Discord Watch for an operator-approved, enumerated set of existing obligations.
+It records an old-to-current assignment without claiming historical process continuity, and keeps the original cutoff and private receipt history.
+The current native owner must accept the exact immutable plan through the existing exact CMUX binding.
+Its approval reference is a cooperative audit note, not authenticated proof.
+While an adoption is partial, Hailing Frequencies holds the selected session's prompts, inbox acknowledgment, enrollment changes, and timer mutations until that same operation completes.
+Ordinary enrollment remains strict and does not become an adoption path.
+See the [Discord Watch adoption guide](../discord-watch/guide.md#explicit-current-generation-custody-adoption) for the bounded workflow and its limits.
+
 To receive escalation prompts, designate one exact enrolled coordinator using `enroll ... --coordinator`.
 Only one coordinator is selected in a state directory.
 With no coordinator, overdue escalation remains visible in local scan output and `status`.
