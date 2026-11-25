@@ -269,6 +269,15 @@ If an existing warning is disabled, its next action shows the supported `checkpo
 New Claude checkpoints default to 50 minutes, while existing checkpoints remain unchanged until their owner enables a warning.
 An armed timer is configuration evidence, not proof that its wake was received.
 
+## Inspect session effort
+
+Run `pattern-buffer session-effort --harness HARNESS --session SESSION_UUID` with `claude` or `codex`.
+The JSON gives model, reasoning effort (thought size or thought budget size), source, timestamp, age and state.
+Claude uses the installed checkpoint-enabled status line without requiring enrollment.
+Codex reads the exact session's latest recorded turn within an 8 MiB window.
+Missing, ambiguous or inherited effort evidence reports unknown.
+See the [README](https://github.com/morecoffeyplease/starfleet-ai/tree/main/apps/pattern-buffer#inspect-session-effort) for evidence limits and Replicator's fallback when a live reading is unavailable.
+
 ## Shared recovery reminder
 
 Pattern Buffer appends the same short runtime PStack reminder to every rendered context, for every role and whether or not a checkpoint is enrolled.
