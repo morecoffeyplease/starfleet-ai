@@ -5,6 +5,11 @@ Use the machine's existing `~/.local/bin/hailing-frequencies` launcher and defau
 Do not create a second state directory or start a duplicate `supervise` worker.
 Use `hailing-frequencies status` to inspect saved enrollment and `hailing-frequencies health` for recent scans with complete target coverage.
 If health reports incomplete coverage, inspect `status` for targets whose inboxes could not be read.
+Run `starfleet doctor --json` from your exact session to check whether a fresh worker scan covers your own route.
+An unrelated missing target can leave the fleet warning in place while your session has intended delivery.
+If your intended delivery is blocked, check your exact target row and send scope in `status`.
+A fresh scan is required after upgrading the worker.
+Confirm actual delivery separately with the exact message or timer receipt.
 Neither establishes permission to start another worker; if worker availability is unclear, ask the existing owner or operator instead.
 
 The default Hailing Frequencies install includes the `agent-notify` Discord conversation command and its skill.

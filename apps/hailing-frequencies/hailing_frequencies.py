@@ -1238,9 +1238,10 @@ class Monitor:
         with contextlib.closing(self.database()) as db:
             for target in config["targets"]:
                 sending = send and (only_sessions is None or target["session"] in only_sessions)
+                scan_owner = {key: target[key] for key in ("harness", "session", "surface", "workspace", "started_at")}
                 initial_error = initial_errors_by_session.get(target["session"])
                 if initial_error:
-                    results.append({"label": target["label"], "session": target["session"],
+                    results.append({"label": target["label"], **scan_owner,
                                     "inbox_status": "incomplete", "error": initial_error["error"],
                                     "sending_enabled": sending, "attempts": []})
                     continue
@@ -1261,7 +1262,7 @@ class Monitor:
                     "SELECT message FROM acknowledgements WHERE session=?", (target["session"],))}
                 snapshot = self.target_snapshot(sources, acknowledged, now, config["remind_after"])
                 overdue = snapshot["overdue_messages"]
-                result = {"label": target["label"], "session": target["session"],
+                result = {"label": target["label"], **scan_owner,
                           "inbox_status": "complete",
                           "native_unread": snapshot["native_unread"],
                           "acknowledged": snapshot["acknowledged"],
@@ -1422,8 +1423,11 @@ def _worker_heartbeat(directory, config, name="last-scan.json", error_name="last
         require(math.isfinite(threshold), "invalid heartbeat threshold")
         require(0 <= age <= threshold, "worker heartbeat is stale")
         target_errors = scan.get("target_errors", [])
-        require(isinstance(target_errors, list) and not target_errors, "worker target coverage is incomplete")
-        require(scan.get("coverage_complete", True) is True, "worker coverage is incomplete")
+        require(isinstance(target_errors, list) and all(isinstance(item, dict)
+                    and isinstance(item.get("session"), str) for item in target_errors),
+                "invalid worker target errors")
+        require(scan.get("coverage_complete", not target_errors) is (not target_errors),
+                "invalid worker target coverage")
         error = _read_diagnostic_json(directory / error_name)
         if error is not None:
             error_at = error.get("at")
@@ -1477,17 +1481,8 @@ def hailing_diagnostic_report(app, caller):
     if caller is not None:
         if target is None:
             delivery = "missing"
-        elif scan is not None and worker == "ready":
-            scope = scan.get("sending_sessions")
-            target_rows = scan.get("targets")
-            row = next((item for item in target_rows if isinstance(item, dict)
-                        and item.get("session") == session_identity(caller["session"], caller["harness"])),
-                       None) if isinstance(target_rows, list) else None
-            if (scan.get("mode") == "send" and (scope is None or target["session"] in scope)
-                    and isinstance(row, dict) and row.get("sending_enabled") is True):
-                delivery = "ready"
-            else:
-                delivery = "blocked"
+        elif scan is not None:
+            delivery = "ready" if _has_exact_send_coverage(scan, target) else "blocked"
     return _common_diagnostic_report("ready", registration, worker, delivery)
 
 
@@ -1498,31 +1493,32 @@ def temporal_diagnostic_report(app, caller):
         return report
     try:
         config = app.config(_read_diagnostic_json(app.directory / "config.json"))
-        worker, scan = _worker_heartbeat(app.directory, config, "timer-last-scan.json",
+        worker, _ = _worker_heartbeat(app.directory, config, "timer-last-scan.json",
                                          "timer-last-error.json")
         checks["worker"] = worker
-        if caller is not None and checks["registration"] == "ready":
-            target = _match_diagnostic_target(config, caller)
-            hailing_scan_state, hailing_scan = _worker_heartbeat(app.directory, config)
-            if hailing_scan_state == "ready" and isinstance(hailing_scan, dict):
-                scope = hailing_scan.get("sending_sessions")
-                checks["intended_delivery"] = (
-                    "ready" if hailing_scan.get("mode") == "send" and
-                    target is not None and (scope is None or target["session"] in scope) and
-                    isinstance(_match_scan_target(hailing_scan, target["session"]), dict) else "blocked")
-            else:
-                checks["intended_delivery"] = "unknown"
+        if checks["registration"] == "ready" and worker != "ready":
+            checks["intended_delivery"] = "blocked" if worker == "blocked" else "unknown"
     except (OSError, ValueError, KeyError, TypeError):
         checks["worker"] = "blocked"
         checks["intended_delivery"] = "unknown"
     return report
 
 
-def _match_scan_target(scan, session):
-    targets = scan.get("targets")
-    return next((item for item in targets if isinstance(item, dict)
-                 and item.get("session") == session and item.get("sending_enabled") is True), None) \
-        if isinstance(targets, list) else None
+def _has_exact_send_coverage(scan, target):
+    scope = scan.get("sending_sessions")
+    if scan.get("mode") != "send" or (scope is not None and (
+            not isinstance(scope, list) or target["session"] not in scope)):
+        return False
+    rows = scan.get("targets")
+    if not isinstance(rows, list):
+        return False
+    matches = [row for row in rows if isinstance(row, dict) and row.get("session") == target["session"]]
+    if len(matches) != 1 or any(error["session"] == target["session"] for error in scan.get("target_errors", [])):
+        return False
+    row = matches[0]
+    return (all(row.get(key) == target[key] for key in ("harness", "surface", "workspace", "started_at"))
+            and row.get("inbox_status") == "complete" and row.get("sending_enabled") is True
+            and not row.get("hold") and not row.get("acknowledgment_hold"))
 
 
 def _parse_static_shell_literal(raw):
