@@ -843,6 +843,78 @@ class RequiredReadsTests(unittest.TestCase):
                                      "--session", self.session, "--json").stdout)
         self.assertEqual(status, {"registered": False})
 
+    def test_pending_successor_can_diagnose_and_adopt_before_both_reads(self):
+        self.initialize_checkpoint()
+        self.save_checkpoint()
+        self.start("compact")
+        outgoing = "codex-outgoing-fixture"
+        standing = self.root / ".context-injector/context.md"
+        enrollment = json.loads(self.cli("session-enroll", "--harness", "codex", "--session", outgoing,
+                                         "--context-file", str(standing)).stdout)
+        self.cli("enrollment-release", "--harness", "codex", "--session", outgoing,
+                 "--enrollment-id", enrollment["enrollment_id"], "--next-harness", "codex",
+                 "--next-session", self.session, "--evidence", "approved fixture release",
+                 env={"CODEX_THREAD_ID": outgoing, "CMUX_AGENT_LAUNCH_KIND": "codex"})
+        self.register()
+        exact = ["--harness", "codex", "--session", self.session]
+        checkpoint = self.home / "checkpoint.md"
+        adopt = ["enrollment-adopt", *exact, "--enrollment-id", enrollment["enrollment_id"],
+                 "--context-file", str(standing), "--checkpoint-file", str(checkpoint),
+                 "--evidence", "reviewed fixture handoff"]
+
+        def decision(args, *, suffix="", cwd=None):
+            command = shlex.join(["python3", str(SCRIPT), "--cwd", str(cwd or self.root), *args])
+            result = self.hook("PreToolUse", tool="Bash", command=command + suffix)
+            return (json.loads(result.stdout)["hookSpecificOutput"].get("permissionDecision")
+                    if result.stdout else None)
+
+        self.assertIsNone(decision(["enrollment-status", *exact]))
+        self.assertEqual(json.loads(self.cli("enrollment-status", *exact).stdout)["state"], "pending")
+        self.assertIsNone(decision(adopt))
+        self.assertEqual(decision(adopt, suffix="; git status"), "deny")
+        for index, value in ((2, "claude"), (4, outgoing), (6, "other-id")):
+            invalid = list(adopt)
+            invalid[index] = value
+            with self.subTest(index=index):
+                self.assertEqual(decision(invalid), "deny")
+        self.assertEqual(decision(adopt + ["--role", "implementer"]), "deny")
+        self.assertEqual(decision(adopt, cwd=self.home), "deny")
+        self.assertEqual(decision(["status", "--harness", "codex", "--session", outgoing]), "deny")
+        self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        registry = self.gitdir / "context-injector/session-enrollments/registry.json"
+        original_registry = registry.read_bytes()
+        parsed_registry = json.loads(original_registry)
+        last_release = parsed_registry["enrollments"][enrollment["enrollment_id"]]["events"][-1]
+        last_release["timers_safe"] = False
+        registry.write_text(json.dumps(parsed_registry), encoding="utf-8")
+        self.assertEqual(decision(adopt), "deny")
+        registry.write_bytes(original_registry)
+        self.cli(*adopt, success=False,
+                 env={"CODEX_THREAD_ID": outgoing, "CMUX_AGENT_LAUNCH_KIND": "codex"})
+        adopted = self.cli(*adopt,
+                           env={"CODEX_THREAD_ID": self.session, "CMUX_AGENT_LAUNCH_KIND": "codex"})
+        self.assertEqual(json.loads(adopted.stdout)["enrollment"]["state"], "active")
+        self.assertEqual(decision(adopt), "deny")
+        self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertFalse(self.status()["gate_open"])
+        checkpoint_status = json.loads(self.cli("checkpoint-status", *exact).stdout)
+        self.assertTrue(checkpoint_status["recovery"]["required"])
+
+        self.native_read(tool_use_id="successor-required-read")
+        self.assertTrue(self.status()["gate_open"])
+        self.assertEqual(self.gate_edit()["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        command = shlex.join(["pattern-buffer", "--cwd", str(self.root),
+                              "checkpoint-read", *exact, "--part", "1"])
+        result = self.hook("PreToolUse", tool="Bash", command=command, tool_use_id="own-checkpoint")
+        self.assertEqual(result.stdout, "")
+        frame = self.cli("checkpoint-read", *exact, "--part", "1").stdout
+        result = self.hook("PostToolUse", tool="Bash", command=command, tool_use_id="own-checkpoint",
+                           tool_response=frame)
+        self.assertEqual(result.stdout, "")
+        self.assertIsNone(self.gate_edit())
+
     def test_checkpoint_frame_read_remains_available_while_static_read_is_pending(self):
         self.register()
         self.initialize_checkpoint()

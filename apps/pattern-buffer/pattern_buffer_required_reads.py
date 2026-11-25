@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import stat
 import sys
 import time
@@ -550,6 +551,17 @@ def _allowed_command_parser():
     checkpoint_save.add_argument("--harness", choices=("claude", "codex"), required=True)
     checkpoint_save.add_argument("--session", required=True)
     checkpoint_save.add_argument("--file", required=True)
+    enrollment_status = commands.add_parser("enrollment-status", add_help=False, allow_abbrev=False)
+    enrollment_status.add_argument("--harness", choices=("claude", "codex"), required=True)
+    enrollment_status.add_argument("--session", required=True)
+    adopt = commands.add_parser("enrollment-adopt", add_help=False, allow_abbrev=False)
+    adopt.add_argument("--harness", choices=("claude", "codex"), required=True)
+    adopt.add_argument("--session", required=True)
+    adopt.add_argument("--enrollment-id", required=True)
+    adopt.add_argument("--context-file", "--file", required=True)
+    adopt.add_argument("--checkpoint-file")
+    adopt.add_argument("--role", choices=sorted(ROLES), default="orchestrator")
+    adopt.add_argument("--evidence", required=True)
     status = commands.add_parser("status", add_help=False, allow_abbrev=False)
     status.add_argument("--harness", choices=("claude", "codex"))
     status.add_argument("--session")
@@ -599,6 +611,15 @@ def _parse_allowed_cli_command(command, root, harness, session, core):
         cwd = Path(parsed.cwd).expanduser()
         if not cwd.is_absolute() or not cwd.resolve().is_relative_to(Path(root).resolve()):
             return None
+    if parsed.command in {"enrollment-status", "enrollment-adopt"} and Path(executable).name == "pattern-buffer":
+        # Match the current launcher rather than accepting another same-named file.
+        launcher = shutil.which("pattern-buffer")
+        try:
+            if not launcher or (executable != "pattern-buffer" and
+                                Path(executable).resolve() != Path(launcher).resolve()):
+                return None
+        except (OSError, RuntimeError, ValueError):
+            return None
     if parsed.command == "guide":
         return parsed
     selected_harness = getattr(parsed, "harness", None)
@@ -618,7 +639,7 @@ def allowed_cli_command(command, root, harness, session, core):
         return parsed.required_action == "status"
     if parsed.command == "read-required":
         return not parsed.next_entry or parsed.part is None
-    return parsed.command in ("status", "validate", "doctor", "guide",
+    return parsed.command in ("status", "validate", "doctor", "guide", "enrollment-status",
                               "checkpoint-read", "checkpoint-status")
 
 
@@ -628,8 +649,30 @@ def allowed_diagnostic_cli_command(command, root, harness, session, core):
         return False
     if parsed.command == "required-reads":
         return parsed.required_action == "status"
-    return parsed.command in ("status", "validate", "doctor", "guide",
+    return parsed.command in ("status", "validate", "doctor", "guide", "enrollment-status",
                               "checkpoint-read", "checkpoint-status")
+
+
+def allowed_pending_adoption(core, root, gitdir, harness, session, parsed):
+    """Admit the documented recovery command for an exact, safely released successor."""
+    if parsed is None or parsed.command != "enrollment-adopt":
+        return False
+    if not parsed.evidence.strip() or (parsed.role == "orchestrator" and not parsed.checkpoint_file):
+        return False
+    try:
+        if parsed.cwd is not None and Path(parsed.cwd).resolve() != Path(root).resolve():
+            return False
+        binding = core.session_binding_readonly(root, gitdir, harness, session)
+    except (OSError, RuntimeError, ValueError, TypeError, UnicodeError, KeyError):
+        return False
+    if (binding is None or binding.state != "pending" or binding.enrollment_id != parsed.enrollment_id
+            or binding.role != parsed.role or not binding.history):
+        return False
+    last_event = binding.history[-1]
+    return (last_event.get("action") == "released" and last_event.get("timers_safe") is True
+            and last_event.get("identity") == binding.predecessor
+            and last_event.get("next_identity") == {
+                "root": str(root), "harness": binding.harness, "session_id": binding.session_id})
 
 
 def _hook_result(message, decision=None, warning=False):
@@ -690,6 +733,10 @@ def pretool_gate(core, root, gitdir, harness, payload):
         if (tool == "Bash" and allowed_diagnostic_cli_command(
                 command, root, harness, session, core)):
             return None
+        if tool == "Bash" and isinstance(command, str) and "enrollment-adopt" in command:
+            parsed = _parse_allowed_cli_command(command, root, harness, session, core)
+            if allowed_pending_adoption(core, root, gitdir, harness, session, parsed):
+                return None
         required = load_list(gitdir)
         if required is None:
             return None
