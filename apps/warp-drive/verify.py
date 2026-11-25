@@ -2585,6 +2585,112 @@ def request_object(key, owner, path, command):
             "repo": str(path), "command": command}
 
 
+def test_owner_args_anonymous_codex_feed(temp):
+    root = temp / "anonymous-owner"
+    root.mkdir()
+    state = root / "unused-state"
+    hailing = root / "hailing"
+    hailing.mkdir()
+    workspace, surface, session = uuid_text(), uuid_text(), uuid_text()
+    owner = {"harness": "codex", "session": session, "surface": surface}
+    (hailing / "config.json").write_text(json.dumps({"version": 1, "targets": [{
+        **owner, "workspace": workspace, "started_at": 1.0, "cutoff": 0.0,
+        "label": "anonymous-feed-fixture",
+    }], "remind_after": 60, "escalate_after": 120, "cooldown": 30, "interval": 10}))
+    pid = 4242
+    anonymous_id = "fallback-" + hashlib.sha256(f"source=codex\npid={pid}".encode()).hexdigest()[:16]
+    named = {"kind": "codex", "session_id": session.lower(), "state": "idle",
+             "has_hook_lifecycle_state": True, "last_activity_at": "2026-11-25T06:29:35Z"}
+    anonymous = {"kind": "codex", "session_id": anonymous_id, "state": "working",
+                 "has_hook_lifecycle_state": True, "last_activity_at": "2026-11-25T03:09:11Z"}
+    agents = [named, anonymous]
+    record = {"agent": "codex", "session_id": session.lower(), "pid": pid, "stored_pid_exists": True,
+              "surface_id": surface, "workspace_id": workspace,
+              "started_at": "2026-11-24T22:12:56.089Z", "updated_at": "2026-11-25T06:29:35.279Z"}
+    target = {"source": "pid", "pid_resolution": "controlling_tty", "pid": pid,
+              "surface_id": surface, "workspace_id": workspace}
+    snapshots = {
+        "identify": {"caller": {"surface_type": "terminal", "workspace_id": workspace, "surface_id": surface}},
+        "current": {"truncated": False, "owner_availability": {"agent_sessions": "available"}, "items": [{
+            "placement": {"kind": "local"}, "lifecycle": "running", "freshness": {"state": "current"},
+            "projections": [{"workspace_id": workspace, "panel_id": surface}], "agents": agents,
+            "omitted": {"agents": 0},
+        }]},
+        "sessions": {"total_matches": 1, "sessions": [record]},
+        "rpc": target,
+        "process_start": "Tue Nov 24 22:00:19 2026",
+    }
+    fixture_path = root / "fixtures.json"
+    cmux = root / "cmux"
+    cmux.write_text("""#!/usr/bin/env python3
+import json, os, sys
+fixture = json.load(open(os.environ["CMUX_FIXTURE"]))
+args = sys.argv[1:]
+if args[:3] == ["--json", "--id-format", "uuids"] and args[3:] == ["identify"]:
+    command = "identify"
+elif args == ["--json", "current", "--limit", "200"]:
+    command = "current"
+elif args == ["--json", "sessions", "list", "--agent", "codex", "--surface",
+              fixture["identify"]["caller"]["surface_id"], "--all"]:
+    command = "sessions"
+elif args[:3] == ["--json", "rpc", "agent.resolve_delivery_target"] and len(args) == 4 and json.loads(args[3]) == {
+    "pid": fixture["sessions"]["sessions"][0]["pid"], "pid_resolution": "controlling_tty",
+}:
+    command = "rpc"
+else:
+    sys.exit(89)
+print(json.dumps(fixture[command]))
+""", encoding="utf-8")
+    cmux.chmod(0o755)
+    ps = root / "ps"
+    ps.write_text("""#!/usr/bin/env python3
+import json, os, sys
+fixture = json.load(open(os.environ["CMUX_FIXTURE"]))
+if sys.argv[1:] != ["-p", str(fixture["sessions"]["sessions"][0]["pid"]), "-o", "lstart="]:
+    sys.exit(89)
+assert os.environ["LC_ALL"] == "C" and os.environ["TZ"] == "UTC"
+print(fixture["process_start"])
+""", encoding="utf-8")
+    ps.chmod(0o755)
+    env = {"WARP_DRIVE_CMUX": str(cmux), "WARP_DRIVE_HAILING_STATE": str(hailing),
+           "CMUX_FIXTURE": str(fixture_path), "PATH": str(root) + os.pathsep + os.environ["PATH"],
+           "CMUX_AGENT_LAUNCH_KIND": "codex", "CODEX_THREAD_ID": session.lower(),
+           "CLAUDE_CODE_SESSION_ID": "", "OPENCODE_SESSION_ID": ""}
+
+    def run(ok=True):
+        fixture_path.write_text(json.dumps(snapshots), encoding="utf-8")
+        return run_cli(state, "owner-args", "--format", "json", ok=ok, env=env)
+
+    check(parse_json(run())["owner"] == owner and not state.exists(),
+          "owner-args did not recognize a corroborated same-process anonymous Feed row")
+
+    def refuses(changes, replacements):
+        original = {key: changes[key] for key in replacements}
+        changes.update(replacements)
+        result = run(ok=False)
+        changes.update(original)
+        check(result.returncode == 2 and not result.stdout and not state.exists(),
+              f"owner-args returned an identity for contradictory evidence: {replacements!r}")
+
+    item = snapshots["current"]["items"][0]
+    refuses(item, {"omitted": {}})
+    refuses(item, {"omitted": {"agents": 1}})
+    refuses(anonymous, {"session_id": uuid_text()})
+    refuses(anonymous, {"session_id": "fallback-0000000000000000"})
+    refuses(anonymous, {"last_activity_at": named["last_activity_at"]})
+    refuses(record, {"session_id": uuid_text()})
+    refuses(record, {"stored_pid_exists": False})
+    refuses(record, {"pid": pid + 1})
+    refuses(target, {"source": "surface"})
+    refuses(target, {"surface_id": uuid_text()})
+    refuses(target, {"workspace_id": uuid_text()})
+    refuses(snapshots, {"process_start": "Tue Nov 24 23:00:00 2026"})
+    refuses(snapshots, {"process_start": "Wed Nov 25 03:11:00 2026"})
+    refuses(snapshots, {"process_start": "unavailable"})
+    refuses(snapshots, {"sessions": {"total_matches": 1, "sessions": []}})
+    refuses(snapshots, {"rpc": {}})
+
+
 def test_owner_args_cli(temp):
     state = temp / "owner-args-state"
     hailing_dir = temp / "owner-args-hailing"
@@ -3071,6 +3177,342 @@ def test_cli_reservations(temp):
     run_cli(state, "boost", waiting_id, "--actor", "unlisted-agent", "--reason", "must refuse", ok=False)
 
 
+def test_helper_diagnostics_cli(temp):
+    state = temp / "custom warp state"
+    hailing_dir = temp / "helper-diagnostics-hailing"
+    hailing_dir.mkdir()
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    target = {"label": "helper-diagnostics-fixture", **owner, "workspace": uuid_text(),
+              "started_at": 1.0, "cutoff": 0.0}
+    config_path = hailing_dir / "config.json"
+    config = {"version": 1, "targets": [target], "remind_after": 60,
+              "escalate_after": 120, "cooldown": 30, "interval": 10}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    env = {"WARP_DRIVE_HAILING_STATE": str(hailing_dir)}
+    run_cli(state, "init", env=env)
+    worktree = temp / "helper-diagnostics-worktree"
+    worktree.mkdir()
+
+    def submit(key, command=None):
+        return parse_json(run_cli(state, "submit", "--key", key, *owner_args(owner),
+            "--size", "light", "--family", "helper-diagnostics", "--workers", "1",
+            "--expected-runtime", "60", "--repo", worktree, "--worktree", worktree,
+            "--", *(command or ["/bin/true"]), env=env))["request_id"]
+
+    def attach(request_id, heartbeat=None):
+        helper_id = str(uuid.uuid4())
+        with contextlib.closing(warp_drive.connect(state)) as db:
+            _, generation, result = warp_drive.attach_helper(db, request_id, owner, helper_id)
+            check(result == "attached", "synthetic prelaunch helper did not attach")
+            if heartbeat is not None:
+                with warp_drive.immediate_transaction(db):
+                    db.execute("UPDATE reservations SET heartbeat_at=? WHERE id=?",
+                               (heartbeat, request_id))
+        return helper_id, generation
+
+    def observe(request_id):
+        def snapshot():
+            with contextlib.closing(warp_drive.connect(state)) as db:
+                row = warp_drive.current_request(db, request_id)
+                event_count = db.execute("SELECT count(*) FROM events WHERE reservation_id=?",
+                                          (request_id,)).fetchone()[0]
+                return (row["helper_id"], row["helper_generation"], row["heartbeat_at"],
+                        row["state"], row["launch_intent_at"], row["lease_active"],
+                        row["outcome"], event_count)
+        before = snapshot()
+        status = parse_json(run_cli(state, "status", env=env))
+        inspected = parse_json(run_cli(state, "inspect", request_id, env=env))
+        after = snapshot()
+        check(before == after, "status or inspect changed helper, launch or event state")
+        status_row = next(item for item in status["reservations"] if item["id"] == request_id)
+        return status_row["helper_diagnostic"], inspected["reservation"]["helper_diagnostic"]
+
+    def inspect_only(request_id):
+        with contextlib.closing(warp_drive.connect(state)) as db:
+            row = warp_drive.current_request(db, request_id)
+            before = (row["state"], row["outcome"], row["exit_code"], row["launch_intent_at"],
+                      row["helper_generation"], db.execute(
+                          "SELECT count(*) FROM events WHERE reservation_id=?", (request_id,)).fetchone()[0])
+        inspected = parse_json(run_cli(state, "inspect", request_id, env=env))
+        with contextlib.closing(warp_drive.connect(state)) as db:
+            row = warp_drive.current_request(db, request_id)
+            after = (row["state"], row["outcome"], row["exit_code"], row["launch_intent_at"],
+                     row["helper_generation"], db.execute(
+                         "SELECT count(*) FROM events WHERE reservation_id=?", (request_id,)).fetchone()[0])
+        check(before == after, "inspect changed terminal helper or launch state")
+        return inspected["reservation"]["helper_diagnostic"]
+
+    never_marker = temp / "held-request-product-command-ran"
+    never_id = submit("helper-never-attached", [sys.executable, "-c",
+        f"from pathlib import Path; Path({str(never_marker)!r}).touch()"])
+    run_cli(state, "delay", never_id, "--hold", env=env)
+    never_status, never_inspect = observe(never_id)
+    expected_command = ["warp-drive", "--state-dir", str(state.absolute()), "attach", never_id,
+                        "--harness", owner["harness"], "--session", owner["session"],
+                        "--surface", owner["surface"], "--detach"]
+    check(never_status["classification"] == "never_attached" and
+          never_inspect["classification"] == "never_attached" and
+          shlex.split(never_status["recovery_command"]) == expected_command and
+          never_status["evidence"]["eligibility"] == "held" and
+          "hold or delay remains in force" in never_status["next_action"],
+          "never-attached request lacked its exact safe recovery command or preserved hold guidance")
+    launcher_dir = temp / "helper-diagnostics-bin"
+    launcher_dir.mkdir()
+    launcher = launcher_dir / "warp-drive"
+    launcher.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " " +
+                        shlex.quote(str(ROOT / "warp_drive.py")) + " \"$@\"\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    action_env = os.environ.copy()
+    action_env.update(env)
+    action_env["PATH"] = str(launcher_dir) + os.pathsep + action_env.get("PATH", "")
+    helper_pid = None
+    try:
+        recovery = subprocess.run(expected_command, cwd=temp, env=action_env, text=True, capture_output=True)
+        check(recovery.returncode == 0, f"printed recovery command failed:\n{recovery.stdout}\n{recovery.stderr}")
+        reported_helper_pid = json.loads(recovery.stdout).get("helper_pid")
+        if type(reported_helper_pid) is int and reported_helper_pid > 0:
+            helper_pid = reported_helper_pid
+        check(helper_pid is not None,
+              "printed recovery command did not return its detached helper PID")
+        deadline = time.monotonic() + 10
+        attached = False
+        while time.monotonic() < deadline:
+            with contextlib.closing(warp_drive.connect(state)) as db:
+                row = warp_drive.current_request(db, never_id)
+                attached = (row["helper_generation"] == 1 and row["helper_id"] is not None)
+            if attached:
+                break
+            time.sleep(0.05)
+        with contextlib.closing(warp_drive.connect(state)) as db:
+            row = warp_drive.current_request(db, never_id)
+            check(attached and row["request_key"] == "helper-never-attached" and
+                  row["state"] == "waiting" and row["eligible_at"] is None and
+                  row["launch_intent_at"] is None and row["helper_generation"] == 1,
+                  "printed recovery command did not attach the same held request without resuming or launching it")
+        check(not never_marker.exists(), "printed held recovery command ran the product command")
+    finally:
+        primary_error = sys.exc_info()[0] is not None
+        cleanup_error = None
+        try:
+            run_cli(state, "cancel", never_id, env=env)
+        except BaseException as exc:
+            cleanup_error = exc
+        if helper_pid is not None:
+            helper_stopped = False
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(helper_pid, 0)
+                except ProcessLookupError:
+                    helper_stopped = True
+                    break
+                except OSError as exc:
+                    cleanup_error = cleanup_error or exc
+                    break
+                time.sleep(0.05)
+            if not helper_stopped:
+                try:
+                    os.kill(helper_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    helper_stopped = True
+                except OSError as exc:
+                    cleanup_error = cleanup_error or exc
+                if not helper_stopped:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        try:
+                            os.kill(helper_pid, 0)
+                        except ProcessLookupError:
+                            helper_stopped = True
+                            break
+                        except OSError as exc:
+                            cleanup_error = cleanup_error or exc
+                            break
+                        time.sleep(0.05)
+            if not helper_stopped:
+                cleanup_error = cleanup_error or AssertionError(
+                    "synthetic detached recovery helper did not stop after its held request was cancelled")
+        if cleanup_error is not None and not primary_error:
+            raise cleanup_error
+
+    stale_id = submit("helper-stale-before-launch")
+    attach(stale_id, time.time() - warp_drive.HELPER_STALE_SECONDS - 1)
+    run_cli(state, "scheduler", "--once", env=env)
+    stale_status, stale_inspect = observe(stale_id)
+    check(stale_status["classification"] == "stale_attached_helper" and
+          stale_inspect["classification"] == "stale_attached_helper" and
+          stale_status["evidence"]["helper_generation"] == 1 and
+          not stale_status["evidence"]["helper_id_present"] and
+          shlex.split(stale_status["recovery_command"]) ==
+          ["warp-drive", "--state-dir", str(state.absolute()), "attach", stale_id,
+           "--harness", owner["harness"], "--session", owner["session"],
+           "--surface", owner["surface"], "--detach"],
+          "stale attached helper was not distinguished after its ID was cleared")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with db:
+            db.execute("DELETE FROM events WHERE reservation_id=? AND kind='helper_attached'", (stale_id,))
+    pruned_status, _ = observe(stale_id)
+    check(pruned_status["classification"] == "stale_attached_helper" and
+          pruned_status["evidence"]["history_basis"] == "generation_counter",
+          "positive monotonic helper generation did not establish prior attachment after event pruning")
+
+    healthy_id = submit("helper-healthy-waiting")
+    run_cli(state, "delay", healthy_id, "--hold", env=env)
+    attach(healthy_id)
+    healthy_status, healthy_inspect = observe(healthy_id)
+    check(healthy_status["classification"] == "healthy_helper" and
+          healthy_inspect["classification"] == "healthy_helper" and
+          healthy_status["recovery_command"] is None and
+          healthy_status["evidence"]["eligibility"] == "held" and
+          "do not replace a healthy helper" in healthy_status["next_action"],
+          "healthy held helper was presented as a replacement candidate")
+
+    unknown_history_id = submit("helper-unknown-history")
+    attach(unknown_history_id)
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET helper_id=NULL,heartbeat_at=NULL,helper_generation=0 WHERE id=?",
+                       (unknown_history_id,))
+    unknown_status, unknown_inspect = observe(unknown_history_id)
+    check(unknown_status["classification"] == "unknown_history" and
+          unknown_inspect["classification"] == "unknown_history" and
+          unknown_status["recovery_command"] is None and
+          unknown_status["evidence"]["history_basis"] == "contradictory",
+          "contradictory helper history was classified as never attached or stale")
+
+    unavailable_history_id = submit("helper-unavailable-history")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET helper_generation=-1 WHERE id=?",
+                       (unavailable_history_id,))
+    unavailable_status, _ = observe(unavailable_history_id)
+    check(unavailable_status["classification"] == "unknown_history" and
+          unavailable_status["recovery_command"] is None and
+          unavailable_status["evidence"]["history_basis"] == "unknown",
+          "unavailable counter without retained helper history was guessed as never or stale")
+
+    event_only_id = submit("helper-event-only-history")
+    attach(event_only_id)
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET helper_generation=-1,helper_id=NULL,heartbeat_at=NULL WHERE id=?",
+                       (event_only_id,))
+    event_only_status, _ = observe(event_only_id)
+    check(event_only_status["classification"] == "stale_attached_helper" and
+          event_only_status["evidence"]["history_basis"] == "retained_attachment_event" and
+          event_only_status["recovery_command"] is None and
+          "helper generation counter is invalid" in event_only_status["next_action"] and
+          "Inspect the reservation" in event_only_status["next_action"] and
+          "hailing-frequencies" not in event_only_status["next_action"],
+          "retained attachment event with an invalid counter was treated as safe to reattach")
+
+    inconsistent_start_id = submit("helper-start-without-launch-intent")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET started_at=? WHERE id=?",
+                       (time.time(), inconsistent_start_id))
+    inconsistent_status, inconsistent_inspect = observe(inconsistent_start_id)
+    check(inconsistent_status["classification"] == "unknown_after_launch" and
+          inconsistent_inspect["classification"] == "unknown_after_launch" and
+          inconsistent_status["recovery_command"] is None,
+          "started_at without launch intent received a recovery command")
+
+    malformed_owner_id = submit("helper-malformed-owner")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET owner_session='malformed-session' WHERE id=?",
+                       (malformed_owner_id,))
+    malformed_status, _ = observe(malformed_owner_id)
+    check(malformed_status["classification"] == "never_attached" and
+          malformed_status["recovery_command"] is None and
+          "stored owner identity is invalid" in malformed_status["next_action"],
+          "malformed stored owner received a recovery command")
+
+    unenrolled_id = submit("helper-unenrolled-owner")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET owner_session=? WHERE id=?",
+                       (uuid_text(), unenrolled_id))
+    unenrolled_status, _ = observe(unenrolled_id)
+    check(unenrolled_status["classification"] == "never_attached" and
+          unenrolled_status["recovery_command"] is None and
+          "no exact Hailing enrollment" in unenrolled_status["next_action"],
+          "unenrolled stored owner received a recovery command")
+
+    config_path.write_text("{", encoding="utf-8")
+    malformed_route_status, _ = observe(stale_id)
+    check(malformed_route_status["classification"] == "stale_attached_helper" and
+          malformed_route_status["recovery_command"] is None and
+          "snapshot is unavailable or malformed" in malformed_route_status["next_action"],
+          "malformed Hailing snapshot received a recovery command")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    launched_marker = temp / "launched-command-replayed"
+    launched_id = submit("helper-active-launch", [sys.executable, "-c",
+        f"from pathlib import Path; Path({str(launched_marker)!r}).touch()"])
+    helper_id, generation = attach(launched_id)
+    claim = str(uuid.uuid4())
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("""UPDATE reservations SET state='reserved',reservation_claim=?,
+                claim_helper_id=?,claim_generation=?,granted_at=?,lease_active=1 WHERE id=?""",
+                (claim, helper_id, generation, time.time(), launched_id))
+        claim, _, _ = warp_drive.claim_launch(db, launched_id, helper_id, generation)
+        warp_drive.mark_started(db, launched_id, claim)
+    active_status, active_inspect = observe(launched_id)
+    check(active_status["classification"] == "active_after_launch" and
+          active_inspect["classification"] == "active_after_launch" and
+          active_status["evidence"]["outcome"] == "unknown" and
+          active_status["recovery_command"] is None,
+          "fresh launched helper with unknown outcome was misclassified as uncertain or offered attach")
+    replay_attempt = run_cli(state, "attach", launched_id, *owner_args(owner), "--timeout", "0.1",
+                             env=env, ok=False)
+    check(replay_attempt.returncode != 0 and not launched_marker.exists(),
+          "monitor attach replayed a command with a recorded launch intent")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET state='finished',outcome='succeeded',exit_code=0,ended_at=?,"
+                       "lease_active=0,wake_status='pending' WHERE id=?", (time.time(), launched_id))
+    finished_success = inspect_only(launched_id)
+    check(finished_success["classification"] == "finished" and
+          finished_success["evidence"]["outcome"] == "succeeded" and
+          finished_success["recovery_command"] is None,
+          "finished launched success was mislabeled uncertain or offered attach")
+
+    uncertain_id = submit("helper-uncertain-after-launch")
+    helper_id, generation = attach(uncertain_id)
+    claim = str(uuid.uuid4())
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("""UPDATE reservations SET state='reserved',reservation_claim=?,
+                claim_helper_id=?,claim_generation=?,granted_at=?,lease_active=1 WHERE id=?""",
+                (claim, helper_id, generation, time.time(), uncertain_id))
+        claim, _, _ = warp_drive.claim_launch(db, uncertain_id, helper_id, generation)
+        warp_drive.mark_started(db, uncertain_id, claim)
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET heartbeat_at=? WHERE id=?",
+                       (time.time() - warp_drive.HELPER_STALE_SECONDS - 1, uncertain_id))
+    run_cli(state, "scheduler", "--once", env=env)
+    uncertain_status, uncertain_inspect = observe(uncertain_id)
+    check(uncertain_status["classification"] == "uncertain_after_launch" and
+          uncertain_inspect["classification"] == "uncertain_after_launch" and
+          uncertain_status["evidence"]["lease_active"] is False and
+          uncertain_status["evidence"]["outcome"] == "unknown" and
+          uncertain_status["recovery_command"] is None and
+          "--outcome unknown --stopped-generation" in uncertain_status["next_action"] and
+          "An inactive lease alone cannot establish a stop" in uncertain_inspect["next_action"],
+          "stale post-launch helper was not kept uncertain with no replay command")
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET state='finished',outcome='failed',exit_code=1,ended_at=?,"
+                       "lease_active=0,wake_status='pending' WHERE id=?", (time.time(), uncertain_id))
+    finished_failure = inspect_only(uncertain_id)
+    check(finished_failure["classification"] == "finished" and
+          finished_failure["evidence"]["outcome"] == "failed" and
+          finished_failure["recovery_command"] is None,
+          "finished launched failure was mislabeled uncertain or offered attach")
+
+
 def test_spawn_failure_accounting_provenance(temp):
     state = temp / "spawn-failure-state"
     run_cli(state, "init")
@@ -3140,6 +3582,103 @@ def test_ignored_sigchld_preserves_child_exit(temp):
           f"helper misreported a failing child with inherited SIGCHLD=SIG_IGN: {stdout}\n{stderr}")
     check(signal_marker.read_text() == str(signal.SIG_DFL),
           "helper did not reset inherited SIGCHLD=SIG_IGN before launching its child")
+
+
+def test_stopped_unknown_release(temp):
+    state = temp / "stopped-unknown-state"
+    worktree = temp / "stopped-unknown-worktree"
+    worktree.mkdir()
+    next_worktree = temp / "stopped-unknown-next-worktree"
+    next_worktree.mkdir()
+    owner = {"harness": "codex", "session": uuid_text(), "surface": uuid_text()}
+    args = owner_args(owner)
+
+    def submit(path, key):
+        return parse_json(run_cli(state, "submit", "--key", key, *args, "--size", "light",
+            "--family", "test", "--workers", "1", "--expected-runtime", "30",
+            "--repo", path, "--worktree", path, "--", sys.executable, "-c", "pass"))["request_id"]
+
+    request = submit(worktree, "stopped")
+    waiting = submit(next_worktree, "next")
+    evidence_args = ("--outcome", "unknown", "--evidence",
+                     "fixture workload and descendants observed stopped")
+    reconcile = ("reconcile", request, *args, *evidence_args)
+    operator = parse_json(run_cli(state, "init"))["operator"]
+    with contextlib.closing(warp_drive.connect(state)) as db:
+        sample = {"at": time.time(), "logical_cpus": 8, "cpu_busy": 0.05,
+                  "memory_pressure": "warning"}
+        with warp_drive.immediate_transaction(db):
+            _, generation, _ = warp_drive.attach_helper(db, request, owner, "old-helper")
+            warp_drive.host_sample(db, source="fixture", fixture=sample)
+            check(warp_drive.scheduler_pass(db, sample=sample)["granted"] == request,
+                  "warning fixture did not reserve the light slot")
+        release = (*reconcile, "--stopped-generation", str(generation))
+        check("launched reservation" in run_cli(state, *release, ok=False).stderr,
+              "unstarted claim was eligible for stopped-workload reconciliation")
+        claim, _, _ = warp_drive.claim_launch(db, request, "old-helper", generation)
+        warp_drive.mark_started(db, request, claim)
+        check("expired unknown claim" in run_cli(state, *release, ok=False).stderr,
+              "a live lease was eligible for stopped-workload reconciliation")
+        with warp_drive.immediate_transaction(db):
+            db.execute("UPDATE reservations SET heartbeat_at=? WHERE id=?",
+                       (time.time() - warp_drive.HELPER_STALE_SECONDS - 1, request))
+            warp_drive.monitor_reservations(db)
+            warp_drive.attach_helper(db, waiting, owner, "next-helper")
+            check(warp_drive.scheduler_pass(db, sample=sample)["granted"] is None,
+                  "an uncertain launch did not retain its warning-mode slot")
+        run_cli(state, *reconcile)
+        candidate = parse_json(run_cli(state, "inspect", waiting))
+        check(candidate["admission"]["request_context"]["wait_reason"] ==
+              "memory warning light reservation limit reached",
+              "an unverified unknown claim stopped consuming capacity")
+        check("Helper generation changed" in run_cli(state, *reconcile, "--stopped-generation",
+              str(generation + 1), ok=False).stderr, "wrong generation could release the claim")
+        foreign_owner = {**owner, "session": uuid_text()}
+        check("Only the current owner" in run_cli(state, "reconcile", request,
+              *owner_args(foreign_owner), *evidence_args, "--stopped-generation", str(generation),
+              ok=False).stderr,
+              "a foreign owner could release the claim")
+        check("recorded owner changed" in run_cli(state, "reconcile", request,
+              *owner_args(foreign_owner), *evidence_args, "--stopped-generation", str(generation),
+              "--actor", operator, ok=False).stderr, "operator could act on stale owner identity")
+        check("not the configured operator" in run_cli(state, *release,
+              "--actor", "unconfigured-actor", ok=False).stderr, "an unconfigured operator could release the claim")
+        check("--actor requires --stopped-generation" in run_cli(state, *reconcile,
+              "--actor", operator, ok=False).stderr, "operator bypassed the verified stop requirement")
+        observed = warp_drive.current_request(db, request)
+        released = parse_json(run_cli(state, *release, "--actor", operator))
+        check(released["state"] == "finished" and released["wake_status"] == "pending",
+              "verified stop did not release capacity and queue a wake")
+        ended = warp_drive.current_request(db, request)
+        check(ended["outcome"] == "unknown" and ended["exit_code"] is None and ended["ended_at"] is None
+              and ended["launch_intent_at"] == observed["launch_intent_at"]
+              and ended["reservation_claim"] == claim, "release altered the unknown result or launch history")
+        run_cli(state, *release, ok=False)
+        replay = run_cli(state, "attach", request, *args, ok=False)
+        check(parse_json(replay)["outcome"] == "unknown", "attach did not return the existing unknown result")
+        with warp_drive.immediate_transaction(db):
+            sample["at"] = time.time()
+            warp_drive.host_sample(db, source="fixture", fixture=sample)
+            check(warp_drive.scheduler_pass(db, sample=sample)["granted"] == waiting,
+                  "next light request did not receive an ordinary warning-mode grant")
+        sender, route = uuid_text(), [owner]
+        with patch.object(warp_drive.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as send:
+            warp_drive.dispatch_pending_completions(state, route, "fake-cmux", sender)
+            warp_drive.dispatch_pending_completions(state, route, "fake-cmux", sender)
+        send.assert_called_once()
+        command = send.call_args.args[0]
+        check(command[3] == owner["surface"] and "exit result is unknown" in command[4],
+              "stopped-workload wake did not preserve the exact owner and the unknown result")
+        inspected = parse_json(run_cli(state, "inspect", request))
+        diagnostic = inspected["reservation"]["helper_diagnostic"]
+        check(diagnostic["classification"] == "finished" and
+              "preserve the unknown exit result" in diagnostic["next_action"] and
+              "accepted enrolled successor" in diagnostic["next_action"],
+              "finished unknown claim omitted retirement guidance")
+        releases = [event for event in inspected["events"] if event["kind"] == "stopped_workload_released"]
+        check(len(releases) == 1 and releases[0]["data"]["actor"] == operator
+              and sum(event["kind"] == "launch_intent" for event in inspected["events"]) == 1,
+              "retry changed the release or launch history")
 
 
 def test_transferred_completion_wake(temp):
@@ -3763,6 +4302,7 @@ def main():
             test_scheduler_refreshes_policy_version(temp)
             test_explicit_cpu_estimates(temp)
             test_owner_args_cli(temp)
+            test_owner_args_anonymous_codex_feed(temp)
             test_new_recipient_enrollment_guard(temp)
             test_missed_turn_ordering(temp)
             test_scheduler_startup_pacing_and_escape_limit(temp)
@@ -3776,8 +4316,10 @@ def main():
             test_scheduler_fair_aged_worktree_and_idle_signal(temp)
             test_protected_target_survives_mean_settling(temp)
             test_cli_reservations(temp)
+            test_helper_diagnostics_cli(temp)
             test_spawn_failure_accounting_provenance(temp)
             test_ignored_sigchld_preserves_child_exit(temp)
+            test_stopped_unknown_release(temp)
             test_transferred_completion_wake(temp)
             test_missing_owner_completion_route_diagnostics_and_recovery(temp)
             test_completion_backlog_connection_bound(temp)

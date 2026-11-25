@@ -1,4 +1,5 @@
 {
+  "packet_successor_acceptance_repositories": ["github.com/morecoffeyplease/starfleet-ai"],
   "approval_authority": {
     "label": "user",
     "accepted_channels": ["direct-user", "configured-contact-route"]

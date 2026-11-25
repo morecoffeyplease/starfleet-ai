@@ -114,6 +114,21 @@ class InstallTest(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10, env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Reviewer judgment guidance", result.stdout)
+        runtime_guide = self.runtime / "reviewer_guidance.py"
+        manifest = json.loads((self.runtime / "install.json").read_text())
+        self.assertEqual(manifest["reviewer_guidance_sha256"], hashlib.sha256(runtime_guide.read_bytes()).hexdigest())
+        probe = ("import importlib.util, pathlib, sys; "
+                 "p=pathlib.Path(sys.argv[1])/'reviewer_guidance.py'; "
+                 "s=importlib.util.spec_from_file_location('installed_guidance',p); "
+                 "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                 "print(m.compose_reviewer_prompt('complex_initial_review','complex task')); "
+                 "print(m.compose_reviewer_prompt('skeptical_review','proposal task'))")
+        roles = subprocess.run([sys.executable, "-c", probe, str(self.runtime)], capture_output=True,
+                              text=True, timeout=10, env=self.env)
+        self.assertEqual(roles.returncode, 0, roles.stderr)
+        self.assertIn("complex task", roles.stdout)
+        self.assertIn("Skeptical continuation proposal review", roles.stdout)
+        self.assertIn("proposal task", roles.stdout)
         self.assertFalse(self.config.exists())
         self.assertFalse(self.state.exists())
 

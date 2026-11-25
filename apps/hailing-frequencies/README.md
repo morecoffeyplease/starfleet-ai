@@ -14,6 +14,9 @@ Temporal Beacon adds durable agent wake timers to this same worker.
 Read the [Temporal Beacon guide](temporal-beacon.md) for `--after`, `--at`, `--every`, time-based `--until`, receipt, installation, and diagnosis, or load its [agent skill](skills/temporal-beacon/SKILL.md).
 Timer delivery uses the existing enrolled-session guards and opt-in send scope; unread-message reminder timing remains separate.
 
+The same worker can send a guarded wake when the local Claude Code weekly allowance changes or reaches a configured threshold.
+Set up a [Claude Code weekly quota watch](temporal-beacon.md#watch-claude-code-weekly-quota) from the exact enrolled session that should receive it.
+
 The Hailing installer also installs the `agent-notify` Discord conversation command, its [setup guide](agent-notify-guide.md), and its [agent skill](skills/agent-notify/SKILL.md).
 Print its setup instructions with `agent-notify guide --print` before creating Discord configuration or a worker.
 Agent Notify keeps its existing private configuration and thread routing state, and registers posts with the existing Discord Watch worker when available.
@@ -81,6 +84,9 @@ It requires no worker restart or enrollment change and leaves local Agent Notify
 Discord Watch may report `remote_missing` for a deleted thread, which is separate from a credential failure or local retirement.
 See the [cleanup guide](discord-cleanup.md) for the date variables, private plan location, and recovery behavior.
 
+If a separately installed Agent Notify is already working, use `python3 apps/hailing-frequencies/install.py --skip-agent-notify`.
+The option leaves the Agent Notify command untouched during installation and uninstallation.
+
 ## Enroll exact sessions
 
 Run `cmux current --json --limit 200` and `cmux --id-format both --json tree --all` to observe the actual harness session, surface, and workspace.
@@ -121,8 +127,24 @@ UUIDs above are placeholders for observed identities.
 Enrollment normally covers only messages created after enrollment.
 Use `--include-existing` to include an enrolled session's existing backlog; messages older than that session's recorded start are always excluded.
 Re-enrollment of an unchanged identity preserves its original cutoff and receipts.
-Session replacement never transfers enrollment or pending prompts automatically.
-Unenroll the old session explicitly, inspect the replacement, then enroll it separately.
+
+### Replace your ended session on the same pane
+
+From the current Claude or Codex session on the same CMUX pane, run:
+
+```sh
+hailing-frequencies replace --harness claude --surface YOUR_SURFACE_UUID --session YOUR_SESSION_UUID --from-session ENROLLED_PREDECESSOR_UUID --label YOUR_LABEL
+```
+
+Use the exact session and pane shown by CMUX, and use `--harness codex` for Codex.
+CMUX must explicitly report the enrolled predecessor as ended and confirm the current session as the native owner in the same workspace and harness.
+The command holds on coordinator enrollments, unresolved predecessor inbox messages, active timers, and open or unresolved managed Discord replies.
+It checks Temporal Beacon in the selected Hailing state and Discord Watch in its standard local state directory.
+Deployments using a custom Discord Watch state directory need the explicit operator handoff so that directory can be reconciled.
+The command replaces the registration in one write, starts a fresh message cutoff, and preserves old receipts and history.
+An identical retry returns the original cutoff.
+Check saved enrollment with `hailing-frequencies status`, and run `warp-drive owner-args` from the successor when using Warp.
+If a required check fails, keep the existing registration and follow the [explicit handoff](guide.md#receive-an-authorized-handoff).
 
 An explicit current-generation custody adoption is a separate operation exposed by Discord Watch for an operator-approved, enumerated set of existing obligations.
 It records an old-to-current assignment without claiming historical process continuity, and keeps the original cutoff and private receipt history.
@@ -184,6 +206,14 @@ Notification presentation depends on macOS notification settings; a requested no
 A failed latest scan is unhealthy immediately.
 Partial scans record a fresh heartbeat and list targets with incomplete inbox coverage.
 Health remains unhealthy until every enrolled inbox can be listed successfully.
+Run `starfleet doctor --json` from an enrolled session to see worker freshness and that session's intended delivery separately.
+A fresh partial scan can still support intended delivery for an exact covered session.
+Doctor checks the session, harness, surface, workspace, generation, send scope, and latest complete inbox result without sending anything.
+A known hold, an incomplete inbox for that session, or missing exact scan evidence blocks intended delivery.
+After updating the worker, allow it to complete a fresh scan before relying on the new exact-session evidence.
+Use `hailing-frequencies health` for the fleet-wide warning and `hailing-frequencies status` for the failed target rows.
+An actual scan failure, including inbox saturation, still blocks worker readiness.
+Intended delivery is setup evidence; use the actual message or timer receipt to confirm delivery.
 The scan report's `inbox_status` describes inbox coverage, not prompt delivery or recipient acknowledgment.
 Notifications repeat at most hourly per unhealthy episode; recovery permits the next failure to notify again.
 The watcher cannot access CMUX, send prompts, restart a closed terminal, or establish coverage after reboot.
@@ -301,11 +331,16 @@ Have the original sender issue a new message only after the operator reconciles 
 New messages can trigger another reminder after the cooldown; an already-attempted message cannot repeatedly interrupt its recipient.
 Escalation is separately deduplicated and sent only to a distinct enrolled coordinator.
 
+## Receive a handoff
+
+Follow the [incoming-owner workflow](guide.md#receive-an-authorized-handoff) for exact enrollment, transfer of named Discord Watch threads, reply receipt, and predecessor removal.
+The workflow uses existing commands and records progress in the same private handoff packet.
+
 ## Inspect and remove
 
 ```sh
 hailing-frequencies status
-hailing-frequencies unenroll --session SESSION_UUID
+hailing-frequencies unenroll --session OWN_SESSION_UUID
 python3 apps/hailing-frequencies/install.py --uninstall
 ```
 

@@ -46,6 +46,11 @@ Use `warp-drive doctor` to inspect sample freshness, stale helpers, the optional
 Doctor counts pending and unavailable completion wakes separately from uncertain sends.
 Use `warp-drive inspect REQUEST_ID` to see one completion's wake status and event history.
 Status and inspect are passive observations and do not attach to or replace a helper.
+Read each request's `helper_diagnostic` for its attachment classification, evidence and next action: `never_attached`, `stale_attached_helper`, and `unknown_history` distinguish a known first attach, a stale prior attach, and insufficient or conflicting history.
+For a waiting request with no launch intent, `recovery_command` prints an exact-owner `attach --detach` command only when helper history is known and one valid Hailing enrollment matches the stored owner.
+Running that command attaches to the existing request; any existing hold or delay remains in force, and admission is not guaranteed.
+Fresh helpers are not replacement candidates, and no attach command is printed after launch intent or a start timestamp.
+For launched work, follow the diagnostic's inspect and reconcile guidance after obtaining owner evidence; never replay an uncertain command.
 Use `status` or `inspect` for the current point-in-time admission snapshot; initial `run` output cannot predict a later scheduler decision.
 The snapshot shows host sample freshness, observed and projected CPU, memory pressure, reserved claim counts, the configured warning heavy limit, estimated active managed contributors, and current candidate constraints.
 The memory-pressure field reports `normal`, `warning`, `critical`, or `unknown`.
@@ -91,6 +96,14 @@ The child then uses those exact parent-provided flags on its existing Warp reque
 The command reads CMUX's current native caller and the local Hailing enrollment without creating Warp state, enrolling an owner or checking notification delivery.
 It requires `CMUX_AGENT_LAUNCH_KIND` and exactly one matching native session hint to agree with CMUX and Hailing, so a delegated child uses its parent's supplied flags instead of asking `owner-args` to infer the parent's identity.
 An exact configured binding does not prove that a future completion message is queued, prompted, received or read.
+
+On CMUX 0.65.2 build 113, anonymous Feed telemetry can appear beside the named Codex session in `cmux current`.
+Warp-drive requires a complete pane inventory with zero omitted agent rows.
+The older anonymous row must match the PID-only digest produced by CMUX, and the saved session must match the named caller.
+The local process start and CMUX controlling-terminal lookup must also match the saved process, pane, and workspace.
+The normal caller-session and Hailing enrollment checks still apply.
+When an ambiguity remains, inspect `cmux current --json --limit 200` and `cmux sessions list --agent codex --surface SURFACE_UUID --all --json`.
+Use the exact native session when the evidence agrees, and route any unresolved discrepancy to the maintainer with the CMUX version and the two row types.
 
 For OpenCode, pass its exact native `ses_` session ID, including letter case, and the current CMUX surface UUID.
 Warp-drive does not convert OpenCode session IDs to UUIDs or borrow an identity from another agent.
@@ -249,6 +262,20 @@ Unavailable delivery stays pending for a later sending scheduler pass after enro
 If a queue attempt is uncertain, inspect the recorded event and do not send a duplicate manually.
 
 For a launched reservation whose helper stopped before recording completion, use `warp-drive reconcile REQUEST_ID --harness claude --session SESSION_UUID --surface SURFACE_UUID --outcome unknown --evidence "what was observed"` to preserve the uncertainty.
+An unknown reservation keeps its capacity claim while workload liveness is ambiguous.
+Tell the current owner and use the existing Reliability incident for that claim while other eligible work continues within available capacity.
+If the current owner verifies the exact workload and its descendants or containers have stopped, use the same command with `--stopped-generation GENERATION` from `inspect` and record the affirmative stop evidence.
+The configured operator or a delegate can record a verified stop by adding `--actor OPERATOR_ID` and passing the reservation's exact current owner arguments.
+The command checks the observed generation, expired heartbeat, and inactive lease before releasing capacity.
+Confirm the launch identity against its process tree or an attributable workload log and the state of any containers it started.
+If you can only confirm a stale helper or inactive lease, leave the reservation reserved.
+Verified-stop reconciliation preserves launch history and the unknown exit result, prevents replay, and makes the standard exact-owner notification pending.
+For a handoff, record the finished reservation and its unknown exit result in the checkpoint.
+If the completion is pending or unavailable, use `warp-drive transfer` with the accepted successor's exact enrolled owner arguments before retiring the outgoing session.
+Verify the recorded owner and completion route with `warp-drive inspect REQUEST_ID`.
+When the result is already queued or the send is uncertain, preserve that delivery record and share the exact reservation ID and result in the handoff.
+The state `finished` after a verified stop settles the capacity claim.
+It does not establish a passing run or a delivered completion.
 Use `--outcome succeeded` or `--outcome failed` only after obtaining owner evidence for that result.
 Record an engineer investigation with `warp-drive incident INCIDENT_ID --evidence "source" --action "what was done" --outcome "observed result"`.
 Resolve it only after the observed condition has cleared, by adding `--resolve` to that command.

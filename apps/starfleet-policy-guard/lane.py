@@ -31,10 +31,28 @@ APP = Path(__file__).resolve().parent
 SELF = Path(__file__).resolve()
 UPGRADE_JOURNAL = 'upgrade-journal.json'
 RETIREMENT_PROTOCOL = 'policy-guard-missing-checkout-retirement-v1'
+SEAT_RETIREMENT_PROTOCOL = 'policy-guard-drained-seat-retirement-v1'
+SEAT_RETIREMENT_JOURNAL = 'seat-retirement-journal.json'
 
 
 def root(cwd):
     return Path(delivery.value(cwd, 'rev-parse', '--show-toplevel')).resolve()
+
+
+def active_operational_anchor(seat):
+    anchor = session_store.operational_anchor(seat)
+    if anchor['state'] != 'active':
+        raise ValueError('This permanent seat has released its operational anchor and is history-only')
+    try:
+        observed_root = str(root(anchor['root']))
+        observed_gitdir = delivery.value(anchor['root'], 'rev-parse', '--absolute-git-dir')
+        observed_common = delivery.value(anchor['root'], 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    except (OSError, TypeError, ValueError):
+        raise ValueError('The permanent seat operational anchor no longer resolves as its recorded Git worktree') from None
+    if (observed_root != anchor['root'] or observed_gitdir != anchor['gitdir'] or
+            (anchor.get('common_gitdir') is not None and observed_common != anchor['common_gitdir'])):
+        raise ValueError('The permanent seat operational anchor Git identity changed; preserve history and inspect recovery')
+    return anchor
 
 
 def directory(cwd):
@@ -119,6 +137,16 @@ def file_locked(cwd):
                     raise ValueError('Delivery lane state busy; retry at a safe boundary')
                 time.sleep(0.02)
         yield
+
+
+@contextlib.contextmanager
+def source_upgrade_locked(cwd, seat_ids):
+    if seat_ids:
+        with session_store.locked_seats(seat_ids):
+            yield
+    else:
+        with file_locked(cwd):
+            yield
 
 
 @contextlib.contextmanager
@@ -241,6 +269,17 @@ def upgrade_journal_path(cwd):
     return directory(cwd) / UPGRADE_JOURNAL
 
 
+def seat_retirement_journal_path(identifier):
+    return session_store.seat_dir(identifier) / SEAT_RETIREMENT_JOURNAL
+
+
+def ensure_no_seat_retirement_journal(identifier):
+    journal = seat_retirement_journal_path(identifier)
+    if journal.exists() or journal.is_symlink():
+        raise ValueError('A drained-seat retirement is incomplete; inspect it with --seat-id ' + identifier +
+                         ' recover --inspect, then use recover --rollback from the exact native operator')
+
+
 def upgrade_recovery_command(cwd):
     return shlex.join([sys.executable, str(SELF), '--cwd', str(root(cwd)),
                        'upgrade-recover', '--rollback'])
@@ -256,6 +295,8 @@ def ensure_no_upgrade_journal(cwd):
                   found['seat'].get('handoff_journal')):
         raise ValueError('A seat installation or migration is incomplete. Preserve its journal and run the installed runtime with --seat-id ' +
                          found['seat']['seat_id'] + ' recover --inspect')
+    if found:
+        ensure_no_seat_retirement_journal(found['seat']['seat_id'])
 
 
 def state_for_upgrade_guard(cwd):
@@ -561,7 +602,46 @@ def check_guidance_publication_comment(publication, state, executable, label, *,
     return remote
 
 
+def packet_successor_acceptance(state, receipt, packet):
+    policy = json.loads(Path(receipt['policy_path']).read_text())
+    ref = github.reference(state['pr_url'], 'pull')
+    repositories = policy.get('packet_successor_acceptance_repositories', [])
+    if not isinstance(repositories, list) or any(not isinstance(value, str) for value in repositories):
+        raise ValueError('Malformed packet successor acceptance repository policy')
+    if ref['host'] + '/' + ref['repo'] not in repositories:
+        raise ValueError('This repository retains its published successor validation policy')
+    acceptance = packet.get('handoff_acceptance')
+    if not isinstance(acceptance, dict) or acceptance.get('version') != 1:
+        raise ValueError('The current handoff packet needs a version 1 handoff_acceptance')
+    owner = guidance_owner_key(state.get('lane_owner'), 'Current lane owner')
+    if guidance_owner_key(acceptance.get('owner'), 'Handoff acceptance') != owner:
+        raise ValueError('Handoff acceptance belongs to a different native owner')
+    previous = guidance_owner_key(acceptance.get('from_owner'), 'Handoff predecessor')
+    guidance_handoff_path(state, previous, owner)
+    for key in ('summary', 'repair_history_ref', 'scope_and_holds_ref'):
+        delivery.text(acceptance, key)
+    report = receipt['report']
+    if acceptance.get('candidate') != report['snapshot']['head'] or not delivery.opening_report_ready(report):
+        raise ValueError('Handoff acceptance requires the current clean candidate and successful canonical verification')
+    return acceptance
+
+
+def require_packet_successor_acceptance(state, cwd):
+    receipt = state.get('receipt')
+    delivery_runs.check(receipt, cwd, state['pr_url'])
+    packet = json.loads(Path(receipt['packet_path']).read_text())
+    acceptance = packet_successor_acceptance(state, receipt, packet)
+    for entry in (receipt.get('required_reads') or {}).get('entries', []):
+        if hashlib.sha256(Path(entry['path']).read_bytes()).hexdigest() != entry['sha256']:
+            raise ValueError('Required read changed after handoff acceptance; reread and record the current packet')
+    return acceptance
+
+
 def require_guidance_attestation(state, cwd, *, local_inspection=False):
+    receipt = state.get('receipt')
+    if isinstance(receipt, dict) and receipt.get('handoff_acceptance') is True:
+        require_packet_successor_acceptance(state, cwd)
+        return
     published = state.get('guidance_attestation_ref')
     if (not isinstance(published, dict) or type(published.get('version')) is not int or
             published['version'] != 1):
@@ -585,9 +665,15 @@ def require_guidance_attestation(state, cwd, *, local_inspection=False):
         prior, _same_owner_publication = successor_predecessor(state, packet)
         if published.get('prior_publication_ref') != prior:
             raise ValueError('Successor publication no longer links the exact inherited publication in its current packet')
+    record = packet.get('guidance_attestation') if isinstance(packet, dict) else None
+    legacy_repair_publication = (
+        published.get('stage') == 'repair_batch' and isinstance(record, dict) and
+        record.get('stage') == 'repair_batch' and 'repair_assessment' not in record and
+        delivery.guidance_attestation_sha256(record) == published.get('attestation_sha256'))
     rendered = delivery.render_guidance_attestation(packet, path.parent, state['pr_url'],
                                                     published.get('stage'), report=report,
-                                                    receipt_context=published.get('required_reads'))
+                                                    receipt_context=published.get('required_reads'),
+                                                    _allow_legacy_repair=legacy_repair_publication)
     if (published.get('body_sha256') != rendered['body_sha256'] or
             published.get('attestation_sha256') != rendered['attestation_sha256']):
         raise ValueError('Local guidance attestation changed after publication; render and publish the current stage again')
@@ -779,10 +865,23 @@ def remote_pr(cwd, pr_url, base_ref, head_branch=None, *, observed=None, executa
 def check_lane_identity(state, cwd):
     owner=state['lane_owner']
     found = session_store.lookup_checkout(root(cwd))
+    anchor = None
+    if state.get('seat_id'):
+        seat = session_store.load_seat(state['seat_id'])
+        if not seat:
+            raise ValueError('The permanent seat registry is missing; preserve its history and inspect recovery')
+        anchor = active_operational_anchor(seat)
+        anchor_root = anchor['root']
+        anchor_gitdir = anchor['gitdir']
+    else:
+        anchor_root = state.get('session_root', state['root'])
+        anchor_gitdir = owner.get('seat_gitdir')
     if (state['phase']!='active' or state['root']!=str(root(cwd)) or
             owner['product_gitdir']!=delivery.value(cwd,'rev-parse','--absolute-git-dir') or
-            owner.get('seat_root', state['session_root']) != str(root(state['session_root'])) or
-            owner['seat_gitdir']!=delivery.value(state['session_root'],'rev-parse','--absolute-git-dir') or
+            state.get('session_root') != anchor_root or
+            owner.get('seat_root', state.get('session_root')) != anchor_root or
+            owner.get('seat_gitdir') != anchor_gitdir or
+            anchor_gitdir != delivery.value(anchor_root,'rev-parse','--absolute-git-dir') or
             (state.get('seat_id') and (not found or found['seat']['seat_id']!=state['seat_id'])) or
             github.origin_repo(delivery.value(cwd,'remote','get-url','origin'),owner['host']).casefold()!=owner['repository']):
         raise ValueError('Enrolled product/seat path or repository changed; preserve registration history and coordinate an explicit path repair')
@@ -843,6 +942,7 @@ def rebind_owner(args):
             seat=session_store.load_seat(identifier)
             if not seat:
                 raise ValueError('Permanent seat registry is missing; preserve its history and inspect recovery')
+            anchor = active_operational_anchor(seat)
             if (session_store.seat_dir(identifier)/UPGRADE_JOURNAL).exists() or \
                     (session_store.seat_dir(identifier)/UPGRADE_JOURNAL).is_symlink():
                 raise ValueError('A seat source upgrade is incomplete; recover it before transferring ownership')
@@ -867,10 +967,18 @@ def rebind_owner(args):
                                  else source_versions(previous['harness']))
             for item in checkout_rows:
                 state = item.get('state')
+                if state is not None and not isinstance(state,dict):
+                    raise ValueError('Checkout state is malformed; preserve its history and inspect status before transfer')
                 if not state:
                     continue
                 if state.get('phase') == 'removed':
                     continue
+                pr_bindings=state.get('pr_bindings',{})
+                if (not isinstance(pr_bindings,dict) or
+                        any(not isinstance(url,str) or not isinstance(binding,dict)
+                            for url,binding in pr_bindings.items()) or
+                        (state.get('pr_url') is not None and not isinstance(state.get('pr_url'),str))):
+                    raise ValueError('Checkout PR history map is malformed; preserve it and inspect status before transfer')
                 state_owner = state.get('lane_owner')
                 if (not isinstance(state_owner, dict) or
                         {key: state_owner.get(key) for key in ('harness', 'session_id')} != previous):
@@ -879,6 +987,33 @@ def rebind_owner(args):
                     raise ValueError('Pinned delivery adapter source changed; restore the reviewed source')
             incoming_versions = (runtime_source_versions(runtime, identity['harness']) if same_harness
                                  else permanent_handoff_source_versions(seat, identity['harness']))
+            changed_attachments=[]
+            retained_attachments=[]
+            path_state_by_checkout={}
+            for item in checkout_rows:
+                state=item.get('state') or {}
+                path_state=checkout_path_availability(item)
+                path_state_by_checkout[item.get('checkout_id')]=path_state
+                bindings=state.get('pr_bindings')
+                pr_refs=sorted((set(bindings) if isinstance(bindings,dict) else set()) |
+                               ({state['pr_url']} if isinstance(state.get('pr_url'),str) else set()))
+                pr_history_intact=('pr_bindings' not in state or (isinstance(bindings,dict) and
+                    all(isinstance(url,str) and isinstance(binding,dict)
+                        for url,binding in bindings.items())))
+                disposition={'checkout_id':item.get('checkout_id'),'root':item.get('root'),
+                             'phase':state.get('phase','missing-or-malformed-state'),
+                             'branch':state.get('branch'),'pr_refs':pr_refs,
+                             'pr_history_state':'intact' if pr_history_intact else 'malformed-preserved',
+                             'worktree_path_state':path_state}
+                if not item.get('state'):
+                    retained_attachments.append({**disposition,'disposition':'retained',
+                                                 'reason':'state-unavailable'})
+                elif state.get('phase') == 'removed':
+                    retained_attachments.append({**disposition,'disposition':'retained',
+                                                 'reason':'retired-history-preserved'})
+                else:
+                    changed_attachments.append({**disposition,'disposition':'rebound',
+                                                'reason':'owner-and-source-pin-updated'})
             target_groups=copy.deepcopy(seat.get('groups',{}))
             target_hooks_installed=bool(seat.get('hooks_installed'))
             target_settings=copy.deepcopy(seat.get('settings'))
@@ -887,7 +1022,7 @@ def rebind_owner(args):
                 settings_path=None
                 current_raw=''
                 if previous['harness']=='claude' and seat.get('hooks_installed'):
-                    settings_path,current_raw,current_settings=settings(seat['seat_root'])
+                    settings_path,current_raw,current_settings=settings(anchor['root'])
                     if str(settings_path)!=(seat.get('settings') or {}).get('path'):
                         raise ValueError('Recorded Claude seat settings path changed; inspect recovery before transfer')
                     for event,group in seat.get('groups',{}).items():
@@ -912,9 +1047,9 @@ def rebind_owner(args):
                     target_groups={}
                     target_hooks_installed=False
                 elif identity['harness']=='claude':
-                    settings_path,current_raw,current_settings=settings(seat['seat_root'])
+                    settings_path,current_raw,current_settings=settings(anchor['root'])
                     runtime_cli=Path(seat['runtime']['path'])/'lane.py'
-                    target_groups=hook_groups(seat['seat_root'],seat['seat_root'],
+                    target_groups=hook_groups(anchor['root'],anchor['root'],
                         seat_identifier=identifier,runtime_cli=runtime_cli)
                     add={event:[group] for event,group in target_groups.items()}
                     change=migration_settings_change(settings_path,{},add)
@@ -970,6 +1105,40 @@ def rebind_owner(args):
                     'preimage_sha256':hashlib.sha256(preimage.encode()).hexdigest(),
                     'postimage':postimage,'postimage_sha256':hashlib.sha256(postimage.encode()).hexdigest()})
             seat_preimage=copy.deepcopy(seat)
+            changed=len(state_changes)
+            settings_receipt={'path':(settings_change['path'] if settings_change else
+                                      (target_settings or {}).get('path')),
+                'changed':bool(settings_change),
+                'before_sha256':settings_change.get('preimage_sha256') if settings_change else None,
+                'after_sha256':settings_change.get('updated_sha256') if settings_change else None,
+                'before_exists':settings_change.get('preimage_exists') if settings_change else None,
+                'after_exists':True if settings_change else None,
+                'mode':settings_change.get('mode') if settings_change else (target_settings or {}).get('mode'),
+                'hook_events_before':sorted((seat_preimage.get('groups') or {}).keys()),
+                'hook_events_after':sorted(target_groups.keys()),
+                'hook_groups_before':copy.deepcopy(seat_preimage.get('groups') or {}),
+                'hook_groups_after':copy.deepcopy(target_groups),
+                'notice':('Hashes cover the exact settings bytes before and after this handoff.'
+                          if settings_change else
+                          'No settings write occurred; the recorded baseline hash is not a current-content observation.')}
+            coverage_commands=[]
+            for item in checkout_rows:
+                state=item.get('state') or {}
+                if (state.get('phase') != 'active' or
+                        path_state_by_checkout.get(item.get('checkout_id')) != 'present'):
+                    continue
+                coverage_commands.append({'checkout_id':item.get('checkout_id'),'root':item.get('root'),
+                    'command':shlex.join([sys.executable,str(Path(runtime['path'])/'lane.py'),
+                                          '--cwd',item['root'],'coverage','--summary'])})
+            fresh_report={'required':True,'checkouts':[row['checkout_id'] for row in changed_attachments
+                    if row['phase'] == 'active' and row['pr_refs']],
+                'reason':'Prior receipts were archived where present; each active rebound checkout with a covered PR needs a fresh report before covered actions can pass.'}
+            verification_receipt={'configured':{'hooks_installed':target_hooks_installed,
+                    'settings_path':settings_receipt['path'],'hook_events':sorted(target_groups.keys()),
+                    'adapter_path':seat_preimage.get('adapter')},
+                'observed':{'state':'not-observed-by-rebind',
+                    'notice':'Rebind records local configuration only; it does not show that the incoming native runtime loaded or intercepted a hook.'},
+                'coverage_commands':coverage_commands}
             seat['handoff_journal']={'kind':'owner-handoff','from':previous,'to':identity,
                 'seat_preimage':seat_preimage,'state_changes':state_changes,
                 'settings_change':settings_change,'target_groups':target_groups,
@@ -996,11 +1165,12 @@ def rebind_owner(args):
             seat['hooks_installed']=target_hooks_installed
             seat['settings']=target_settings
             seat.pop('handoff_journal',None)
-            changed=len(state_changes)
             seat['updated_at']=time.time()
             session_store.save_seat(seat)
         return {'rebound':True,'owner':identity,'history_preserved':True,'report_required':True,
-                'checkouts_rebound':changed,
+                'checkouts_rebound':changed,'changed_attachments':changed_attachments,
+                'retained_attachments':retained_attachments,'settings_receipt':settings_receipt,
+                'fresh_report':fresh_report,'verification':verification_receipt,
                 'notice':'Explicit seat-wide handoff from the permanent seat registry. Deleted product Git directories were not read.'}
     current=read(args.cwd) or {}
     if current.get('seat_id'):
@@ -1128,13 +1298,26 @@ def plan(args):
                          'enrollment, or omit owner flags for a legacy per-PR installation')
     cwd = root(args.cwd)
     owner = root(args.session_root or cwd)
+    selected_manifest = None
+    if args.lane and args.seat_id:
+        selected_manifest = session_store.load_seat(args.seat_id)
+        if not selected_manifest:
+            raise ValueError('The exact --seat-id does not identify a permanent seat')
+        ensure_no_seat_retirement_journal(args.seat_id)
+        selected_anchor = active_operational_anchor(selected_manifest)
+        if args.session_root:
+            if str(owner) != selected_anchor['root']:
+                raise ValueError('The supplied session root differs from the exact seat operational anchor')
+        else:
+            owner = root(selected_anchor['root'])
     ensure_no_upgrade_journal(cwd)
     if not args.lane and delivery.value(owner, 'rev-parse', '--path-format=absolute', '--git-common-dir') != delivery.value(cwd, 'rev-parse', '--path-format=absolute', '--git-common-dir'):
         raise ValueError('Session root and product worktree must belong to the same repository')
     previous = read(cwd)
     reattach_same_root=False
     if previous and previous.get('phase') != 'removed':
-        if (args.lane and previous.get('phase')=='active' and previous.get('seat_id')==session_store.seat_id(owner)
+        if (args.lane and previous.get('phase')=='active' and
+                previous.get('seat_id')==(args.seat_id or session_store.seat_id(owner))
                 and previous.get('root')==str(cwd) and previous.get('lane_owner') and
                 previous['lane_owner'].get('product_gitdir')!=delivery.value(cwd,'rev-parse','--absolute-git-dir')):
             seat=session_store.load_seat(previous['seat_id'])
@@ -1163,8 +1346,12 @@ def plan(args):
         identity = lane_scope.native_identity()
         if identity != {'harness':args.owner_harness,'session_id':args.owner_session}:
             raise ValueError('Declared lane owner must match the actual native session')
-        seat_identifier = session_store.seat_id(owner)
-        seat = session_store.seat_manifest(seat_identifier)
+        seat_identifier = args.seat_id or session_store.seat_id(owner)
+        seat = selected_manifest or session_store.seat_manifest(seat_identifier)
+        if seat:
+            selected_anchor = active_operational_anchor(seat)
+            if selected_anchor['root'] != str(owner):
+                raise ValueError('This seat has no matching active operational anchor; select its exact --seat-id and anchor')
         if seat and seat.get('owner') != identity:
             raise ValueError('This permanent seat belongs to another native session. Use an explicitly authorized rebind-owner handoff.')
         owner_context=lane_scope.native_session_context()
@@ -1273,11 +1460,16 @@ def install_seat(proposed):
                     ('session_parent_id', 'session_project_id', 'session_directory') if key in proposed['lane_owner']}
     with session_store.locked_seat(seat_identifier):
         seat = session_store.load_seat(seat_identifier)
+        ensure_no_seat_retirement_journal(seat_identifier)
         seat_preimage = copy.deepcopy(seat)
         new_seat = seat is None
         if seat:
             if seat['owner'] != identity:
                 raise ValueError('This permanent seat belongs to another native session; use an explicitly authorized handoff')
+            anchor = active_operational_anchor(seat)
+            if (anchor['root'] != proposed['session_root'] or
+                    anchor['gitdir'] != proposed['lane_owner'].get('seat_gitdir')):
+                raise ValueError('The exact permanent seat no longer has the planned active operational anchor')
             if identity['harness'] == 'opencode' and seat.get('owner_context') != owner_context:
                 raise ValueError('This permanent seat belongs to a different OpenCode session API project or location; use an explicitly authorized handoff')
             if seat.get('runtime', {}).get('version') != proposed['runtime']['version']:
@@ -1285,6 +1477,8 @@ def install_seat(proposed):
         else:
             seat = session_store.make_manifest(proposed['session_root'], identity, proposed['runtime'])
             seat['seat_gitdir'] = delivery.value(proposed['session_root'], 'rev-parse', '--absolute-git-dir')
+            seat['seat_common_gitdir'] = delivery.value(
+                proposed['session_root'], 'rev-parse', '--path-format=absolute', '--git-common-dir')
             seat['real_gh'] = proposed['real_gh_identity']
         checkout_state_path = seat_location / 'checkouts' / proposed['checkout_id'] / 'state.json'
         refuse_symlinked_path(checkout_state_path)
@@ -1638,6 +1832,26 @@ def upgraded_state(state, source, new_groups, new_adapter_hash):
     return result
 
 
+def apply_anchor_transition_state(state, transition, settings_after_text, settings_after_mode,
+                                 settings_baseline_text, settings_baseline_value):
+    result = copy.deepcopy(state)
+    result['session_root'] = transition['replacement_root']
+    owner = result.get('lane_owner')
+    if not isinstance(owner, dict):
+        raise ValueError('Replacement-anchor recovery requires a native-owner checkout state')
+    owner['seat_root'] = transition['replacement_root']
+    owner['seat_gitdir'] = transition['replacement_gitdir']
+    result['settings'] = str(Path(transition['replacement_root']) / '.claude/settings.local.json')
+    if settings_baseline_text is not None:
+        settings_path = result['settings']
+        result.update(settings=settings_path, settings_sha256=text_digest(settings_after_text),
+                      settings_mode=settings_after_mode,
+                      settings_backup=transition['settings_backup_path'],
+                      original_hook_events=list(settings_baseline_value.get('hooks', {})),
+                      original_had_hooks='hooks' in settings_baseline_value)
+    return result
+
+
 def next_activation_generation(previous, source, adapter_sha256):
     identity = {'previous': previous, 'source': source.get('source'),
                 'source_revision': source.get('source_revision'),
@@ -1655,15 +1869,28 @@ def upgrade_binding_summary(state):
             for binding in bindings if binding.get('pr_url')]
 
 
-def validate_upgrade_scope(state, cwd):
+def validate_upgrade_scope(state, cwd, replacement_seat_root=None, exact_seat_id=None):
     product = root(cwd)
     if state.get('phase') != 'active' or state.get('root') != str(product) or state.get('branch') != branch(product):
         raise ValueError('Upgrade requires the active installed product root and branch; inspect status before planning')
     if not state.get('lane_owner') and not state.get('pr_url'):
         raise ValueError('No active per-PR or native-owner installation to upgrade')
     seat_path = state.get('session_root', state['root'])
-    seat = root(seat_path)
-    if str(seat) != seat_path:
+    if replacement_seat_root is not None:
+        if not state.get('seat_id') or exact_seat_id != state.get('seat_id'):
+            raise ValueError('Missing-root recovery requires the exact --seat-id for the recorded seat')
+        seat = root(replacement_seat_root)
+    elif state.get('seat_id'):
+        manifest = session_store.load_seat(state['seat_id'])
+        if not manifest:
+            raise ValueError('Permanent seat registry is missing; preserve checkout history and inspect recovery')
+        anchor = active_operational_anchor(manifest)
+        if seat_path != anchor['root']:
+            raise ValueError('Permanent owner seat path differs from its active operational anchor; inspect before upgrading')
+        seat = root(anchor['root'])
+    else:
+        seat = root(seat_path)
+    if replacement_seat_root is None and str(seat) != seat_path:
         raise ValueError('Permanent owner seat path changed; preserve history and coordinate an explicit path repair')
     if not state.get('seat_id') and delivery.value(seat, 'rev-parse', '--path-format=absolute', '--git-common-dir') != delivery.value(
             product, 'rev-parse', '--path-format=absolute', '--git-common-dir'):
@@ -1672,7 +1899,8 @@ def validate_upgrade_scope(state, cwd):
         lane_scope.check_owner(state)
         owner = state['lane_owner']
         if (owner.get('product_gitdir') != delivery.value(product, 'rev-parse', '--absolute-git-dir') or
-                owner.get('seat_gitdir') != delivery.value(seat, 'rev-parse', '--absolute-git-dir') or
+                (replacement_seat_root is None and
+                 owner.get('seat_gitdir') != delivery.value(seat, 'rev-parse', '--absolute-git-dir')) or
                 github.origin_repo(delivery.value(product, 'remote', 'get-url', 'origin'), owner['host']).casefold() !=
                 owner.get('repository', '').casefold()):
             raise ValueError('Enrolled product/seat path or repository changed; preserve registration history and coordinate an explicit path repair')
@@ -1718,7 +1946,7 @@ def migration_runtime_metadata_matches(state, seat_manifest):
     return recorded_runtime['version'] == version and recorded_runtime['files'] == files
 
 
-def validate_upgrade_seat_runtime(state, seat_manifest, seat):
+def validate_upgrade_seat_runtime(state, seat_manifest, seat, *, replacing_anchor=False):
     runtime = seat_manifest.get('runtime') if isinstance(seat_manifest, dict) else None
     if not isinstance(runtime, dict) or not isinstance(runtime.get('version'), str) or \
             not isinstance(runtime.get('path'), str) or not Path(runtime['path']).is_absolute() or \
@@ -1726,8 +1954,11 @@ def validate_upgrade_seat_runtime(state, seat_manifest, seat):
             not runtime['source_revision']:
         raise ValueError('Permanent seat runtime metadata is malformed; preserve it and inspect status')
     expected_owner = {key: state.get('lane_owner', {}).get(key) for key in ('harness', 'session_id')}
-    if (seat_manifest.get('owner') != expected_owner or seat_manifest.get('seat_root') != str(seat) or
-            seat_manifest.get('seat_gitdir') != delivery.value(seat, 'rev-parse', '--absolute-git-dir')):
+    anchor = (session_store.operational_anchor(seat_manifest) if replacing_anchor else
+              active_operational_anchor(seat_manifest))
+    if (anchor['state'] != 'active' or seat_manifest.get('owner') != expected_owner or
+            (not replacing_anchor and (anchor.get('root') != str(seat) or
+             anchor.get('gitdir') != delivery.value(seat, 'rev-parse', '--absolute-git-dir')))):
         raise ValueError('Permanent seat runtime or owner changed; inspect status and review a fresh upgrade plan')
     current = state.get('runtime')
     if isinstance(current, dict) and current.get('version') == runtime['version']:
@@ -1737,7 +1968,152 @@ def validate_upgrade_seat_runtime(state, seat_manifest, seat):
     raise ValueError('Permanent seat runtime or owner changed; inspect status and review a fresh upgrade plan')
 
 
-def migrated_settings_mode_repair(state, seat_manifest, runtime_missing, settings_before):
+def replacement_anchor_plan(state, target_seat, replacement_root, release_identifier):
+    """Bind one missing birth anchor to an exact same-repository operational anchor."""
+    identifier = state.get('seat_id')
+    if not identifier or not isinstance(target_seat, dict):
+        raise ValueError('Missing-root recovery requires an intact durable seat registry')
+    birth_root = target_seat.get('seat_root')
+    birth_gitdir = target_seat.get('seat_gitdir')
+    current_anchor = session_store.operational_anchor(target_seat)
+    if (current_anchor['state'] != 'active' or current_anchor['root'] != birth_root or
+            current_anchor['gitdir'] != birth_gitdir):
+        raise ValueError('Only an unreleased immutable birth anchor can use this missing-root recovery path')
+    if not isinstance(birth_root, str) or not Path(birth_root).is_absolute() or \
+            not isinstance(birth_gitdir, str) or not Path(birth_gitdir).is_absolute():
+        raise ValueError('The immutable birth root or Gitdir is not recorded completely; preserve the seat and inspect recovery')
+    if os.path.lexists(birth_root) or os.path.lexists(birth_gitdir):
+        raise ValueError('Replacement-anchor recovery requires the recorded birth root and Gitdir to both be absent')
+    destination = root(replacement_root)
+    if str(destination) != str(replacement_root):
+        raise ValueError('Replacement seat root must be an exact canonical Git worktree path')
+    destination_identity = git_path_identity(destination)
+    birth_rows = [(checkout_id, row) for checkout_id, row in target_seat.get('checkouts', {}).items()
+                  if row.get('root') == birth_root and row.get('gitdir') == birth_gitdir]
+    if len(birth_rows) != 1 or not isinstance(birth_rows[0][1].get('common_gitdir'), str):
+        raise ValueError('Same-repository proof is unavailable: no unique retained birth-root attachment records its Git common directory')
+    birth_checkout_id, birth_row = birth_rows[0]
+    expected_state_path = session_store.seat_dir(identifier) / 'checkouts' / birth_checkout_id / 'state.json'
+    if (birth_checkout_id != session_store.checkout_id(birth_root) or
+            birth_row.get('state_file') != str(expected_state_path)):
+        raise ValueError('Same-repository proof does not come from the exact retained birth-root attachment')
+    recorded_common = birth_row['common_gitdir']
+    if (current_anchor.get('common_gitdir') is not None and
+            current_anchor['common_gitdir'] != recorded_common) or \
+            (target_seat.get('seat_common_gitdir') is not None and
+             target_seat['seat_common_gitdir'] != recorded_common):
+        raise ValueError('Recorded birth-root Git common-directory identities disagree; preserve the seat and inspect recovery')
+    if destination_identity['common_gitdir'] != recorded_common:
+        raise ValueError('Replacement root belongs to a different Git common directory than the retained birth-root attachment')
+    destination_identifier = session_store.seat_id(destination)
+    seats = session_store.all_seats()
+    destination_claimants = []
+    for candidate in seats:
+        anchor = session_store.operational_anchor(candidate)
+        if anchor['state'] == 'active' and (anchor['root'] == str(destination) or
+                                             anchor['gitdir'] == destination_identity['gitdir']):
+            destination_claimants.append(candidate)
+    if len(destination_claimants) > 1:
+        raise ValueError('More than one active seat claims the replacement Git anchor; preserve both histories and inspect status')
+    if destination_claimants:
+        claimant = destination_claimants[0]
+        if (not release_identifier or release_identifier != claimant['seat_id'] or
+                claimant['seat_id'] != destination_identifier):
+            raise ValueError('Replacement root is already owned by a distinct seat; name that exact seat with --release-anchor-seat after its attachments are retired')
+    elif release_identifier:
+        raise ValueError('--release-anchor-seat does not identify the active seat that owns the replacement root')
+    if release_identifier:
+        if release_identifier == identifier:
+            raise ValueError('A seat cannot release itself as a replacement anchor')
+        release = session_store.load_seat(release_identifier)
+        if not release or release['seat_id'] != destination_identifier or release.get('seat_root') != str(destination):
+            raise ValueError('--release-anchor-seat must name the exact durable seat born at the replacement root')
+        release_anchor = active_operational_anchor(release)
+        if (release_anchor['root'] != str(destination) or
+                release_anchor['gitdir'] != destination_identity['gitdir']):
+            raise ValueError('The named destination seat no longer owns the exact replacement Git anchor')
+        current_owner = lane_scope.native_identity()
+        if current_owner != target_seat.get('owner') or current_owner != release.get('owner'):
+            raise ValueError('Both seats must have the exact same current native owner')
+        if current_owner.get('harness') == 'opencode':
+            context = lane_scope.native_session_context()
+            if context != target_seat.get('owner_context') or context != release.get('owner_context'):
+                raise ValueError('Both OpenCode seats must match the exact current native session context')
+        if any(release.get(key) for key in ('install_journal', 'migration_journal', 'handoff_journal')) or \
+                (session_store.seat_dir(release_identifier) / UPGRADE_JOURNAL).exists() or \
+                (session_store.seat_dir(release_identifier) / UPGRADE_JOURNAL).is_symlink():
+            raise ValueError('The destination seat has a pending transition; recover it before releasing its anchor')
+        release_rows = session_store.all_checkouts(release_identifier)
+        for row in release_rows:
+            prior = row.get('state')
+            expected_state_path = session_store.seat_dir(release_identifier) / 'checkouts' / row['checkout_id'] / 'state.json'
+            if (not isinstance(prior, dict) or prior.get('phase') != 'removed' or
+                    prior.get('seat_id') != release_identifier or prior.get('root') != row.get('root') or
+                    row.get('state_file') != str(expected_state_path)):
+                raise ValueError('Every destination attachment must already be retired before its anchor can be released')
+        permanent_handoff_runtime(release)
+        expected_release_adapter = session_store.seat_dir(release_identifier) / 'bin' / 'gh'
+        if Path(release.get('adapter', '')) != expected_release_adapter:
+            raise ValueError('Destination seat adapter path differs from its durable seat identity')
+        recorded_real_gh = release.get('real_gh')
+        if not isinstance(recorded_real_gh, dict) or not isinstance(recorded_real_gh.get('path'), str) or \
+                captured_binary_identity(recorded_real_gh['path']) != recorded_real_gh:
+            raise ValueError('Destination seat captured GitHub executable identity changed; preserve its pin')
+        adapter_integrity = managed_adapter_status(release)
+        if adapter_integrity['state'] != 'intact':
+            raise ValueError('The destination seat adapter pin is not intact; inspect it before releasing the anchor')
+        release_groups = release.get('groups', {})
+        if not isinstance(release_groups, dict):
+            raise ValueError('The destination seat hook pin is malformed; preserve it and inspect recovery')
+        if release.get('hooks_installed'):
+            settings_info = release.get('settings')
+            if not isinstance(settings_info, dict) or settings_info.get('path') != str(destination / '.claude/settings.local.json'):
+                raise ValueError('Destination hook settings do not identify the replacement root')
+            settings_path, settings_raw, settings_value = settings(destination)
+            if str(settings_path) != settings_info['path']:
+                raise ValueError('Destination hook settings path changed; preserve it and inspect recovery')
+            release_settings_before = capture_text(settings_path, settings_info.get('mode', 0o600))
+            if (release_settings_before['mode'] != settings_info.get('mode') or
+                    release_settings_before['exists'] != settings_info.get('existed')):
+                raise ValueError('Destination hook settings mode or existence changed; preserve it and inspect recovery')
+            for event, group in release_groups.items():
+                groups = settings_value.get('hooks', {}).get(event, [])
+                if not isinstance(groups, list) or groups.count(group) != 1:
+                    raise ValueError('Each owned destination hook must be present exactly once before anchor release')
+        else:
+            if release_groups:
+                raise ValueError('Destination seat records hook groups without owning installed hooks; inspect before release')
+            release_settings_before = None
+        release_after = copy.deepcopy(release)
+        release_after['operational_anchor'] = {'state': 'released', 'root': None,
+                                               'gitdir': None, 'common_gitdir': None}
+        release_after['hooks_installed'] = False
+        release_manifest_file_before = capture_text(
+            session_store.seat_dir(release_identifier) / 'seat.json')
+    else:
+        release = None
+        release_after = None
+        release_settings_before = None
+        release_groups = {}
+        release_manifest_file_before = None
+    for key in ('install_journal', 'migration_journal', 'handoff_journal'):
+        if target_seat.get(key):
+            raise ValueError('The source seat has a pending transition; recover it before replacing its anchor')
+    if (session_store.seat_dir(identifier) / UPGRADE_JOURNAL).exists() or \
+            (session_store.seat_dir(identifier) / UPGRADE_JOURNAL).is_symlink():
+        raise ValueError('The source seat has a pending source upgrade; recover it before replacing its anchor')
+    return {'target_seat_id': identifier, 'birth_root': birth_root, 'birth_gitdir': birth_gitdir,
+            'birth_common_gitdir': recorded_common, 'replacement_root': str(destination),
+            'replacement_seat_id': destination_identifier, 'replacement_gitdir': destination_identity['gitdir'],
+            'replacement_common_gitdir': destination_identity['common_gitdir'],
+            'release_seat_id': release_identifier, 'release_seat_before': release,
+            'release_seat_after': release_after, 'release_settings_before': release_settings_before,
+            'release_manifest_file_before': release_manifest_file_before,
+            'release_groups': copy.deepcopy(release_groups)}
+
+
+def migrated_settings_mode_repair(state, seat_manifest, runtime_missing, settings_before,
+                                  relocated_settings_path=None):
     if not runtime_missing or not state.get('manages_claude_hooks', True):
         return None
     settings_info = seat_manifest.get('settings') if isinstance(seat_manifest, dict) else None
@@ -1746,8 +2122,9 @@ def migrated_settings_mode_repair(state, seat_manifest, runtime_missing, setting
         raise ValueError('Permanent seat settings metadata is malformed; preserve it and inspect status')
     path = settings_info.get('path')
     mode = settings_info.get('mode')
+    expected_current_path = relocated_settings_path or path
     if (not isinstance(path, str) or not Path(path).is_absolute() or path != state.get('settings') or
-            path != settings_before.get('path') or isinstance(mode, bool) or not isinstance(mode, int) or
+            expected_current_path != settings_before.get('path') or isinstance(mode, bool) or not isinstance(mode, int) or
             mode < 0 or mode > 0o777):
         raise ValueError('Permanent seat settings path or mode is malformed; preserve it and inspect status')
     if 'settings_mode' not in state:
@@ -1782,6 +2159,10 @@ def retirement_recovery_command(seat_id, action='recover'):
 def ensure_retirement_lifecycle_clear(seat):
     identifier = seat['seat_id']
     seat_location = session_store.seat_dir(identifier)
+    seat_retirement_journal = seat_retirement_journal_path(identifier)
+    if seat_retirement_journal.exists() or seat_retirement_journal.is_symlink():
+        raise ValueError('A drained-seat retirement is incomplete; inspect it with ' +
+                         retirement_recovery_command(identifier) + ' and use recover --rollback before retiring an attachment')
     journal = seat_location / UPGRADE_JOURNAL
     if journal.exists() or journal.is_symlink():
         inspect_command = retirement_recovery_command(identifier)
@@ -1823,7 +2204,7 @@ def checkout_pr_records(seat, checkout_id, state):
     return rows
 
 
-def retirement_checkout_evidence(checkout, state):
+def retirement_checkout_evidence(checkout, state, *, live_registration=False):
     checkout_path = Path(checkout['root'])
     recorded_branch = state.get('branch')
     if not checkout_path.exists() and not checkout_path.is_symlink():
@@ -1862,18 +2243,26 @@ def retirement_checkout_evidence(checkout, state):
                      observed_common_gitdir == checkout.get('common_gitdir'))
     if same_worktree and observed_branch != recorded_branch:
         raise ValueError('The recorded checkout exists on another branch; restore its recorded branch and run uninstall from that checkout. Missing-checkout retirement does not apply to a live worktree on another branch')
-    if same_worktree and observed_repository == checkout.get('repository'):
-        raise ValueError('The recorded checkout is live and matches its recorded repository and branch; run uninstall from that checkout')
+    if same_worktree:
+        if not live_registration:
+            raise ValueError('The recorded checkout is live; run uninstall from that checkout or explicitly review --live-registration')
+        if observed_repository != checkout.get('repository'):
+            raise ValueError('The recorded checkout repository changed; inspect it before retiring its live registration')
+        observed['head'] = delivery.value(checkout_path, 'rev-parse', '--verify', 'HEAD^{commit}')
+        return {'state': 'live', 'reason': 'recorded worktree, repository, and branch match',
+                'path_exists': True, 'path_is_symlink': False, 'recorded_branch': recorded_branch,
+                'observed': observed}
     return {'state': 'not-recorded-worktree', 'reason': 'recorded path no longer identifies its recorded repository worktree',
             'path_exists': True, 'path_is_symlink': False, 'recorded_branch': recorded_branch,
             'observed': observed}
 
 
-def build_retire_attachment_plan(identifier, checkout_value):
+def build_retire_attachment_plan(identifier, checkout_value, *, live_registration=False):
     seat = session_store.load_seat(identifier)
     if not seat:
         raise ValueError('Permanent Policy Guard seat registry is missing; preserve history and use recover --inspect')
-    lane_scope.check_owner({'lane_owner': seat['owner']})
+    if not valid_historical_seat_owner(seat):
+        raise ValueError('The recorded historical seat owner is malformed; preserve it and inspect status')
     ensure_retirement_lifecycle_clear(seat)
     checkout_value = Path(checkout_value)
     if not checkout_value.is_absolute():
@@ -1899,7 +2288,9 @@ def build_retire_attachment_plan(identifier, checkout_value):
                 'history_preserved': True}
     if state.get('phase') != 'active':
         raise ValueError('The recorded attachment is not active; preserve its state and use recover --inspect')
-    evidence = retirement_checkout_evidence(item, state)
+    evidence = retirement_checkout_evidence(item, state, live_registration=live_registration)
+    if live_registration and evidence['state'] != 'live':
+        raise ValueError('--live-registration requires the exact recorded worktree; inspect without it if the worktree is missing')
     pr_records = checkout_pr_records(seat, item['checkout_id'], state)
     seat_path = session_store.seat_dir(identifier) / 'seat.json'
     review = {'protocol': RETIREMENT_PROTOCOL, 'seat_id': identifier,
@@ -1927,7 +2318,8 @@ def retire_attachment(args):
     if args.apply:
         if not args.plan_sha256:
             raise ValueError('retire-attachment --apply requires --plan-sha256 from a reviewed retire-attachment plan')
-        review = build_retire_attachment_plan(identifier, args.checkout)
+        review = build_retire_attachment_plan(identifier, args.checkout,
+                                              live_registration=args.live_registration)
         if review.get('already_retired'):
             return {'retired': True, 'already_retired': True, 'history_preserved': True,
                     'seat_id': identifier, 'attachment': review['attachment'],
@@ -1935,7 +2327,8 @@ def retire_attachment(args):
         if args.plan_sha256 != review['plan_sha256']:
             raise ValueError('Retirement plan or a bound preimage changed; inspect a fresh retire-attachment plan')
         with session_store.locked_seat(identifier):
-            current = build_retire_attachment_plan(identifier, args.checkout)
+            current = build_retire_attachment_plan(identifier, args.checkout,
+                                                   live_registration=args.live_registration)
             if current.get('already_retired'):
                 return {'retired': True, 'already_retired': True, 'history_preserved': True,
                         'seat_id': identifier, 'attachment': current['attachment'],
@@ -1968,10 +2361,401 @@ def retire_attachment(args):
                 'retirement_receipt': receipt, 'plan_sha256': current['plan_sha256']}
     if args.plan_sha256:
         raise ValueError('Use --apply with --plan-sha256 to apply a reviewed retirement plan')
-    return build_retire_attachment_plan(identifier, args.checkout)
+    return build_retire_attachment_plan(identifier, args.checkout,
+                                        live_registration=args.live_registration)
 
 
-def build_upgrade_plan(cwd):
+def seat_retirement_attachment_summary(identifier, seat):
+    rows = session_store.all_checkouts(identifier)
+    if not rows:
+        raise ValueError('No recorded retired attachments prove this seat is drained; preserve its history and inspect status')
+    summaries = []
+    for item in rows:
+        checkout_id = item.get('checkout_id')
+        checkout_root = item.get('root')
+        if (not isinstance(checkout_id, str) or not isinstance(checkout_root, str) or
+                not Path(checkout_root).is_absolute() or
+                str(Path(os.path.abspath(checkout_root))) != checkout_root or
+                session_store.checkout_id(checkout_root) != checkout_id):
+            raise ValueError('A registered attachment identity is malformed; preserve history and inspect status')
+        expected_dir = session_store.seat_dir(identifier) / 'checkouts' / checkout_id
+        state_path = expected_dir / 'state.json'
+        if (Path(item.get('checkout_dir', '')) != expected_dir or
+                item.get('state_file') != str(state_path) or not state_path.is_file()):
+            raise ValueError('A registered attachment state path is missing or inconsistent; preserve history and inspect status')
+        refuse_symlinked_path(state_path)
+        state = item.get('state')
+        if not isinstance(state, dict):
+            raise ValueError('A registered attachment state is malformed; preserve history and inspect status')
+        if (state.get('phase') != 'removed' or state.get('seat_id') != identifier or
+                state.get('root') != checkout_root or not isinstance(state.get('branch'), str) or
+                not isinstance(state.get('lane_owner'), dict)):
+            raise ValueError('Every registered attachment must have an exact terminal removed identity before seat retirement')
+        receipt = state.get('retirement_receipt')
+        if (not isinstance(receipt, dict) or receipt.get('protocol') != RETIREMENT_PROTOCOL or
+                receipt.get('seat_id') != identifier or receipt.get('checkout_id') != checkout_id or
+                receipt.get('checkout_path') != checkout_root):
+            raise ValueError('A removed attachment lacks its exact retirement receipt; preserve history and inspect status')
+        row_owner = state['lane_owner']
+        owner_pair = {key: row_owner.get(key) for key in ('harness', 'session_id')}
+        valid_pair = (owner_pair['harness'] in ('claude', 'codex', 'opencode') and
+                      isinstance(owner_pair['session_id'], str) and
+                      bool(re.fullmatch(r'ses_[A-Za-z0-9]+' if owner_pair['harness'] == 'opencode'
+                                        else r'[A-Za-z0-9_.:-]{1,256}', owner_pair['session_id'])))
+        if not valid_pair or receipt.get('owner') != owner_pair:
+            raise ValueError('A retired attachment owner receipt is malformed; preserve its recorded ownership and inspect status')
+        bindings = state.get('pr_bindings', {})
+        if (not isinstance(bindings, dict) or
+                any(not isinstance(url, str) or not isinstance(binding, dict)
+                    for url, binding in bindings.items()) or
+                (state.get('pr_url') is not None and not isinstance(state.get('pr_url'), str))):
+            raise ValueError('A retired attachment PR binding is malformed; preserve history and inspect status')
+        pr_records = checkout_pr_records(seat, checkout_id, state)
+        expected_pr_digest = text_digest(json.dumps(pr_records, sort_keys=True, separators=(',', ':')))
+        if (receipt.get('pr_records_sha256') != expected_pr_digest or
+                receipt.get('pr_records_preserved') != len(pr_records)):
+            raise ValueError('A retired attachment PR history no longer matches its receipt; preserve history and inspect status')
+        summaries.append({'checkout_id': checkout_id, 'path': checkout_root,
+                          'repository': item.get('repository'), 'branch': state['branch'],
+                          'owner': {key: row_owner.get(key) for key in ('harness', 'session_id')},
+                          'state_sha256': delivery_runs.digest(state_path),
+                          'retirement_receipt_sha256': text_digest(json.dumps(
+                              receipt, sort_keys=True, separators=(',', ':'))),
+                          'pr_records_sha256': expected_pr_digest,
+                          'pr_records_preserved': len(pr_records), 'phase': 'removed'})
+    return summaries
+
+
+def seat_retirement_lock_ids(identifier, anchor_root):
+    ids = {identifier, session_store.seat_id(anchor_root)}
+    found = session_store.lookup_checkout(anchor_root)
+    if found:
+        ids.add(found['seat']['seat_id'])
+    root_seat_id = session_store.seat_id(anchor_root)
+    root_seat = session_store.load_seat(root_seat_id) if root_seat_id != identifier else None
+    if root_seat:
+        root_anchor = session_store.operational_anchor(root_seat)
+        if root_anchor['state'] == 'active' and root_anchor['root'] == anchor_root:
+            raise ValueError('A different active seat owns the settings anchor; preserve both seats and inspect status')
+    return sorted(ids)
+
+
+def valid_historical_seat_owner(seat):
+    owner = seat.get('owner') if isinstance(seat, dict) else None
+    context = seat.get('owner_context', {}) if isinstance(seat, dict) else None
+    if not isinstance(context, dict):
+        return False
+    if valid_recorded_owner(owner):
+        return context == {}
+    if not isinstance(owner, dict) or owner.get('harness') != 'opencode':
+        return False
+    return (isinstance(owner.get('session_id'), str) and
+            bool(re.fullmatch(r'ses_[A-Za-z0-9]+', owner['session_id'])) and
+            isinstance(context, dict) and
+            (context.get('session_parent_id') is None or
+             (isinstance(context.get('session_parent_id'), str) and
+              bool(re.fullmatch(r'ses_[A-Za-z0-9]+', context['session_parent_id'])))) and
+            isinstance(context.get('session_project_id'), str) and bool(context['session_project_id']) and
+            isinstance(context.get('session_directory'), str) and
+            Path(context['session_directory']).is_absolute())
+
+
+@contextlib.contextmanager
+def seat_retirement_locks(identifier, anchor_root):
+    lock_ids = seat_retirement_lock_ids(identifier, anchor_root)
+    with session_store.locked_seats(lock_ids):
+        found = session_store.lookup_checkout(anchor_root)
+        if found and found['seat']['seat_id'] not in lock_ids:
+            raise ValueError('The settings-writer seat changed while acquiring locks; review a fresh retirement plan')
+        if found:
+            yield
+        else:
+            # The per-worktree lock serializes an existing legacy settings writer at this exact anchor.
+            with file_locked(anchor_root):
+                yield
+
+
+def build_retire_seat_plan(identifier, *, expected_owner_harness, expected_owner_session,
+                           expected_operator_harness, expected_operator_session, authorization_ref,
+                           confirmed):
+    seat = session_store.load_seat(identifier)
+    if not seat:
+        raise ValueError('Permanent Policy Guard seat registry is missing; preserve history and inspect status')
+    owner = seat.get('owner')
+    owner_context = seat.get('owner_context', {})
+    if not valid_historical_seat_owner(seat):
+        raise ValueError('The recorded historical seat owner is malformed; preserve it and inspect status')
+    if (owner.get('harness') != expected_owner_harness or
+            owner.get('session_id') != expected_owner_session):
+        raise ValueError('Expected historical owner flags do not match the exact recorded seat owner')
+    if not confirmed:
+        raise ValueError('retire-seat requires explicit --confirm-retirement after existing authorization')
+    if (not isinstance(authorization_ref, str) or not authorization_ref.strip() or
+            len(authorization_ref) > 512 or any(char in authorization_ref for char in '\r\n\0')):
+        raise ValueError('retire-seat requires a short existing authorization reference')
+    operator = lane_scope.native_identity()
+    expected_operator = {'harness': expected_operator_harness,
+                         'session_id': expected_operator_session}
+    if operator != expected_operator:
+        raise ValueError('Expected operator flags do not match the actual native operator')
+    operator_context = (lane_scope.native_session_context()
+                        if operator['harness'] == 'opencode' else {})
+    if operator['harness'] == 'opencode' and not isinstance(operator_context, dict):
+        raise ValueError('The actual OpenCode operator context is unavailable; retire-seat cannot bind this operator')
+    if not isinstance(seat.get('checkouts'), dict):
+        raise ValueError('The permanent seat attachment registry is malformed; preserve history and inspect status')
+    anchor = active_operational_anchor(seat)
+    anchor_root = anchor['root']
+    if (session_store.operational_anchor(seat)['state'] != 'active' or
+            not Path(anchor_root).is_absolute() or not Path(anchor['gitdir']).is_absolute()):
+        raise ValueError('Only a seat with its exact active operational anchor can be retired')
+    ensure_retirement_lifecycle_clear(seat)
+    retirement_journal = seat_retirement_journal_path(identifier)
+    if retirement_journal.exists() or retirement_journal.is_symlink():
+        raise ValueError('A drained-seat retirement is already pending; inspect and roll it back before planning again')
+    runtime = permanent_handoff_runtime(seat)
+    runtime_source_versions(runtime, owner['harness'])
+    attachment_summaries = seat_retirement_attachment_summary(identifier, seat)
+    if (not isinstance(seat.get('hooks_installed'), bool) or
+            not isinstance(seat.get('groups', {}), dict)):
+        raise ValueError('The recorded seat hook ownership is malformed; preserve it and inspect status')
+    adapter_path = session_store.seat_dir(identifier) / 'bin' / 'gh'
+    if Path(seat.get('adapter', '')) != adapter_path:
+        raise ValueError('The recorded seat adapter path differs from its durable identity; preserve it and inspect status')
+    adapter_before = capture_text(adapter_path)
+    if (not adapter_before['exists'] or adapter_before['mode'] != 0o700 or
+            adapter_before['sha256'] != seat.get('adapter_sha256')):
+        raise ValueError('The recorded seat adapter is missing or changed; preserve it and inspect status')
+    real_gh = seat.get('real_gh')
+    if (not isinstance(real_gh, dict) or not isinstance(real_gh.get('path'), str) or
+            captured_binary_identity(real_gh['path']) != real_gh):
+        raise ValueError('The captured GitHub executable identity changed; preserve it and inspect status')
+
+    groups = seat.get('groups', {})
+    settings_before = None
+    settings_after = None
+    group_summaries = []
+    if seat['hooks_installed']:
+        settings_info = seat.get('settings')
+        expected_settings_path = str(Path(anchor_root) / '.claude/settings.local.json')
+        if (not isinstance(settings_info, dict) or settings_info.get('path') != expected_settings_path or
+                not groups):
+            raise ValueError('The installed seat hooks do not identify one exact owned settings path and group set')
+        settings_path, settings_text, settings_value = settings(anchor_root)
+        if str(settings_path) != expected_settings_path:
+            raise ValueError('The Claude settings path differs from the active operational anchor')
+        settings_before = capture_text(settings_path, settings_info.get('mode', 0o600))
+        if (not settings_before['exists'] or settings_before['text'] != settings_text or
+                settings_before['mode'] != settings_info.get('mode')):
+            raise ValueError('Claude settings existence, contents or mode changed; coordinate the settings writer and inspect again')
+        hooks = settings_value.get('hooks', {})
+        if not isinstance(hooks, dict):
+            raise ValueError('Claude settings hook map is malformed; preserve settings and inspect status')
+        for event, group in sorted(groups.items()):
+            if not isinstance(event, str) or not isinstance(group, dict):
+                raise ValueError('The recorded seat hook group is malformed; preserve it and inspect status')
+            existing = hooks.get(event, [])
+            if not isinstance(existing, list) or existing.count(group) != 1:
+                raise ValueError('Each owned Claude hook group must be present exactly once before seat retirement')
+            commands = hook_commands(group)
+            if any(commands.intersection(hook_commands(other)) and other != group for other in existing):
+                raise ValueError('A Claude hook command was changed independently; preserve settings and inspect status')
+            group_summaries.append({'event': event,
+                                    'group_sha256': text_digest(json.dumps(
+                                        group, sort_keys=True, separators=(',', ':'))),
+                                    'occurrences': 1})
+        settings_change = migration_settings_change(
+            settings_path, {event: [group] for event, group in groups.items()}, {})
+        settings_after = {'path': settings_change['path'], 'exists': True,
+                          'sha256': settings_change['updated_sha256'],
+                          'mode': settings_change['mode']}
+    elif groups:
+        raise ValueError('The seat records hook groups without installed hooks; preserve settings and inspect status')
+
+    manifest_path = session_store.seat_dir(identifier) / 'seat.json'
+    manifest_before = capture_text(manifest_path)
+    if not manifest_before['exists']:
+        raise ValueError('Permanent seat manifest disappeared during retirement planning')
+    lock_ids = seat_retirement_lock_ids(identifier, anchor_root)
+    plan = {'protocol': SEAT_RETIREMENT_PROTOCOL, 'seat_id': identifier,
+            'birth_identity': {'seat_root': seat['seat_root'], 'seat_gitdir': seat.get('seat_gitdir'),
+                               'seat_common_gitdir': seat.get('seat_common_gitdir')},
+            'operational_anchor': anchor,
+            'historical_owner': copy.deepcopy(owner), 'historical_owner_context': copy.deepcopy(owner_context),
+            'expected_historical_owner': {'harness': expected_owner_harness,
+                                          'session_id': expected_owner_session},
+            'actual_operator': copy.deepcopy(operator), 'operator_context': copy.deepcopy(operator_context),
+            'expected_operator': expected_operator,
+            'authorization': {'reference': authorization_ref.strip(),
+                              'confirmation_required': True,
+                              'notice': 'The reference records existing authorization; Policy Guard does not authenticate it.'},
+            'attachments': attachment_summaries,
+            'effects': {'settings': ({'path': settings_before['path'],
+                                     'preimage_sha256': settings_before['sha256'],
+                                     'postimage_sha256': settings_after['sha256'],
+                                     'mode': settings_before['mode'],
+                                     'removed_groups': group_summaries}
+                                    if settings_before else None),
+                        'adapter': {'path': adapter_before['path'],
+                                    'preimage_sha256': adapter_before['sha256'],
+                                    'mode': adapter_before['mode'], 'remove': True},
+                        'operational_anchor': {'before': 'active', 'after': 'released'},
+                        'native_refresh_observed': False},
+            'preimages': {'seat_manifest': {'path': str(manifest_path),
+                                            'sha256': manifest_before['sha256'],
+                                            'mode': manifest_before['mode']},
+                          'settings': ({'path': settings_before['path'],
+                                        'exists': settings_before['exists'],
+                                        'sha256': settings_before['sha256'],
+                                        'mode': settings_before['mode']}
+                                       if settings_before else None),
+                          'adapter': {'path': adapter_before['path'],
+                                      'exists': adapter_before['exists'],
+                                      'sha256': adapter_before['sha256'],
+                                      'mode': adapter_before['mode']}},
+            'lock_seat_ids': lock_ids,
+            'history': {'attachments_preserved': True, 'owner_preserved': True,
+                        'pull_request_records_preserved': True},
+            'lifecycle_preconditions': {'install_journal': False, 'migration_journal': False,
+                                        'handoff_journal': False, 'upgrade_journal': False,
+                                        'seat_retirement_journal': False,
+                                        'all_attachments_removed': True}}
+    plan['plan_sha256'] = text_digest(json.dumps(plan, sort_keys=True, separators=(',', ':')))
+    return plan
+
+
+def retire_seat(args):
+    identifier = selected_seat_id(args)
+    parameters = {'expected_owner_harness': args.expected_owner_harness,
+                  'expected_owner_session': args.expected_owner_session,
+                  'expected_operator_harness': args.expected_operator_harness,
+                  'expected_operator_session': args.expected_operator_session,
+                  'authorization_ref': args.authorization_ref,
+                  'confirmed': args.confirm_retirement}
+    if args.apply and not args.plan_sha256:
+        raise ValueError('retire-seat --apply requires --plan-sha256 from a reviewed retire-seat plan')
+    if not args.apply and args.plan_sha256:
+        raise ValueError('Use --apply with --plan-sha256 to apply a reviewed retire-seat plan')
+    plan = build_retire_seat_plan(identifier, **parameters)
+    if not args.apply:
+        return plan
+    if args.plan_sha256 != plan['plan_sha256']:
+        raise ValueError('Seat retirement plan or a bound preimage changed; inspect a fresh retire-seat plan')
+    anchor_root = plan['operational_anchor']['root']
+    with seat_retirement_locks(identifier, anchor_root):
+        current = build_retire_seat_plan(identifier, **parameters)
+        if current['plan_sha256'] != args.plan_sha256:
+            raise ValueError('Seat retirement plan or a bound preimage changed after locking; inspect a fresh plan')
+        return apply_retire_seat_plan(current)
+
+
+def apply_retire_seat_plan(plan):
+    identifier = plan['seat_id']
+    seat_path = session_store.seat_dir(identifier) / 'seat.json'
+    adapter_path = Path(plan['effects']['adapter']['path'])
+    settings_effect = plan['effects']['settings']
+    settings_path = Path(settings_effect['path']) if settings_effect else None
+    seat_before = capture_text(seat_path)
+    adapter_before = capture_text(adapter_path)
+    settings_before = capture_text(settings_path) if settings_path else None
+    if (seat_before['exists'] != True or
+            seat_before['sha256'] != plan['preimages']['seat_manifest']['sha256'] or
+            seat_before['mode'] != plan['preimages']['seat_manifest']['mode'] or
+            not adapter_before['exists'] or
+            adapter_before['sha256'] != plan['preimages']['adapter']['sha256'] or
+            adapter_before['mode'] != plan['preimages']['adapter']['mode'] or
+            (settings_before and (settings_before['exists'] != plan['preimages']['settings']['exists'] or
+                                  settings_before['sha256'] != plan['preimages']['settings']['sha256'] or
+                                  settings_before['mode'] != plan['preimages']['settings']['mode']))):
+        raise ValueError('A seat retirement preimage changed while the reviewed plan was being applied')
+    seat = session_store.load_seat(identifier)
+    retired_at = time.time()
+    receipt = {'protocol': SEAT_RETIREMENT_PROTOCOL, 'seat_id': identifier,
+               'retired_at': retired_at, 'plan_sha256': plan['plan_sha256'],
+               'historical_owner': copy.deepcopy(seat['owner']),
+               'operator': copy.deepcopy(plan['actual_operator']),
+               'operator_context': copy.deepcopy(plan['operator_context']),
+               'authorization_reference': plan['authorization']['reference'],
+               'birth_identity': copy.deepcopy(plan['birth_identity']),
+               'operational_anchor': copy.deepcopy(plan['operational_anchor']),
+               'attachments_sha256': text_digest(json.dumps(plan['attachments'], sort_keys=True,
+                                                             separators=(',', ':'))),
+               'settings': copy.deepcopy(plan['effects']['settings']),
+               'adapter': copy.deepcopy(plan['effects']['adapter']),
+               'history_preserved': True,
+               'native_refresh_observed': False,
+               'notice': 'Managed settings and adapter removal are on disk; native hook refresh and detachment remain unobserved.'}
+    seat_after = copy.deepcopy(seat)
+    seat_after['operational_anchor'] = {'state': 'released', 'root': None,
+                                        'gitdir': None, 'common_gitdir': None}
+    seat_after['hooks_installed'] = False
+    seat_after['groups'] = {}
+    seat_after['retirement_receipt'] = receipt
+    seat_after['updated_at'] = retired_at
+    seat_after_text = json.dumps(seat_after, indent=2, sort_keys=True) + '\n'
+    settings_after_text = None
+    if settings_path:
+        current_settings_path, current_settings_text, current_settings_value = settings(plan['operational_anchor']['root'])
+        if str(current_settings_path) != str(settings_path):
+            raise ValueError('The seat settings path changed after planning; inspect a fresh plan')
+        settings_change = migration_settings_change(
+            settings_path, {event: [group] for event, group in seat.get('groups', {}).items()}, {})
+        if (settings_change['preimage_sha256'] != settings_before['sha256'] or
+                settings_change['preimage_exists'] != settings_before['exists'] or
+                settings_change['mode'] != settings_before['mode']):
+            raise ValueError('Claude settings changed after planning; coordinate the settings writer and inspect again')
+        settings_after_text = settings_change['updated']
+        if settings_change['updated_sha256'] != plan['effects']['settings']['postimage_sha256']:
+            raise ValueError('Claude settings removal differs from the reviewed retirement plan')
+    journal = {'version': 1, 'protocol': SEAT_RETIREMENT_PROTOCOL, 'seat_id': identifier,
+               'operator': copy.deepcopy(plan['actual_operator']),
+               'operator_context': copy.deepcopy(plan['operator_context']),
+               'plan_sha256': plan['plan_sha256'],
+               'seat_manifest': {'path': str(seat_path), 'preimage': seat_before,
+                                 'postimage': {'path': str(seat_path), 'exists': True, 'text': seat_after_text,
+                                               'sha256': text_digest(seat_after_text),
+                                               'mode': seat_before['mode']}},
+               'adapter': {'path': str(adapter_path), 'preimage': adapter_before,
+                           'postimage': {'path': str(adapter_path), 'exists': False, 'text': '', 'sha256': text_digest(''),
+                                         'mode': adapter_before['mode']}},
+               'settings': ({'path': str(settings_path), 'preimage': settings_before,
+                             'postimage': {'path': str(settings_path), 'exists': True, 'text': settings_after_text,
+                                           'sha256': text_digest(settings_after_text),
+                                           'mode': settings_before['mode']}}
+                            if settings_path else None)}
+    journal_path = seat_retirement_journal_path(identifier)
+    if journal_path.exists() or journal_path.is_symlink():
+        raise ValueError('A seat retirement journal already exists; inspect and roll it back before applying')
+    write(journal_path, json.dumps(journal, indent=2, sort_keys=True) + '\n', 0o600)
+    if settings_path:
+        current_settings = capture_text(settings_path, settings_before['mode'])
+        if (current_settings['exists'] != settings_before['exists'] or
+                current_settings['sha256'] != settings_before['sha256'] or
+                current_settings['mode'] != settings_before['mode']):
+            raise ValueError('Claude settings changed after the retirement journal was prepared; preserve the journal and inspect again')
+        write(settings_path, settings_after_text, settings_before['mode'])
+    current_adapter = capture_text(adapter_path, adapter_before['mode'])
+    if (current_adapter['exists'] != adapter_before['exists'] or
+            current_adapter['sha256'] != adapter_before['sha256'] or
+            current_adapter['mode'] != adapter_before['mode']):
+        raise ValueError('The seat adapter changed after the retirement journal was prepared; preserve it and inspect manually')
+    adapter_path.unlink()
+    sync_directory(adapter_path.parent)
+    current_manifest = capture_text(seat_path, seat_before['mode'])
+    if (current_manifest['exists'] != seat_before['exists'] or
+            current_manifest['sha256'] != seat_before['sha256'] or
+            current_manifest['mode'] != seat_before['mode']):
+        raise ValueError('The seat manifest changed during retirement; preserve the journal and inspect manually')
+    write(seat_path, seat_after_text, seat_before['mode'])
+    journal_path.unlink()
+    sync_directory(journal_path.parent)
+    return {'retired': True, 'already_retired': False, 'seat_id': identifier,
+            'history_preserved': True, 'plan_sha256': plan['plan_sha256'],
+            'retirement_receipt': receipt,
+            'notice': 'The exact seat adapter and owned hook groups were removed on disk. Native hook refresh and detachment remain unobserved.'}
+
+
+def build_upgrade_plan(cwd, *, replacement_seat_root=None, release_anchor_seat=None, exact_seat_id=None):
     product = root(cwd)
     ensure_no_upgrade_journal(product)
     state_path = directory(product) / 'state.json'
@@ -1979,7 +2763,11 @@ def build_upgrade_plan(cwd):
     if not state_file['exists']:
         raise ValueError('No active installation state to upgrade')
     state = json.loads(state_file['text'])
-    product, seat = validate_upgrade_scope(state, product)
+    if release_anchor_seat and replacement_seat_root is None:
+        raise ValueError('--release-anchor-seat requires --replacement-seat-root')
+    if exact_seat_id and exact_seat_id != state.get('seat_id'):
+        raise ValueError('The selected --seat-id differs from this active checkout state')
+    product, seat = validate_upgrade_scope(state, product, replacement_seat_root, exact_seat_id)
     if source_is_immutable_runtime():
         require_intact_upgrade_source_pin(state)
         raise ValueError(upgrade_source_guidance_reason(immutable_runtime=True))
@@ -2004,7 +2792,20 @@ def build_upgrade_plan(cwd):
         seat_manifest_before = session_store.load_seat(state['seat_id'])
         if not seat_manifest_before:
             raise ValueError('Permanent seat registry is missing; preserve checkout history and inspect recovery')
-        selected_runtime_missing = validate_upgrade_seat_runtime(state, seat_manifest_before, seat)
+        selected_runtime_missing = validate_upgrade_seat_runtime(
+            state, seat_manifest_before, seat, replacing_anchor=replacement_seat_root is not None)
+    anchor_transition = None
+    if replacement_seat_root is not None:
+        if not runtime_plan or not seat_manifest_before:
+            raise ValueError('Replacement-anchor recovery requires a durable seat with an intact pinned runtime')
+        permanent_handoff_runtime(seat_manifest_before)
+        if (seat_manifest_before.get('adapter_sha256') != state.get('adapter_sha256') or
+                seat_manifest_before.get('adapter') != state.get('adapter')):
+            raise ValueError('Source seat adapter pin differs between its manifest and active checkout')
+        anchor_transition = replacement_anchor_plan(
+            state, seat_manifest_before, replacement_seat_root, release_anchor_seat)
+        anchor_transition['target_manifest_file_before'] = capture_text(
+            session_store.seat_dir(state['seat_id']) / 'seat.json')
     new_source = {'source': runtime_plan['path'] if runtime_plan else str(APP),
                   'source_revision': ('runtime:' + runtime_plan['version']) if runtime_plan else new_revision,
                   'source_versions': new_versions}
@@ -2039,16 +2840,23 @@ def build_upgrade_plan(cwd):
     selected_settings_mode_repair = None
     if manages_hooks:
         settings_path, settings_text, settings_value = settings(seat)
-        if str(settings_path) != state.get('settings'):
+        if anchor_transition:
+            if anchor_transition.get('release_settings_before') and \
+                    str(settings_path) != anchor_transition['release_settings_before']['path']:
+                raise ValueError('Replacement root settings differ from the released seat settings path')
+        elif str(settings_path) != state.get('settings'):
             raise ValueError('Managed settings path changed; inspect status before upgrade')
         settings_before = capture_text(settings_path, state.get('settings_mode', 0o600))
         if settings_before['text'] != settings_text:
             raise ValueError('Claude settings changed during planning; retry at the coordinated single-writer checkpoint')
         if selected_runtime_missing:
             selected_settings_mode_repair = migrated_settings_mode_repair(
-                state, seat_manifest_before, selected_runtime_missing, settings_before)
+                state, seat_manifest_before, selected_runtime_missing, settings_before,
+                relocated_settings_path=(settings_before['path'] if anchor_transition else None))
         expected_settings_mode = (selected_settings_mode_repair if selected_settings_mode_repair is not None
                                   else state.get('settings_mode', 0o600))
+        if anchor_transition and anchor_transition.get('release_settings_before'):
+            expected_settings_mode = anchor_transition['release_settings_before']['mode']
         if settings_before['mode'] != expected_settings_mode:
             raise ValueError('Claude settings mode changed since installation; coordinate the settings writer before upgrade')
         if old_groups:
@@ -2058,6 +2866,39 @@ def build_upgrade_plan(cwd):
             if not set(old_groups).issubset(available_groups):
                 raise ValueError('Recorded managed hook events are unsupported by this source version')
             new_groups = {event: available_groups[event] for event in old_groups}
+        if anchor_transition:
+            release_groups = anchor_transition['release_groups'] if \
+                anchor_transition['release_seat_before'].get('hooks_installed') else {}
+            for event, group in release_groups.items():
+                groups = settings_value.get('hooks', {}).get(event, [])
+                if not isinstance(groups, list) or groups.count(group) != 1:
+                    raise ValueError('Released seat hook preimage changed after planning; inspect its settings')
+            additions = {event: [group] for event, group in new_groups.items()}
+            cleanup = migration_settings_change(
+                settings_path, {event: [group] for event, group in release_groups.items()}, {})
+            settings_baseline_text = cleanup['updated']
+            settings_baseline_value = json.loads(settings_baseline_text)
+            for event, group in new_groups.items():
+                if group in settings_baseline_value.get('hooks', {}).get(event, []):
+                    raise ValueError('Target seat hook already exists at the replacement root')
+            settings_change = migration_settings_change(
+                settings_path, {event: [group] for event, group in release_groups.items()}, additions)
+            replacement = json.loads(settings_change['updated'])
+            anchor_transition['settings_baseline_text'] = settings_baseline_text
+            anchor_transition['settings_baseline_sha256'] = text_digest(settings_baseline_text)
+            anchor_transition['settings_baseline_value'] = settings_baseline_value
+            anchor_transition['settings_backup_path'] = str(
+                session_store.seat_dir(state['seat_id']) / 'settings-backups' /
+                (anchor_transition['settings_baseline_sha256'] + '.json'))
+            anchor_transition['settings_backup_before'] = capture_text(
+                anchor_transition['settings_backup_path'])
+            if (anchor_transition['settings_backup_before']['exists'] and
+                    (anchor_transition['settings_backup_before']['text'] != settings_baseline_text or
+                     anchor_transition['settings_backup_before']['mode'] != 0o600)):
+                raise ValueError('Target settings backup path already contains different history; preserve it and inspect')
+            settings_after_text = json.dumps(replacement, indent=2) + '\n'
+            settings_after_exists = True
+        elif old_groups:
             replacement = replace_exact_hook_groups(settings_value, old_groups, new_groups)
             settings_after_text = json.dumps(replacement, indent=2) + '\n'
             settings_after_exists = True
@@ -2069,6 +2910,11 @@ def build_upgrade_plan(cwd):
         settings_after_mode = settings_before['mode']
 
     new_state = upgraded_state(state, new_source, new_groups, new_adapter_hash)
+    if anchor_transition:
+        new_state = apply_anchor_transition_state(
+            new_state, anchor_transition, settings_after_text, settings_after_mode,
+            anchor_transition.get('settings_baseline_text'),
+            anchor_transition.get('settings_baseline_value', {}))
     new_state['phase'] = 'active'
     metadata_repairs = []
     seat_manifest_after=None
@@ -2079,6 +2925,22 @@ def build_upgrade_plan(cwd):
         seat_manifest_after['adapter_sha256']=new_adapter_hash
         new_state['runtime']={'version':runtime_plan['version'],'path':runtime_plan['path'],
                               'files':runtime_plan['files']}
+    if anchor_transition:
+        seat_manifest_after['operational_anchor'] = {
+            'state': 'active', 'root': anchor_transition['replacement_root'],
+            'gitdir': anchor_transition['replacement_gitdir'],
+            'common_gitdir': anchor_transition['replacement_common_gitdir']}
+        if manages_hooks and anchor_transition.get('settings_baseline_text') is not None:
+            baseline_value = anchor_transition['settings_baseline_value']
+            seat_manifest_after['settings'] = {
+                'path': str(Path(anchor_transition['replacement_root']) / '.claude/settings.local.json'),
+                'backup': anchor_transition['settings_backup_path'],
+                'sha256': anchor_transition['settings_baseline_sha256'],
+                'existed': settings_before['exists'], 'mode': settings_before['mode'],
+                'original_hook_events': list(baseline_value.get('hooks', {})),
+                'original_had_hooks': 'hooks' in baseline_value}
+            seat_manifest_after['groups'] = copy.deepcopy(new_groups)
+            seat_manifest_after['hooks_installed'] = bool(new_groups)
     installing_state = copy.deepcopy(new_state)
     installing_state['phase'] = 'installing'
     active_state_text = json.dumps(new_state, indent=2) + '\n'
@@ -2119,12 +2981,33 @@ def build_upgrade_plan(cwd):
                 raise ValueError('An active seat checkout is unavailable or on another branch; when its recorded path is missing or no longer identifies its recorded worktree, review ' +
                                  retire_command + '. If the recorded worktree exists on another branch, restore its recorded branch and run uninstall from that checkout')
             lane_scope.check_owner(prior)
-            check_lane_identity(prior,product_path)
+            if anchor_transition:
+                prior_owner = prior.get('lane_owner', {})
+                if (prior.get('session_root') != anchor_transition['birth_root'] or
+                        prior_owner.get('seat_root') != anchor_transition['birth_root'] or
+                        prior_owner.get('seat_gitdir') != anchor_transition['birth_gitdir'] or
+                        prior.get('seat_id') != state['seat_id']):
+                    raise ValueError('An active target checkout does not retain the exact missing birth-anchor identity')
+                if (state.get('lane_owner', {}).get('harness') != prior_owner.get('harness') or
+                        state.get('lane_owner', {}).get('session_id') != prior_owner.get('session_id')):
+                    raise ValueError('Active target checkout owners differ; preserve the seat and inspect status')
+                if (prior.get('root') != str(root(product_path)) or
+                        prior_owner.get('product_gitdir') != item.get('gitdir') or
+                        prior_owner.get('repository', '').casefold() != item.get('repository', '').casefold() or
+                        prior_owner.get('host') != item.get('host')):
+                    raise ValueError('An active target checkout does not match its recorded owner or destination settings metadata')
+            else:
+                check_lane_identity(prior,product_path)
             prior_runtime_missing = validate_checkout_runtime(prior, seat_manifest_before)
             if source_pin_status(prior)['integrity']!='intact':
                 raise ValueError('An active seat checkout source pin is unavailable; preserve it and recover before upgrade')
             bindings.extend(upgrade_binding_summary(prior))
             next_state=upgraded_state(prior,new_source,new_groups,new_adapter_hash)
+            if anchor_transition:
+                next_state = apply_anchor_transition_state(
+                    next_state, anchor_transition, settings_after_text, settings_after_mode,
+                    anchor_transition.get('settings_baseline_text'),
+                    anchor_transition.get('settings_baseline_value', {}))
             next_state['phase']='active'
             if prior_runtime_missing:
                 metadata_repairs.append({'checkout':str(product_path),'field':'runtime',
@@ -2132,10 +3015,11 @@ def build_upgrade_plan(cwd):
                 prior_mode_repair = None
                 if prior.get('manages_claude_hooks', True):
                     prior_settings_path = prior.get('settings')
-                    if not settings_before or prior_settings_path != settings_before['path']:
+                    if not settings_before or (not anchor_transition and prior_settings_path != settings_before['path']):
                         raise ValueError('Migrated checkout settings path differs from the permanent seat; preserve it and inspect status')
                     prior_mode_repair = migrated_settings_mode_repair(
-                        prior, seat_manifest_before, prior_runtime_missing, settings_before)
+                        prior, seat_manifest_before, prior_runtime_missing, settings_before,
+                        relocated_settings_path=(settings_before['path'] if anchor_transition else None))
                     if prior_mode_repair is not None:
                         next_state['settings_mode'] = prior_mode_repair
                         metadata_repairs.append({'checkout':str(product_path),'field':'settings_mode',
@@ -2164,8 +3048,35 @@ def build_upgrade_plan(cwd):
 
     if not runtime_plan:
         bindings = upgrade_binding_summary(state)
+    anchor_transition_review = None
+    if anchor_transition:
+        release_before = anchor_transition.get('release_seat_before')
+        release_after = anchor_transition.get('release_seat_after')
+        anchor_transition_review = {
+            'target_seat_id': anchor_transition['target_seat_id'],
+            'immutable_birth_root': anchor_transition['birth_root'],
+            'immutable_birth_gitdir': anchor_transition['birth_gitdir'],
+            'birth_common_gitdir_proof': anchor_transition['birth_common_gitdir'],
+            'replacement_root': anchor_transition['replacement_root'],
+            'replacement_seat_id': anchor_transition['replacement_seat_id'],
+            'replacement_git_identity': {'gitdir': anchor_transition['replacement_gitdir'],
+                                         'common_gitdir': anchor_transition['replacement_common_gitdir']},
+            'released_seat_id': anchor_transition['release_seat_id'],
+            'released_seat_manifest_before_sha256': (text_digest(json.dumps(
+                release_before, indent=2, sort_keys=True) + '\n') if release_before else None),
+            'target_manifest_file_before_sha256': anchor_transition['target_manifest_file_before']['sha256'],
+            'target_manifest_file_before_mode': anchor_transition['target_manifest_file_before']['mode'],
+            'released_manifest_file_before_sha256': (anchor_transition['release_manifest_file_before']['sha256']
+                if anchor_transition.get('release_manifest_file_before') else None),
+            'released_manifest_file_before_mode': (anchor_transition['release_manifest_file_before']['mode']
+                if anchor_transition.get('release_manifest_file_before') else None),
+            'released_seat_manifest_after_sha256': (text_digest(json.dumps(
+                release_after, indent=2, sort_keys=True) + '\n') if release_after else None),
+            'settings_backup_path': anchor_transition.get('settings_backup_path'),
+            'settings_backup_sha256': anchor_transition.get('settings_baseline_sha256')}
     review = {
-        'protocol': 'policy-guard-source-upgrade-v1',
+        'protocol': ('policy-guard-source-upgrade-v2' if anchor_transition else
+                     'policy-guard-source-upgrade-v1'),
         'binding_type': 'native-owner-lane' if state.get('lane_owner') else 'legacy-per-pr',
         'identity': {'root': str(product), 'branch': branch(product), 'session_root': str(seat),
                      'product_git': git_path_identity(product), 'seat_git': git_path_identity(seat),
@@ -2195,8 +3106,19 @@ def build_upgrade_plan(cwd):
                          'mode': settings_before['mode'] if settings_before else None},
             'seat_manifest': {'managed':bool(runtime_plan),
                 'path':str(session_store.seat_dir(state['seat_id'])/'seat.json') if runtime_plan else None,
-                'sha256':text_digest(json.dumps(seat_manifest_before,indent=2,sort_keys=True)+'\n')
-                    if seat_manifest_before else None}},
+                'sha256':(anchor_transition['target_manifest_file_before']['sha256'] if anchor_transition else
+                    text_digest(json.dumps(seat_manifest_before,indent=2,sort_keys=True)+'\n'))
+                    if seat_manifest_before else None,
+                'mode':anchor_transition['target_manifest_file_before']['mode'] if anchor_transition else None},
+            'released_seat_manifest': ({'path':str(session_store.seat_dir(anchor_transition['release_seat_id'])/'seat.json'),
+                'sha256':anchor_transition['release_manifest_file_before']['sha256'],
+                'mode':anchor_transition['release_manifest_file_before']['mode']}
+                if anchor_transition and anchor_transition['release_seat_id'] else None),
+            'settings_backup': ({'path':anchor_transition['settings_backup_path'],
+                'exists':anchor_transition['settings_backup_before']['exists'],
+                'sha256':anchor_transition['settings_backup_before']['sha256'],
+                'mode':anchor_transition['settings_backup_before']['mode']}
+                if anchor_transition and anchor_transition.get('settings_backup_before') else None)},
         'replacements': {
             'adapter': {'path': str(adapter_path), 'mode': 0o700, 'sha256': new_adapter_hash,
                         'content': new_adapter_text},
@@ -2215,7 +3137,14 @@ def build_upgrade_plan(cwd):
             'seat_manifest': {'managed':bool(runtime_plan),
                 'path':str(session_store.seat_dir(state['seat_id'])/'seat.json') if runtime_plan else None,
                 'sha256':text_digest(json.dumps(seat_manifest_after,indent=2,sort_keys=True)+'\n')
-                    if seat_manifest_after else None}},
+                    if seat_manifest_after else None},
+            'released_seat_manifest': ({'path':str(session_store.seat_dir(anchor_transition['release_seat_id'])/'seat.json'),
+                'sha256':anchor_transition_review['released_seat_manifest_after_sha256']}
+                if anchor_transition and anchor_transition['release_seat_id'] else None),
+            'settings_backup': ({'path':anchor_transition['settings_backup_path'],
+                'sha256':anchor_transition['settings_baseline_sha256']}
+                if anchor_transition and anchor_transition.get('settings_backup_path') else None)},
+        'anchor_transition': anchor_transition_review,
         'recovery': {'journal_path': str(upgrade_journal_path(product)),
                      'command': upgrade_recovery_command(product),
                      'strategy': 'Keep the journal guard until exact owned preimages are restored.'},
@@ -2230,13 +3159,20 @@ def build_upgrade_plan(cwd):
                'checkout_states':checkout_states,
                'runtime_plan':runtime_plan,'seat_manifest_before':seat_manifest_before,
                'seat_manifest_after':seat_manifest_after,
+               'anchor_transition':anchor_transition,
                'settings_managed': bool(manages_hooks), 'old_groups': copy.deepcopy(old_groups),
-               'new_groups': copy.deepcopy(new_groups), 'review': review}
+               'new_groups': copy.deepcopy(new_groups),
+               'lock_seat_ids': sorted(set(([state['seat_id']] if state.get('seat_id') else []) +
+                   ([anchor_transition['replacement_seat_id']] if anchor_transition else []))),
+               'review': review}
     return review, payload
 
 
 def upgrade_plan(args):
-    review, _ = build_upgrade_plan(args.cwd)
+    review, _ = build_upgrade_plan(args.cwd,
+        replacement_seat_root=getattr(args, 'replacement_seat_root', None),
+        release_anchor_seat=getattr(args, 'release_anchor_seat', None),
+        exact_seat_id=getattr(args, 'seat_id', None))
     return review
 
 
@@ -2244,7 +3180,9 @@ def upgrade_journal(payload):
     settings_before = payload['settings_before']
     state_before = payload['state_before']
     adapter_before = payload['adapter_before']
-    return {'version': 1, 'protocol': 'policy-guard-source-upgrade-v1',
+    protocol = ('policy-guard-source-upgrade-v2' if payload.get('anchor_transition') else
+                'policy-guard-source-upgrade-v1')
+    return {'version': 2 if payload.get('anchor_transition') else 1, 'protocol': protocol,
             'root': payload['root'], 'binding_type': payload['review']['binding_type'],
             'git_identity': {'product': payload['review']['identity']['product_git'],
                              'seat': payload['review']['identity']['seat_git'],
@@ -2278,16 +3216,60 @@ def upgrade_journal(payload):
                 'postimage':payload.get('seat_manifest_after'),
                 'postimage_sha256':(hashlib.sha256((json.dumps(payload['seat_manifest_after'],
                     indent=2,sort_keys=True)+'\n').encode()).hexdigest()
-                    if payload.get('seat_manifest_after') else None)}}
+                    if payload.get('seat_manifest_after') else None)},
+            'anchor_transition': (None if not payload.get('anchor_transition') else {
+                'target_seat_id':payload['anchor_transition']['target_seat_id'],
+                'replacement_seat_id':payload['anchor_transition']['replacement_seat_id'],
+                'replacement_root':payload['anchor_transition']['replacement_root'],
+                'replacement_gitdir':payload['anchor_transition']['replacement_gitdir'],
+                'replacement_common_gitdir':payload['anchor_transition']['replacement_common_gitdir'],
+                'birth_root':payload['anchor_transition']['birth_root'],
+                'birth_gitdir':payload['anchor_transition']['birth_gitdir'],
+                'birth_common_gitdir':payload['anchor_transition']['birth_common_gitdir'],
+                'release_seat_id':payload['anchor_transition']['release_seat_id'],
+                'target_manifest_preimage':payload.get('seat_manifest_before'),
+                'target_manifest_preimage_sha256':(text_digest(json.dumps(
+                    payload.get('seat_manifest_before'),indent=2,sort_keys=True)+'\n')
+                    if payload.get('seat_manifest_before') else None),
+                'target_manifest_postimage':payload.get('seat_manifest_after'),
+                'target_manifest_postimage_sha256':(text_digest(json.dumps(
+                    payload.get('seat_manifest_after'),indent=2,sort_keys=True)+'\n')
+                    if payload.get('seat_manifest_after') else None),
+                'target_manifest_file_preimage':payload['anchor_transition'].get('target_manifest_file_before'),
+                'target_manifest_file_postimage':(json.dumps(
+                    payload.get('seat_manifest_after'),indent=2,sort_keys=True)+'\n'
+                    if payload.get('seat_manifest_after') else None),
+                'release_manifest_preimage':payload['anchor_transition'].get('release_seat_before'),
+                'release_manifest_preimage_sha256':(text_digest(json.dumps(
+                    payload['anchor_transition'].get('release_seat_before'),indent=2,sort_keys=True)+'\n')
+                    if payload['anchor_transition'].get('release_seat_before') else None),
+                'release_manifest_postimage':payload['anchor_transition'].get('release_seat_after'),
+                'release_manifest_postimage_sha256':(text_digest(json.dumps(
+                    payload['anchor_transition'].get('release_seat_after'),indent=2,sort_keys=True)+'\n')
+                    if payload['anchor_transition'].get('release_seat_after') else None),
+                'release_manifest_file_preimage':payload['anchor_transition'].get('release_manifest_file_before'),
+                'release_manifest_file_postimage':(json.dumps(
+                    payload['anchor_transition'].get('release_seat_after'),indent=2,sort_keys=True)+'\n'
+                    if payload['anchor_transition'].get('release_seat_after') else None),
+                'settings_backup': ({'preimage':payload['anchor_transition']['settings_backup_before'],
+                    'postimage':payload['anchor_transition']['settings_baseline_text'],
+                    'postimage_sha256':payload['anchor_transition']['settings_baseline_sha256']}
+                    if payload['anchor_transition'].get('settings_backup_path') else None)})}
 
 
 def upgrade(args):
-    review, payload = build_upgrade_plan(args.cwd)
+    review, payload = build_upgrade_plan(args.cwd,
+        replacement_seat_root=getattr(args, 'replacement_seat_root', None),
+        release_anchor_seat=getattr(args, 'release_anchor_seat', None),
+        exact_seat_id=getattr(args, 'seat_id', None))
     if args.plan_sha256 != review['plan_sha256']:
         raise ValueError('Upgrade plan or a bound preimage changed; inspect a fresh upgrade-plan')
     product = Path(payload['root'])
-    with file_locked(product):
-        current_review, payload = build_upgrade_plan(product)
+    with source_upgrade_locked(product, payload.get('lock_seat_ids', [])):
+        current_review, payload = build_upgrade_plan(product,
+            replacement_seat_root=getattr(args, 'replacement_seat_root', None),
+            release_anchor_seat=getattr(args, 'release_anchor_seat', None),
+            exact_seat_id=getattr(args, 'seat_id', None))
         if args.plan_sha256 != current_review['plan_sha256']:
             raise ValueError('Upgrade plan or a bound preimage changed; inspect a fresh upgrade-plan')
         journal_path = upgrade_journal_path(product)
@@ -2310,6 +3292,16 @@ def upgrade(args):
                   payload['adapter_after_mode'])
             for row in payload['checkout_states']:
                 write(row['path'],row['installing_text'],row['before']['mode'])
+            transition = payload.get('anchor_transition')
+            if transition and transition.get('settings_backup_path'):
+                backup = transition['settings_backup_before']
+                current_backup = capture_text(backup['path'], backup['mode'])
+                if (current_backup['exists'] != backup['exists'] or
+                        current_backup['sha256'] != backup['sha256'] or
+                        current_backup['mode'] != backup['mode']):
+                    raise ValueError('Target seat settings backup changed after planning; stop and recover')
+                if not backup['exists']:
+                    write(backup['path'], transition['settings_baseline_text'], 0o600)
             if payload['settings_managed'] and payload['settings_after_text'] is not None:
                 settings_before = payload['settings_before']
                 current = capture_text(settings_before['path'], settings_before['mode'])
@@ -2333,6 +3325,16 @@ def upgrade(args):
                 if current_hash!=seat_info['preimage_sha256']:
                     raise ValueError('Permanent seat changed during source upgrade; retain the journal and recover')
                 session_store.save_seat(payload['seat_manifest_after'])
+            if transition and transition.get('release_seat_after'):
+                release_id = transition['release_seat_id']
+                release_path = session_store.seat_dir(release_id) / 'seat.json'
+                current_release = session_store.load_seat(release_id)
+                current_hash = text_digest(json.dumps(current_release, indent=2, sort_keys=True) + '\n')
+                expected_hash = text_digest(json.dumps(transition['release_seat_before'],
+                                                      indent=2, sort_keys=True) + '\n')
+                if current_hash != expected_hash:
+                    raise ValueError('Destination seat changed during source upgrade; retain the journal and recover')
+                session_store.save_seat(transition['release_seat_after'])
             journal_path.unlink()
             sync_directory(journal_path.parent)
         except Exception as error:
@@ -2347,6 +3349,7 @@ def upgrade(args):
             'source_revision': review['executing_source_after']['revision'],
             'history_preserved': True, 'fresh_report_required': any(
                 row['receipt_will_be_archived'] for row in review['bindings']),
+            'operational_anchor_replaced': bool(payload.get('anchor_transition')),
             'adapter': review['replacements']['adapter']['path'],
             'notice': 'Source upgrade only; no verification or audit was run. Native activation still requires observation in the actual owner session.'}
 
@@ -2404,7 +3407,20 @@ def validate_journal_preimage(image, expected_path):
 def upgrade_recover(args):
     product = root(args.cwd)
     journal_path = upgrade_journal_path(product)
-    with file_locked(product):
+    lock_ids = []
+    if journal_path.exists() and not journal_path.is_symlink():
+        try:
+            journal_hint = json.loads(journal_path.read_text())
+            transition_hint = journal_hint.get('anchor_transition') or {}
+            lock_ids = [value for value in (transition_hint.get('target_seat_id'),
+                transition_hint.get('replacement_seat_id'), transition_hint.get('release_seat_id')) if value]
+            if not lock_ids and journal_hint.get('seat_manifest', {}).get('managed'):
+                state_hint = json.loads(journal_hint['state']['preimage']['text'])
+                if state_hint.get('seat_id'):
+                    lock_ids = [state_hint['seat_id']]
+        except (OSError, TypeError, ValueError, KeyError):
+            lock_ids = []
+    with source_upgrade_locked(product, lock_ids):
         if not journal_path.exists() and not journal_path.is_symlink():
             return {'recovered': False, 'already_clean': True,
                     'notice': 'No pending source-upgrade journal exists.'}
@@ -2416,8 +3432,11 @@ def upgrade_recover(args):
             journal = json.loads(journal_path.read_text())
         except (OSError, ValueError) as error:
             raise ValueError('Upgrade journal is unreadable; leave it and the adapter untouched for owner review') from error
-        if journal.get('version') != 1 or journal.get('protocol') != 'policy-guard-source-upgrade-v1':
+        if (journal.get('version'), journal.get('protocol')) not in (
+                (1, 'policy-guard-source-upgrade-v1'), (2, 'policy-guard-source-upgrade-v2')):
             raise ValueError('Upgrade journal version is unsupported; leave the adapter guarded for owner review')
+        if ((journal.get('version') == 2) != bool(journal.get('anchor_transition'))):
+            raise ValueError('Upgrade journal anchor-transition protocol is malformed; leave the adapter guarded for owner review')
         if journal.get('root') != str(product):
             raise ValueError('Upgrade journal root differs from this product worktree; leave it and the adapter untouched')
         state_path = directory(product) / 'state.json'
@@ -2442,7 +3461,26 @@ def upgrade_recover(args):
             lane_scope.check_owner(original_state)
         if original_state.get('root') != str(product) or original_state.get('phase') != 'active':
             raise ValueError('Recorded preimage is not the original active installation; journal retained')
-        seat = root(original_state.get('session_root', original_state['root']))
+        transition = journal.get('anchor_transition')
+        if transition:
+            birth_root = transition.get('birth_root')
+            birth_gitdir = transition.get('birth_gitdir')
+            replacement_root = transition.get('replacement_root')
+            if (original_state.get('session_root') != birth_root or
+                    original_state.get('lane_owner', {}).get('seat_root') != birth_root or
+                    original_state.get('lane_owner', {}).get('seat_gitdir') != birth_gitdir or
+                    os.path.lexists(birth_root) or os.path.lexists(birth_gitdir)):
+                raise ValueError('The immutable birth root or Gitdir changed during anchor rollback; preserve the journal')
+            replacement = root(replacement_root)
+            replacement_identity = git_path_identity(replacement)
+            if (str(replacement) != replacement_root or
+                    replacement_identity.get('gitdir') != transition.get('replacement_gitdir') or
+                    replacement_identity.get('common_gitdir') != transition.get('replacement_common_gitdir') or
+                    transition.get('birth_common_gitdir') != transition.get('replacement_common_gitdir')):
+                raise ValueError('Replacement Git identity changed during anchor rollback; keep the journal gate for review')
+            seat = replacement
+        else:
+            seat = root(original_state.get('session_root', original_state['root']))
         current_git_identity = {'product': git_path_identity(product), 'seat': git_path_identity(seat),
                                 'branch': branch(product)}
         if journal.get('git_identity') != current_git_identity:
@@ -2497,27 +3535,77 @@ def upgrade_recover(args):
                 adapter_info['preimage']['mode'], adapter_info['replacement_mode']):
             raise ValueError('Managed adapter changed independently; journal retained and recovery refused')
         settings_restore = None
+        settings_backup_restore = None
         if settings_info.get('managed'):
-            validate_journal_preimage(settings_info.get('preimage'), original_state.get('settings'))
+            settings_expected_path = (str(Path(transition['replacement_root']) / '.claude/settings.local.json')
+                                      if transition else original_state.get('settings'))
+            validate_journal_preimage(settings_info.get('preimage'), settings_expected_path)
             if settings_info.get('replacement_mode') != settings_info['preimage'].get('mode'):
                 raise ValueError('Upgrade journal settings modes are inconsistent; leave the adapter guarded for owner review')
-            if settings_info['preimage']['path'] != original_state.get('settings'):
+            if not transition and settings_info['preimage']['path'] != original_state.get('settings'):
                 raise ValueError('Upgrade journal settings path differs from the recorded owner settings')
-            try:
-                previous_settings = json.loads(settings_info['preimage']['text']) if settings_info['preimage']['exists'] else {}
-            except ValueError as error:
-                raise ValueError('Upgrade journal settings preimage is invalid JSON; leave the adapter guarded') from error
-            previous_hooks = previous_settings.get('hooks', {}) if isinstance(previous_settings, dict) else {}
-            for event, group in settings_info.get('old_groups', {}).items():
-                groups = previous_hooks.get(event, []) if isinstance(previous_hooks, dict) else []
-                if not isinstance(groups, list) or groups.count(group) != 1:
-                    raise ValueError('Upgrade journal does not bind the exact old ' + event + ' hook preimage')
-            if set(settings_info.get('old_groups', {})) != set(settings_info.get('new_groups', {})):
-                raise ValueError('Upgrade journal hook replacement scope changed; leave the adapter guarded')
-            settings_restore = recover_settings(settings_info)
+            if transition:
+                preimage = settings_info['preimage']
+                settings_path = Path(preimage['path'])
+                current_settings = capture_text(settings_path, preimage['mode'])
+                is_preimage = (current_settings['exists'] == preimage['exists'] and
+                               current_settings['sha256'] == preimage['sha256'] and
+                               current_settings['mode'] == preimage['mode'])
+                is_postimage = (current_settings['exists'] == settings_info['replacement_exists'] and
+                                current_settings['sha256'] == settings_info['replacement_sha256'] and
+                                current_settings['mode'] == settings_info['replacement_mode'])
+                if not is_preimage and not is_postimage:
+                    raise ValueError('Replacement settings changed independently; journal retained and adapter remains guarded')
+                try:
+                    previous_settings = json.loads(preimage['text']) if preimage['exists'] else {}
+                except ValueError as error:
+                    raise ValueError('Upgrade journal settings preimage is invalid JSON; leave the adapter guarded') from error
+                release_manifest_preimage = transition.get('release_manifest_preimage') or {}
+                release_groups = release_manifest_preimage.get('groups', {})
+                release_settings = release_manifest_preimage.get('settings') or {}
+                if release_manifest_preimage.get('hooks_installed'):
+                    previous_hooks = previous_settings.get('hooks', {}) if isinstance(previous_settings, dict) else {}
+                    for event, group in release_groups.items():
+                        groups = previous_hooks.get(event, []) if isinstance(previous_hooks, dict) else []
+                        if not isinstance(groups, list) or groups.count(group) != 1:
+                            raise ValueError('Upgrade journal does not bind the exact released-seat hook preimage')
+                backup_info = transition.get('settings_backup')
+                if backup_info:
+                    backup_before = backup_info.get('preimage')
+                    backup_postimage = backup_info.get('postimage')
+                    backup_path = Path(backup_before.get('path', '')) if isinstance(backup_before, dict) else None
+                    validate_journal_preimage(backup_before, backup_path)
+                    current_backup = capture_text(backup_path, backup_before['mode'])
+                    backup_is_preimage = (current_backup['exists'] == backup_before['exists'] and
+                        current_backup['sha256'] == backup_before['sha256'] and
+                        current_backup['mode'] == backup_before['mode'])
+                    backup_is_postimage = (current_backup['exists'] and
+                        current_backup['sha256'] == backup_info.get('postimage_sha256') and
+                        current_backup['text'] == backup_postimage and current_backup['mode'] == 0o600)
+                    if not backup_is_preimage and not backup_is_postimage:
+                        raise ValueError('Target settings backup changed independently; journal retained')
+                    if backup_is_postimage:
+                        settings_backup_restore = backup_before
+                if is_postimage:
+                    settings_restore = {'exists': preimage['exists'], 'text': preimage['text'],
+                                        'mode': preimage['mode']}
+            else:
+                try:
+                    previous_settings = json.loads(settings_info['preimage']['text']) if settings_info['preimage']['exists'] else {}
+                except ValueError as error:
+                    raise ValueError('Upgrade journal settings preimage is invalid JSON; leave the adapter guarded') from error
+                previous_hooks = previous_settings.get('hooks', {}) if isinstance(previous_settings, dict) else {}
+                for event, group in settings_info.get('old_groups', {}).items():
+                    groups = previous_hooks.get(event, []) if isinstance(previous_hooks, dict) else []
+                    if not isinstance(groups, list) or groups.count(group) != 1:
+                        raise ValueError('Upgrade journal does not bind the exact old ' + event + ' hook preimage')
+                if set(settings_info.get('old_groups', {})) != set(settings_info.get('new_groups', {})):
+                    raise ValueError('Upgrade journal hook replacement scope changed; leave the adapter guarded')
+                settings_restore = recover_settings(settings_info)
 
         seat_manifest_info=journal.get('seat_manifest',{})
         seat_manifest_restore=None
+        seat_manifest_file_restore=None
         if seat_manifest_info.get('managed'):
             expected_path=session_store.seat_dir(original_state['seat_id'])/'seat.json'
             manifest_path=Path(seat_manifest_info.get('path',''))
@@ -2531,6 +3619,35 @@ def upgrade_recover(args):
             seat_manifest_restore=seat_manifest_info.get('preimage')
             if not isinstance(seat_manifest_restore,dict):
                 raise ValueError('Seat manifest preimage is malformed; preserve it and the upgrade journal')
+            if transition:
+                transition_manifest = transition.get('target_manifest_file_preimage')
+                validate_journal_preimage(transition_manifest, expected_path)
+                expected_post = transition.get('target_manifest_file_postimage')
+                if not isinstance(expected_post, str):
+                    raise ValueError('Anchor rollback target manifest postimage is malformed')
+                current_image = capture_text(expected_path, transition_manifest['mode'])
+                if (current_image['sha256'] != transition_manifest['sha256'] and
+                        current_image['sha256'] != text_digest(expected_post)):
+                    raise ValueError('Target seat manifest changed independently; preserve it and the upgrade journal')
+                seat_manifest_file_restore = transition_manifest
+
+        release_manifest_file_restore = None
+        if transition and transition.get('release_seat_id'):
+            release_id = transition['release_seat_id']
+            release_manifest_path = session_store.seat_dir(release_id) / 'seat.json'
+            release_image = transition.get('release_manifest_file_preimage')
+            validate_journal_preimage(release_image, release_manifest_path)
+            release_postimage = transition.get('release_manifest_file_postimage')
+            if not isinstance(release_postimage, str):
+                raise ValueError('Anchor rollback released-seat manifest postimage is malformed')
+            current_release_image = capture_text(release_manifest_path, release_image['mode'])
+            if (current_release_image['sha256'] != release_image['sha256'] and
+                    current_release_image['sha256'] != text_digest(release_postimage)):
+                raise ValueError('Released seat manifest changed independently; preserve it and the upgrade journal')
+            if transition.get('release_manifest_preimage_sha256') != text_digest(
+                    json.dumps(transition.get('release_manifest_preimage'), indent=2, sort_keys=True) + '\n'):
+                raise ValueError('Released seat manifest journal hash is inconsistent')
+            release_manifest_file_restore = release_image
 
         # The journal and new adapter continue guarding work throughout rollback.
         if state_now['sha256'] != state_info['preimage']['sha256']:
@@ -2551,7 +3668,27 @@ def upgrade_recover(args):
             if current['sha256']!=image['sha256']:
                 write(path,image['text'],image['mode'])
         if seat_manifest_restore is not None and current_manifest_hash!=seat_manifest_info['preimage_sha256']:
-            session_store.save_seat(seat_manifest_restore)
+            if seat_manifest_file_restore:
+                write(seat_manifest_file_restore['path'], seat_manifest_file_restore['text'],
+                      seat_manifest_file_restore['mode'])
+            else:
+                session_store.save_seat(seat_manifest_restore)
+        if release_manifest_file_restore:
+            release_current = capture_text(release_manifest_file_restore['path'],
+                                           release_manifest_file_restore['mode'])
+            post = transition['release_manifest_file_postimage']
+            if release_current['sha256'] == text_digest(post):
+                write(release_manifest_file_restore['path'], release_manifest_file_restore['text'],
+                      release_manifest_file_restore['mode'])
+        if settings_backup_restore:
+            if settings_backup_restore['exists']:
+                write(settings_backup_restore['path'], settings_backup_restore['text'],
+                      settings_backup_restore['mode'])
+            else:
+                backup_path = Path(settings_backup_restore['path'])
+                if backup_path.exists():
+                    backup_path.unlink()
+                    sync_directory(backup_path.parent)
         journal_path.unlink()
         sync_directory(journal_path.parent)
     return {'recovered': True, 'rolled_back': True, 'history_preserved': True,
@@ -2702,9 +3839,15 @@ def record(args):
             owner = state['lane_owner']
             receipt_report = delivery.required_reads_status(state['root'], owner['harness'],
                                                             owner['session_id'])
+            if 'handoff_acceptance' in packet:
+                packet = {**packet, 'guidance_attestation': {
+                    'reread': delivery.required_read_packet_entries(receipt_report)}}
             receipt_context = delivery.require_required_read_receipts(
                 receipt_report, packet, evidence_path.parent)
         receipt = delivery_runs.run(args.cwd, state['base_ref'], state['pr_url'], args.evidence, args.policy)
+        if packet is not None and 'handoff_acceptance' in packet:
+            packet_successor_acceptance(state, receipt, packet)
+            receipt['handoff_acceptance'] = True
         if receipt_context is not None:
             attestation = packet['guidance_attestation']
             receipt['required_reads'] = {**receipt_context, 'stage': attestation.get('stage')}
@@ -2820,6 +3963,35 @@ def valid_recorded_owner(owner):
                 isinstance(directory, str) and Path(directory).is_absolute())
 
 
+def rebind_route_ready(owner, actual, runtime, checkout_rows):
+    try:
+        outgoing_versions=runtime_source_versions(runtime, owner['harness'])
+        runtime_source_versions(runtime, actual['harness'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    for item in checkout_rows:
+        state=item.get('state')
+        if state is None:
+            continue
+        if not isinstance(state,dict):
+            return False
+        if not state or state.get('phase') == 'removed':
+            continue
+        bindings=state.get('pr_bindings',{})
+        if (not isinstance(bindings,dict) or
+                any(not isinstance(url,str) or not isinstance(binding,dict)
+                    for url,binding in bindings.items()) or
+                (state.get('pr_url') is not None and not isinstance(state.get('pr_url'),str))):
+            return False
+        state_owner=state.get('lane_owner')
+        if (not isinstance(state_owner, dict) or
+                {key:state_owner.get(key) for key in ('harness','session_id')} !=
+                {key:owner.get(key) for key in ('harness','session_id')} or
+                state.get('source_versions') != outgoing_versions):
+            return False
+    return True
+
+
 def managed_adapter_status(state):
     path_value = state.get('adapter') if isinstance(state, dict) else None
     expected = state.get('adapter_sha256') if isinstance(state, dict) else None
@@ -2859,6 +4031,56 @@ def origin_host(cwd):
         return None
 
 
+def recorded_seat_root_problem(state):
+    """Read-only check that a durable lane still points at its recorded Git worktree."""
+    if not state or not state.get('seat_id') or not isinstance(state.get('lane_owner'), dict):
+        return None
+    owner = state['lane_owner']
+    try:
+        seat = session_store.load_seat(state['seat_id'])
+        anchor = session_store.operational_anchor(seat)
+    except (OSError, TypeError, ValueError):
+        return 'The durable seat registry or its operational Git anchor cannot be verified.'
+    if not seat:
+        return 'The durable seat registry is unavailable; preserve its history and inspect it.'
+    if anchor['state'] != 'active':
+        return 'This durable seat has released its operational anchor and is history-only.'
+    expected_root = state.get('session_root')
+    expected_owner_root = owner.get('seat_root', expected_root)
+    expected_gitdir = owner.get('seat_gitdir')
+    if not isinstance(expected_root, str) or not Path(expected_root).is_absolute():
+        return 'The durable lane has no valid recorded permanent seat Git root.'
+    if expected_root != anchor['root'] or expected_owner_root != anchor['root']:
+        return ('The recorded permanent seat root differs from the durable seat: ' +
+                f"checkout {expected_root}, owner binding {expected_owner_root}, seat {anchor['root']}.")
+    if expected_gitdir != anchor['gitdir']:
+        return ('The recorded permanent seat Gitdir changed: ' +
+                f"owner binding {expected_gitdir}, durable seat {anchor['gitdir']}.")
+    if not os.path.lexists(expected_root):
+        return 'The recorded permanent seat Git root is missing at ' + expected_root + '.'
+    root_path = Path(expected_root)
+    if root_path.is_symlink() or not root_path.is_dir():
+        return 'The recorded permanent seat Git root no longer identifies its original worktree path.'
+    if not isinstance(expected_gitdir, str) or not Path(expected_gitdir).is_dir():
+        return 'The recorded permanent seat Gitdir is unavailable at ' + str(expected_gitdir) + '.'
+    try:
+        observed_root = str(root(root_path))
+        observed_gitdir = delivery.value(root_path, 'rev-parse', '--absolute-git-dir')
+        observed_common = delivery.value(root_path, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    except (OSError, ValueError):
+        return 'The recorded permanent seat path no longer resolves as a Git worktree.'
+    if observed_root != expected_root:
+        return ('The recorded permanent seat root now resolves to a different worktree path: ' +
+                observed_root + '.')
+    if observed_gitdir != expected_gitdir:
+        return ('The recorded permanent seat Gitdir changed: expected ' + expected_gitdir +
+                ', observed ' + observed_gitdir + '.')
+    if anchor.get('common_gitdir') is not None and observed_common != anchor['common_gitdir']:
+        return ('The recorded permanent seat Git common directory changed: expected ' +
+                anchor['common_gitdir'] + ', observed ' + observed_common + '.')
+    return None
+
+
 def setup_guidance(cwd, state, detail):
     """Choose one read-only setup recommendation from status observations."""
     identity = detail['current_native_identity']['actual']
@@ -2895,6 +4117,11 @@ def setup_guidance(cwd, state, detail):
         owner_matches = (identity is not None and
                          (owner is None or detail['current_owner']['state'] == 'matches'))
         if branch_matches and owner_matches and source['integrity'] == 'intact':
+            root_problem = recorded_seat_root_problem(state)
+            if root_problem:
+                command = shlex.join([sys.executable, str(SELF), '--seat-id', state['seat_id'],
+                                      'recover', '--inspect'])
+                return guidance('inspect', root_problem + ' Recover --inspect shows the preserved seat state. A separate reviewed upgrade can replace an absent birth root only when both its root and Gitdir are absent and a retained attachment proves the same Git common directory. Missing active attachments must be retired first, and a conflicting anchor seat requires its exact ID after every attachment is retired. The released seat remains history-only; source upgrade archives receipts and requires fresh reports.', command)
             return guidance('recover', 'An upgrade journal is pending for this checkout. The recorded owner can review the exact rollback command before continuing.',
                             detail['upgrade']['recovery_command'])
         return guidance('inspect', 'An upgrade journal is pending, but this native owner or checkout context is not confirmed. Keep the journal and adapter guard in place for the recorded owner to inspect.')
@@ -2918,6 +4145,12 @@ def setup_guidance(cwd, state, detail):
             reason = ('This lane belongs to another native owner. A status mismatch does not authorize transfer; '
                       'only after the recorded owner explicitly authorizes a handoff may the actual incoming session run the supported command.')
             return guidance('handoff', reason, command)
+
+    root_problem = recorded_seat_root_problem(state)
+    if root_problem:
+        command = shlex.join([sys.executable, str(SELF), '--seat-id', state['seat_id'],
+                              'recover', '--inspect'])
+        return guidance('inspect', root_problem + ' Recover --inspect shows the preserved seat state. A separate reviewed upgrade can replace an absent birth root only when both its root and Gitdir are absent and a retained attachment proves the same Git common directory. Missing active attachments must be retired first, and a conflicting anchor seat requires its exact ID after every attachment is retired. The released seat remains history-only; source upgrade archives receipts and requires fresh reports.', command)
 
     if source['integrity'] == 'missing' and not state.get('seat_id'):
         current_source_clean = current_cli['source_revision'] and current_cli['working_tree_dirty'] is False
@@ -3001,6 +4234,113 @@ def retired_attachments_for_seat(identifier, seat=None, checkout_rows=None):
                         'pr_records': [dict(row, attachment_state='retired') for row in pr_records],
                         'retirement_receipt': copy.deepcopy(receipt)})
     return retired
+
+
+def seat_retirement_status(seat, checkout_rows, anchor, actual, adapter_status,
+                           pending_transition):
+    identifier = seat['seat_id']
+    journal_path = seat_retirement_journal_path(identifier)
+    pending = pending_transition or journal_path.exists() or journal_path.is_symlink()
+    receipt = seat.get('retirement_receipt')
+    if isinstance(receipt, dict) and receipt.get('protocol') == SEAT_RETIREMENT_PROTOCOL:
+        adapter_record = receipt.get('adapter')
+        adapter_path_value = adapter_record.get('path') if isinstance(adapter_record, dict) else None
+        try:
+            if not isinstance(adapter_path_value, str) or not adapter_path_value:
+                raise ValueError('retirement adapter path is malformed')
+            adapter_path = Path(adapter_path_value)
+            refuse_symlinked_path(adapter_path)
+            adapter_removed = not adapter_path.exists() and not adapter_path.is_symlink()
+        except (OSError, ValueError):
+            adapter_removed = False
+        settings_receipt = receipt.get('settings')
+        settings_state = 'not-managed'
+        if isinstance(settings_receipt, dict):
+            settings_path = Path(settings_receipt.get('path', ''))
+            try:
+                current_settings = capture_text(settings_path, settings_receipt.get('mode', 0o600))
+                settings_state = ('removed-on-disk' if current_settings['exists'] and
+                                  current_settings['sha256'] == settings_receipt.get('postimage_sha256') and
+                                  current_settings['mode'] == settings_receipt.get('mode') else
+                                  'changed-after-retirement')
+            except (OSError, TypeError, ValueError):
+                settings_state = 'unavailable'
+        state = ('pending-recovery' if pending else
+                 'retired-on-disk' if anchor['state'] == 'released' and adapter_removed and
+                 settings_state in ('not-managed', 'removed-on-disk') else
+                 'retirement-effect-changed')
+        next_action = ('Inspect the exact operator-owned retirement journal, then use recover --rollback if the operation was interrupted.'
+                       if pending else
+                       'Verify native hook refresh through real receiving evidence or a supported owner reload at a safe boundary. File removal does not prove native detachment; do not force a restart.'
+                       if state == 'retired-on-disk' else
+                       'Preserve the receipt and inspect the changed adapter or settings before any new operation.')
+        return {'state': state, 'attachments': 'preserved-and-retired',
+                'retained_hook_condition': 'removed-on-disk' if settings_state == 'removed-on-disk' else settings_state,
+                'adapter_state': 'removed-on-disk' if adapter_removed else 'unexpected-or-unavailable',
+                'settings_path': settings_receipt.get('path') if isinstance(settings_receipt, dict) else None,
+                'settings_state': settings_state, 'receipt': copy.deepcopy(receipt),
+                'native_refresh_observed': False, 'next_action': next_action,
+                'command': None,
+                'notice': 'The receipt records local file changes only; it does not establish native hook refresh or detachment.'}
+
+    phases = [((item.get('state') or {}).get('phase')) for item in checkout_rows]
+    recorded_all_removed = bool(phases) and all(phase == 'removed' for phase in phases)
+    retirement_plan = None
+    readiness_error = None
+    owner = seat.get('owner')
+    if (not pending and not pending_transition and anchor['state'] == 'active' and
+            actual is not None and isinstance(owner, dict)):
+        try:
+            retirement_plan = build_retire_seat_plan(
+                identifier, expected_owner_harness=owner.get('harness'),
+                expected_owner_session=owner.get('session_id'),
+                expected_operator_harness=actual.get('harness'),
+                expected_operator_session=actual.get('session_id'),
+                authorization_ref='EXISTING_AUTHORIZATION_REFERENCE', confirmed=True)
+        except (OSError, TypeError, ValueError) as error:
+            readiness_error = str(error)
+    all_removed = retirement_plan is not None
+    command = None
+    if all_removed:
+        command = shlex.join([sys.executable, str(SELF), '--seat-id', identifier, 'retire-seat',
+                              '--expected-owner-harness', owner['harness'],
+                              '--expected-owner-session', owner['session_id'],
+                              '--expected-operator-harness', actual['harness'],
+                              '--expected-operator-session', actual['session_id'],
+                              '--authorization-ref', 'EXISTING_AUTHORIZATION_REFERENCE',
+                              '--confirm-retirement'])
+    if pending:
+        state = 'pending-recovery'
+        next_action = 'Inspect the exact operator-owned retirement journal, then use recover --rollback before another lifecycle action.'
+    elif all_removed:
+        state = 'drained-hook-retained' if seat.get('hooks_installed') else 'drained-seat-ready'
+        next_action = ('After the existing authorization is explicit, review the exact retire-seat plan and apply only its digest.'
+                       if command else
+                       'Run status in the actual native operator session, resolve any pending transition or pin drift, and then review retire-seat after explicit authorization.')
+    elif recorded_all_removed and actual is None:
+        state = 'drained-operator-unavailable'
+        next_action = 'Run status from the actual native operator session, then review retire-seat only after existing authorization.'
+    elif recorded_all_removed:
+        state = 'drained-retirement-blocked'
+        next_action = ('Resolve this plan refusal before retrying: ' + readiness_error
+                       if readiness_error else
+                       'Resolve the anchor, runtime, adapter, settings, or lifecycle state before reviewing retire-seat.')
+    else:
+        state = 'attachments-active-or-uncertain'
+        next_action = ('Review an exact retire-attachment plan for each registration before reviewing seat retirement. '
+                       'Use --live-registration to select a present recorded worktree explicitly.')
+    return {'state': state, 'active_or_uncertain_attachments': sum(phase != 'removed' for phase in phases),
+            'retired_attachments': sum(phase == 'removed' for phase in phases),
+            'retained_hook_condition': ('retained-active' if seat.get('hooks_installed') and
+                                        anchor['state'] == 'active' and all_removed else
+                                        'recorded-but-unverified' if seat.get('hooks_installed') and
+                                        anchor['state'] == 'active' and recorded_all_removed else
+                                        'configured' if seat.get('hooks_installed') else 'not-installed'),
+            'adapter_state': adapter_status.get('state'), 'next_action': next_action,
+            'command': command, 'authorization_required': True,
+            'readiness_reason': readiness_error,
+            'native_refresh_observed': False,
+            'notice': 'A retirement plan records an existing authorization reference but does not authenticate it. Status does not prove native hook loading or delivery interception.'}
 
 
 def status(cwd, session_id=None, state=None, native_context=None):
@@ -3148,12 +4488,13 @@ def status(cwd, session_id=None, state=None, native_context=None):
     published_context = publication.get('required_reads') if isinstance(publication, dict) else None
     report_receipt = (state or {}).get('receipt')
     recorded_context = report_receipt.get('required_reads') if isinstance(report_receipt, dict) else None
-    receipt_context = published_context if isinstance(published_context, dict) else recorded_context
+    receipt_context = (recorded_context if isinstance(report_receipt, dict) and report_receipt.get('handoff_acceptance')
+                       else published_context if isinstance(published_context, dict) else recorded_context)
     if isinstance(receipt_context, dict):
         entries = receipt_context.get('entries')
         result['guidance_attestation_receipts'] = {
-            'stage': (publication.get('stage') if isinstance(publication, dict) else
-                      receipt_context.get('stage')),
+            'stage': ('handoff_acceptance' if isinstance(report_receipt, dict) and report_receipt.get('handoff_acceptance')
+                      else publication.get('stage') if isinstance(publication, dict) else receipt_context.get('stage')),
             'list_sha256': receipt_context.get('list_sha256'),
             'generation': receipt_context.get('generation'),
             'observed_at': receipt_context.get('observed_at'),
@@ -3161,6 +4502,12 @@ def status(cwd, session_id=None, state=None, native_context=None):
                             if isinstance(entries, list) else []),
         }
     result['setup_guidance'] = setup_guidance(cwd, state, result)
+    if state is None:
+        permanent_seat = permanent_seat_status_for_anchor(cwd)
+        if permanent_seat is not None:
+            result['permanent_seat_hint'] = permanent_seat
+            result['permanent_seat_hint_notice'] = (
+                'This exact permanent seat is already registered. setup_guidance above describes only the current product checkout attachment.' )
     return result
 
 
@@ -3227,6 +4574,66 @@ def coverage(cwd, pr_url=None):
                   'The declared PR is caller input. Preserve manual zoom-out reminders and repository delivery rules.'}
 
 
+def checkout_path_availability(item):
+    state = item.get('state') or {}
+    if state.get('phase') == 'removed':
+        return 'retired' if isinstance(state.get('retirement_receipt'), dict) else 'inactive'
+    if state.get('phase') != 'active':
+        return 'unavailable' if not state else 'inactive'
+    path = item.get('root')
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        return 'unavailable'
+    if not os.path.lexists(path):
+        return 'missing'
+    if Path(path).is_symlink() or not Path(path).is_dir():
+        return 'changed'
+    return 'present'
+
+
+def checkout_worktree_availability(item):
+    availability = checkout_path_availability(item)
+    if availability != 'present':
+        return availability
+    state = item.get('state') or {}
+    path = item.get('root')
+    try:
+        observed_root = str(root(path))
+        observed_identity = git_path_identity(path)
+        observed_branch = branch(path)
+    except (OSError, ValueError):
+        return 'changed'
+    expected_common = item.get('common_gitdir')
+    if (observed_root != path or observed_identity['gitdir'] != item.get('gitdir') or
+            (expected_common is not None and observed_identity['common_gitdir'] != expected_common) or
+            observed_branch != state.get('branch')):
+        return 'changed'
+    return 'present'
+
+
+def permanent_seat_status_for_anchor(cwd):
+    """Return one seat only when its active Git anchor exactly matches this unbound root."""
+    try:
+        checkout_root = str(root(cwd))
+        checkout_identity = git_path_identity(cwd)
+        seats = session_store.all_seats()
+    except (OSError, TypeError, ValueError):
+        return None
+    matches = []
+    for seat in seats:
+        try:
+            anchor = session_store.operational_anchor(seat)
+        except (TypeError, ValueError):
+            return None
+        if (anchor['state'] == 'active' and anchor['root'] == checkout_root and
+                anchor['gitdir'] == checkout_identity['gitdir'] and
+                (anchor.get('common_gitdir') is None or
+                 anchor['common_gitdir'] == checkout_identity['common_gitdir'])):
+            matches.append(seat['seat_id'])
+    if len(matches) != 1:
+        return None
+    return seat_status(matches[0])
+
+
 def seat_status(identifier):
     seat=session_store.load_seat(identifier)
     if not seat:
@@ -3262,27 +4669,94 @@ def seat_status(identifier):
     for item in checkout_rows:
         state=item.get('state') or {}
         retirement = retired_by_id.get(item['checkout_id'])
+        bindings=state.get('pr_bindings')
+        bindings_valid=(('pr_bindings' not in state or (isinstance(bindings,dict) and
+            all(isinstance(url,str) and isinstance(binding,dict) for url,binding in bindings.items()))) and
+            (state.get('pr_url') is None or isinstance(state.get('pr_url'),str)))
+        known_prs=set(bindings) if isinstance(bindings,dict) else set()
+        if isinstance(state.get('pr_url'),str):
+            known_prs.add(state['pr_url'])
         checkouts.append({'checkout_id':item['checkout_id'],'root':item.get('root'),
             'repository':item.get('repository'),'host':item.get('host'),
             'phase':state.get('phase','missing-or-malformed-state'),'branch':state.get('branch'),
             'attachment_state': 'retired' if retirement else state.get('phase','missing-or-malformed-state'),
-            'current_pr':state.get('pr_url'),'known_prs':sorted(set(state.get('pr_bindings',{})) |
-                ({state['pr_url']} if state.get('pr_url') else set())),
+            'worktree_availability': checkout_worktree_availability(item),
+            'current_pr':state.get('pr_url'),'known_prs':sorted(known_prs),
+            'pr_history_state':'intact' if bindings_valid else 'malformed-preserve-and-inspect',
             'pr_records': retirement['pr_records'] if retirement else [],
             'retirement_receipt': copy.deepcopy(state.get('retirement_receipt')),
             'last_updated_at':state.get('updated_at')})
-    return {'seat_id':identifier,'seat_root':seat['seat_root'],'owner':seat['owner'],
+    runtime_cli = runtime_path / 'lane.py'
+    recorded_owner = seat.get('owner')
+    anchor = session_store.operational_anchor(seat)
+    upgrade_journal = session_store.seat_dir(identifier)/UPGRADE_JOURNAL
+    retirement_journal = seat_retirement_journal_path(identifier)
+    pending_transition = bool(seat.get('install_journal') or seat.get('migration_journal') or
+        seat.get('handoff_journal') or upgrade_journal.exists() or upgrade_journal.is_symlink() or
+        retirement_journal.exists() or retirement_journal.is_symlink())
+    complete_runtime_pin = bool(isinstance(runtime.get('version'), str) and
+                                isinstance(runtime.get('path'), str) and Path(runtime['path']).is_absolute() and
+                                isinstance(runtime.get('files'), dict) and runtime.get('files') and
+                                'lane.py' in runtime.get('files', {}) and runtime_files and
+                                all(row['state'] == 'intact' for row in runtime_files.values()) and
+                                runtime_files.get('lane.py', {}).get('state') == 'intact')
+    all_checkouts_removed = bool(checkout_rows) and all(
+        isinstance(item.get('state'), dict) and item['state'].get('phase') == 'removed'
+        for item in checkout_rows)
+    can_offer_rebind = (actual is not None and not owner_matches and anchor['state'] == 'active' and
+                        not pending_transition and valid_recorded_owner(recorded_owner) and
+                        not all_checkouts_removed and
+                        complete_runtime_pin and adapter_status.get('state') == 'intact' and
+                        rebind_route_ready(recorded_owner, actual, runtime, checkout_rows))
+    rebind_command = (shlex.join([sys.executable, str(runtime_cli), '--seat-id', identifier,
+                                  'rebind-owner', '--from-harness', recorded_owner['harness'],
+                                  '--from-session', recorded_owner['session_id'], '--confirm-handoff'])
+                      if can_offer_rebind else None)
+    settings_info = seat.get('settings') if isinstance(seat.get('settings'), dict) else {}
+    prospective_settings_path = (str(Path(anchor['root'])/'.claude/settings.local.json')
+                                 if anchor['state'] == 'active' else None)
+    recorded_settings_path = settings_info.get('path')
+    settings_path = recorded_settings_path or prospective_settings_path
+    settings_path_source = 'recorded' if recorded_settings_path else (
+        'prospective' if prospective_settings_path else 'unavailable')
+    settings_state = ('installed' if recorded_settings_path and seat.get('hooks_installed') else
+                      'recorded-inactive' if recorded_settings_path else
+                      'prospective' if prospective_settings_path else 'unavailable')
+    retirement_status = seat_retirement_status(seat, checkout_rows, anchor, actual,
+                                                adapter_status,
+                                                pending_transition)
+    if retirement_status['state'] == 'retired-on-disk':
+        adapter_status = dict(adapter_status, state='retired')
+        settings_state = ('retired-on-disk' if retirement_status['settings_state'] == 'removed-on-disk'
+                          else 'not-managed')
+    elif retirement_status['state'] == 'pending-recovery':
+        settings_state = 'retirement-pending-recovery'
+    return {'seat_id':identifier,'seat_root':seat['seat_root'],'birth_root':seat['seat_root'],
+        'operational_anchor':anchor,'owner':seat['owner'],
         'owner_context':seat.get('owner_context',{}),'actual_native_identity':actual,
         'actual_session_context':actual_context,'owner_matches':owner_matches,'identity_error':identity_error,
         'hooks_installed':bool(seat.get('hooks_installed')),'adapter':seat.get('adapter'),
         'adapter_state':adapter_status['state'],'adapter_integrity':adapter_status,
+            'runtime_cli':str(runtime_cli),
+            'settings':{'path':settings_path,'path_source':settings_path_source,'state':settings_state,
+                'recorded_path':recorded_settings_path,'prospective_path':prospective_settings_path,
+                'hooks_installed':bool(seat.get('hooks_installed')),
+                'recorded_baseline_sha256':settings_info.get('sha256'),
+                'baseline_hash_notice':'This is the install-time baseline, not a current settings-content observation.',
+                'mode':settings_info.get('mode')},
+            'handoff':{'rebind_owner_command':rebind_command,
+                'command_condition':'Use only after the authorized scope transfer is recorded and the incoming owner has accepted it. Status does not establish transfer authority.',
+                'retirement_notice':'A drained-seat retirement preserves recorded owner and checkout history. On-disk hook removal does not prove a running native host refreshed its configuration.'},
+            'verification':{'configured':{'hooks_installed':bool(seat.get('hooks_installed')),
+                    'settings_path':settings_path,'settings_path_state':settings_state,
+                    'adapter_path':seat.get('adapter')},
+                'observed':{'state':'not-observed-by-seat-status',
+                    'notice':'Use coverage from each active checkout to inspect local events; configured hooks and adapter probes do not prove native interception.'}},
             'runtime':{'version':runtime.get('version'),
             'path':str(runtime_path),'files':runtime_files},'checkouts':checkouts,
         'retired_attachments': retired,
-        'pr_records':len(seat.get('prs',{})),'pending_transition':bool(seat.get('install_journal') or
-            seat.get('migration_journal') or seat.get('handoff_journal') or
-            (session_store.seat_dir(identifier)/UPGRADE_JOURNAL).exists() or
-            (session_store.seat_dir(identifier)/UPGRADE_JOURNAL).is_symlink()),
+        'seat_retirement': retirement_status,
+        'pr_records':len(seat.get('prs',{})),'pending_transition':pending_transition,
         'notice':'Read-only permanent-seat inspection. It remains available without product Git directories and does not prove native hook loading or delivery interception.'}
 
 
@@ -3484,6 +4958,7 @@ def seat_action(seat_identifier, cwd, argv, *, event=None, published=False):
         raise ValueError('This Policy Guard seat belongs to another native session. Use an explicitly authorized rebind-owner handoff.')
     if actual['harness']=='opencode' and lane_scope.native_session_context(event)!=seat.get('owner_context',{}):
         raise ValueError('This Policy Guard seat belongs to a different OpenCode session API project or location. Use an explicitly authorized rebind-owner handoff.')
+    anchor = active_operational_anchor(seat)
     if seat.get('install_journal') or seat.get('migration_journal') or seat.get('handoff_journal'):
         raise ValueError('Policy Guard seat installation or migration is incomplete; preserve the journal and use recover --inspect')
     attached, current_root, current_repo, checkout = seat_repository(seat, cwd, action)
@@ -3832,10 +5307,12 @@ def session(args):
             raise ValueError('Permanent Policy Guard seat registry is missing; preserve history and use recover --inspect')
         if lane_scope.native_identity(event=event) != seat.get('owner'):
             raise ValueError('This Policy Guard seat belongs to another native session; use the explicit handoff command')
-        if seat.get('install_journal') or seat.get('migration_journal') or seat.get('handoff_journal'):
+        if seat.get('install_journal') or seat.get('migration_journal') or seat.get('handoff_journal') or \
+                (session_store.seat_dir(args.seat_id) / UPGRADE_JOURNAL).exists():
             raise ValueError('This Policy Guard seat has an interrupted state transition; use recover --inspect before starting covered work')
+        anchor = active_operational_anchor(seat)
         if (event.get('hook_event_name') != 'SessionStart' or
-                root(event.get('cwd', args.cwd)) != root(seat['seat_root'])):
+                root(event.get('cwd', args.cwd)) != root(anchor['root'])):
             return 0
         envfile = os.environ.get('CLAUDE_ENV_FILE')
         if envfile:
@@ -3940,6 +5417,10 @@ def migration_plan(args):
     seat = session_store.seat_manifest(identifier)
     runtime = session_store.runtime_plan(APP)
     if seat:
+        anchor = active_operational_anchor(seat)
+        if anchor['root'] != str(seat_root) or anchor['gitdir'] != delivery.value(
+                seat_root, 'rev-parse', '--absolute-git-dir'):
+            raise ValueError('Target permanent seat no longer owns this exact active operational root; released seats are history-only')
         if seat.get('owner') != identity:
             raise ValueError('Target permanent seat belongs to another native session; use an authorized handoff first')
         if seat.get('runtime', {}).get('version') != runtime['version']:
@@ -4069,6 +5550,12 @@ def migrate_legacy(args):
         seat=session_store.load_seat(identifier)
         if seat and (seat.get('owner')!=proposed['owner'] or seat.get('runtime',{}).get('version')!=proposed['runtime']['version']):
             raise ValueError('Target seat changed since migration planning')
+        if seat:
+            anchor = active_operational_anchor(seat)
+            expected_root = proposed['seat_root']
+            expected_gitdir = proposed['migrated_state']['lane_owner']['seat_gitdir']
+            if anchor['root'] != expected_root or anchor['gitdir'] != expected_gitdir:
+                raise ValueError('Target seat anchor changed since migration planning; released seats remain history-only')
         journal={'kind':'migration','legacy_state_path':proposed['legacy_state_path'],
                  'legacy_state':proposed['legacy_state_text'],
                  'legacy_state_sha256':proposed['legacy_state_sha256'],
@@ -4086,6 +5573,8 @@ def migrate_legacy(args):
         if seat is None:
             seat=session_store.make_manifest(proposed['seat_root'],proposed['owner'],proposed['runtime'])
             seat['seat_gitdir']=delivery.value(proposed['seat_root'],'rev-parse','--absolute-git-dir')
+            seat['seat_common_gitdir']=delivery.value(
+                proposed['seat_root'],'rev-parse','--path-format=absolute','--git-common-dir')
         seat['migration_journal']=journal
         seat['real_gh']=proposed['real_gh']
         seat['adapter']=proposed['migrated_state']['adapter']
@@ -4174,6 +5663,8 @@ def recover_inspect(args):
             files[relative] = {'expected_sha256': expected, 'actual_sha256': actual_hash,
                                'state': 'intact' if actual_hash == expected else 'missing-or-changed'}
         adapter_status = managed_adapter_status(seat)
+        retirement_journal = seat_retirement_journal_path(identifier)
+        retirement_pending = retirement_journal.exists() or retirement_journal.is_symlink()
         settings_state = 'not-managed'
         settings_path = (seat.get('settings') or {}).get('path')
         if seat.get('hooks_installed') and settings_path:
@@ -4185,13 +5676,18 @@ def recover_inspect(args):
                     for event, group in seat.get('groups', {}).items()) else 'missing-or-changed'
             except (OSError, ValueError):
                 settings_state = 'missing-or-changed'
-        return {'seat_id': identifier, 'seat_root': seat['seat_root'], 'owner': seat['owner'],
+        return {'seat_id': identifier, 'seat_root': seat['seat_root'],
+                'operational_anchor': session_store.operational_anchor(seat), 'owner': seat['owner'],
                 'actual_native_identity': actual, 'owner_matches': owner_matches,
                 'identity_error': identity_error, 'runtime': {'path': str(runtime_path),
                 'version': runtime.get('version'), 'files': files}, 'adapter': adapter_status,
                 'settings': {'path': settings_path, 'state': settings_state},
                 'install_journal': seat.get('install_journal'), 'migration_journal':seat.get('migration_journal'),
                 'handoff_journal':seat.get('handoff_journal'),
+                'seat_retirement_journal': {'pending': retirement_pending,
+                    'path': str(retirement_journal) if retirement_pending else None,
+                    'recovery': 'Use recover --rollback from the exact native operator recorded by the journal.'
+                    if retirement_pending else None},
                 'checkouts': session_store.all_checkouts(identifier),
                 'notice': 'Read-only local recovery inspection. It does not recreate receipts, checklists, manual counts or activation claims.'}
     state = read(args.cwd)
@@ -4212,10 +5708,15 @@ def recover_plan(args):
     seat = session_store.load_seat(identifier)
     if not seat:
         raise ValueError('Permanent seat registry is missing; preserve its checkout history and inspect the private state directory')
+    ensure_no_seat_retirement_journal(identifier)
     if lane_scope.native_identity() != seat.get('owner'):
         raise ValueError('Only the exact current native seat owner may plan recovery')
+    anchor = active_operational_anchor(seat)
     if seat.get('install_journal') or seat.get('migration_journal') or seat.get('handoff_journal'):
         raise ValueError('An interrupted seat state transition needs recover --rollback before repair planning')
+    if (session_store.seat_dir(identifier) / UPGRADE_JOURNAL).exists() or \
+            (session_store.seat_dir(identifier) / UPGRADE_JOURNAL).is_symlink():
+        raise ValueError('A source upgrade is incomplete; use upgrade-recover --rollback from its recorded checkout')
     actions = []
     runtime = seat.get('runtime', {})
     runtime_path = Path(runtime.get('path', ''))
@@ -4267,7 +5768,9 @@ def recover_plan(args):
                                'preimage_exists': path.exists(), 'preimage_mode': path.stat().st_mode & 0o777 if path.exists() else 0o600,
                                'updated': json.dumps(updated, indent=2) + '\n'}
             actions.append(settings_action)
-    plan = {'seat_id': identifier, 'actions': actions, 'runtime_version': runtime.get('version')}
+    plan = {'seat_id': identifier, 'operational_anchor': anchor,
+            'seat_manifest_sha256': delivery_runs.digest(session_store.seat_dir(identifier) / 'seat.json'),
+            'actions': actions, 'runtime_version': runtime.get('version')}
     plan['plan_sha256'] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
     return plan
 
@@ -4284,11 +5787,16 @@ def recover_apply(args):
         seat = session_store.load_seat(identifier)
         if not seat or lane_scope.native_identity() != seat.get('owner'):
             raise ValueError('Permanent seat owner changed after recovery planning; inspect a fresh plan')
+        current_proposed = recover_plan(args)
+        if current_proposed['plan_sha256'] != args.plan_sha256:
+            raise ValueError('Recovery plan or seat anchor changed after planning; inspect a fresh plan')
+        proposed = current_proposed
         if any(action['kind'] == 'restore-runtime' for action in proposed['actions']):
             session_store.install_runtime(APP, session_store.runtime_plan(APP))
         if any(action['kind'] == 'restore-adapter' for action in proposed['actions']):
             runtime_cli = Path(seat['runtime']['path']) / 'lane.py'
-            write(seat['adapter'], adapter_script(seat['seat_root'], seat_identifier=identifier,
+            anchor = active_operational_anchor(seat)
+            write(seat['adapter'], adapter_script(anchor['root'], seat_identifier=identifier,
                                                    runtime_cli=runtime_cli,
                                                    real_gh=seat['real_gh']['path']), 0o700)
         for action in proposed['actions']:
@@ -4306,6 +5814,192 @@ def recover_apply(args):
             'notice': 'Only missing managed runtime, entrypoint or exact hook content was restored; no report or verification ran.'}
 
 
+def validate_seat_retirement_image(image, expected_path, label):
+    if (not isinstance(image, dict) or image.get('path') != str(expected_path) or
+            not isinstance(image.get('exists'), bool) or not isinstance(image.get('text'), str) or
+            not isinstance(image.get('mode'), int) or
+            image.get('sha256') != text_digest(image['text'])):
+        raise ValueError('The seat retirement ' + label + ' image is malformed; preserve the journal and inspect manually')
+
+
+def recover_seat_retirement(identifier):
+    journal_path = seat_retirement_journal_path(identifier)
+    if journal_path.is_symlink():
+        raise ValueError('Seat retirement journal is symlinked; leave it and all managed files untouched for owner review')
+    if not journal_path.exists():
+        return None
+    refuse_symlinked_path(journal_path)
+    if journal_path.stat().st_mode & 0o777 != 0o600:
+        raise ValueError('Seat retirement journal mode changed; preserve it and inspect manually')
+    try:
+        journal = json.loads(journal_path.read_text())
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError('Seat retirement journal is unreadable; preserve it and inspect manually') from error
+    if (not isinstance(journal, dict) or journal.get('version') != 1 or
+            journal.get('protocol') != SEAT_RETIREMENT_PROTOCOL or journal.get('seat_id') != identifier):
+        raise ValueError('Seat retirement journal version or identity is unsupported; preserve it and inspect manually')
+    actual = lane_scope.native_identity()
+    operator = journal.get('operator')
+    if (not isinstance(operator, dict) or
+            {key: actual.get(key) for key in ('harness', 'session_id')} !=
+            {key: operator.get(key) for key in ('harness', 'session_id')}):
+        raise ValueError('Only the exact native operator that applied this seat retirement may roll it back')
+    expected_context = journal.get('operator_context', {})
+    actual_context = lane_scope.native_session_context() if actual['harness'] == 'opencode' else {}
+    if actual_context != expected_context:
+        raise ValueError('The native operator session context changed since this retirement began')
+    seat_dir = session_store.seat_dir(identifier)
+    seat_path = seat_dir / 'seat.json'
+    adapter_path = seat_dir / 'bin' / 'gh'
+    manifest_info = journal.get('seat_manifest')
+    adapter_info = journal.get('adapter')
+    settings_info = journal.get('settings')
+    if (not isinstance(manifest_info, dict) or not isinstance(adapter_info, dict) or
+            manifest_info.get('path') != str(seat_path) or adapter_info.get('path') != str(adapter_path)):
+        raise ValueError('Seat retirement journal paths do not match the exact durable seat')
+    manifest_pre = manifest_info.get('preimage')
+    manifest_post = manifest_info.get('postimage')
+    adapter_pre = adapter_info.get('preimage')
+    adapter_post = adapter_info.get('postimage')
+    validate_seat_retirement_image(manifest_pre, seat_path, 'manifest preimage')
+    validate_seat_retirement_image(adapter_pre, adapter_path, 'adapter preimage')
+    if (not manifest_pre['exists'] or not adapter_pre['exists'] or
+            not isinstance(manifest_post, dict) or not isinstance(adapter_post, dict)):
+        raise ValueError('Seat retirement journal preimages or postimages are incomplete')
+    if (manifest_post.get('exists') is not True or not isinstance(manifest_post.get('text'), str) or
+            manifest_post.get('sha256') != text_digest(manifest_post['text']) or
+            manifest_post.get('mode') != manifest_pre['mode'] or
+            adapter_post.get('exists') is not False or adapter_post.get('text') != '' or
+            adapter_post.get('sha256') != text_digest('')):
+        raise ValueError('Seat retirement journal postimages are malformed; preserve it and inspect manually')
+    validate_seat_retirement_image(manifest_post, seat_path, 'manifest postimage')
+    validate_seat_retirement_image(adapter_post, adapter_path, 'adapter postimage')
+    try:
+        original_seat = json.loads(manifest_pre['text'])
+        retired_seat = json.loads(manifest_post['text'])
+    except (TypeError, ValueError) as error:
+        raise ValueError('Seat retirement manifest journal images are malformed; preserve them and inspect manually') from error
+    if (not isinstance(original_seat, dict) or not isinstance(retired_seat, dict) or
+            original_seat.get('seat_id') != identifier or retired_seat.get('seat_id') != identifier or
+            session_store.seat_id(original_seat.get('seat_root', '')) != identifier or
+            original_seat.get('adapter') != str(adapter_path) or
+            adapter_pre.get('mode') != 0o700 or
+            adapter_pre.get('sha256') != original_seat.get('adapter_sha256') or
+            retired_seat.get('owner') != original_seat.get('owner') or
+            retired_seat.get('checkouts') != original_seat.get('checkouts') or
+            retired_seat.get('prs') != original_seat.get('prs') or
+            session_store.operational_anchor(retired_seat)['state'] != 'released' or
+            retired_seat.get('hooks_installed') is not False or retired_seat.get('groups') != {} or
+            (retired_seat.get('retirement_receipt') or {}).get('protocol') != SEAT_RETIREMENT_PROTOCOL or
+            (retired_seat.get('retirement_receipt') or {}).get('plan_sha256') != journal.get('plan_sha256') or
+            (retired_seat.get('retirement_receipt') or {}).get('operator') != journal.get('operator') or
+            (retired_seat.get('retirement_receipt') or {}).get('operator_context') != journal.get('operator_context') or
+            (retired_seat.get('retirement_receipt') or {}).get('history_preserved') is not True):
+        raise ValueError('Seat retirement journal does not preserve the exact seat history; preserve it and inspect manually')
+    retirement_receipt = retired_seat.get('retirement_receipt') or {}
+    retired_adapter = retirement_receipt.get('adapter')
+    if (not isinstance(retired_adapter, dict) or retired_adapter.get('path') != str(adapter_path) or
+            retired_adapter.get('preimage_sha256') != adapter_pre['sha256'] or
+            retired_adapter.get('mode') != adapter_pre['mode'] or retired_adapter.get('remove') is not True or
+            adapter_post.get('mode') != adapter_pre['mode']):
+        raise ValueError('Seat retirement adapter receipt does not match its journal preimage')
+    settings_pre = settings_post = None
+    if bool(original_seat.get('hooks_installed')) != (settings_info is not None):
+        raise ValueError('Seat retirement journal settings do not match the recorded hook ownership')
+    if settings_info is not None:
+        if not isinstance(settings_info, dict) or not isinstance(settings_info.get('path'), str):
+            raise ValueError('Seat retirement settings journal is malformed; preserve it and inspect manually')
+        settings_path = Path(settings_info['path'])
+        old_anchor = session_store.operational_anchor(original_seat)
+        if (old_anchor['state'] != 'active' or
+                settings_path != Path(old_anchor['root']) / '.claude/settings.local.json' or
+                (original_seat.get('settings') or {}).get('path') != str(settings_path)):
+            raise ValueError('Seat retirement settings path differs from the recorded active anchor')
+        settings_pre = settings_info.get('preimage')
+        settings_post = settings_info.get('postimage')
+        validate_seat_retirement_image(settings_pre, settings_path, 'settings preimage')
+        validate_seat_retirement_image(settings_post, settings_path, 'settings postimage')
+        if (not settings_pre['exists'] or not isinstance(settings_post, dict) or
+                settings_post.get('exists') is not True or not isinstance(settings_post.get('text'), str) or
+                settings_post.get('sha256') != text_digest(settings_post['text']) or
+                settings_post.get('mode') != settings_pre['mode']):
+            raise ValueError('Seat retirement settings postimage is malformed; preserve it and inspect manually')
+        owned_groups = original_seat.get('groups')
+        if not isinstance(owned_groups, dict) or not owned_groups:
+            raise ValueError('The preimage seat has no valid hook groups for its recorded settings removal')
+        try:
+            settings_value = json.loads(settings_pre['text'])
+        except (TypeError, ValueError) as error:
+            raise ValueError('Seat retirement settings preimage is malformed; preserve it and inspect manually') from error
+        if not isinstance(settings_value, dict) or not isinstance(settings_value.get('hooks', {}), dict):
+            raise ValueError('Seat retirement settings preimage has no valid hook map')
+        updated_settings = copy.deepcopy(settings_value)
+        updated_hooks = updated_settings['hooks']
+        for event, group in sorted(owned_groups.items()):
+            existing = updated_hooks.get(event, [])
+            if not isinstance(existing, list) or existing.count(group) != 1:
+                raise ValueError('Seat retirement journal does not remove one exact recorded hook group')
+            commands = hook_commands(group)
+            if any(commands.intersection(hook_commands(other)) and other != group for other in existing):
+                raise ValueError('Seat retirement journal hook group changed independently')
+            existing.remove(group)
+        if not any(updated_hooks.values()) and not settings_value.get('hooks'):
+            updated_settings.pop('hooks', None)
+        expected_settings_post = json.dumps(updated_settings, indent=2) + '\n'
+        if settings_post['text'] != expected_settings_post:
+            raise ValueError('Seat retirement settings postimage changes data beyond the exact owned hook groups')
+        retired_settings = retirement_receipt.get('settings')
+        if (not isinstance(retired_settings, dict) or
+                retired_settings.get('path') != str(settings_path) or
+                retired_settings.get('preimage_sha256') != settings_pre['sha256'] or
+                retired_settings.get('postimage_sha256') != settings_post['sha256'] or
+                retired_settings.get('mode') != settings_pre['mode']):
+            raise ValueError('Seat retirement receipt settings do not match their journal preimages')
+    elif retirement_receipt.get('settings') is not None:
+        raise ValueError('Seat retirement receipt names settings without a journaled hook removal')
+
+    def image_state(path, before, after, label):
+        refuse_symlinked_path(path)
+        current = capture_text(path, before['mode'])
+        for expected in (before, after):
+            if (current['exists'] == expected['exists'] and current['sha256'] == expected['sha256'] and
+                    (not current['exists'] or current['mode'] == expected['mode'])):
+                return current, expected
+        raise ValueError('The ' + label + ' changed during interrupted seat retirement; preserve the journal and inspect manually')
+
+    manifest_now, manifest_expected = image_state(seat_path, manifest_pre, manifest_post, 'seat manifest')
+    adapter_now, adapter_expected = image_state(adapter_path, adapter_pre, adapter_post, 'seat adapter')
+    settings_now = None
+    if settings_info is not None:
+        settings_now, settings_expected = image_state(Path(settings_info['path']), settings_pre,
+                                                      settings_post, 'Claude settings')
+
+    def restore(path, before, after, label):
+        refuse_symlinked_path(path)
+        current = capture_text(path, before['mode'])
+        if (current['exists'] == before['exists'] and current['sha256'] == before['sha256'] and
+                (not current['exists'] or current['mode'] == before['mode'])):
+            return
+        if (current['exists'] != after['exists'] or current['sha256'] != after['sha256'] or
+                (current['exists'] and current['mode'] != after['mode'])):
+            raise ValueError('The ' + label + ' changed immediately before rollback; preserve the journal and inspect manually')
+        if before['exists']:
+            write(path, before['text'], before['mode'])
+        else:
+            path.unlink()
+            sync_directory(path.parent)
+
+    if settings_info is not None:
+        restore(Path(settings_info['path']), settings_pre, settings_post, 'Claude settings')
+    restore(adapter_path, adapter_pre, adapter_post, 'seat adapter')
+    restore(seat_path, manifest_pre, manifest_post, 'seat manifest')
+    journal_path.unlink()
+    sync_directory(journal_path.parent)
+    return {'rolled_back': True, 'kind': 'seat-retirement', 'history_preserved': True,
+            'seat_id': identifier,
+            'notice': 'The exact seat manifest, adapter and settings preimages were restored. The native host refresh state remains unobserved.'}
+
+
 def recover_rollback(args):
     identifier=args.seat_id
     if not identifier:
@@ -4314,6 +6008,9 @@ def recover_rollback(args):
     if not identifier:
         raise ValueError('No durable seat journal is associated with this checkout')
     with session_store.locked_seat(identifier):
+        retirement_rollback = recover_seat_retirement(identifier)
+        if retirement_rollback is not None:
+            return retirement_rollback
         seat=session_store.load_seat(identifier)
         if not seat:
             raise ValueError('Permanent seat registry is missing; no rollback was attempted')
@@ -4335,7 +6032,8 @@ def recover_rollback(args):
             settings_change=handoff.get('settings_change')
             if settings_change:
                 settings_path=Path(settings_change['path']);refuse_symlinked_path(settings_path)
-                expected_settings=Path(handoff['seat_preimage']['seat_root'])/'.claude/settings.local.json'
+                preimage_anchor=active_operational_anchor(handoff['seat_preimage'])
+                expected_settings=Path(preimage_anchor['root'])/'.claude/settings.local.json'
                 if settings_path!=expected_settings:
                     raise ValueError('Handoff settings path differs from the permanent seat; preserve the journal')
                 settings_exists=settings_path.exists()
@@ -4555,7 +6253,7 @@ def build_parser():
     parser.add_argument('--cwd', type=Path, default=Path.cwd())
     parser.add_argument('--installation', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--session-root', type=Path, help='Permanent orchestrator context when the product worktree is separate')
-    parser.add_argument('--seat-id', help='Permanent orchestrator seat for operations that can run without a product checkout')
+    parser.add_argument('--seat-id', help='Permanent seat for standalone operations or to select the exact identity of a moved seat')
     sub = parser.add_subparsers(dest='action', required=True)
     for action in ('plan', 'install'):
         help_text = ('Review a per-PR or native-owner delivery installation' if action == 'plan' else
@@ -4570,9 +6268,17 @@ def build_parser():
         p.add_argument('--head-branch', help='Explicit published head-branch mapping when different from the local branch')
         if action == 'install':
             p.add_argument('--plan-sha256', required=True)
-    sub.add_parser('upgrade-plan', help='Read-only plan to replace an active installation source pin')
+    p = sub.add_parser('upgrade-plan', help='Read-only plan to replace an active installation source pin or recover a missing permanent seat root')
+    p.add_argument('--replacement-seat-root', type=Path,
+                   help='Exact same-repository Git worktree to become the active operational anchor when the birth root and Gitdir are absent')
+    p.add_argument('--release-anchor-seat',
+                   help='Exact same-owner seat at the replacement root; all of its attachments must already be retired')
     p = sub.add_parser('upgrade', help='Apply a reviewed active-installation source upgrade')
     p.add_argument('--plan-sha256', required=True)
+    p.add_argument('--replacement-seat-root', type=Path,
+                   help='Exact replacement root from the reviewed upgrade plan')
+    p.add_argument('--release-anchor-seat',
+                   help='Exact seat whose empty operational anchor is released in this transaction')
     p = sub.add_parser('upgrade-recover', help='Restore exact preimages after an interrupted source upgrade')
     p.add_argument('--rollback', action='store_true', required=True,
                    help='Explicitly restore the previous source pin and owned files')
@@ -4660,19 +6366,48 @@ def build_parser():
     p.add_argument('--pr-url',required=True)
     p = sub.add_parser('unpin', help='Remove a local PR retention pin')
     p.add_argument('--pr-url',required=True)
-    p = sub.add_parser('retire-attachment', help='Retire a missing Policy Guard checkout with a reviewed plan hash',
-                       description='Plan or apply history-preserving retirement of one missing Policy Guard attachment.',
+    p = sub.add_parser('retire-attachment', help='Retire one Policy Guard attachment with a reviewed plan hash',
+                       description='Any local operator can plan or apply retirement of one permanent-seat attachment while preserving its history.',
                        formatter_class=argparse.RawDescriptionHelpFormatter,
                        epilog='Example:\n  lane.py --seat-id SEAT_ID retire-attachment --checkout /worktrees/temporary-feature\n  lane.py --seat-id SEAT_ID retire-attachment --checkout /worktrees/temporary-feature --apply --plan-sha256 REVIEWED_PLAN_SHA256')
     p.add_argument('--checkout', type=Path, required=True,
                    help='Absolute recorded checkout path to inspect; the command never writes to this path')
+    p.add_argument('--live-registration', action='store_true',
+                   help='Explicitly retire the registration for a present recorded worktree, preserving shared hooks and adapters')
     p.add_argument('--apply', action='store_true', help='Apply only the exact plan named by --plan-sha256')
     p.add_argument('--plan-sha256', help='Exact hash from a reviewed retire-attachment plan')
+    p = sub.add_parser('retire-seat', help='Retire one exact drained durable seat after existing authorization',
+                       description='Plan or apply removal of one drained seat adapter and its exact owned hook groups.')
+    p.add_argument('--expected-owner-harness', choices=('claude', 'codex', 'opencode'), required=True,
+                   help='Exact historical harness recorded on the durable seat')
+    p.add_argument('--expected-owner-session', required=True,
+                   help='Exact historical session recorded on the durable seat')
+    p.add_argument('--expected-operator-harness', choices=('claude', 'codex', 'opencode'), required=True,
+                   help='Harness of the actual operator running this command')
+    p.add_argument('--expected-operator-session', required=True,
+                   help='Session of the actual operator running this command')
+    p.add_argument('--authorization-ref', required=True,
+                   help='Short reference to the existing explicit authorization; this command does not authenticate it')
+    p.add_argument('--confirm-retirement', action='store_true', required=True,
+                   help='Confirm the reviewed seat-local retirement scope')
+    p.add_argument('--apply', action='store_true', help='Apply only the exact plan named by --plan-sha256')
+    p.add_argument('--plan-sha256', help='Exact hash from a reviewed retire-seat plan')
     return parser
 
 
 def dispatch(args):
     try:
+        if args.action not in ('status', 'coverage', 'registrations', 'guide', 'recover',
+                               'retire-seat', 'opencode'):
+            guarded_seat_id = args.seat_id
+            if not guarded_seat_id:
+                try:
+                    found = session_store.lookup_checkout(root(args.cwd))
+                    guarded_seat_id = found['seat']['seat_id'] if found else None
+                except (OSError, TypeError, ValueError):
+                    guarded_seat_id = None
+            if guarded_seat_id:
+                ensure_no_seat_retirement_journal(guarded_seat_id)
         if args.action == 'plan':
             print(json.dumps(plan(args), indent=2))
         elif args.action == 'install':
@@ -4739,6 +6474,9 @@ def dispatch(args):
             return 0
         elif args.action == 'retire-attachment':
             print(json.dumps(retire_attachment(args), indent=2))
+            return 0
+        elif args.action == 'retire-seat':
+            print(json.dumps(retire_seat(args), indent=2))
             return 0
         elif args.action == 'hook':
             return hook(args)

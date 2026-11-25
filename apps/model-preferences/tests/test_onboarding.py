@@ -174,7 +174,8 @@ class OnboardingTest(unittest.TestCase):
         artifacts = repo / ".planning/administrator/8199"; artifacts.mkdir(parents=True)
         for n in range(150): (artifacts / f"capture-{n}.json").write_text(str(n))
         facts = self.root / "facts.json"; facts.write_text(json.dumps(dict.fromkeys(mp.FLAGS, False)))
-        plan = self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(facts))
+        plan = self.call("review-plan", "--cwd", str(repo), "--base", "HEAD", "--facts", str(facts),
+                         "--purpose", "later")
         self.assertEqual(plan["paths_count"], 151)
         self.assertEqual(plan["untracked_paths_count"], 150)
         self.assertEqual(len(plan["paths"]), 20)

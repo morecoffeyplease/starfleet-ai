@@ -314,11 +314,53 @@ class LaunchRecoveryTest(unittest.TestCase):
         self.assertGreaterEqual(len(successes), 1)
         self.assertLessEqual(len(errors), 1)
         if errors:
-            self.assertIn("continuation in flight", errors[0])
+            self.assertIn(errors[0], (
+                "This native session has a continuation in flight; inspect and retry reconciliation.",
+                "Launch changed before reconciliation; inspect again before retrying.",
+            ))
         self.assertEqual([result["status"] for result in successes], ["interrupted"] * len(successes))
         with self.stopped_owner(launch, identity):
             retry = self.reconcile(launch, key=key)
         self.assertTrue(retry["reused"])
+        saved = self.app.state(f"launches/{launch['id']}", None)
+        self.assertEqual(len(saved["recovery"]["history"]), 1)
+
+    def test_same_request_key_refuses_snapshot_changed_before_lock_and_reuses_retry(self):
+        launch, identity = self.launch()
+        key = str(uuid.uuid4())
+        initial_read = threading.Event()
+        committed = threading.Event()
+        original_state = mp.App.state
+        main_thread = threading.current_thread()
+
+        def state(app, name, default):
+            value = original_state(app, name, default)
+            if threading.current_thread() is not main_thread and name == f"launches/{launch['id']}" \
+                    and not initial_read.is_set():
+                initial_read.set()
+                if not committed.wait(timeout=5):
+                    raise AssertionError("winning reconciliation did not finish")
+            return value
+
+        def reconcile_stale_snapshot():
+            with self.assertRaisesRegex(mp.PreferenceError, "^Launch changed before reconciliation; "
+                                        "inspect again before retrying\\.$"):
+                self.reconcile(launch, key=key)
+
+        with self.stopped_owner(launch, identity), patch.object(mp.App, "state", state), \
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            stale = pool.submit(reconcile_stale_snapshot)
+            try:
+                self.assertTrue(initial_read.wait(timeout=5), "competing snapshot was not read")
+                winner = self.reconcile(launch, key=key)
+                self.assertEqual(winner["status"], "interrupted")
+                self.assertFalse(winner["reused"])
+            finally:
+                committed.set()
+            stale.result(timeout=5)
+            retry = self.reconcile(launch, key=key)
+        self.assertTrue(retry["reused"])
+        self.assertEqual(retry["status"], "interrupted")
         saved = self.app.state(f"launches/{launch['id']}", None)
         self.assertEqual(len(saved["recovery"]["history"]), 1)
 

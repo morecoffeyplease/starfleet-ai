@@ -13,6 +13,31 @@ An assigned-item pointer may be updated only when the context owner has granted 
 The orchestrator supplies and explicitly updates task briefs within the work already authorized by the user.
 Task updates do not grant new scope or supersede later user instructions.
 
+## Briefing and evidence acceptance
+
+Use Outcome, Playbook, Size and Facts in an implementer brief.
+Outcome names the user result, affected path and observation that demonstrates success.
+Playbook names the applicable PStack playbook and first step.
+Size bounds the affected area, exclusions, stop conditions and granted file or repair-round budget.
+Facts lists checked facts with supporting artifacts and candidate identities.
+Keep hypotheses and unverified worker claims separate from Facts.
+Investigating a hypothesis is allowed; work that requires it to be true must wait until it is established or resolved with the owner.
+
+Explain prescribed implementation or commit constraints using the governing decision, rule or technical evidence.
+A chosen design, named data shape or deliberate commit sequence can be appropriate under PStack.
+Do not turn an untested mechanism or arbitrary packaging preference into a requirement.
+If a worker stops on a constraint, check its source before treating the stop as a product blocker.
+A worker must report a conflict rather than ignore the constraint or expand its assignment.
+
+Before reporting a pass or briefing work that depends on a change, inspect the supporting artifact, actual command, candidate, result and affected-path coverage.
+A worker report points to evidence; it does not replace that inspection.
+A mock, arithmetic calculation or in-memory experiment supports only the behavior it exercises.
+For example, a collector accepting an overlay does not prove acceptance of the complete edited file with its imports and consumers.
+Verify the changed behavior through the appropriate affected path before relying on it in dependent work.
+Reuse applicable evidence rather than rerunning every worker command, and let independent work continue within its existing authority.
+Report checks that ran separately from checks that were skipped, incomplete or only proposed.
+Preserve the repository's final-candidate verification and stronger repair or approval requirements.
+
 ## Parents with exact-session context
 
 An exact-session parent must not substitute a different worktree-default mission when dispatch refuses that source.
@@ -101,6 +126,21 @@ Dispatch supplies a plain-text brief on stdin, so streaming-JSON input mode is u
 Both examples start a fresh session; they do not attach a new assignment to a running agent.
 This implementation supports the implementer role only for dispatch.
 Do not automatically migrate review sessions to this workflow merely because their command also uses `codex exec`.
+
+## Upstream overlap advisory
+
+Pattern Buffer runs this advisory while preparing a task through `dispatch --prepare-only`, normal `dispatch`, or OpenCode `prepare-dispatch`.
+It reads a known upstream `main` ref already present in the task checkout and never fetches.
+It compares committed task changes since their merge base, tracked task worktree edits or deletions, and upstream path changes.
+The comparison treats both old and new paths in a detected rename as changed paths.
+A detected overlap prints the examined ref and revision, fork revision, task head, concrete paths, and a `git -C TASK_WORKTREE diff --find-renames ...` command to stderr.
+Pattern Buffer stores warning deduplication in the task checkout's private Git metadata and can warn again for a new upstream path change or a newly overlapping path.
+No-overlap results stay quiet, and unavailable Git metadata is reported without refusing preparation.
+The advisory is informational and does not add a review step.
+It checks paths and does not analyze semantic dependencies.
+It excludes untracked files.
+It can miss nonoverlapping interface changes and upstream changes that arrive after preparation.
+It does not establish that the task checkout or product behavior is current.
 
 ## Enrollment and session binding
 

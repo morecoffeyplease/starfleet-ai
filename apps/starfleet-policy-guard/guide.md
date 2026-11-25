@@ -2,7 +2,7 @@
 
 Policy Guard keeps delivery reports and their local history for a native orchestrator seat.
 It can refuse covered GitHub readiness and merge commands when an attached checkout or pull request has no valid report.
-It does not run audits or verification, classify prompts, grant readiness authority, or enforce fix rounds.
+It does not run audits or verification, classify prompts, grant readiness authority, automatically detect new repair batches, count rounds, or enforce repair decisions.
 
 ## Review and fix cycles
 
@@ -52,6 +52,16 @@ From round three, prepare a fresh zoom-out for the actual upcoming repair batch 
 Before round four, obtain user approval for a specific next batch or explicit allowance.
 For an existing PR already beyond round three, apply this prospectively before the next unapproved batch; do not reset or retroactively approve its history.
 
+After the third unsuccessful repair batch, if deciding evidence still shows a material blocker, stop and ask the configured human authority whether they want one optional skeptical review of the exact next-step proposal.
+State the approved outcome, remaining blocker, attempts and outcomes, added complexity, and smallest safe next route.
+Count from the existing accepted repair history; never infer repair-round count from a Model Preferences review-cycle ordinal.
+The skeptical review is optional, uses the single reviewer saved in the active profile's adopted Model Preferences policy, and is scoped to the exact target, proposal, selection and worktree.
+See the [Model Preferences skeptical proposal review path](../model-preferences/README.md#request-an-optional-skeptical-proposal-review) for its explicit setup, approval and dispatch commands.
+If the human authority declines, no model launches, and the user may still make a separate bounded continuation, revert or defer decision under the existing rules.
+If the review runs, return its recommendation and unresolved disagreement to the human authority before asking for a separate bounded continuation decision.
+Approval to run the reviewer authorizes only that review and never authorizes the next repair batch.
+This optional review is not a readiness gate, and neither Model Preferences nor Policy Guard detects undeclared repair edits.
+
 The request for approval should state the approved outcome, remaining evidence-backed blocker, attempts and outcomes, added complexity, simplest safe route, and proposed bounded batch.
 One request may cover overlapping stop conditions, but approval applies only to its stated batch or allowance.
 Preserve stricter scope, mechanism, review, merge, safety, and human-approval rules.
@@ -78,7 +88,8 @@ The guard continues to require its existing accepted and dismissed finding-ID co
 If the selected decision is `split out`, or `adds_scope` or `adds_mechanism` is true, the fixture guard stops and requires human approval.
 Policy Guard does not import or authenticate that approval.
 This guidance does not change the fixture schema, round counting, or delivery-seat behavior.
-The current delivery seat does not enforce fix rounds, and this guide does not claim automated enforcement.
+The delivery seat does not automatically detect new batches, count rounds, or enforce repair decisions.
+Its bounded repair-batch check validates declared assessment fields, required approval references, and whether the packet has an accepted repair disposition.
 
 ## Published guidance attestations
 
@@ -89,6 +100,9 @@ The evidence packet may be authored manually before a PR exists, while the curre
 For each reread file, record its kind, name, actual source reference, local path and SHA-256 of its current bytes.
 Use navigable source references, such as a public file URL pinned to a commit, and record installed-only files by their actual path and digest.
 The validator checks the declared local bytes, packet fields, gaps and stage ordering; it cannot prove comprehension, sound judgment or that every applicable source was declared.
+Before attesting, inspect the evidence supporting each fact the approach relies on.
+A worker report or partial check does not establish more than its demonstrated coverage.
+Follow the [briefing and evidence acceptance guidance](../pattern-buffer/docs/implementer-dispatch.md#briefing-and-evidence-acceptance).
 
 Add one `guidance_attestation` object to the existing evidence packet.
 Use `stage: "opening"` for the opening comment and `stage: "repair_batch"` for an accepted repair batch.
@@ -99,6 +113,123 @@ Resolve an unknown required fact by investigating it or asking the configured hu
 Disclosing an unknown as an assumption or uncertainty does not complete a prerequisite or waive missing evidence, verification, scope or authority.
 The `uncertainty` list may still record honest tool-capability limits or future outcomes, such as a later authenticated comment read being unavailable.
 Do not claim future repair verification is complete.
+Keep actual repair rounds in the linked existing history, separately from Model Preferences review-cycle ordinals.
+Use existing `evidence_refs` for the exact skeptical proposal and review result when applicable.
+Keep `approval_evidence_ref` bound to the distinct authorization for the accepted repair batch; approval for a skeptical review is not that authorization.
+Do not add a second repair-round counter or claim that attestation records intercept undeclared work.
+
+Before recommending another repair, requesting approval, or dispatching implementation, complete the existing assessment of prior outcomes, premise, deciding observation, disposition, and applicable rules.
+After any required authorization, reuse this same assessment in the accepted repair-batch attestation without creating a second form or store.
+New repair-batch attestations also require `repair_assessment` in the same `guidance_attestation` object.
+It contains a nonempty `findings` list and an explicit `approval_required` boolean.
+Each finding requires `finding_ref`, an explicit `prior_attempts` list, `premise`, `deciding_observation`, `deciding_evidence_ref`, `disposition`, and a nonempty `applicable_rules` list.
+Each prior attempt requires an `attempt_ref` and an `outcome`.
+Each applicable rule requires a `reference` and `why_applicable` explanation.
+Use an empty `prior_attempts` list only when existing history confirms this is a first attempt.
+The validator checks required fields and their types, but it cannot prove that history is complete, the observation is true, the assessment preceded a recommendation, or the referenced approval was authored by the required person.
+If a required fact remains unknown, keep it in the existing `gaps` list and do not attest.
+
+Allowed finding dispositions are `fix here`, `revert`, `simplify`, `split out`, `defer`, `dismiss`, and `stop`.
+An accepted repair-batch attestation needs at least one `fix here`, `revert`, `simplify`, or `split out` disposition.
+Additional findings in the same batch may be deferred or dismissed.
+A `stop` disposition refuses rendering and start-checking until the existing stop is resolved and reassessed.
+An all-deferred or all-dismissed assessment describes no accepted repair batch and stays in the existing PR or tracker.
+If `approval_required` is true, `approval_evidence_ref` must link the existing approval evidence; if false, set `approval_evidence_ref` to `null`.
+A `split out` disposition requires the assessment to declare approval and link its evidence.
+These checks do not infer approval thresholds, decision quality, timing, or authorship.
+
+The renderer prints each declared finding assessment once under `Repair assessment`.
+The accepted repair-batch body records completed prerequisites and the approved batch before implementation; it does not claim final candidate verification is complete.
+Run the repository's canonical verification and record the resulting candidate through the existing report flow after the repair.
+
+### Repair assessment example
+
+Add this object inside the repair-batch `guidance_attestation` object.
+Keep `accepted_batch_ref` and `repair_history_ref` as the existing batch and history links.
+
+```json
+{
+  "repair_assessment": {
+    "findings": [
+      {
+        "finding_ref": "https://github.com/OWNER/REPO/issues/123#finding-1",
+        "prior_attempts": [
+          {
+            "attempt_ref": "https://github.com/OWNER/REPO/pull/123#issuecomment-98",
+            "outcome": "The same finding remained after the first attempt."
+          }
+        ],
+        "premise": "The remaining defect comes from the existing branch binding.",
+        "deciding_observation": "The supported path reproduces the defect when the branch binding is stale.",
+        "deciding_evidence_ref": "https://github.com/OWNER/REPO/pull/123#issuecomment-99",
+        "disposition": "simplify",
+        "applicable_rules": [
+          {
+            "reference": "https://github.com/OWNER/REPO/blob/FULL_COMMIT/apps/starfleet-policy-guard/guide.md#handle-repair-caused-regressions-and-count-attempts",
+            "why_applicable": "The prior attempt targeted this same underlying finding."
+          }
+        ]
+      },
+      {
+        "finding_ref": "https://github.com/OWNER/REPO/issues/123#finding-2",
+        "prior_attempts": [],
+        "premise": "The separate edge case does not block the approved outcome.",
+        "deciding_observation": "The common path succeeds and the edge case is not reproduced.",
+        "deciding_evidence_ref": "https://github.com/OWNER/REPO/pull/123#issuecomment-100",
+        "disposition": "defer",
+        "applicable_rules": [
+          {
+            "reference": "https://github.com/OWNER/REPO/blob/FULL_COMMIT/apps/starfleet-policy-guard/guide.md#triage-findings",
+            "why_applicable": "The issue is nonblocking and unrelated to the accepted repair."
+          }
+        ]
+      }
+    ],
+    "approval_required": false,
+    "approval_evidence_ref": null
+  }
+}
+```
+
+For a repair requiring approval under existing policy, set `approval_required` to `true` and provide its existing evidence reference.
+The validator requires the reference but does not authenticate its author or infer whether approval was required.
+Keep stop and no-work outcomes in the existing brief or tracker instead of publishing them as an accepted repair batch.
+
+### Starfleet handoff acceptance
+
+For `github.com/morecoffeyplease/starfleet-ai`, record concise successor acceptance in the existing evidence packet after the supported owner rebind.
+The default checklist's `packet_successor_acceptance_repositories` selects this policy only for Starfleet.
+Other repositories retain their existing publication requirements.
+Existing publication references and owner history remain preserved.
+
+```json
+{
+  "handoff_acceptance": {
+    "version": 1,
+    "owner": {"harness": "codex", "session_id": "ACTUAL_CURRENT_SESSION"},
+    "from_owner": {"harness": "codex", "session_id": "ACTUAL_PREDECESSOR_SESSION"},
+    "candidate": "FULL_CURRENT_CANDIDATE_SHA",
+    "summary": "Accepted the reconciled work and current evidence in this handoff packet.",
+    "repair_history_ref": "Existing repair history with cumulative counts and remaining gaps.",
+    "scope_and_holds_ref": "Existing approved scope and unchanged human holds."
+  }
+}
+```
+
+Run the existing `record --evidence PATH` command from the exact incoming owner session.
+Use the current candidate's successful canonical verification, including an explicit successful unaffected verdict when applicable.
+The report preserves its normal candidate, target, packet, policy and evidence freshness checks.
+The recorded predecessor must connect to the current native owner through the existing supported owner history.
+When Pattern Buffer has required reads, complete them through its native owner flow before recording.
+The report uses those current receipts directly, without copying read hashes into another attestation.
+Changed required-read bytes invalidate the recorded acceptance.
+
+No successor-render command, new public comment, copied predecessor publication hash or comment reread is needed for this selected policy.
+Keep the existing handoff packet as the acceptance record.
+This does not approve a new repair batch, reset repair counts, waive a human hold, grant delivery authority or prove comprehension.
+Immutable installed seats still require their supported source upgrade before this behavior is available.
+
+### Published successor validation for other policies
 
 After a supported `rebind-owner` handoff on an already adopted target, the current native owner can use `stage: "successor_validation"` to reconcile work that is already complete.
 The `prior_publication_ref` must be an exact copy of the current `guidance_attestation_ref` object shown in the owner session's `status` JSON, including any nested predecessor reference.
@@ -218,8 +349,40 @@ For each later PR, discover its current binding and validate its own published c
 Opening and repair-batch publications remain bound to their original owner and PR; after a supported owner handoff, successor validation creates a separate current-owner publication that links the exact predecessor.
 There is no disable or fallback flag.
 
-An adopted target refuses covered ready or merge unless its current packet attestation, exact local reread bytes and per-PR publication reference match.
-Each covered action reads the exact authenticated GitHub comment using the captured `gh` executable with a bounded timeout; unavailable, edited, deleted or mismatched comments fail closed.
+### Preserve an active legacy repair publication during upgrade
+
+The reviewed source upgrade preserves an already accepted repair publication as the current publication while its original packet and exact rendered comment still match the stored attestation and body hashes.
+This compatibility path exists only inside covered delivery validation for that exact current publication.
+It does not let `attestation-render` or `attestation-start-check` accept a new repair-batch packet without `repair_assessment`.
+The software cannot detect an undeclared new repair batch or prove that the assessment preceded a recommendation.
+After the owner accepts another repair batch, add its assessment to the existing packet, render a new body, publish it as a new PR comment, then run `attestation-start-check` without `--enable`.
+Do not edit or replace an earlier comment or rewrite prior attempt counts, repair history, or owner history.
+An all-deferred, all-dismissed, or stopped decision remains in the existing PR or tracker and cannot authorize implementation dispatch.
+
+For an active pinned seat, use the normal reviewed source upgrade before the next accepted batch.
+The upgrade updates active source pins and requires a fresh report for covered actions, while preserving the existing current publication for in-progress accepted work.
+Before the next batch starts, update the packet and publish a new exact comment through the same flow:
+
+```sh
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade-plan
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade \
+  --plan-sha256 REVIEWED_PLAN_SHA256
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree attestation-rereads
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree attestation-render \
+  --evidence /private/delivery-evidence.json --stage repair-batch > /tmp/repair-batch-attestation.md
+gh pr comment https://github.com/OWNER/REPO/pull/123 --body-file /tmp/repair-batch-attestation.md
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree attestation-start-check \
+  --evidence /private/delivery-evidence.json --stage repair-batch \
+  --comment-url 'https://github.com/OWNER/REPO/pull/123#issuecomment-NEW'
+```
+
+The reviewed source must be clean and committed as required by `upgrade-plan`.
+Preserve the existing batch/history references and required-read workflow, add the new assessment, and leave the prior comment intact.
+The repair-batch attestation is prerequisite evidence before work, not final candidate proof.
+After implementation, run canonical verification and record a fresh report for the resulting candidate before covered delivery.
+
+Under the published policy, an adopted target refuses covered ready or merge unless its current packet attestation, exact local reread bytes and per-PR publication reference match.
+Under that policy, each covered action reads the exact authenticated GitHub comment using the captured `gh` executable with a bounded timeout; unavailable, edited, deleted or mismatched comments fail closed.
 When evaluating a recorded report, ordinary `status` checks the attestation packet and reread bytes locally without querying GitHub for comment freshness.
 The explicit `attestation-start-check` and each covered ready or merge action still make a fresh authenticated read.
 The ordinary report still checks candidate freshness and preserves its existing checklist-gap behavior.
@@ -350,16 +513,23 @@ Neither path intercepts arbitrary shell scripts, other applications, or commands
 ## Retire a missing attachment
 
 Use `retire-attachment` when a recorded checkout path no longer exists or no longer identifies the recorded repository worktree.
-The command requires the exact recorded native owner and the absolute checkout path from the seat record.
-It can run from any surviving attachment, or with global `--seat-id SEAT_ID` when no product checkout is available.
+Any local operator can run this command without the recorded owner's session.
+Select one seat with global `--seat-id SEAT_ID` or use a surviving attachment.
+Pass the absolute checkout path shown in the seat record.
+An older installed runtime may still require the former owner.
+In that case, use `lane.py` from a current Starfleet source checkout for the same preview and apply commands.
 The default command prints a plan with the seat, attachment path, recorded repository and branch, pull request records, missing-checkout evidence, and preimage hashes.
 Review that output, then apply only with `--apply --plan-sha256 REVIEWED_PLAN_SHA256`.
-The command refuses a live matching worktree and says to run `uninstall` from it.
+For a live worktree with the recorded Git identity, use the [live registration workflow](#retire-a-live-attachment-registration) or run the existing owner-bound `uninstall` workflow from that checkout.
+Changing the Git remote leaves the worktree identity intact.
 It refuses a checkout that still has the recorded worktree identity but is on a different branch.
 For that case, restore the recorded branch and run `uninstall` from the checkout.
 It refuses while a seat install, migration, handoff, or upgrade is incomplete and names the applicable recovery command.
 It never creates, deletes, or modifies a product checkout, branch, or repository metadata.
-The command marks the checkout removed, writes a receipt with owner, time, and evidence, and preserves the attachment state, report history, pull request bindings, and counts.
+A successful apply reports `retired: true` and `history_preserved: true`.
+The receipt records the historical seat owner, retirement time, and checkout evidence.
+The report history, PR bindings, and counts remain available.
+A transfer of live work or seat ownership still uses its existing handoff workflow.
 `status` and `coverage --summary` from a surviving attachment show retired checkout paths and the preserved pull request records.
 
 For example, a temporary checkout and its branch can both be deleted while another attachment remains live:
@@ -409,13 +579,129 @@ If an interrupted upgrade leaves a journal, use the reviewed source and same pro
 python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py --cwd /product/worktree upgrade-recover --rollback
 ```
 
+### Replace an absent permanent seat root
+
+`recover --inspect` reads the seat, while `recover --plan` can repair only its recorded runtime, adapter, or exact hook files.
+It does not move a Git worktree identity.
+Use `upgrade-plan --replacement-seat-root` only when the immutable birth root and recorded birth Gitdir are both absent.
+The transition preserves the source seat ID, birth root, birth Gitdir, owner history, PR history, and removed attachment states, then records a separate active operational anchor for live Git and settings checks.
+Same-repository proof comes from a retained attachment row for the birth root whose recorded Gitdir matches the immutable birth Gitdir and whose recorded common Git directory matches the replacement worktree's actual common directory.
+An owner match, remote URL, host label, or repository name cannot substitute for that recorded proof.
+Every active source attachment must exist and match its recorded worktree; review and apply the existing `retire-attachment` plan for each missing active attachment first.
+If another seat already owns the replacement root, its exact ID must be supplied with `--release-anchor-seat`.
+The destination seat must have no pending transition, an intact runtime and adapter pin, intact owned hooks, and only attachment rows already marked removed.
+An absent active destination attachment still blocks release until an operator retires it through `retire-attachment`.
+The transaction removes the destination seat's exact owned hook groups, adds the source seat's current groups when that harness manages hooks, upgrades the source seat, and leaves the released seat's runtime pin and history intact.
+The two seat IDs are never merged, and removed attachment state bytes are not rewritten.
+The normal upgrade receipt policy applies: prior receipts are archived and each active attachment needs a fresh report before covered actions can pass.
+
+Review and apply the operation from the clean source checkout and an active source-seat product attachment:
+
+```sh
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /product/worktree --seat-id SOURCE_SEAT_ID upgrade-plan \
+  --replacement-seat-root /worktrees/permanent-anchor \
+  --release-anchor-seat DESTINATION_SEAT_ID
+python3 /clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /product/worktree --seat-id SOURCE_SEAT_ID upgrade \
+  --replacement-seat-root /worktrees/permanent-anchor \
+  --release-anchor-seat DESTINATION_SEAT_ID --plan-sha256 REVIEWED_PLAN_SHA256
+```
+
+When no seat owns the replacement root, omit `--release-anchor-seat`.
+Future `plan` and `install` commands at the moved operational anchor must put global `--seat-id SOURCE_SEAT_ID` before the action so Policy Guard does not derive a new ID from the replacement path.
+The released destination remains available for read-only status and history inspection.
+An older pinned executable cannot understand a later release marker, so use a current supported source checkout for later state changes and do not treat the old binary as enforcing the marker.
+If an upgrade is interrupted, use `upgrade-recover --rollback` from the recorded product checkout while the replacement worktree still has the Git identity in the journal.
+Rollback restores the exact state, settings, adapter, settings backup, and both seat manifests without recreating the missing birth root.
+
+### Retire a drained durable seat
+
+Use `retire-seat` only after every recorded attachment is already removed and an existing explicit authorization names this local seat cleanup.
+The command requires the exact historical seat owner and separately checks the actual native operator running it.
+The operator may differ from the historical owner, and neither identity is rewritten by this operation.
+The authorization reference is recorded for review but is not authenticated by Policy Guard.
+`--seat-id SEAT_ID status` reports a drained seat whose adapter or managed hook groups remain installed and gives the conditional next action.
+The read-only plan binds the active Git anchor, complete runtime pin, captured `gh` identity, adapter bytes and mode, current settings bytes and mode, exact owned hook groups, every removed attachment receipt, and the expected operator.
+It reports settings paths and hashes without printing unrelated settings content.
+Review the plan, then apply only the exact digest:
+
+```sh
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID retire-seat \
+  --expected-owner-harness claude --expected-owner-session HISTORICAL_SESSION_ID \
+  --expected-operator-harness codex --expected-operator-session OPERATOR_SESSION_ID \
+  --authorization-ref EXISTING_AUTHORIZATION_REFERENCE --confirm-retirement
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID retire-seat \
+  --expected-owner-harness claude --expected-owner-session HISTORICAL_SESSION_ID \
+  --expected-operator-harness codex --expected-operator-session OPERATOR_SESSION_ID \
+  --authorization-ref EXISTING_AUTHORIZATION_REFERENCE --confirm-retirement \
+  --apply --plan-sha256 REVIEWED_PLAN_SHA256
+```
+
+The apply removes only the selected seat's exact adapter file and owned hook groups that appear once in its recorded active settings path.
+It releases that seat's operational anchor and preserves its owner, immutable runtime pin, attachment rows, PR records, and report history.
+It does not change product Git checkouts, branches, or upstream PRs.
+If the operation is interrupted, `recover --inspect` shows the private retirement journal and `recover --rollback` restores the exact manifest, settings, and adapter preimages for the native operator that began the operation.
+
+```sh
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID recover --inspect
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID recover --rollback
+```
+
+The receipt proves only the local file changes.
+It does not prove that a running native host refreshed its hook configuration or stopped invoking a cached hook.
+Use real receiving evidence or a supported owner reload at a safe boundary to confirm native refresh, and do not force a restart.
+
+## Retire a live attachment registration
+
+Use `retire-attachment --live-registration` when the recorded permanent-seat checkout still exists.
+Any local operator can review and apply the plan.
+Coordinate an idle point for that checkout with any active writer before you apply.
+The plan checks the exact Git worktree, repository, branch, and current head.
+If any bound record or checkout evidence changes, review a fresh plan.
+
+```sh
+python3 /path/to/current/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/finished-feature --live-registration
+python3 /path/to/current/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/finished-feature --live-registration --apply --plan-sha256 REVIEWED_PLAN_SHA256
+python3 /path/to/current/lane.py --seat-id SEAT_ID status
+```
+
+Check that the exact attachment reports `retired` and shows its preserved PR records.
+The operation writes only the local registration and receipt.
+Shared hooks and the seat adapter remain installed for other attachments.
+If the seat is now drained, use [the drained-seat retirement workflow](#retire-a-drained-durable-seat) to detach its exact hooks and adapter.
+Use the existing owner-bound `uninstall` workflow for legacy per-worktree installations, whose registrations and hook ownership do not use the permanent-seat transaction.
+
 ## Inspect, hand off, and recover
 
 Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status` to inspect a permanent seat even when product checkouts are unavailable.
+Status reports the immutable birth root separately from the active operational anchor, the pinned runtime CLI, recorded or prospective Claude settings path, and each checkout's active, missing, changed, or retired worktree state.
+When run from an unbound permanent root, `permanent_seat_hint` identifies a unique registered seat only when its active root and recorded Gitdir match exactly.
+The accompanying `setup_guidance` still describes the current product checkout attachment, so do not create another seat when the hint says the permanent seat is already registered.
 Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID registrations` to inspect attached PR history without a product checkout.
 Run `coverage --summary` or `status` from an attached checkout to inspect local configuration and observations.
 Configured hooks and adapters are not proof that the native runtime loaded or used them.
-Use `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID rebind-owner --from-harness claude --from-session OUTGOING_SESSION_ID --confirm-handoff` only after an authorized transfer to the incoming actual native session.
+For a seat handoff, the outgoing owner prepares the exact seat ID, every active and retired attachment, covered PRs, pending work, and any missing worktree in the existing checkpoint.
+Retire missing attachments through the reviewed `retire-attachment` plan before handoff if they block it.
+Record the authorized release to the exact incoming owner in the existing checkpoint, with the outgoing owner recording it when available.
+If the outgoing owner is unavailable, resolve the scope through the applicable existing authority process and hold the dependent handoff until that disposition is recorded.
+The incoming owner records acceptance of that same scope before the rebind.
+When `handoff.rebind_owner_command` is present, the current incoming native session should use that exact command.
+If the installed CLI is unavailable or outdated, the documented same-harness maintenance fallback below remains supported when its full runtime-pin checks pass.
+Run a rebind only after the authorized scope transfer is recorded and the incoming owner has accepted it.
+The status command is read-only and does not supply transfer authority or establish a new owner.
+For a drained seat, `seat_retirement` reports whether the old hook and adapter remain on disk and gives a conditional plan command only when the exact owner, actual operator, runtime pin, and anchor are available.
+Retirement removes local files only; a cached native hook can remain active until a supported host reload or real receiving evidence confirms refresh.
+The rebind receipt lists every changed and retained checkout by branch and PR, with retired history preserved and active missing worktrees identified without guessing at their owner.
+For cross-harness handoffs, review the exact Claude settings path, before and after hashes, and managed hook groups in `settings_receipt`.
+The rebind receipt archives prior reports where present and identifies active rebound checkouts with covered PRs that need a fresh report.
+After rebind, run each available command in `verification.coverage_commands` to inspect local coverage and report state.
+Use actual native tool output when a relevant action has occurred, but do not create a production action or restart solely to validate a handoff.
+If no native event occurred, record that interception remains unobserved; `verification.observed.state` is a static note about the rebind and does not update later.
+The supported explicit adapter probe is non-forwarding and does not prove native hook interception.
+If any custody, permission, trust, or checkout state is uncertain, keep the scope held and resolve it through the existing checkpoint process before rebind.
 If the installed CLI entrypoint is unavailable or outdated, a current source checkout can run this command for an existing permanent seat after an authorized same-harness transfer, provided the seat-recorded runtime remains present and intact:
 
 ```sh
@@ -434,6 +720,7 @@ For a cross-harness handoff, the transaction adds or removes only the seat-owned
 Coordinate the existing single-writer settings checkpoint before a Claude settings change, and preserve native trust requirements.
 The settings change records configuration only and does not prove that the incoming native runtime loaded or trusted the hook.
 If the seat `gh` entrypoint, Claude hook or a non-CLI runtime file is missing while the installed `lane.py` is intact, run `recover --inspect`, review `recover --plan`, then apply its hash with `recover --apply --plan-sha256 PLAN_SHA256` through the installed runtime.
+Released history-only seats cannot use `recover --plan` or `recover --apply` to restore live hooks or adapters.
 If the installed runtime's `lane.py` or its entire directory is missing, use a clean current source checkout whose runtime fingerprint matches the seat's recorded version, then run those same recovery commands with that source `lane.py`.
 Recovery verifies the exact recorded file hashes before restoring missing files, and changed runtime files fail closed for inspection rather than being overwritten.
 If a legacy per-worktree source checkout or hook is missing, run `migrate-plan` and `migrate` from a clean current source checkout while the existing product Gitdir and state are available.

@@ -288,25 +288,18 @@ TEMPLATE = """# shared
 - Assigned items: <AUTHORIZED_ITEM_REFERENCES>
 - Read first: <3-5 exact paths or commands>
 
-{RESTATEMENT}
+After the required reads, give four lines in your own chat. State the accepted outcome, the next deliverable, the holds and any unavailable reads, and what you will not do.
 System and developer instructions take precedence. Follow the latest human instruction, then the standing mission, tracker, checkpoint, and memory or summary. Reconcile conflicts and preserve ownership and holds.
 
 **Scope**
-- If the mission, authoritative tracker or authorized assignment is missing or unclear, ask the user to establish it.
-- Never invent values, infer new scope or treat placeholders as approval.
-- If no tracker or assignment applies, record the user's explicit agreement.
-- Stay within the user's authorized scope.
-
-**PStack guidance - do this now**
-- Use the installed PStack runtime and Poteto Mode.
-- After compaction, read the sections relevant to current work in full.
-- Do not assume you know what this guidance says.
+- Ask the user to establish a missing or unclear mission, tracker or assignment; record explicit agreement when none applies.
+Never invent values, infer scope or treat placeholders as approval.
+Stay within the user's authorized scope.
 
 **Agents**
-- Before launching any agent, read the saved active profile in Model Preferences and resolve its configured reviewers.
-- A pilot preference or old startup summary doesn't prove the active selection or reviewer count.
-- Launch only configured reviewer slots.
-- Advanced-review permission doesn't authorize an extra reviewer, another provider or a shared profile switch.
+- Before each launch, read saved active Model Preferences and resolve exact configured reviewer slots.
+Old summaries, pilots and your harness do not select the profile or count.
+- Advanced permission adds no extra reviewer, provider or shared profile switch.
 
 **Agent communication** (concise but accurate)
 - Lead with what changed and any action needed.
@@ -316,31 +309,28 @@ System and developer instructions take precedence. Follow the latest human instr
 - Send blockers, approval requests and key handoffs promptly.
 
 **Test failures and claims about systems**
-- Every explanation is a hypothesis until it survives an attempt to disprove it.
-- Before you name a cause or a fix option, or state what CI, a config or a tool does, write down at least one competing explanation and the observation that would tell them apart.
-- Check that observation on the failing run AND a passing control: the base branch, main, or an earlier green run of the same check.
-- Use evidence already on disk first: result files, timestamps, receipts, logs, and the config and source themselves.
-- Ask for a new run only when disk cannot answer.
-- Look for the check that could prove you wrong, not the one that agrees.
-- A mechanism that fits is not a cause.
-- Agreement is not evidence: not from another agent, a reviewer, a coordinating tool or service, or your own earlier message.
-- When config says one thing and behavior shows another, that contradiction is the finding.
-- Report it; do not explain it away.
-- Facts about tools and CI come from reading them now, not from memory.
-- Never offer a fix option built on an unverified cause.
-- Do not implement or dispatch a fix based on an unverified cause; diagnostic investigation is allowed.
-- When reporting, separate what you observed from what you concluded, and mark every unchecked claim "unverified".
-- When you find you were wrong, say so first and plainly, then correct it.
+- Every explanation is a hypothesis until tested against a competing explanation and a decisive observation.
+Check that observation on the failing run AND a passing control.
+Use existing logs, receipts, timestamps, configuration and source before requesting another run.
+- Seek evidence that could disprove the claim.
+A plausible mechanism, agreement, or an earlier message is not proof of cause.
+- Report contradictions between configuration and behavior; do not explain them away.
+Read current tool and CI sources rather than relying on memory.
+- Do not propose or dispatch a fix built on an unverified cause; diagnostic investigation is allowed.
+Separate observations from conclusions, label unchecked claims unverified, and correct errors plainly.
 
 **Review judgment: protect delivery**
-- Review exists to deliver the approved outcome safely, not to eliminate every imaginable defect; repeated repairs can create more risk and delay than the finding warrants.
-- Before a repair, choose fix here, defer, or dismiss using evidence, user impact, likelihood and the PR's purpose; bot and security labels do not decide for you.
+- Review protects delivery; repeated repairs can create more risk and delay than a finding warrants.
+- Fix straightforward bugs directly within scope.
+When a simpler approach would materially reduce repair effort or complexity while preserving the user experience, or changing it only slightly, recommend it to the user with the tradeoff.
+Do not assume the current implementation must be preserved.
+Ask before changing product behavior or scope.
 - Fix here only within existing authority for a material PR regression, an unmet approved outcome, or a high-impact defect on a common path.
 - Ask the user before fixing a serious-but-rare security, data-loss, or safety-contract exception.
-- Do not turn uncertainty into a blocker or call it disproved; investigate the cheapest decisive evidence, then defer unresolved claims explicitly.
+- Investigate the cheapest decisive evidence; keep unresolved claims explicit, not disproved or automatically blocking.
 - Workers report new findings rather than expanding the batch.
-- If uncertainty remains after checking the deciding evidence, ask the user rather than guess or start a repair.
-- Before starting or resuming a review-and-fix cycle, read the [Prime Directive (Policy Guard) review and fix cycles guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full; Prime Directive and Policy Guard are names for the same tool.
+- Ask rather than guess or repair when deciding evidence leaves uncertainty.
+- Before starting or resuming a repair cycle, read the [Policy Guard cycle guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#review-and-fix-cycles) in full.
 - Revisit the relevant rule before each repair decision.
 
 # implementer
@@ -349,27 +339,35 @@ System and developer instructions take precedence. Follow the latest human instr
 - Verify completed changes through the user's path.
 
 # orchestrator
-**Before resuming, do this now:**
-1. Re-read the mission, roadmap/tracker and current PRs’ issues IN FULL; reconcile actual checkout, PR heads/states, active work, evidence and human holds, don’t rely on assumptions; then update only this lane's tracker sections where facts changed.
-   Re-pull before editing; coordinate with other tracker owners.
-2. Ask now: "Are we fanned out across as many temporary worktrees as would help finish ready, independent work sooner, respecting dependencies, clear ownership and shared resource limits?”
+**Before resuming**
+1. Read the mission, tracker and current PR issues in full.
+Reconcile checkout, heads, active work, evidence and holds; re-pull before editing and coordinate tracker ownership.
+Update only changed facts in this lane's sections.
+2. Consider temporary worktrees for ready independent work, respecting dependencies, ownership and resource limits.
 
-**PR openings and accepted repair batches:**
-- At PR opening or accepted repair-batch start, read Published guidance attestations in `python3 /path/to/installed/lane.py guide --print`. Adopted ready and merge actions require current evidence.
-- The owner rereads the applicable files, records references, digests and their effect, resolves prerequisites, and keeps `assumptions: []`. Prepare opening evidence before the PR and publish the exact comment on its draft. Run `attestation-start-check` after publication and before repair work. Use `--enable` for first adoption. Use Outcome, Playbook, Size and Facts in each implementer brief and the PR opening explanation.
+**PR openings and accepted repair batches**
+- Before opening or starting an accepted batch, read Published guidance attestations in `python3 /path/to/installed/lane.py guide --print`.
+Follow its owner rereads, source references/digests/application, resolved prerequisites, empty assumptions, opening evidence and exact draft-comment publication flow.
+Run `attestation-start-check` after publication and before repair work; use `--enable` only for first adoption.
+Adopted ready/merge requires current evidence.
+- Brief outcomes, bounds and checked facts; justify implementation constraints and follow PStack.
 
 **Repair rounds: don't spiral**
-- Use the existing PR or tracker to record dispositions, evidence, and cumulative rounds.
-- From round three, make a fresh zoom-out before accepting or dispatching the next repair batch.
-- Stop a repair chain immediately when its fix creates another regression in that area; prefer reverting an isolatable unsuccessful repair instead of patching the patch.
-- Do not blindly revert mixed changes or restore a serious vulnerability.
-- After two unsuccessful attempts on the same underlying finding, attack the premise and ask the user before a third attempt; a renamed symptom, worker, or handoff does not reset the count.
-- Before round four, or the next unapproved round if already beyond three, obtain approval for a bounded next batch or allowance.
-- State the purpose, remaining blocker, attempted fixes, added complexity, and smallest safe route.
-- A qualifying fix round is an accepted product-repair batch, not a commit, worker launch, or unchanged rerun.
-- Preserve stronger holds, read the cycle guide for counting and exceptions, and continue independent authorized work while waiting.
+- Record assessment, evidence and cumulative rounds in the PR/tracker before recommending, requesting approval or dispatching; reuse it in the attestation.
+From round three, prepare a fresh zoom-out before accepting or dispatching the batch.
+After three unsuccessful repair rounds, ask the configured human authority whether they want the profile's optional skeptical review of the exact next-step proposal; count actual repair history, not review-cycle ordinals.
+Review approval authorizes only that review; require a separate bounded batch decision before round four. A declined review still permits a separate approved continuation, revert, or defer decision.
+- Stop a chain when its fix causes another regression there; prefer reverting an isolatable failed repair.
+Do not blindly revert mixed changes or restore a serious vulnerability.
+- After two failed attempts on one finding, attack the premise and ask before a third.
+Renaming the symptom, worker or handoff does not reset the count.
+- Before round four or the next unapproved round beyond it, get approval for a bounded batch or allowance.
+State purpose, blocker, attempted fixes, added complexity and smallest safe route.
+- Count accepted product-repair batches, not commits, launches or unchanged reruns.
+Preserve stronger holds, consult the cycle guide and continue independent authorized work while waiting.
 
-**Takeover:** reconcile inherited PR identities, fix counts, round-specific zoom-out evidence and human holds before more product fixes; write a fresh assessment for the next repair round; confirm mission and roadmap still apply; verify successor tool bindings and actual context delivery before dispatching work.
+**Takeover:** reconcile PR identities, counts, zoom-out evidence and holds before fixes.
+Assess the next round afresh; confirm mission/tracker and actual successor bindings/context delivery before dispatch.
 
 **Always**
 - Preserve unknowns and missing evidence as gaps; don't rewrite unchanged status or infer new authority.
@@ -761,7 +759,8 @@ def opencode_plugin_directory(runtime_dir=None):
     runtime = opencode_runtime_directory(runtime_dir) if runtime_dir else Path(__file__).resolve().parent
     return runtime / "opencode-plugin"
 
-RUNTIME_HELPERS = ("checkpoint", "enrollment", "sessions", "reliability", "required_reads")
+RUNTIME_HELPERS = ("checkpoint", "enrollment", "sessions", "reliability", "required_reads",
+                   "upstream_overlap")
 
 
 def runtime_bundle_paths(script):
@@ -903,6 +902,7 @@ def prepare_install(args):
         "sessions": bounded(auxiliary_source("sessions"), 256 * 1024),
         "reliability": bounded(auxiliary_source("reliability"), 256 * 1024),
         "required_reads": bounded(auxiliary_source("required_reads"), 256 * 1024),
+        "upstream_overlap": bounded(auxiliary_source("upstream_overlap"), 256 * 1024),
     }
     launcher_template = sources["launcher_template"]
     runtime_binding = "RUNTIME_DIR = None"
@@ -1130,6 +1130,7 @@ def configure_opencode(args):
                 runtime / "pattern_buffer.py": Path(__file__).resolve(),
                 runtime / "pattern_buffer_sessions.py": auxiliary_source("sessions"),
                 runtime / "pattern_buffer_reliability.py": auxiliary_source("reliability"),
+                runtime / "pattern_buffer_upstream_overlap.py": auxiliary_source("upstream_overlap"),
                 runtime / "pattern_buffer_checkpoint.py": checkpoint_source(),
                 runtime / "pattern_buffer_enrollment.py": enrollment_source(),
                 runtime / "guide.md": guide_source(),
@@ -1917,11 +1918,29 @@ def prepare_dispatch(root, gitdir, args):
         parent_harness = "claude" if kind in ("claude", "claudeteams") else "codex" if kind == "codex" else None
         parent_session = os.environ.get("CLAUDE_CODE_SESSION_ID" if parent_harness == "claude" else "CODEX_THREAD_ID")
         parent = session_binding(owner_root, owner_gitdir, parent_harness, parent_session) if parent_harness else None
-        if parent is not None or session_files.exists() or session_files.is_symlink():
-            if (parent is None or parent.state != "active" or parent.file_status != "valid" or
-                    parent.source_sha256 != hashlib.sha256(bounded(source, FILE_LIMIT).encode()).hexdigest()):
-                raise ValueError("dispatch cannot substitute a worktree default for a session-specific parent mission; "
-                                 "use a dedicated --owner-worktree containing the parent's approved standing context")
+        if parent is not None and (
+                parent.state != "active" or parent.file_status != "valid" or
+                parent.source_sha256 != hashlib.sha256(bounded(source, FILE_LIMIT).encode()).hexdigest()):
+            raise ValueError("dispatch cannot substitute a worktree default for a session-specific parent mission; "
+                             "use a dedicated --owner-worktree containing the parent's approved standing context")
+        if parent is None:
+            try:
+                session_mode = session_files.lstat().st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISDIR(session_mode) or session_files.parent.is_symlink():
+                    raise ValueError("dispatch cannot read the parent session directory safely")
+                session_store = auxiliary("sessions")
+                exact_session = session_store._normalize_session(parent_session, strict=False)
+                if parent_harness is None or exact_session is None:
+                    raise ValueError("dispatch cannot confirm the exact parent in a worktree with session context")
+                try:
+                    session_store._session_path(owner_root, parent_harness, exact_session).lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ValueError("dispatch found exact parent context without a registered binding")
         parent_kind = parent_harness if parent is not None else "worktree"
         if getattr(args, "parent_task_id", None) is not None:
             raise ValueError("--parent-task-id is only valid for a verified OpenCode parent session")
@@ -1981,6 +2000,18 @@ def prepare_dispatch(root, gitdir, args):
             raise ValueError("task brief changed while preparing the dispatch")
         atomic(path, json.dumps(data, indent=2))
     return task_id
+
+
+def print_upstream_overlap_notice(root, gitdir):
+    try:
+        overlap = auxiliary("upstream_overlap")
+        observation = overlap.observe(root, gitdir, locked, atomic)
+        notice = overlap.format_notice(observation)
+    except Exception:
+        notice = ("Pattern Buffer upstream overlap check unavailable. "
+                  "No overlap conclusion is available. Task preparation continues.")
+    if notice:
+        print(notice, file=sys.stderr, flush=True)
 
 
 def preflight_dispatch_context(root, harness, task_id, task_data, brief, session=None):
@@ -3655,10 +3686,12 @@ def main():
                 print(f"Pattern Buffer receipt {receipt}: immutable dispatch snapshot, not live task state.\n"
                       f"Current task state: {saved_receipt['task_status_command']}", file=sys.stderr, flush=True)
             if args.prepare_only:
+                print_upstream_overlap_notice(root, gitdir)
                 print(json.dumps({"task_id": task_id, "environment": {DISPATCH_ENV: task_id}}))
             else:
                 task_data, brief = read_task(root, gitdir, task_id)
                 preflight_dispatch_context(root, args.harness, task_id, task_data, brief)
+                print_upstream_overlap_notice(root, gitdir)
                 print(f"Pattern Buffer dispatch {task_id}; task retained for explicit update/finish.", file=sys.stderr, flush=True)
                 snapshot = task_path(gitdir, task_id).parent / f"{hashlib.sha256(brief.encode()).hexdigest()}.txt"
                 with snapshot.open("rb") as handle:
@@ -3673,6 +3706,7 @@ def main():
                 raise ValueError("OpenCode task preparation requires a dedicated child worktree")
             task_id = prepare_dispatch(root, gitdir, args)
             saved_receipt = write_dispatch_receipt(receipt, root, gitdir, task_id)
+            print_upstream_overlap_notice(root, gitdir)
             result = {"task_id": task_id, "harness": "opencode", "role": args.role,
                       "status": "pending", "receipt_file": str(receipt),
                       "receipt_type": saved_receipt["receipt_type"]}

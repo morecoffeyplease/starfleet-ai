@@ -849,7 +849,8 @@ class Watch:
                 "Cannot verify this caller; run Discord Watch from an enrolled Claude, Codex, or OpenCode session")
         return launch
 
-    def current_owner(self, verify=True, session_hint=None):
+    def current_owner(self, verify=True, session_hint=None, *,
+                      readiness_policy=hf.NATIVE_PROMPT_READINESS):
         harness = self._launch_kind()
         env_key = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
                    "opencode": "OPENCODE_SESSION_ID"}[harness]
@@ -861,6 +862,10 @@ class Watch:
         matches = [item for item in config["targets"]
                    if item.get("surface") == surface and item.get("harness") == harness]
         workspace = os.environ.get("CMUX_WORKSPACE_ID")
+        # A native owner can inherit its old workspace after a CMUX pane move.
+        # Use the current projection and hook binding for that exact session and pane.
+        if verify and readiness_policy == hf.DISCORD_REPLY_READINESS and harness != "opencode" and session_value:
+            workspace = None
         if workspace:
             workspace = hf.identity(workspace)
             matches = [item for item in matches if item.get("workspace") == workspace]
@@ -884,18 +889,18 @@ class Watch:
                     "Selected session differs from the current harness session")
         target = self.binding_snapshot(target)
         if verify:
-            self.cmux_factory().binding(target)
+            cmux = self.cmux_factory()
+            if harness == "opencode" and readiness_policy == hf.DISCORD_REPLY_READINESS:
+                cmux.owner_identity_binding(target)
+            elif readiness_policy == hf.NATIVE_PROMPT_READINESS:
+                cmux.binding(target)
+            else:
+                cmux.binding(target, readiness_policy=readiness_policy)
         return target
 
     def _identity_owner(self, session_hint=None):
         """Verify the exact Discord Watch owner without prompt input readiness."""
-        current = self.current_owner(verify=False, session_hint=session_hint)
-        cmux = self.cmux_factory()
-        if current["harness"] == "opencode":
-            cmux.owner_identity_binding(current)
-        else:
-            cmux.binding(current, readiness_policy=hf.DISCORD_REPLY_READINESS)
-        return current
+        return self.current_owner(session_hint=session_hint, readiness_policy=hf.DISCORD_REPLY_READINESS)
 
     @staticmethod
     def binding_snapshot(target):
@@ -1160,8 +1165,23 @@ class Watch:
     def transfer(self, thread_id, from_session, session_hint=None):
         thread_id = snowflake(thread_id, "thread ID")
         old_session = hf.session_identity(from_session)
-        # Resolve and verify the caller before taking the short SQLite write lock.
         current = self._identity_owner(session_hint=session_hint)
+        self._update_thread_owner(thread_id, current, old_session)
+        return {"thread": thread_id, "transferred": True, "from_session": old_session,
+                "to_session": current["session"], "pending_preserved": True}
+
+    def recover(self, thread_id):
+        thread_id = snowflake(thread_id, "thread ID")
+        harness = self._launch_kind()
+        session_key = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID"}.get(harness)
+        require(session_key and os.environ.get(session_key),
+                "Recovery requires the exact native Claude or Codex session ID")
+        current = self._identity_owner()
+        updated = self._update_thread_owner(thread_id, current)
+        return {"thread": thread_id, "recovered": updated, "owner_session": current["session"],
+                "pending_preserved": True}
+
+    def _update_thread_owner(self, thread_id, current, old_session=None):
         now = self.clock()
         with contextlib.closing(self.database(create=False)) as db:
             with db:
@@ -1169,9 +1189,23 @@ class Watch:
                 thread = self._thread(db, thread_id, require_open=False)
                 require(not self._custody_adoption_hold(db, thread_id),
                         "Thread is held by an explicit custody adoption")
-                require(thread["owner"].get("session") == old_session,
-                        "--from-session does not match the registered owner")
-                require(thread["owner"] != current, "Thread already belongs to this exact session")
+                owner = thread["owner"]
+                if old_session is None:
+                    require(owner["harness"] == current["harness"] and owner["session"] == current["session"],
+                            "Only this thread's exact native session can recover its binding")
+                    require(owner["started_at"] == current["started_at"],
+                            "Session generation changed; reconcile its ownership before recovery")
+                    if owner == current:
+                        return False
+                    old_session = owner["session"]
+                else:
+                    require(owner["session"] != current["session"] or
+                            owner["started_at"] == current["started_at"],
+                            "Session generation changed; use custody-adoption")
+                    require(owner["session"] == old_session, "--from-session does not match the registered owner")
+                    require(owner != current, "Thread already belongs to this exact session")
+                    db.execute("UPDATE messages SET state='pending',wake_attempts=0,last_wake_at=NULL,submitted_at=NULL "
+                               "WHERE thread_id=? AND group_id IS NULL AND state='awaiting_receipt'", (thread_id,))
                 generation = thread["owner_generation"] + 1
                 stored_owner_json = db.execute("SELECT owner_json FROM threads WHERE thread_id=?",
                                                (thread_id,)).fetchone()[0]
@@ -1180,16 +1214,13 @@ class Watch:
                                      (json.dumps(current, separators=(",", ":")), generation, now,
                                       thread_id, stored_owner_json, thread["owner_generation"]))
                 require(updated.rowcount == 1,
-                        "Thread owner changed before the explicit transfer could commit")
+                        "Thread owner changed before the owner update could commit")
                 db.execute("INSERT INTO ownership_events(thread_id,from_session,to_session,at,owner_generation) "
                            "VALUES(?,?,?,?,?)", (thread_id, old_session, current["session"], now, generation))
-                db.execute("UPDATE messages SET state='pending',wake_attempts=0,last_wake_at=NULL,submitted_at=NULL "
-                           "WHERE thread_id=? AND group_id IS NULL AND state='awaiting_receipt'", (thread_id,))
                 db.execute("UPDATE messages SET owner_generation=? WHERE thread_id=? AND group_id IS NULL "
                            "AND state!='received'", (generation, thread_id))
                 self._ensure_gateway_recovery_coverage(db, now)
-        return {"thread": thread_id, "transferred": True, "from_session": old_session,
-                "to_session": current["session"], "pending_preserved": True}
+        return True
 
     @staticmethod
     def _attachment_json(row):
@@ -3170,6 +3201,8 @@ def parser():
     transfer.add_argument("thread")
     transfer.add_argument("--from-session", required=True)
     transfer.add_argument("--session", help="Select an exact OpenCode ses_ owner when the surface is ambiguous")
+    recover = sub.add_parser("recover", help="Refresh this thread after its same native session moves panes")
+    recover.add_argument("thread")
     adoption = sub.add_parser("custody-adoption",
                               help="Explicitly adopt selected obligations for a verified current generation")
     adoption_sub = adoption.add_subparsers(dest="adoption_action", required=True)
@@ -3235,6 +3268,9 @@ def main(argv=None):
     elif args.command == "transfer":
         with app.locked():
             result = app.transfer(args.thread, args.from_session, args.session)
+    elif args.command == "recover":
+        with app.locked():
+            result = app.recover(args.thread)
     elif args.command == "status":
         result = app.status()
     elif args.command == "doctor":

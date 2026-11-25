@@ -34,7 +34,8 @@ NATIVE_PROMPT_READINESS = "native_prompt"
 DISCORD_REPLY_READINESS = "discord_reply"
 CMUX_READINESS_POLICIES = frozenset((NATIVE_PROMPT_READINESS, DISCORD_REPLY_READINESS))
 INSTALL_MARKER = "# starfleet-hailing-frequencies:v1"
-RUNTIME_SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py", "guide.md",
+RUNTIME_SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py",
+                        "quota_alert.py", "replacement_custody.py", "guide.md",
                         "agent-notify", "agent-notify-guide.md", "discord_cleanup.py",
                         "discord-cleanup.md", "opencode_adapter.py")
 RUNTIME_SKILL_NAMES = ("skills/temporal-beacon/SKILL.md", "skills/agent-notify/SKILL.md")
@@ -671,6 +672,70 @@ class Monitor:
                 "WHERE session=? AND started_at=? AND event_key=?",
                 (target["session"], target["started_at"], event_key)).fetchone()
 
+    def native_enrollment_target(self, args):
+        surface, session = identity(args.surface), identity(args.session)
+        store = json.loads((self.cmux.hook_directory / (args.harness + "-hook-sessions.json")).read_text())
+        record = next((value for key, value in store["sessions"].items() if key.upper() == session), None)
+        require(record is not None, "Exact successor hook record is unavailable")
+        return {"surface": surface, "workspace": identity(record["workspaceId"]), "session": session,
+                "harness": args.harness, "label": args.label, "started_at": record["startedAt"],
+                "cutoff": record["startedAt"] if getattr(args, "include_existing", False) else self.clock()}
+
+    def replace_enrollment(self, config, args):
+        from replacement_custody import clear_predecessor
+
+        target = self.native_enrollment_target(args)
+        predecessor_id = identity(args.from_session)
+        require(predecessor_id != target["session"], "Choose a different predecessor session")
+        require(os.environ.get("CMUX_SURFACE_ID") and identity(os.environ["CMUX_SURFACE_ID"]) == target["surface"],
+                "Run replacement from the exact successor CMUX surface")
+        require(os.environ.get("CMUX_WORKSPACE_ID") and identity(os.environ["CMUX_WORKSPACE_ID"]) == target["workspace"],
+                "Run replacement from the exact successor CMUX workspace")
+        launch_kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").casefold()
+        require(launch_kind in (("claude", "claudeteams") if target["harness"] == "claude" else ("codex",)),
+                "Run replacement from the successor harness")
+        session_env = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID"}[target["harness"]]
+        if target["harness"] == "codex":
+            require(os.environ.get(session_env), "Run replacement from the exact Codex session")
+        if os.environ.get(session_env):
+            require(identity(os.environ[session_env]) == target["session"],
+                    "Caller session does not match the proposed successor")
+        require(target["label"].strip(), "Enrollment label is required")
+        self.cmux.binding(target)
+        target["replaced_session"] = predecessor_id
+        receipt = {"replaced": predecessor_id, "enrolled": target, "receipts_preserved": True}
+        current = next((item for item in config["targets"] if item["surface"] == target["surface"]), None)
+        if current and current["session"] == target["session"]:
+            require(current == {**target, "cutoff": current["cutoff"]},
+                    "Successor enrollment does not match this replacement request")
+            return {**receipt, "enrolled": current}
+
+        require(current and current["session"] == predecessor_id,
+                "Expected predecessor is not enrolled on this surface")
+        require(current["workspace"] == target["workspace"] and current["harness"] == target["harness"],
+                "Replacement requires the same workspace and harness")
+        require(target["started_at"] > current["started_at"], "Successor must be a newer session generation")
+        require(config["coordinator"] != predecessor_id, "Coordinator enrollment requires an explicit handoff")
+        require(not any(item["session"] == target["session"] for item in config["targets"]),
+                "Successor is already enrolled on another surface")
+        require(self.cmux.activity(current)["state"] == "ended", "CMUX has not confirmed the predecessor ended")
+        rows = self.cmux.messages(current)
+        sources = [message for message in self.source_messages(current, rows)
+                   if message["created_at"] < target["started_at"]]
+        replies = [message for message in rows if type(message.get("created_at")) in (int, float)
+                   and message["created_at"] < target["started_at"]]
+        acknowledgements = self.reply_acknowledgements(current, sources, replies)
+        for message in sources:
+            if message.get("state") in ("queued", "delivered") and message.get("read_at") is None:
+                require(identity(message["id"]) in acknowledgements,
+                        "Predecessor has unread native CMUX messages; reconcile the inbox before replacing")
+        self.cmux.binding(target)
+        with clear_predecessor(self, current):
+            target["cutoff"] = self.clock()
+            config["targets"][config["targets"].index(current)] = target
+            atomic_json(self.directory / "config.json", self.config(config))
+        return receipt
+
     def attention_result(self, outcome, attempted, detail, event_key):
         return {"outcome": outcome, "attempted": bool(attempted),
                 "detail": str(detail)[:500], "event_key": str(event_key)[:128]}
@@ -1216,9 +1281,10 @@ class Monitor:
         with contextlib.closing(self.database()) as db:
             for target in config["targets"]:
                 sending = send and (only_sessions is None or target["session"] in only_sessions)
+                scan_owner = {key: target[key] for key in ("harness", "session", "surface", "workspace", "started_at")}
                 initial_error = initial_errors_by_session.get(target["session"])
                 if initial_error:
-                    results.append({"label": target["label"], "session": target["session"],
+                    results.append({"label": target["label"], **scan_owner,
                                     "inbox_status": "incomplete", "error": initial_error["error"],
                                     "sending_enabled": sending, "attempts": []})
                     continue
@@ -1239,7 +1305,7 @@ class Monitor:
                     "SELECT message FROM acknowledgements WHERE session=?", (target["session"],))}
                 snapshot = self.target_snapshot(sources, acknowledged, now, config["remind_after"])
                 overdue = snapshot["overdue_messages"]
-                result = {"label": target["label"], "session": target["session"],
+                result = {"label": target["label"], **scan_owner,
                           "inbox_status": "complete",
                           "native_unread": snapshot["native_unread"],
                           "acknowledged": snapshot["acknowledged"],
@@ -1400,8 +1466,11 @@ def _worker_heartbeat(directory, config, name="last-scan.json", error_name="last
         require(math.isfinite(threshold), "invalid heartbeat threshold")
         require(0 <= age <= threshold, "worker heartbeat is stale")
         target_errors = scan.get("target_errors", [])
-        require(isinstance(target_errors, list) and not target_errors, "worker target coverage is incomplete")
-        require(scan.get("coverage_complete", True) is True, "worker coverage is incomplete")
+        require(isinstance(target_errors, list) and all(isinstance(item, dict)
+                    and isinstance(item.get("session"), str) for item in target_errors),
+                "invalid worker target errors")
+        require(scan.get("coverage_complete", not target_errors) is (not target_errors),
+                "invalid worker target coverage")
         error = _read_diagnostic_json(directory / error_name)
         if error is not None:
             error_at = error.get("at")
@@ -1455,17 +1524,8 @@ def hailing_diagnostic_report(app, caller):
     if caller is not None:
         if target is None:
             delivery = "missing"
-        elif scan is not None and worker == "ready":
-            scope = scan.get("sending_sessions")
-            target_rows = scan.get("targets")
-            row = next((item for item in target_rows if isinstance(item, dict)
-                        and item.get("session") == session_identity(caller["session"], caller["harness"])),
-                       None) if isinstance(target_rows, list) else None
-            if (scan.get("mode") == "send" and (scope is None or target["session"] in scope)
-                    and isinstance(row, dict) and row.get("sending_enabled") is True):
-                delivery = "ready"
-            else:
-                delivery = "blocked"
+        elif scan is not None:
+            delivery = "ready" if _has_exact_send_coverage(scan, target) else "blocked"
     return _common_diagnostic_report("ready", registration, worker, delivery)
 
 
@@ -1476,31 +1536,32 @@ def temporal_diagnostic_report(app, caller):
         return report
     try:
         config = app.config(_read_diagnostic_json(app.directory / "config.json"))
-        worker, scan = _worker_heartbeat(app.directory, config, "timer-last-scan.json",
+        worker, _ = _worker_heartbeat(app.directory, config, "timer-last-scan.json",
                                          "timer-last-error.json")
         checks["worker"] = worker
-        if caller is not None and checks["registration"] == "ready":
-            target = _match_diagnostic_target(config, caller)
-            hailing_scan_state, hailing_scan = _worker_heartbeat(app.directory, config)
-            if hailing_scan_state == "ready" and isinstance(hailing_scan, dict):
-                scope = hailing_scan.get("sending_sessions")
-                checks["intended_delivery"] = (
-                    "ready" if hailing_scan.get("mode") == "send" and
-                    target is not None and (scope is None or target["session"] in scope) and
-                    isinstance(_match_scan_target(hailing_scan, target["session"]), dict) else "blocked")
-            else:
-                checks["intended_delivery"] = "unknown"
+        if checks["registration"] == "ready" and worker != "ready":
+            checks["intended_delivery"] = "blocked" if worker == "blocked" else "unknown"
     except (OSError, ValueError, KeyError, TypeError):
         checks["worker"] = "blocked"
         checks["intended_delivery"] = "unknown"
     return report
 
 
-def _match_scan_target(scan, session):
-    targets = scan.get("targets")
-    return next((item for item in targets if isinstance(item, dict)
-                 and item.get("session") == session and item.get("sending_enabled") is True), None) \
-        if isinstance(targets, list) else None
+def _has_exact_send_coverage(scan, target):
+    scope = scan.get("sending_sessions")
+    if scan.get("mode") != "send" or (scope is not None and (
+            not isinstance(scope, list) or target["session"] not in scope)):
+        return False
+    rows = scan.get("targets")
+    if not isinstance(rows, list):
+        return False
+    matches = [row for row in rows if isinstance(row, dict) and row.get("session") == target["session"]]
+    if len(matches) != 1 or any(error["session"] == target["session"] for error in scan.get("target_errors", [])):
+        return False
+    row = matches[0]
+    return (all(row.get(key) == target[key] for key in ("harness", "surface", "workspace", "started_at"))
+            and row.get("inbox_status") == "complete" and row.get("sending_enabled") is True
+            and not row.get("hold") and not row.get("acknowledgment_hold"))
 
 
 def _parse_static_shell_literal(raw):
@@ -1633,6 +1694,12 @@ def parser():
     enroll.add_argument("--label", required=True)
     enroll.add_argument("--include-existing", action="store_true", help="Include this session's existing messages")
     enroll.add_argument("--coordinator", action="store_true", help="Receive escalation prompts")
+    replace = sub.add_parser("replace", help="Replace an ended enrollment from its exact successor on the same surface")
+    replace.add_argument("--from-session", required=True)
+    replace.add_argument("--surface", required=True)
+    replace.add_argument("--session", required=True)
+    replace.add_argument("--harness", choices=("claude", "codex"), required=True)
+    replace.add_argument("--label", required=True)
     opencode_enroll = sub.add_parser("opencode-enroll",
                                      help="Self-enroll one exact OpenCode session from a private binding manifest")
     opencode_enroll.add_argument("--manifest", type=Path, required=True)
@@ -1694,10 +1761,17 @@ def parser():
     set_timer.add_argument("--request-id")
     set_timer.add_argument("--replace-key")
     temporal_sub.add_parser("list", help="List this exact owner's timers")
+    quota_watch = temporal_sub.add_parser("quota-watch", help="Wake on a Claude weekly quota change")
+    quota_watch.add_argument("--message", required=True, help="Continuation to retrieve when woken")
+    quota_watch.add_argument("--at-or-below", type=float, metavar="PERCENT",
+                             help="wake at or below this remaining percentage, once per reset")
+    temporal_sub.add_parser("quota-status", help="Inspect this exact owner's quota watch and cache")
+    temporal_sub.add_parser("quota-stop", help="Stop this exact owner's quota watch")
     inspect = temporal_sub.add_parser("inspect", help="Inspect a timer and its occurrence history")
     inspect.add_argument("timer_id")
     cancel = temporal_sub.add_parser("cancel", help="Cancel a timer and any held occurrence")
     cancel.add_argument("timer_id")
+    cancel.add_argument("--reason", help="Required when the enrolled coordinator cancels another owner's timer")
     temporal_sub.add_parser("receive", help="Output the current continuation and record its receipt")
     temporal_sub.choices["receive"].add_argument("--timer-id")
     temporal_doctor = temporal_sub.add_parser("doctor", help="Diagnose timer worker and delivery state")
@@ -1802,13 +1876,19 @@ def main(argv=None):
         if args.temporal_command == "set":
             return beacon.set(args.after, args.at, args.every, args.until, args.message,
                               args.request_id, args.replace_key, after_idle=args.after_idle)
+        if args.temporal_command == "quota-watch":
+            return beacon.quota_watch(args.message, args.at_or_below)
+        if args.temporal_command == "quota-status":
+            return beacon.quota_status()
+        if args.temporal_command == "quota-stop":
+            return beacon.quota_stop()
         target, owner_key, _worktree = beacon.owner()
         if args.temporal_command == "list":
             return beacon.list(owner_key)
         if args.temporal_command == "inspect":
             return beacon.inspect(owner_key, args.timer_id)
         if args.temporal_command == "cancel":
-            return beacon.cancel(owner_key, args.timer_id)
+            return beacon.cancel(owner_key, args.timer_id, reason=args.reason)
         if args.temporal_command == "receive":
             receipt = beacon.receive(owner_key, sys.stdout, args.timer_id)
             print(json.dumps(receipt), file=sys.stderr)
@@ -1830,17 +1910,17 @@ def main(argv=None):
         if args.command == "ack":
             return {"acknowledgments": [app.acknowledge(args.session, mid, os.environ.get("CMUX_SURFACE_ID"))
                                          for mid in args.message]}
+        if args.command == "replace":
+            return app.replace_enrollment(config, args)
         if args.command == "enroll":
-            surface, session = identity(args.surface), identity(args.session)
+            target = app.native_enrollment_target(args)
+            surface, session = target["surface"], target["session"]
             require(not app.custody_adoption_hold("hailing_session", session),
                     "Session is held by an explicit custody adoption")
-            store = json.loads((app.cmux.hook_directory / (args.harness + "-hook-sessions.json")).read_text())
-            record = next((v for k, v in store["sessions"].items() if k.upper() == session), {})
-            target = {"surface": surface, "workspace": identity(record["workspaceId"]), "session": session,
-                      "harness": args.harness, "label": args.label, "started_at": record["startedAt"],
-                      "cutoff": record["startedAt"] if args.include_existing else app.clock()}
             app.cmux.binding(target)
             existing = next((t for t in config["targets"] if t["session"] == session), None)
+            if existing and "replaced_session" in existing:
+                target["replaced_session"] = existing["replaced_session"]
             require(existing is None or existing == {**target, "cutoff": existing["cutoff"]},
                     "Session enrollment differs; unenroll explicitly before changing it")
             require(not any(t["surface"] == surface and t["session"] != session for t in config["targets"]),

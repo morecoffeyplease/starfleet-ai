@@ -113,11 +113,30 @@ Unsealed messages can be assigned to the new generation, and a group never combi
 An unexplained generation change without the matching ownership-event chain holds its groups.
 An uncertain send stays uncertain across transfer.
 
-`custody-adoption` is a separate, explicit current-generation assignment for selected existing threads and timers when historical process continuity is unavailable.
+### Recover a moved native session
+
+If CMUX moved your Claude or Codex session to a different pane, first verify that Hailing Frequencies lists your exact new pane and workspace with the same session and hook start.
+From that session, run:
+
+```sh
+discord-watch recover THREAD_ID
+discord-watch managed THREAD_ID
+```
+
+`recover` verifies the explicit native session ID and its current CMUX projection, hook record, generation, and receiving settings.
+A workspace ID inherited from the old pane does not override that live evidence.
+The command preserves the thread's cursor, open or closed state, queued replies, group receipts, and earlier submissions.
+Running it again on the already current binding makes no changes.
+Use `custody-adoption` for a changed hook generation in the same native session, or `transfer` for a different session.
+If recovery reports a per-thread REST catch-up hold, run `discord-watch scan --only-thread THREAD_ID` to reconcile that thread without submitting a wake.
+Confirm delivery by receiving an actual reply.
+
+`custody-adoption` assigns selected existing threads and timers to a new hook generation of the same native session, pane, and workspace.
 It preserves the old and current generation identities, records continuity as unestablished, and requires a private approval-reference audit note plus independent acceptance by the current exact native owner.
 The approval reference is cooperative evidence and is not authenticated proof.
 Preview is read-only and omits reply bodies, attachment URLs, and continuation text.
-Apply holds only the selected obligations while it appends the per-resource events and preserves their existing delivery state.
+Apply holds the Hailing session and selected obligations while it appends per-resource events and preserves their existing delivery state.
+Unselected threads and timers retain their old generation, so review all outstanding obligations before preparing the plan.
 The full workflow and interruption rules are in the [setup guide](guide.md#explicit-current-generation-custody-adoption).
 
 ## Commands
@@ -128,7 +147,7 @@ Global path options go before the command:
 discord-watch --state-dir PATH --notify-home PATH --hailing-state PATH --cmux PATH status
 ```
 
-The main commands are `register`, `managed`, `receive`, `close`, `transfer`, `custody-adoption`, `status`, `doctor`, `scan`, `serve`, and `supervise`.
+The main commands are `register`, `managed`, `receive`, `close`, `transfer`, `recover`, `custody-adoption`, `status`, `doctor`, `scan`, `serve`, and `supervise`.
 `scan` is observe-only unless `--send` is supplied.
 `serve` runs one Gateway, REST, and sender topology, while `supervise` owns a separate supervisor lock and restarts a crashed worker with bounded backoff.
 Both accept `--send` and `--only-thread THREAD`.

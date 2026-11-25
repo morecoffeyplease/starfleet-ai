@@ -27,14 +27,23 @@ A recorded report is a covered-delivery requirement, not proof of setup or a pre
 
 Prime Directive (Policy Guard) is the same delivery tool described by this README and its `lane.py` CLI.
 An owner can explicitly adopt its stage-specific opening and accepted repair-batch attestations for a target; older attachments remain unchanged until adoption.
-After an authorized owner handoff, the current owner can publish a successor-validation attestation that links the exact inherited publication and reconciles current evidence.
+For Starfleet itself, the successor records concise acceptance in the existing handoff evidence packet with the ordinary `record` command.
+The default checklist scopes this policy to `github.com/morecoffeyplease/starfleet-ai`.
+Exact owner history, current candidate verification, required reads, repair history and human holds remain required.
+No new public successor comment or copied predecessor publication hashes are needed.
+Other repositories retain their selected publication policy.
+Under that policy, the current owner can publish a successor-validation attestation that links the inherited publication and reconciles current evidence.
 Successor validation requires the current owner's clean report with successful canonical verification and the current required-read receipts.
 The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, handoff ancestry, recovery, the `--enable` adoption command and source/runtime upgrade requirements.
+New repair-batch publications require a structured assessment of the existing attempts, deciding evidence, dispositions, applicable rules and any required approval evidence.
+After a reviewed source upgrade, an existing repair publication remains usable only while its packet and rendered body still match the exact current publication reference.
+The legacy compatibility path cannot render or start-check a new repair batch without the assessment.
+For a later accepted batch, the owner publishes a new comment and start-checks it while leaving earlier comments and repair history intact.
 When Pattern Buffer is installed with a required-reads list, the owner must include current matching read receipts in the attestation; `attestation-rereads` prints the required packet entries and leaves `source_ref` for the owner to supply.
 An attestation requires `assumptions: []`; unknown required facts must be investigated or raised to the configured human on Discord, then resolved before attesting.
 The packet can record honest uncertainty about tool limits and future outcomes, but it cannot prove that the author's reasoning contains no hidden assumptions.
 Existing immutable seats must use the reviewed source-upgrade flow before they can run the new pinned attestation commands.
-Adopted targets require a current per-PR comment reference before covered ready or merge actions, with source and comment freshness checked on each supported action.
+Targets retaining the published policy require a current per-PR comment reference before covered ready or merge actions, with source and comment freshness checked on each supported action.
 Codex coverage is through the explicit seat `gh` entrypoint and Claude coverage is through its supported direct ready/merge hook path; raw push, PR creation, comments and alternate tools are not intercepted.
 The notice comes from Pattern Buffer's existing SessionStart context injection, which does not detect issues or batches.
 
@@ -107,12 +116,51 @@ It may correct a stale settings mode only when that checkout records the same se
 Review every `migration_metadata_recovery` entry and apply only its exact plan hash.
 For this metadata recovery path, changed settings content or mode, mismatched paths, invalid pins, and malformed runtime metadata continue to fail closed.
 
+## Replace a missing permanent seat root
+
+Use the reviewed `upgrade-plan` and `upgrade` flow with `--replacement-seat-root` only when the immutable birth root and its recorded Gitdir are both absent.
+The source seat ID, birth root, birth Gitdir, owner history, PR records, and removed checkout rows remain unchanged; the manifest records a separate active operational anchor for current Git and settings checks.
+The replacement must be in the same Git common directory proved by the retained birth-root attachment metadata; owner identity, repository origin, and host labels do not establish that proof.
+Every active source attachment must still exist and match its recorded worktree; retire missing active attachments through the existing `retire-attachment` route before planning.
+If the replacement root belongs to another seat, name that exact seat with `--release-anchor-seat` only after every destination attachment is already removed and its runtime, adapter, and installed hooks are intact.
+This operation releases the destination seat's operational anchor and owned hook groups without merging its seat ID, immutable runtime pin, or history into the source seat.
+The source seat upgrades normally, archives existing receipts, and requires fresh reports before covered actions can pass.
+A pending transaction can be rolled back with `upgrade-recover --rollback`; rollback verifies the replacement Git identity and restores both manifests, settings, backup, adapter, and checkout states without recreating the absent birth root.
+After recovery, future attachments at the operational anchor must select the source seat with global `--seat-id SOURCE_SEAT_ID` before `plan` or `install`.
+The released seat remains available for read-only history inspection; an older pinned runtime cannot enforce a release marker it does not understand, so use a current supported source for later state changes.
+
+For example, review and apply an explicit same-owner anchor release:
+
+```sh
+python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /worktrees/active-product --seat-id SOURCE_SEAT_ID upgrade-plan \
+  --replacement-seat-root /worktrees/permanent-anchor \
+  --release-anchor-seat DESTINATION_SEAT_ID
+python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
+  --cwd /worktrees/active-product --seat-id SOURCE_SEAT_ID upgrade \
+  --replacement-seat-root /worktrees/permanent-anchor \
+  --release-anchor-seat DESTINATION_SEAT_ID --plan-sha256 REVIEWED_PLAN_SHA256
+```
+
+## Retire a drained durable seat
+
+Use `retire-seat` after every recorded attachment is removed and an existing explicit authorization names the local cleanup.
+The read-only plan binds the historical seat owner separately from the actual native operator, plus the anchor, immutable runtime pin, captured `gh`, adapter, exact hooks, settings hashes and attachment receipts.
+The required authorization reference is recorded but not authenticated, and the historical owner and attachment history remain unchanged.
+Apply only the reviewed `--plan-sha256`; the operation removes only this seat's adapter and exact managed hook groups, releases its operational anchor and preserves PR history.
+An interrupted operation can be inspected and rolled back through `recover --inspect` and `recover --rollback` from the native operator that began it.
+The receipt proves local file changes only and does not prove that a running native host refreshed or stopped invoking a cached hook.
+See [the printable guide](guide.md#retire-a-drained-durable-seat) for the exact command sequence and limits.
+
 ## Retire a missing attachment
 
-An exact seat owner can retire a recorded attachment when its checkout path is gone or now belongs to a different Git repository or worktree.
-The command refuses a live matching checkout and directs the owner to run `uninstall` from that checkout.
-It also refuses a recorded worktree that exists on another branch, and refuses while an install, migration, handoff, or upgrade recovery is pending.
-It changes only the Policy Guard attachment record, preserves pull request records and their counts, and records the owner, time, and missing-checkout evidence.
+Any local operator can retire a recorded attachment when its checkout path is gone or now identifies another worktree.
+Use the recorded seat ID and absolute checkout path to review and apply the exact plan.
+Use a current source checkout's `lane.py` if an older installed runtime still asks for the former owner.
+For a live worktree with the recorded Git identity, use the [live registration workflow](#retire-a-live-attachment-registration) or run the existing owner-bound `uninstall` workflow from that checkout.
+A pending install, migration, handoff, or upgrade still requires recovery first.
+Retirement preserves the seat's owner, existing hooks, and PR records and counts.
+The receipt records the historical owner, time, and missing-checkout evidence.
 
 For example, review the plan for a deleted temporary checkout, then apply only its exact hash:
 
@@ -127,3 +175,12 @@ python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
 
 If the recorded checkout still exists on another branch, restore its recorded branch and run `uninstall` from it instead of retiring it.
 Use the [Policy Guard guide](guide.md#retire-a-missing-attachment) for the full plan, apply, upgrade, and recovery workflow.
+
+## Retire a live attachment registration
+
+Use `retire-attachment --live-registration` to remove one exact permanent-seat registration from a checkout that still exists.
+The reviewed plan binds the checkout's Git identity, recorded branch, and current head.
+Apply only that plan's hash with the same exact seat ID, checkout path, and live-registration flag.
+The operation preserves the checkout, the seat owner, shared hooks and adapter, and PR history.
+Use the reviewed `retire-seat` workflow for physical hook and adapter cleanup after all attachments are retired.
+See [the printable guide](guide.md#retire-a-live-attachment-registration) for the command sequence.

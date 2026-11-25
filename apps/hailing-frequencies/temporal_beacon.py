@@ -13,6 +13,8 @@ import subprocess
 import time
 import uuid
 
+import quota_alert
+
 
 def require(condition, message):
     if not condition:
@@ -61,6 +63,7 @@ class TemporalBeacon:
         self.app = app
         self.directory = app.directory
         self.clock = clock
+        self.quota_cache = Path.home() / ".claude/cache/rate-limits.json"
 
     @contextlib.contextmanager
     def locked(self):
@@ -117,10 +120,15 @@ class TemporalBeacon:
           before_digest TEXT NOT NULL, after_preserved_digest TEXT NOT NULL,
           committed_at REAL NOT NULL, PRIMARY KEY(operation_id,resource_kind,resource_id)
         );
+        CREATE TABLE IF NOT EXISTS timer_cancellations (
+          timer_id TEXT PRIMARY KEY REFERENCES timers(id), canceled_by_session TEXT NOT NULL,
+          canceled_by_owner_key TEXT NOT NULL, reason TEXT NOT NULL, canceled_at REAL NOT NULL
+        );
         """)
         columns = {row[1] for row in db.execute("PRAGMA table_info(timers)")}
         if "schedule_spec" not in columns:
             db.execute("ALTER TABLE timers ADD COLUMN schedule_spec TEXT NOT NULL DEFAULT '{}'")
+        quota_alert.initialize(db)
         return db
 
     def binding(self, target, expected_worktree=None):
@@ -237,24 +245,30 @@ class TemporalBeacon:
         value["due_at_local"] = timestamp(value["due_at"])
         return value
 
-    def capability(self, target):
+    def capability(self, target, *, quota=False):
         try:
             service_state = json.loads((self.directory / "service.json").read_text())
+        except (OSError, ValueError, TypeError):
+            service_state = {}
+        try:
             scan = json.loads((self.directory / "last-scan.json").read_text())
         except (OSError, ValueError, TypeError):
-            service_state, scan = {}, {}
+            scan = {}
+        quota_supported, direct_worker = False, False
         try:
             timer_scan = json.loads((self.directory / "timer-last-scan.json").read_text())
             timer_scan_age = self.clock() - timer_scan["at"]
             interval = self.app.config()["interval"]
             timer_worker_ready = (type(timer_scan["at"]) in (int, float) and math.isfinite(timer_scan["at"])
                                   and 0 <= timer_scan_age <= max(120, interval * 4))
+            if quota and timer_worker_ready and timer_scan.get("supports_quota") is True:
+                quota_supported, direct_worker = self._quota_worker(timer_scan, service_state)
         except (OSError, ValueError, KeyError, TypeError):
             timer_scan_age, timer_worker_ready = None, False
         sending = scan.get("mode") == "send"
         scope = scan.get("sending_sessions")
         covered = scope is None or target["session"] in scope
-        running = service_state.get("state") == "running"
+        running = service_state.get("state") == "running" or direct_worker
         reason = None
         if not running:
             reason = "start the existing supervisor inside CMUX"
@@ -264,12 +278,36 @@ class TemporalBeacon:
             reason = "exact owner is outside the supervisor send scope"
         elif not timer_worker_ready:
             reason = "no fresh Temporal Beacon worker heartbeat; restart the current installed worker"
+        elif quota and not quota_supported:
+            reason = "worker heartbeat does not advertise quota alerts; use the current installed worker"
         transport = "guarded_opencode_api" if target["harness"] == "opencode" else "guarded_cmux"
-        return {"transport": transport, "worker_running": running, "send_enabled": sending,
-                "owner_in_send_scope": covered,
-                "timer_worker_ready": timer_worker_ready, "timer_scan_age_seconds": timer_scan_age,
-                "currently_covered": running and sending and covered and timer_worker_ready,
-                "action": reason}
+        result = {"transport": transport, "worker_running": running, "send_enabled": sending,
+                  "owner_in_send_scope": covered,
+                  "timer_worker_ready": timer_worker_ready, "timer_scan_age_seconds": timer_scan_age,
+                  "currently_covered": running and sending and covered and timer_worker_ready,
+                  "action": reason}
+        if quota:
+            result["supports_quota"] = quota_supported
+            result["currently_covered"] = result["currently_covered"] and quota_supported
+        return result
+
+    def _quota_worker(self, scan, service_state):
+        pid, token = scan.get("worker_pid"), scan.get("worker_token")
+        if type(pid) is not int or pid <= 0:
+            return False, False
+        try:
+            os.kill(pid, 0)
+            if service_state.get("state") != "running":
+                direct_worker = token is None and self._worker_lease_held("serve.lock")
+                return direct_worker, direct_worker
+            supervised = (
+                isinstance(token, str) and bool(token) and token == service_state.get("worker_token")
+                and pid == service_state.get("worker_pid")
+                and service_state.get("at", float("inf")) <= scan["at"] and self.worker_leases_held()
+            )
+            return supervised, False
+        except (OSError, ValueError, TypeError):
+            return False, False
 
     def idle_due(self, target, seconds, now):
         activity = self.app.cmux.activity(target)
@@ -306,18 +344,18 @@ class TemporalBeacon:
 
     def worker_leases_held(self):
         """Kernel-owned lifetime locks disappear on exit even while a heartbeat stays fresh."""
-        for name in ("supervisor.lock", "serve.lock"):
-            path = self.directory / name
-            require(path.is_file() and not path.is_symlink(), "Worker lifetime lock is unavailable")
-            with path.open("r") as stream:
-                try:
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    continue
-                else:
-                    fcntl.flock(stream, fcntl.LOCK_UN)
-                    return False
-        return True
+        return all(self._worker_lease_held(name) for name in ("supervisor.lock", "serve.lock"))
+
+    def _worker_lease_held(self, name):
+        path = self.directory / name
+        require(path.is_file() and not path.is_symlink(), "Worker lifetime lock is unavailable")
+        with path.open("r") as stream:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(stream, fcntl.LOCK_UN)
+            return False
 
     def set(self, after=None, at=None, every=None, until=None, continuation="", request_id=None, replacement_key=None,
             after_idle=None):
@@ -361,6 +399,8 @@ class TemporalBeacon:
         with self.locked(), contextlib.closing(self.database()) as db:
             if self.app.custody_adoption_hold("hailing_session", target["session"]):
                 raise ValueError("Session is held by an explicit custody adoption")
+            require(target in self.app.config()["targets"],
+                    "Timer owner enrollment changed before creation")
             db.execute("BEGIN IMMEDIATE")
             if request_id:
                 existing = db.execute("SELECT * FROM timers WHERE request_id=?", (request_id,)).fetchone()
@@ -392,6 +432,86 @@ class TemporalBeacon:
                     "resolved_due": resolved_due, "timezone": datetime.now().astimezone().tzname(),
                     "delivery_capability": self.capability(target)}
 
+    def _quota_owner(self):
+        target, owner_key, worktree = self.owner(verify=False)
+        require(target["harness"] in ("claude", "codex"), "Quota alerts support Claude and Codex recipients")
+        self.binding(target, worktree)
+        return target, owner_key, worktree
+
+    def quota_watch(self, continuation, threshold=None):
+        require(isinstance(continuation, str) and continuation.strip(),
+                "Continuation message cannot be empty")
+        require(threshold is None or (quota_alert.finite_number(threshold) and 0 <= threshold <= 100),
+                "Quota threshold must be a finite percentage between 0 and 100")
+        continuation = continuation.strip()
+        target, owner_key, worktree = self._quota_owner()
+        with self.locked(), contextlib.closing(self.database()) as db:
+            require(target in self.app.config()["targets"], "Quota watch owner enrollment changed")
+            db.execute("BEGIN IMMEDIATE")
+            watch = quota_alert.get_watch(db, owner_key)
+            idempotent = watch is not None and watch["active"]
+            if idempotent:
+                require((watch["continuation"], watch["threshold"]) == (continuation, threshold),
+                        "An active quota watch differs; stop it before changing its settings")
+            else:
+                db.execute("""
+                    INSERT INTO quota_watches (owner_key, session, canonical_worktree, continuation, threshold, active)
+                    VALUES (?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(owner_key) DO UPDATE SET continuation=excluded.continuation,
+                        threshold=excluded.threshold, active=1, observed_at=NULL,
+                        resets_at=NULL, remaining_percent=NULL
+                """, (owner_key, target["session"], worktree, continuation, threshold))
+                watch = quota_alert.get_watch(db, owner_key)
+            db.commit()
+        return {"watch": watch, "idempotent": idempotent,
+                "delivery_capability": self.capability(target, quota=True)}
+
+    def quota_status(self):
+        target, owner_key, _ = self._quota_owner()
+        path = self.directory / "receipts.sqlite3"
+        require(not path.is_symlink(), "Refusing symlink database")
+        watch = timer = occurrence = None
+        if path.is_file():
+            with contextlib.closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as db:
+                exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='quota_watches'").fetchone()
+                if exists:
+                    db.execute("BEGIN")
+                    watch = quota_alert.get_watch(db, owner_key)
+                    if watch is not None and watch["timer_id"] is not None:
+                        timer = self._timer(db, watch["timer_id"])
+                        row = db.execute(
+                            "SELECT id,timer_id,sequence,due_at,status,continuation,attempted_at,received_at,detail "
+                            "FROM timer_occurrences WHERE timer_id=? ORDER BY sequence DESC LIMIT 1",
+                            (timer["id"],),
+                        ).fetchone()
+                        if row is not None:
+                            occurrence = self._occurrence_dict(row)
+        return {"watch": watch, "sample": quota_alert.read_cache(self.quota_cache, self.clock()),
+                "timer": timer, "occurrence": occurrence, "delivery_capability": self.capability(target, quota=True)}
+
+    def quota_stop(self):
+        target, owner_key, _ = self._quota_owner()
+        with self.locked(), contextlib.closing(self.database()) as db:
+            require(target in self.app.config()["targets"], "Quota watch owner enrollment changed")
+            db.execute("BEGIN IMMEDIATE")
+            watch = quota_alert.get_watch(db, owner_key)
+            timer_id = watch["timer_id"] if watch is not None else None
+            canceled = False
+            if watch is not None and watch["active"]:
+                db.execute("UPDATE quota_watches SET active=0 WHERE owner_key=?", (owner_key,))
+                if quota_alert.timer_active(db, timer_id):
+                    attempted = db.execute("SELECT 1 FROM timer_occurrences WHERE timer_id=? "
+                                           "AND status IN ('submitted','uncertain')", (timer_id,)).fetchone()
+                    if attempted is None:
+                        db.execute("UPDATE timers SET status='canceled',updated_at=? WHERE id=?",
+                                   (self.clock(), timer_id))
+                        db.execute("UPDATE timer_occurrences SET status='canceled' WHERE timer_id=? "
+                                   "AND status IN ('pending','held')", (timer_id,))
+                        canceled = True
+            db.commit()
+        return {"stopped": watch is not None and watch["active"], "timer_id": timer_id,
+                "pending_canceled": canceled}
+
     def list(self, owner_key):
         with self.locked(), contextlib.closing(self.database()) as db:
             rows = db.execute("SELECT * FROM timers WHERE owner_key=? ORDER BY created_at DESC", (owner_key,)).fetchall()
@@ -402,28 +522,58 @@ class TemporalBeacon:
             timer = self._timer(db, timer_id)
             require(timer["owner_key"] == owner_key, "Timer belongs to another exact owner")
             rows = db.execute("SELECT id,timer_id,sequence,due_at,status,continuation,attempted_at,received_at,detail FROM timer_occurrences WHERE timer_id=? ORDER BY sequence", (timer_id,)).fetchall()
-            return {"timer": timer, "occurrences": [self._occurrence_dict(row) for row in rows]}
+            result = {"timer": timer, "occurrences": [self._occurrence_dict(row) for row in rows]}
+            cancellation = self._cancellation(db, timer_id)
+            if cancellation is not None:
+                result["coordinator_cancellation"] = cancellation
+            return result
 
-    def cancel(self, owner_key, timer_id):
-        now = self.clock()
-        with self.locked(), contextlib.closing(self.database()) as db:
+    @staticmethod
+    def _cancellation(db, timer_id):
+        columns = ("canceled_by_session", "reason", "canceled_at")
+        row = db.execute("SELECT canceled_by_session,reason,canceled_at FROM timer_cancellations WHERE timer_id=?",
+                         (timer_id,)).fetchone()
+        return dict(zip(columns, row)) if row is not None else None
+
+    def cancel(self, owner_key, timer_id, reason=None):
+        monitor_lock = contextlib.nullcontext() if reason is None else self.app.locked()
+        with monitor_lock, self.locked(), contextlib.closing(self.database()) as db:
             db.execute("BEGIN IMMEDIATE")
             timer = self._timer(db, timer_id)
-            require(timer["owner_key"] == owner_key, "Timer belongs to another exact owner")
+            coordinator = None
+            if timer["owner_key"] != owner_key:
+                require(reason is not None and reason.strip(),
+                        "Timer belongs to another exact owner; coordinator cancellation requires a nonblank --reason")
+                target, verified_key, _worktree = self.owner()
+                require(verified_key == owner_key and self.app.config().get("coordinator") == target["session"],
+                        "Only the currently enrolled Hailing Frequencies coordinator can cancel another owner's timer")
+                coordinator = target["session"]
             require(not self.app.custody_adoption_hold("temporal_timer", timer_id),
                     "Timer is held by an explicit custody adoption")
-            if timer["status"] == "active":
+            status = timer["status"]
+            if status == "active":
+                now = self.clock()
                 db.execute("UPDATE timers SET status='canceled',updated_at=? WHERE id=? AND status='active'", (now, timer_id))
                 db.execute("UPDATE timer_occurrences SET status='canceled' WHERE timer_id=? AND status IN ('pending','held')", (timer_id,))
+                if coordinator is not None:
+                    db.execute(
+                        "INSERT INTO timer_cancellations(timer_id,canceled_by_session,canceled_by_owner_key,reason,canceled_at) "
+                        "VALUES(?,?,?,?,?)", (timer_id, coordinator, owner_key, reason.strip(), now),
+                    )
+                status = "canceled"
+            result = {"timer_id": timer_id, "status": status, "submitted_input_recallable": False}
+            if coordinator is not None:
+                cancellation = self._cancellation(db, timer_id)
+                if cancellation is not None:
+                    result["coordinator_cancellation"] = cancellation
             db.commit()
-            return {"timer_id": timer_id, "status": "canceled" if timer["status"] == "active" else timer["status"],
-                    "submitted_input_recallable": False}
+            return result
 
     def receive(self, owner_key, output, timer_id=None):
         target, _, _ = self.owner()
         with self.locked(), contextlib.closing(self.database()) as db:
             db.execute("BEGIN IMMEDIATE")
-            query = "SELECT o.id,o.timer_id,o.sequence,o.due_at,o.status,o.continuation,o.attempted_at,o.received_at,o.detail,t.status,t.owner_key,t.until_at,t.interval,t.due_at,t.canonical_worktree FROM timer_occurrences o JOIN timers t ON t.id=o.timer_id WHERE t.owner_key=? AND t.session=? AND t.surface=? AND t.workspace=? AND t.started_at=? AND o.status IN ('submitted','uncertain')"
+            query = "SELECT o.id,o.timer_id,o.sequence,o.due_at,o.status,o.continuation,o.attempted_at,o.received_at,o.detail,t.status,t.owner_key,t.until_at,t.interval,t.due_at,t.canonical_worktree,t.schedule_spec FROM timer_occurrences o JOIN timers t ON t.id=o.timer_id WHERE t.owner_key=? AND t.session=? AND t.surface=? AND t.workspace=? AND t.started_at=? AND o.status IN ('submitted','uncertain')"
             params = [owner_key, target["session"], target["surface"], target["workspace"], target["started_at"]]
             if timer_id:
                 query += " AND t.id=?"
@@ -432,7 +582,7 @@ class TemporalBeacon:
             row = db.execute(query, params).fetchone()
             require(row is not None, "No submitted continuation is waiting for receipt")
             occurrence = self._occurrence_dict(row[:9])
-            timer_status, stored_owner, until_at, interval, due_at, worktree = row[9:]
+            timer_status, stored_owner, until_at, interval, due_at, worktree, schedule_spec = row[9:]
             require(stored_owner == owner_key, "Timer owner changed")
             require(not self.app.custody_adoption_hold("temporal_timer", occurrence["timer_id"]),
                     "Timer is held by an explicit custody adoption")
@@ -441,6 +591,9 @@ class TemporalBeacon:
             payload = {"timer_id": occurrence["timer_id"], "occurrence_id": occurrence["id"],
                        "sequence": occurrence["sequence"], "due_at": occurrence["due_at_local"],
                        "continuation": occurrence["continuation"], "receipt_means_task_completed": False}
+            quota_observation = json.loads(schedule_spec).get("quota_observation")
+            if quota_observation is not None:
+                payload["quota_observation"] = quota_observation
             rendered = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
             written = output.write(rendered)
             require(written == len(rendered), "Output was incomplete; receipt not recorded")
@@ -477,6 +630,10 @@ class TemporalBeacon:
             import hailing_frequencies as hf
             allowed = {hf.session_identity(session) for session in only_sessions}
         with self.locked(), contextlib.closing(self.database()) as db:
+            if send:
+                db.execute("BEGIN IMMEDIATE")
+                quota_alert.enqueue(self, db, now, allowed)
+                db.commit()
             timers = db.execute("SELECT * FROM timers WHERE status='active' AND due_at<=? ORDER BY due_at", (now,)).fetchall()
             results = []
             for raw in timers:
@@ -588,7 +745,7 @@ class TemporalBeacon:
                     db.execute("UPDATE timer_occurrences SET status='uncertain',detail=? WHERE id=?", (detail, occurrence_id))
                     db.commit()
                     results.append({"timer_id": timer["id"], "occurrence_id": occurrence_id, "status": "uncertain", "detail": detail})
-            report = {"at": now, "timers": results, "supports_idle": True,
+            report = {"at": now, "timers": results, "supports_idle": True, "supports_quota": True,
                       "worker_pid": os.getpid(), "worker_token": os.environ.get("STARFLEET_HF_WORKER_TOKEN")}
             import hailing_frequencies as hf
             hf.atomic_json(self.directory / "timer-last-scan.json", report)

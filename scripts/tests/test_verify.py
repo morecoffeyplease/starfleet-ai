@@ -84,15 +84,15 @@ class VerificationRunnerTests(unittest.TestCase):
                 self.assertFalse(verify.python_verification_succeeded(result, "success"))
                 with contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(
-                        verify.main(["--require-python-results", result, "success"]), 1
+                        verify.main(["--all", "--require-python-results", result, "success"]), 1
                     )
             with self.subTest(preparation_result=result):
                 self.assertFalse(verify.python_verification_succeeded("success", result))
                 with contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(
-                        verify.main(["--require-python-results", "success", result]), 1
+                        verify.main(["--all", "--require-python-results", "success", result]), 1
                     )
-        self.assertEqual(verify.main(["--require-python-results", "success", "success"]), 0)
+        self.assertEqual(verify.main(["--all", "--require-python-results", "success", "success"]), 0)
 
     def test_single_component_mode_skips_markup(self):
         with (
@@ -110,8 +110,8 @@ class VerificationRunnerTests(unittest.TestCase):
             mock.patch.object(verify, "verify_python", return_value=[]) as verify_python,
             mock.patch.object(verify, "verify_markup", return_value=[]) as verify_markup,
         ):
-            self.assertEqual(verify.main([]), 0)
-            self.assertEqual(verify.main(["--python-only"]), 0)
+            self.assertEqual(verify.main(["--all"]), 0)
+            self.assertEqual(verify.main(["--all", "--python-only"]), 0)
         self.assertEqual(runner_tests.call_count, 2)
         verify_python.assert_has_calls([mock.call(None), mock.call(None)])
         verify_markup.assert_called_once_with()

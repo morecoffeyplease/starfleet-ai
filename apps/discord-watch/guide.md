@@ -111,16 +111,30 @@ Unsealed messages can be assigned to the new generation, while a group never com
 An unexplained generation change without a matching ownership-event chain holds the affected groups.
 Uncertain submissions are never retried automatically.
 
+### Recover a moved Claude or Codex session
+
+From the same native session, verify its Hailing enrollment on the current CMUX pane and workspace.
+Then run `discord-watch recover THREAD_ID` and confirm the exact owner with `discord-watch managed THREAD_ID`.
+Recovery checks the explicit session ID, live CMUX projection, hook generation, and native receiving settings even if your shell still carries the previous workspace ID.
+It leaves the cursor, thread state, replies, and previous delivery attempts intact.
+A repeated recovery of the current binding makes no changes.
+If the hook generation changed, keep the existing ownership and follow the explicit custody adoption procedure below.
+If the session ID changed, use the authorized transfer route.
+If needed, use `discord-watch scan --only-thread THREAD_ID` for observe-only REST catch-up on that thread.
+A local recovery receipt verifies the binding update.
+Use the actual `receive` command to verify that an incoming reply reached you.
+
 ## Explicit current-generation custody adoption
 
-Use custody adoption only for an externally approved, enumerated set of existing obligations when the old native process generation is unavailable.
+Use custody adoption for an operator-approved set of existing obligations when the same native session, pane, and workspace have a changed hook generation.
 The operation records an explicit assignment to the verified current generation and never claims that the old and current generations are one continuous process.
 The old Hailing Frequencies and Discord Watch records do not retain the old canonical worktree for Claude or Codex, so the preview labels that historical worktree as unrecorded.
 The current worktree is read from the current native hook record and checked by the existing exact CMUX binding.
 An approval reference is a cooperative private audit record, not authenticated proof of human approval.
 Select one or more exact Discord Watch thread IDs or Temporal timer UUIDs, and the operation includes the exact Hailing Frequencies session registration.
 One operation can select at most 24 threads and timers combined.
-No unselected thread or timer is adopted.
+Unselected threads and timers keep their old owner generation and require separate disposition.
+Include every approved obligation for the old generation in the plan before applying it, because the Hailing enrollment advances when the plan commits.
 
 Run the preview from the current owner after an operator has approved the exact resource scope:
 

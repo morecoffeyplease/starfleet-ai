@@ -91,8 +91,12 @@ def locked(directory):
 
 
 ROLES = ("orchestrator", "implementer", "researcher", "standard_review", "advanced_review")
+POLICY_REVIEW_ROLES = ("complex_initial_review", "skeptical_review")
+DISPATCH_ROLES = (*ROLES, *POLICY_REVIEW_ROLES)
 LIGHT_PROFILE = "claude-codex-light"
+REVIEW_POLICY_PROFILES = ("Codex-only", "Claude-only", "Claude-Codex", LIGHT_PROFILE)
 LIGHT_REVIEW_POLICY = {"initial_slots": [1, 2], "later_slots": [1]}
+REVIEW_POLICY_VERSION = 1
 REVIEW_TARGET_SCHEMA = 1
 QWEN_OBSERVER_GUIDE_URL = (
     "https://github.com/morecoffeyplease/starfleet-ai/blob/main/docs/qwen-operating-guide.md"
@@ -153,7 +157,7 @@ def example_config():
     light = profile("claude-opus", "codex-luna", ["codex-sol", "claude-opus"],
                     ["claude-fable", "codex-astra"])
     light["standard_review_policy"] = copy.deepcopy(LIGHT_REVIEW_POLICY)
-    return {"schema_version": 1, "active": None, "activation": None, "models": models, "profiles": {
+    profiles = {
         "Claude-Codex": profile("claude-opus", "codex-luna", ["codex-sol", "claude-opus"],
                                 ["claude-fable", "codex-astra"]),
         LIGHT_PROFILE: light,
@@ -165,7 +169,27 @@ def example_config():
                        "standard_review": [sol_high], "advanced_review": [sol_high]},
         "Qwen-only": {"orchestrator": qwen_max, "implementer": qwen_max, "researcher": qwen_max,
                       "standard_review": [sol_high], "advanced_review": [sol_high]},
-    }, "approval_authority": {"label": None}, "review_rules": {"file_threshold": 10,
+    }
+
+    def review_policy(complex_initial, skeptical):
+        return {"version": REVIEW_POLICY_VERSION,
+                "complex_initial": [copy.deepcopy(choice) for choice in complex_initial],
+                "skeptical_proposal": [copy.deepcopy(choice) for choice in skeptical]}
+
+    profiles["Codex-only"]["review_policy"] = review_policy(
+        [{"model": "codex-astra", "effort": "high"}],
+        [{"model": "codex-astra", "effort": "high"}])
+    profiles["Claude-only"]["review_policy"] = review_policy(
+        [{"model": "claude-fable", "effort": "high"}],
+        [{"model": "claude-fable", "effort": "high"}])
+    profiles["Claude-Codex"]["review_policy"] = review_policy(
+        [{"model": "codex-astra", "effort": "high"}, {"model": "claude-opus", "effort": "high"}],
+        [{"model": "claude-fable", "effort": "high"}])
+    profiles[LIGHT_PROFILE]["review_policy"] = review_policy(
+        [{"model": "codex-astra", "effort": "high"}, {"model": "claude-opus", "effort": "high"}],
+        [{"model": "codex-astra", "effort": "high"}])
+    return {"schema_version": 1, "active": None, "activation": None, "models": models, "profiles": profiles,
+            "approval_authority": {"label": None}, "review_rules": {"file_threshold": 10,
         "money_paths": ["**/money/**", "**/payments/**", "**/pricing/**"],
         "time_zone_paths": ["**/timezone/**", "**/timezones/**", "**/time-zone/**"],
         "excluded_paths": ["docs/**", "**/docs/**", "**/test/**", "**/tests/**",
@@ -179,6 +203,26 @@ def initial_config():
     config = example_config()
     config.update(models={}, profiles={})
     return config
+
+
+def suggested_review_policy(profile_name, profile):
+    require(profile_name in REVIEW_POLICY_PROFILES,
+            "Policy migration supports Codex-only, Claude-only, Claude-Codex, and claude-codex-light only.")
+    standard = profile.get("standard_review")
+    advanced = profile.get("advanced_review")
+    require(isinstance(standard, list) and isinstance(advanced, list),
+            "Review policy migration needs the saved standard_review and advanced_review groups.")
+    if profile_name in ("Codex-only", "Claude-only"):
+        require(advanced, "Review policy migration needs one saved advanced reviewer.")
+        complex_initial = [copy.deepcopy(advanced[0])]
+        skeptical = [copy.deepcopy(advanced[0])]
+    else:
+        require(len(standard) == 2 and len(advanced) == 2,
+                "Review policy migration needs two saved standard and advanced choices; inspect and edit the profile before retrying.")
+        complex_initial = [copy.deepcopy(advanced[1]), copy.deepcopy(standard[1])]
+        skeptical = [copy.deepcopy(advanced[1] if profile_name == LIGHT_PROFILE else advanced[0])]
+    return {"version": REVIEW_POLICY_VERSION, "complex_initial": complex_initial,
+            "skeptical_proposal": skeptical}
 
 
 def require(condition, message):
@@ -210,8 +254,9 @@ def validate(config):
         else:
             require("provider_id" not in model, f"Only OpenCode models may define provider_id ({key}).")
     for name, profile in profiles.items():
-        expected_keys = set(ROLES) | ({"standard_review_policy"} if isinstance(profile, dict)
-                                     and "standard_review_policy" in profile else set())
+        metadata_keys = {key for key in ("standard_review_policy", "review_policy")
+                         if isinstance(profile, dict) and key in profile}
+        expected_keys = set(ROLES) | metadata_keys
         require(isinstance(name, str) and name and isinstance(profile, dict) and set(profile) == expected_keys
                 and set(ROLES).issubset(profile),
                 f"Profile {name} must define exactly {', '.join(ROLES)} and supported policy metadata.")
@@ -227,7 +272,7 @@ def validate(config):
                     and all(isinstance(entry, dict) for entry in reviewers),
                     f"{name}/standard_review_policy requires two configured reviewers.")
             first, second = [models.get(entry.get("model"), {}) for entry in reviewers]
-            require(first.get("harness") == "codex" and first.get("slug") == "gpt-6.1-sol"
+            require(first.get("harness") == "codex" and first.get("slug") in ("gpt-6.1-sol", "gpt-6.2-sol")
                     and reviewers[0].get("effort") == "high"
                     and second.get("harness") == "claude" and second.get("slug") == "claude-opus-5-5"
                     and reviewers[1].get("effort") == "high",
@@ -262,6 +307,38 @@ def validate(config):
                         require(m["harness"] == "opencode" and entry["model"] == "local-qwen3.6-35b"
                                 and entry["effort"] == "max",
                                 f"{name}/{role} requires the exact local Qwen OpenCode model at max effort.")
+        if "review_policy" in profile:
+            policy = profile["review_policy"]
+            require(name in REVIEW_POLICY_PROFILES,
+                    f"{name}/review_policy is supported only for Codex-only, Claude-only, Claude-Codex, and claude-codex-light profiles.")
+            require(type(policy) is dict and set(policy) == {"version", "complex_initial", "skeptical_proposal"}
+                    and policy.get("version") == REVIEW_POLICY_VERSION,
+                    f"{name}/review_policy has an unsupported shape; use review-policy-migrate or profile-put.")
+            for key in ("complex_initial", "skeptical_proposal"):
+                choices = policy[key]
+                require(type(choices) is list and len(choices) in (1, 2),
+                        f"{name}/review_policy/{key} must configure one or two saved reviewer choices.")
+                for entry in choices:
+                    require(type(entry) is dict and set(entry) == {"model", "effort"}
+                            and entry["model"] in models and entry["effort"] in models[entry["model"]]["efforts"],
+                            f"{name}/review_policy/{key} must use configured model families and supported effort values.")
+            complex_choices = policy["complex_initial"]
+            skeptical_choices = policy["skeptical_proposal"]
+            expected_complex_count = (1 if name in ("Codex-only", "Claude-only") else 2
+                                      if name in ("Claude-Codex", LIGHT_PROFILE) else len(complex_choices))
+            require(len(complex_choices) == expected_complex_count and len(skeptical_choices) == 1,
+                    f"{name}/review_policy requires {expected_complex_count} complex reviewer(s) and one skeptical reviewer.")
+            complex_harnesses = [models[entry["model"]]["harness"] for entry in complex_choices]
+            skeptical_harness = models[skeptical_choices[0]["model"]]["harness"]
+            expected_harnesses = {
+                "Codex-only": (["codex"], "codex"),
+                "Claude-only": (["claude"], "claude"),
+                "Claude-Codex": (["codex", "claude"], "claude"),
+                LIGHT_PROFILE: (["codex", "claude"], "codex"),
+            }.get(name)
+            if expected_harnesses:
+                require(complex_harnesses == expected_harnesses[0] and skeptical_harness == expected_harnesses[1],
+                        f"{name}/review_policy must follow the configured provider and reviewer-count policy.")
     authority = config.get("approval_authority")
     require(isinstance(authority, dict) and set(authority) == {"label"} and
             (authority.get("label") is None or
@@ -294,7 +371,21 @@ def selection(config):
               "approval_authority": config["approval_authority"]}
     if "standard_review_policy" in profile:
         result["standard_review_policy"] = profile["standard_review_policy"]
+    if "review_policy" in profile:
+        policy = profile["review_policy"]
+        result["review_policy"] = {
+            "version": policy["version"],
+            "complex_initial": [resolve_policy_choice(config, name, entry) for entry in policy["complex_initial"]],
+            "skeptical_proposal": [resolve_policy_choice(config, name, entry) for entry in policy["skeptical_proposal"]],
+        }
     return {**result, "selection": digest({**result, "activation": config.get("activation")})}
+
+
+def resolve_policy_choice(config, profile_name, entry):
+    model = config["models"][entry["model"]]
+    return {"family": entry["model"], "harness": model["harness"], "model": model["slug"],
+            "effort": entry["effort"], "contributor_mode": model["harness"] == "muse",
+            **({"provider_id": model["provider_id"]} if model["harness"] == "opencode" else {})}
 
 
 def configured_authority(config):
@@ -381,7 +472,7 @@ class App(CmuxTransport):
                 "Caller needs one unambiguous active native owner; nothing changed.")
         return {**recipient, "session": agents[0]["session_id"], "harness": agents[0]["kind"]}
 
-    def notify(self, snapshot, policy, retry=False):
+    def notify(self, snapshot, policy, retry=False, exclusions=()):
         with locked(self.config_dir):
             require(selection(self.config())["selection"] == snapshot["selection"], "Profile changed; notify the current selection instead.")
             recipients = self.state("orchestrators", {})
@@ -389,7 +480,10 @@ class App(CmuxTransport):
             if not retry or notice.get("selection") != snapshot["selection"]:
                 notice = {"selection": snapshot["selection"], "profile": snapshot["profile"],
                           "orchestrators": policy, "recipients": {}, "created_at": now()}
+                if exclusions:
+                    notice["excluded_orchestrators"] = list(exclusions)
                 self.save_state("notification", notice)
+            excluded = set(notice.get("excluded_orchestrators", ()))
         try:
             current = self.current()
         except PreferenceError as exc:
@@ -397,6 +491,8 @@ class App(CmuxTransport):
             error = str(exc)
         results = {}
         for identity, recipient in recipients.items():
+            if identity in excluded:
+                continue
             if (retry and notice["recipients"].get(identity, {}).get("status") == "queued" and
                     same_recipient(notice["recipients"][identity].get("recipient"), recipient)):
                 previous = notice["recipients"][identity]
@@ -574,6 +670,61 @@ def review_scope(config, cwd, base, facts):
                              "rules": rules})}
 
 
+def bounded_document(path, description):
+    try:
+        absolute = Path(path).expanduser().resolve(strict=True)
+        data = absolute.read_bytes()
+        text = data.decode("utf-8")
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        raise PreferenceError(f"Cannot read {description} as UTF-8: {exc}") from None
+    require(0 < len(data) <= 16384 and text.strip(),
+            f"{description.capitalize()} must be 1 to 16384 bytes of nonempty UTF-8.")
+    return {"path": str(absolute), "sha256": hashlib.sha256(data).hexdigest(), "text": text}
+
+
+def bind_plan_target(app, plan, cwd, target_id):
+    target_id = review_target_id(target_id)
+    target = load_target(app, target_id)
+    require(repository_identity(cwd) == target["repository"],
+            "Review worktree belongs to a different repository than the target.")
+    plan.update(review_target=target_id, review_repository=target["repository"])
+    return target
+
+
+def apply_review_purpose(app, config, args, plan):
+    active = selection(config)
+    purpose = args.purpose or ("later" if args.previous_cycle else "initial")
+    plan["purpose"] = purpose
+    plan["classification"] = "complex" if plan["reasons"] else "straightforward"
+    if purpose == "skeptical_proposal":
+        require(not args.cycle_key and not args.previous_cycle,
+                "A skeptical proposal review is bound to its target and proposal, not a review-cycle ordinal.")
+        require(args.target,
+                "A skeptical proposal review needs the existing PR review target; create it with review-target create.")
+        require(isinstance(active.get("review_policy"), dict),
+                f"{active['profile']} has no adopted review policy. Run review-policy-migrate {active['profile']} and review the saved-choice mapping first.")
+        proposal = bounded_document(args.proposal_file, "proposal")
+        bind_plan_target(app, plan, args.cwd, args.target)
+        plan.update(role="skeptical_review", proposal_path=proposal["path"],
+                    proposal_sha256=proposal["sha256"],
+                    policy_choices=copy.deepcopy(active["review_policy"]["skeptical_proposal"]))
+        return plan
+    require(not args.proposal_file,
+            "--proposal-file applies only to --purpose skeptical_proposal.")
+    if args.target:
+        bind_plan_target(app, plan, args.cwd, args.target)
+    if purpose == "initial" and plan["classification"] == "complex":
+        if active["profile"] in ("Codex-only", "Claude-only", "Claude-Codex", LIGHT_PROFILE):
+            require(isinstance(active.get("review_policy"), dict),
+                    f"{active['profile']} needs its explicit review policy before initial complex review. Run review-policy-migrate {active['profile']}, inspect the saved-choice mapping, then apply it.")
+            if active["profile"] == LIGHT_PROFILE:
+                require(args.target and args.cycle_key,
+                        "claude-codex-light complex initial reviews require --target and --cycle-key so the completed initial panel is the target's first cycle.")
+            plan.update(role="complex_initial_review",
+                        policy_choices=copy.deepcopy(active["review_policy"]["complex_initial"]))
+    return plan
+
+
 def review_summary(plan):
     """Bound terminal output only; full scope and content hashing remain unchanged."""
     result = {key: value for key, value in plan.items() if key != "selection_snapshot"}
@@ -618,26 +769,58 @@ def review_approval_decisions(app, plan):
     if not directory.is_dir():
         return [], "available"
     decisions = []
+
+    def is_digest(value):
+        return (isinstance(value, str) and len(value) == 64
+                and all(character in "0123456789abcdef" for character in value))
+
+    identity_fields = ("scope", "selection")
     for path in sorted(directory.glob("*.json")):
         try:
             approval = read(path)
         except (OSError, ValueError, TypeError, PreferenceError):
             return decisions, "unknown"
-        required = {"id", "scope", "selection", "authority", "authorization", "at", "role"}
-        if not isinstance(approval, dict) or not required.issubset(approval):
+        if not isinstance(approval, dict):
             return decisions, "unknown"
-        if (approval.get("scope") == plan.get("scope")
-                and approval.get("selection") == plan.get("selection")
-                and approval.get("role") in ("advanced_review", "standard_review")):
+        if any(not is_digest(approval.get(field)) or not is_digest(plan.get(field))
+               for field in identity_fields):
+            return decisions, "unknown"
+        if any(approval[field] != plan[field] for field in identity_fields):
+            continue
+        required = {"id", "scope", "selection", "authority", "authorization", "at", "role"}
+        if not required.issubset(approval):
+            return decisions, "unknown"
+        if "purpose" in approval or "plan_id" in approval or "proposal_sha256" in approval:
+            if not all(key in approval for key in ("purpose", "plan_id")):
+                return decisions, "unknown"
+            if (approval.get("purpose") != plan.get("purpose")
+                    or approval.get("plan_id") != plan.get("id")):
+                continue
+            expected_proposal = plan.get("proposal_sha256")
+            if approval.get("proposal_sha256") != expected_proposal:
+                return decisions, "unknown"
+        elif plan.get("purpose") == "skeptical_proposal":
+            continue
+        if approval.get("role") in ("advanced_review", "standard_review", "skeptical_review",
+                                      "skeptical_review_declined", "skeptical_review_route",
+                                      "repair_continuation"):
             decisions.append({"id": approval.get("id", path.stem),
                               "review_role": approval["role"],
+                              "decision": approval.get("decision"),
+                              "purpose": approval.get("purpose"),
+                              "plan_id": approval.get("plan_id"),
+                              "proposal_sha256": approval.get("proposal_sha256"),
+                              "review_result_sha256": approval.get("review_result_sha256"),
+                              "continuation_batch_sha256": approval.get("continuation_batch_sha256"),
+                              "skeptical_approval_id": approval.get("skeptical_approval_id"),
+                              "route": approval.get("route"),
                               "authority": approval.get("authority"),
                               "recorded_at": approval.get("at")})
     return decisions, "available"
 
 
 def review_cycle_slots(app, plan):
-    if plan.get("role") != "standard_review" or not plan.get("review_target") or not plan.get("review_cycle"):
+    if plan.get("role") not in ("standard_review", "complex_initial_review") or not plan.get("review_target") or not plan.get("review_cycle"):
         return None, "not_applicable"
     try:
         target = load_target(app, plan["review_target"])
@@ -654,6 +837,65 @@ def review_cycle_slots(app, plan):
     return cycle, "saved_cycle"
 
 
+def policy_review_launches(app, plan):
+    directory = app.state_dir / "launches"
+    if not directory.is_dir():
+        return [], "available"
+    launches = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            launch = read(path)
+        except (OSError, ValueError, TypeError, PreferenceError):
+            return launches, "unknown"
+        if not isinstance(launch, dict):
+            return launches, "unknown"
+        binding = launch.get("review_plan_binding")
+        if not isinstance(binding, dict) or binding.get("plan_id") != plan.get("id"):
+            continue
+        choices = plan.get("policy_choices")
+        slot = launch.get("slot")
+        require(isinstance(choices, list) and type(slot) is int and 1 <= slot <= len(choices),
+                "Review-plan launch slot is missing from the frozen reviewer set; inspect before continuing.")
+        expected = {"plan_id": plan.get("id"), "purpose": plan.get("purpose"),
+                    "scope": plan.get("scope"), "selection": plan.get("selection"),
+                    "role": plan.get("role"), "slot": slot,
+                    "review_target": plan.get("review_target"),
+                    "proposal_sha256": plan.get("proposal_sha256")}
+        expected_choice = {"profile": plan.get("selection_snapshot", {}).get("profile"),
+                           "selection": plan.get("selection"), "role": plan.get("role"),
+                           **choices[slot - 1]}
+        require(all(binding.get(key) == value for key, value in expected.items())
+                and launch.get("choice") == expected_choice,
+                "A review-plan launch record conflicts with its saved scope, purpose, selection, or proposal; inspect before continuing.")
+        launches.append(launch)
+    return sorted(launches, key=lambda item: (item.get("created_at", ""), item.get("id", ""))), "available"
+
+
+def bound_policy_approval(app, plan, approval_id, decision):
+    approval = app.state(f"approvals/{safe_id(approval_id)}", None)
+    require(isinstance(approval, dict)
+            and approval.get("scope") == plan.get("scope")
+            and approval.get("selection") == plan.get("selection")
+            and approval.get("plan_id") == plan.get("id")
+            and approval.get("purpose") == plan.get("purpose")
+            and approval.get("proposal_sha256") == plan.get("proposal_sha256")
+            and approval.get("decision") == decision,
+            "Decision does not match this exact review plan, purpose, scope, profile selection, and proposal.")
+    return approval
+
+
+def approval_decision(app, plan, decision):
+    decisions, status = review_approval_decisions(app, plan)
+    if status != "available":
+        return None, status
+    matches = [item for item in decisions if item.get("decision") == decision
+               and item.get("plan_id") == plan.get("id")
+               and item.get("purpose") == plan.get("purpose")
+               and item.get("proposal_sha256") == plan.get("proposal_sha256")]
+    match = max(matches, key=lambda item: item.get("recorded_at", ""), default=None)
+    return match, status
+
+
 def review_freshness(config, plan):
     try:
         active = selection(config)
@@ -667,13 +909,23 @@ def review_freshness(config, plan):
         scope_status = "unknown"
     else:
         scope_status = "current" if current["scope"] == plan.get("scope") else "stale"
-    if "stale" in (selection_status, scope_status):
+    proposal_status = "not_applicable"
+    if plan.get("purpose") == "skeptical_proposal":
+        try:
+            saved_proposal = bounded_document(plan.get("proposal_path"), "proposal")
+        except (OSError, PreferenceError, ValueError, TypeError, KeyError):
+            proposal_status = "unknown"
+        else:
+            proposal_status = ("current" if saved_proposal["sha256"] == plan.get("proposal_sha256")
+                               else "stale")
+    if "stale" in (selection_status, scope_status, proposal_status):
         status = "stale"
-    elif "unknown" in (selection_status, scope_status):
+    elif "unknown" in (selection_status, scope_status, proposal_status):
         status = "unknown"
     else:
         status = "current"
-    return {"status": status, "selection": selection_status, "scope": scope_status}
+    return {"status": status, "selection": selection_status, "scope": scope_status,
+            "proposal": proposal_status}
 
 
 def review_guidance(app, config, plan):
@@ -694,10 +946,14 @@ def review_guidance(app, config, plan):
         freshness["status"] = "stale"
 
     classification_role = plan.get("role")
-    requires_approval = classification_role == "advanced_review"
+    requires_approval = classification_role in ("advanced_review", "skeptical_review")
     decisions, decisions_status = review_approval_decisions(app, plan)
     advanced_approval = next((item for item in decisions if item["review_role"] == "advanced_review"), None)
     standard_instead = next((item for item in decisions if item["review_role"] == "standard_review"), None)
+    skeptical_approval = next((item for item in decisions if item.get("decision") == "skeptical_review"), None)
+    skeptical_decline = next((item for item in decisions if item.get("decision") == "skeptical_review_declined"), None)
+    skeptical_route = next((item for item in decisions if item.get("decision") == "review_route"), None)
+    continuation = next((item for item in decisions if item.get("decision") == "repair_continuation"), None)
     if freshness["status"] == "stale":
         approval_status = "not_required" if not requires_approval else "stale"
     elif decisions_status == "unknown":
@@ -731,6 +987,10 @@ def review_guidance(app, config, plan):
     elif saved_selection is not None and dispatch_role in ROLES and dispatch_role.endswith("_review"):
         for slot, choice in enumerate(saved_selection.get("roles", {}).get(dispatch_role, []), 1):
             reviewer_choices.append(describe_choice(slot, choice))
+    elif saved_selection is not None and dispatch_role in POLICY_REVIEW_ROLES:
+        policy_key = "complex_initial" if dispatch_role == "complex_initial_review" else "skeptical_proposal"
+        for slot, choice in enumerate(saved_selection.get("review_policy", {}).get(policy_key, []), 1):
+            reviewer_choices.append(describe_choice(slot, choice))
 
     if classification_role == "advanced_review" and freshness["status"] == "current":
         if approval_status == "multiple_decisions":
@@ -745,6 +1005,8 @@ def review_guidance(app, config, plan):
     if saved_selection is not None:
         for role in option_roles:
             if role == dispatch_role and cycle is not None:
+                choices = reviewer_choices
+            elif role in POLICY_REVIEW_ROLES:
                 choices = reviewer_choices
             else:
                 choices = [describe_choice(slot, choice) for slot, choice in
@@ -813,11 +1075,130 @@ def review_guidance(app, config, plan):
         if command and " dispatch " in command:
             command += ' --review-authorization "<fresh operator authorization>"'
 
+    continuation_status = "not_applicable"
+    policy_launch_status = "not_applicable"
+    if classification_role in POLICY_REVIEW_ROLES:
+        try:
+            policy_launches, policy_launch_status = policy_review_launches(app, plan)
+        except (OSError, PreferenceError, ValueError, KeyError, TypeError):
+            policy_launches, policy_launch_status = [], "unknown"
+        latest_policy_launch = policy_launches[-1] if policy_launches else None
+    else:
+        latest_policy_launch = None
+    if classification_role == "complex_initial_review":
+        approval_status = "not_required"
+        if freshness["status"] == "current" and policy_launch_status == "available":
+            next_action = "This configured initial-complex panel is an approved profile default. Dispatch each saved slot; no per-PR approval is required."
+            next_role = "complex_initial_review"
+            command = (f"{prefix} dispatch --role complex_initial_review --slot <slot> --cwd "
+                       f"{shlex.quote(str(plan.get('root', '<worktree>')))} --task-file <review-brief> "
+                       f"--review-plan {plan_id}")
+            if plan.get("review_target"):
+                command += f" --review-target {shlex.quote(plan['review_target'])}"
+            if plan.get("review_cycle"):
+                command += f" --review-cycle {shlex.quote(plan['review_cycle'])}"
+        elif policy_launch_status != "available":
+            next_action = "Review launch records could not be verified. Inspect local launch state before dispatch."
+            next_role = None
+            command = None
+    elif classification_role == "skeptical_review":
+        continuation_status = ("approved" if continuation else "missing")
+        if skeptical_approval and skeptical_decline:
+            approval_status = "conflicting_decisions"
+        elif continuation and (skeptical_approval or skeptical_decline):
+            approval_status = "continuation_approved"
+        elif skeptical_route and skeptical_decline:
+            approval_status = "routed"
+        elif skeptical_decline:
+            approval_status = "declined"
+        elif freshness["status"] != "current":
+            approval_status = "stale" if freshness["status"] == "stale" else "unknown"
+        elif decisions_status != "available" or policy_launch_status != "available":
+            approval_status = "unknown"
+        elif not skeptical_approval:
+            approval_status = "missing"
+        elif latest_policy_launch is None:
+            approval_status = "approved"
+        elif latest_policy_launch.get("status") != "exited" or type(latest_policy_launch.get("exit_code")) is not int:
+            approval_status = "launch_unresolved"
+        elif latest_policy_launch["exit_code"] != 0:
+            approval_status = "review_failed"
+        elif continuation:
+            approval_status = "continuation_approved"
+        else:
+            approval_status = "review_complete"
+
+        if freshness["status"] != "current":
+            next_action = "The skeptical plan is stale or unknown. Refresh the scope, profile selection, and proposal before asking for a decision."
+            next_role = None
+            command = None
+        elif authority_status == "unset":
+            next_action = "Configure the actual human approval authority, then create a fresh plan because the profile selection changes."
+            next_role = None
+            command = f'{prefix} authority-set "<human approval authority label>" --orchestrators future-only'
+        elif approval_status == "missing":
+            next_action = ("Ask the configured human authority whether they want this single skeptical proposal review. "
+                           "A decline may record a revert or defer route; repairs need a separate bounded continuation decision.")
+            next_role = None
+            command = (f'{prefix} approve-review {plan_id} --authorization "<recorded explicit decision>"')
+        elif approval_status == "declined":
+            next_action = ("The configured human authority declined the skeptical model review. No reviewer launch is authorized. "
+                           "Record a separate bounded continuation, revert, or defer decision before taking that route.")
+            next_role = None
+            command = None
+        elif approval_status == "routed":
+            next_action = (f"After declining the skeptical review, the configured human authority selected {skeptical_route.get('route')}. "
+                           "No reviewer launch or repair continuation is authorized by this route record.")
+            next_role = None
+            command = None
+        elif approval_status == "approved":
+            next_action = (f"Use skeptical-review approval {skeptical_approval['id']} for the single configured reviewer. "
+                           "This approval authorizes only this review, not a repair batch.")
+            next_role = "skeptical_review"
+            command = (f"{prefix} dispatch --role skeptical_review --slot 1 --cwd "
+                       f"{shlex.quote(str(plan.get('root', '<worktree>')))} --task-file <proposal-review-brief> "
+                       f"--review-plan {plan_id} --approval {skeptical_approval['id']} "
+                       f"--review-target {shlex.quote(plan.get('review_target', '<target>'))} "
+                       f"--proposal-file {shlex.quote(plan.get('proposal_path', '<proposal-file>'))}")
+        elif approval_status == "launch_unresolved":
+            next_action = ("A skeptical reviewer launch is active or uncertain. Inspect the exact launch before any retry or continuation decision.")
+            next_role = None
+            command = f"{prefix} launch-inspect {latest_policy_launch['id']}"
+        elif approval_status == "review_failed":
+            next_action = ("The skeptical reviewer exited unsuccessfully. Inspect its recorded result before retrying or choosing a separate bounded route.")
+            next_role = None
+            command = f"{prefix} launch-inspect {latest_policy_launch['id']}"
+        elif approval_status == "review_complete":
+            next_action = ("Review the recommendation and unresolved disagreement with the configured human authority. "
+                           "Repairs resume only after a distinct bounded continuation decision that names the exact batch.")
+            next_role = None
+            command = (f'{prefix} approve-review {plan_id} --continue-repair '
+                       '--authorization "<recorded bounded decision>" '
+                       '--review-result-file <skeptical-review-result> '
+                       '--continuation-batch-file <exact-bounded-repair-batch>')
+        elif approval_status == "continuation_approved":
+            next_action = (f"Bounded continuation approval {continuation['id']} follows the skeptical review. "
+                           "It authorizes only the recorded batch; it does not claim to intercept undeclared edits.")
+            next_role = None
+            command = None
+        elif approval_status == "conflicting_decisions":
+            next_action = "Both skeptical approval and decline records exist for this plan. Resolve the conflicting human decisions before continuing."
+            next_role = None
+            command = None
+        else:
+            next_action = "Approval or review-launch state is unknown. Inspect the saved records before continuing."
+            next_role = None
+            command = None
+
     return {"plan_status": freshness["status"], "selection_status": freshness["selection"],
             "scope_status": freshness["scope"], "selection_source": selection_source,
+            "purpose": plan.get("purpose"), "classification": plan.get("classification"),
+            "proposal_status": freshness.get("proposal"),
             "classification_role": classification_role, "review_role": next_role or dispatch_role,
             "review_slots": reviewer_choices, "review_options": review_options,
             "approval_required": requires_approval, "approval_status": approval_status,
+            "continuation_status": continuation_status,
+            "review_launch_status": policy_launch_status,
             "approval_authority": {"status": authority_status, "label": authority},
             "fresh_review_authorization_required": fresh_review_authorization_required,
             "approval_records_status": decisions_status, "review_cycle_status": cycle_status,
@@ -989,6 +1370,8 @@ def cycle_summary(app, target, cycle):
                       "status": status, "launch": launch_id})
     return {"id": cycle["id"], "key": cycle["key"],
             "previous_cycle_id": cycle["previous_cycle_id"],
+            "purpose": cycle.get("purpose", "initial" if cycle["previous_cycle_id"] is None else "later"),
+            "classification": cycle.get("classification", "straightforward"),
             "plan_id": cycle["current_plan"]["id"], "scope": cycle["current_plan"]["scope"],
             "slots": slots, "complete": all(slot["status"] == "complete" for slot in slots)}
 
@@ -1059,7 +1442,10 @@ def cycle_review_context(app, config, args, cwd=None):
     require(active["profile"] == LIGHT_PROFILE and cycle["profile"] == LIGHT_PROFILE
             and active["selection"] == cycle["selection"] == plan.get("selection"),
             "Current profile selection does not match this review cycle.")
-    require(plan.get("role") == "standard_review" and plan.get("review_target") == target_id
+    purpose = cycle.get("purpose", "initial" if cycle["previous_cycle_id"] is None else "later")
+    classification = cycle.get("classification", "straightforward")
+    expected_role = "complex_initial_review" if purpose == "initial" and classification == "complex" else "standard_review"
+    require(plan.get("role") == expected_role and plan.get("review_target") == target_id
             and plan.get("review_cycle") == cycle_id
             and plan.get("review_cycle_key") == cycle["key"]
             and plan.get("review_repository") == target["repository"]
@@ -1074,7 +1460,7 @@ def cycle_review_context(app, config, args, cwd=None):
         requested_slot = cycle["slots"][0]["number"]
     slot = next((item for item in cycle["slots"] if item["number"] == requested_slot), None)
     require(slot, "Reviewer slot is not required by this review cycle.")
-    choice = resolve(active, "standard_review", requested_slot)
+    choice = resolve(active, expected_role, requested_slot)
     require(choice == slot["choice"],
             "Configured reviewer choice conflicts with the frozen review cycle slot.")
     return target, cycle, plan, slot, choice
@@ -1119,6 +1505,14 @@ def make_light_review_plan(app, config, args, plan):
                         "A reviewer launch is active or uncertain; review plan refresh is held.")
         cycle_id = cycle["id"]
         previous_cycle = cycle["previous_cycle_id"]
+        purpose = cycle.get("purpose", "initial" if previous_cycle is None else "later")
+        classification = cycle.get("classification", "straightforward")
+        role = "complex_initial_review" if purpose == "initial" and classification == "complex" else "standard_review"
+        plan.update(purpose=purpose, classification=classification, role=role)
+        if role == "complex_initial_review":
+            plan["policy_choices"] = copy.deepcopy(active["review_policy"]["complex_initial"])
+        else:
+            plan.pop("policy_choices", None)
     else:
         if target["cycles"]:
             previous = target["cycles"][-1]
@@ -1128,9 +1522,23 @@ def make_light_review_plan(app, config, args, plan):
             slots = LIGHT_REVIEW_POLICY["later_slots"]
             predecessor = completed
             previous_cycle = previous["id"]
+            purpose = "later"
+            classification = plan["classification"]
+            role = "standard_review"
+            plan.update(purpose=purpose, classification=classification, role=role)
+            plan.pop("policy_choices", None)
         else:
             require(args.previous_cycle is None, "The first review cycle cannot name a predecessor.")
-            slots = LIGHT_REVIEW_POLICY["initial_slots"]
+            purpose = "initial"
+            classification = plan["classification"]
+            role = "complex_initial_review" if classification == "complex" else "standard_review"
+            plan.update(purpose=purpose, classification=classification, role=role)
+            if role == "complex_initial_review":
+                plan["policy_choices"] = copy.deepcopy(active["review_policy"]["complex_initial"])
+                slots = list(range(1, len(plan["policy_choices"]) + 1))
+            else:
+                plan.pop("policy_choices", None)
+                slots = LIGHT_REVIEW_POLICY["initial_slots"]
             predecessor = None
             previous_cycle = None
         orphaned = find_cycle_plans(app, target_id, cycle_key)
@@ -1146,7 +1554,8 @@ def make_light_review_plan(app, config, args, plan):
         cycle = {"id": cycle_id, "key": cycle_key, "previous_cycle_id": previous_cycle,
                  "predecessor": predecessor, "profile": LIGHT_PROFILE,
                  "selection": active["selection"], "policy": copy.deepcopy(LIGHT_REVIEW_POLICY),
-                 "slots": [{"number": slot, "choice": resolve(active, "standard_review", slot), "launches": []}
+                 "purpose": purpose, "classification": classification,
+                 "slots": [{"number": slot, "choice": resolve(active, role, slot), "launches": []}
                            for slot in slots],
                  "prior_plans": [], "current_plan": {"id": plan["id"], "scope": plan["scope"]}}
     if cycle and cycle["current_plan"]["scope"] != plan["scope"]:
@@ -1227,9 +1636,10 @@ def validate_target(app, target, target_id):
         review_pr_locator(target["pr_locator"])
     cycle_ids, cycle_keys, launch_ids = set(), set(), set()
     for index, cycle in enumerate(target["cycles"]):
-        expected_fields = {"id", "key", "previous_cycle_id", "predecessor", "profile", "selection",
-                           "policy", "slots", "prior_plans", "current_plan"}
-        require(isinstance(cycle, dict) and set(cycle) == expected_fields and
+        base_fields = {"id", "key", "previous_cycle_id", "predecessor", "profile", "selection",
+                       "policy", "slots", "prior_plans", "current_plan"}
+        policy_fields = base_fields | {"purpose", "classification"}
+        require(isinstance(cycle, dict) and set(cycle) in (base_fields, policy_fields) and
                 isinstance(cycle.get("slots"), list) and isinstance(cycle.get("prior_plans"), list) and
                 isinstance(cycle.get("current_plan"), dict) and
                 isinstance(cycle.get("id"), str) and len(cycle["id"]) == 32 and
@@ -1243,9 +1653,11 @@ def validate_target(app, target, target_id):
         require(cycle["key"] not in cycle_keys, "Review target has duplicate cycle keys; progression is held.")
         cycle_ids.add(cycle["id"])
         cycle_keys.add(cycle["key"])
-        expected_slots = LIGHT_REVIEW_POLICY["initial_slots"] if index == 0 else LIGHT_REVIEW_POLICY["later_slots"]
-        require([slot.get("number") if isinstance(slot, dict) else None for slot in cycle["slots"]] == expected_slots,
-                "Review cycle required slots conflict with the light policy; progression is held.")
+        purpose = cycle.get("purpose", "initial" if cycle.get("previous_cycle_id") is None else "later")
+        classification = cycle.get("classification", "straightforward")
+        require(purpose in ("initial", "later") and classification in ("straightforward", "complex")
+                and purpose == ("initial" if index == 0 else "later"),
+                "Review cycle purpose or classification conflicts with its predecessor position.")
         if index == 0:
             require(cycle["previous_cycle_id"] is None and cycle["predecessor"] is None,
                     "The first review cycle cannot have a predecessor.")
@@ -1267,27 +1679,46 @@ def validate_target(app, target, target_id):
                 "Review cycle plan history is malformed or conflicting; progression is held.")
         for plan in plan_refs:
             saved = app.state(f"reviews/{plan['id']}", None)
+            expected_role = ("complex_initial_review" if purpose == "initial" and classification == "complex"
+                             else "standard_review")
             require(isinstance(saved, dict) and saved.get("id") == plan["id"]
-                    and saved.get("role") == "standard_review"
+                    and saved.get("role") == expected_role
+                    and saved.get("purpose", purpose) == purpose
+                    and saved.get("classification", classification) == classification
                     and saved.get("selection") == cycle["selection"] and saved.get("scope") == plan["scope"]
                     and saved.get("review_target") == target_id and saved.get("review_cycle") == cycle["id"]
                     and saved.get("review_cycle_key") == cycle["key"]
                     and saved.get("review_previous_cycle") == cycle["previous_cycle_id"]
                     and saved.get("review_repository") == target["repository"],
                     "Review cycle plan record is missing or conflicts with its target; progression is held.")
+        current_saved = app.state(f"reviews/{cycle['current_plan']['id']}", None)
+        require(isinstance(current_saved, dict) and isinstance(current_saved.get("selection_snapshot"), dict)
+                and current_saved["selection_snapshot"].get("selection") == cycle["selection"],
+                "Review cycle saved selection snapshot is missing or conflicting; progression is held.")
+        expected_role = ("complex_initial_review" if purpose == "initial" and classification == "complex"
+                         else "standard_review")
+        if expected_role == "complex_initial_review":
+            panel = current_saved.get("selection_snapshot", {}).get("review_policy", {}).get("complex_initial")
+            require(isinstance(panel, list) and len(panel) in (1, 2),
+                    "Complex initial cycle is missing its frozen profile panel; progression is held.")
+            expected_slots = list(range(1, len(panel) + 1))
+            require(current_saved.get("policy_choices") == panel,
+                    "Complex initial cycle panel differs from its saved selection; progression is held.")
+        else:
+            expected_slots = LIGHT_REVIEW_POLICY["initial_slots"] if index == 0 else LIGHT_REVIEW_POLICY["later_slots"]
+        require([slot.get("number") if isinstance(slot, dict) else None for slot in cycle["slots"]] == expected_slots,
+                "Review cycle required slots conflict with its saved initial or later policy.")
         plan_ids = {plan["id"] for plan in plan_refs}
         for slot in cycle["slots"]:
             number = slot["number"]
-            expected_model = ("gpt-6.1-sol", "codex", "high") if number == 1 else \
-                ("claude-opus-5-5", "claude", "high")
             choice = slot.get("choice")
+            expected_choice = resolve(current_saved["selection_snapshot"], expected_role, number)
             require(set(slot) == {"number", "choice", "launches"} and isinstance(choice, dict)
                     and choice.get("profile") == cycle["profile"]
                     and choice.get("selection") == cycle["selection"]
-                    and choice.get("role") == "standard_review"
-                    and (choice.get("model"), choice.get("harness"), choice.get("effort")) == expected_model
+                    and choice == expected_choice
                     and isinstance(slot.get("launches"), list),
-                    "Review cycle slot choice is malformed or conflicts with the light policy.")
+                    "Review cycle slot choice is malformed or conflicts with its saved initial or later policy.")
             references = set()
             for link in slot["launches"]:
                 require(isinstance(link, dict) and set(link) == {"plan_id", "launch_id"}
@@ -1325,7 +1756,9 @@ def startup_report(config, expected=None):
         instruction = "Use these saved choices for new dispatches; existing sessions and jobs keep their original models."
     return {"active_profile": active["profile"] if active else None, "intended_profile": expected,
             "profile_mismatch": mismatch, "selection": active["selection"] if active else None,
-            "roles": active["roles"] if active else None, "ready_for_dispatch": bool(active) and not mismatch,
+            "roles": active["roles"] if active else None,
+            "review_policy": active.get("review_policy") if active else None,
+            "ready_for_dispatch": bool(active) and not mismatch,
             "instruction": instruction,
             "authority": "Read-only check; startup intent does not activate a profile or replace an orchestrator."}
 
@@ -1497,11 +1930,20 @@ def parser():
             s.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
     put = sub.add_parser("profile-put"); put.add_argument("name"); put.add_argument("--file", required=True)
     put.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
+    policy_migrate = sub.add_parser("review-policy-migrate",
+                                    help="Preview or apply the explicit review-policy migration for a saved profile.")
+    policy_migrate.add_argument("profile")
+    policy_migrate.add_argument("--apply", action="store_true")
+    policy_migrate.add_argument("--policy-sha256", help="Reviewed digest returned by the read-only preview.")
+    policy_migrate.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"),
+                                 help="Required when this migration changes the active profile selection.")
     model = sub.add_parser("model-set"); model.add_argument("family"); model.add_argument("--harness", choices=("claude", "codex", "muse", "opencode"), required=True)
     model.add_argument("--provider-id")
     model.add_argument("--slug", required=True)
     model.add_argument("--efforts", nargs="+", required=True); model.add_argument("--source", required=True)
     model.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
+    model.add_argument("--exclude-orchestrator", action="append", default=[], metavar="NAME",
+                       help="Skip this enrolled name in future-only notices. Repeat for each name.")
     authority = sub.add_parser("authority-set"); authority.add_argument("label")
     authority.add_argument("--orchestrators", choices=("future-only", "ask", "handoff"))
     enroll = sub.add_parser("enroll"); enroll.add_argument("name")
@@ -1523,7 +1965,7 @@ def parser():
     target_bind.add_argument("target")
     target_bind.add_argument("--pr-locator", required=True)
     for name in ("resolve", "dispatch"):
-        s = sub.add_parser(name); s.add_argument("--role", choices=ROLES, required=True)
+        s = sub.add_parser(name); s.add_argument("--role", choices=DISPATCH_ROLES, required=True)
         s.add_argument("--slot", type=int, choices=(1, 2))
         s.add_argument("--review-target")
         s.add_argument("--review-cycle")
@@ -1534,6 +1976,7 @@ def parser():
                            help="Retry a reviewer slot only after its prior launch exited nonzero.")
             s.add_argument("--approval")
             s.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review launch.")
+            s.add_argument("--proposal-file", help="Exact continuation proposal bound to a skeptical review plan.")
             s.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for guarded preflight.")
             s.add_argument("--pattern-buffer", "--context-injector", dest="context_injector", help="Pattern Buffer script; --context-injector is a compatibility alias."); s.add_argument("--owner-worktree")
             s.add_argument("--receipt-file", help="Forward a unique Pattern Buffer dispatch snapshot path; requires its script and owner worktree.")
@@ -1542,6 +1985,7 @@ def parser():
     resume.add_argument("--opencode-manifest", help="Private loopback OpenCode connection manifest for a guarded continuation.")
     resume.add_argument("--review-plan"); resume.add_argument("--approval")
     resume.add_argument("--review-target"); resume.add_argument("--review-cycle")
+    resume.add_argument("--proposal-file", help="Exact continuation proposal bound to a skeptical review plan.")
     resume.add_argument("--review-authorization", help="Fresh explicit operator authorization for each Qwen profile review continuation.")
     launch_inspect = sub.add_parser("launch-inspect", help="Read-only inspection of an exact recorded launch and its recovery evidence.")
     launch_inspect.add_argument("launch")
@@ -1552,6 +1996,8 @@ def parser():
                                   help="Unique canonical UUID retained with the reconciliation history for idempotent retry.")
     review = sub.add_parser("review-plan"); review.add_argument("--cwd", required=True)
     review.add_argument("--base", required=True); review.add_argument("--facts", required=True)
+    review.add_argument("--purpose", choices=("initial", "later", "skeptical_proposal"))
+    review.add_argument("--proposal-file", help="Required for a skeptical continuation proposal review.")
     review.add_argument("--target"); review.add_argument("--cycle-key"); review.add_argument("--previous-cycle")
     review.add_argument("--full", action="store_true", help="Print every path; default output is a bounded preview of the full saved scope.")
     inspect = sub.add_parser("review-inspect"); inspect.add_argument("plan"); inspect.add_argument("--full", action="store_true")
@@ -1559,6 +2005,14 @@ def parser():
     approve.add_argument("--authorization", required=True)
     approve.add_argument("--standard-instead", action="store_true",
                          help="Record the configured authority's decision to decline advanced review and use standard reviewers.")
+    approve.add_argument("--continue-repair", action="store_true",
+                         help="Record a separate bounded repair-continuation decision after a completed skeptical review.")
+    approve.add_argument("--decline-skeptical", action="store_true",
+                         help="Record the configured human authority's decision to skip the skeptical model review.")
+    approve.add_argument("--route", choices=("revert", "defer"),
+                         help="Record a separate revert or defer decision after the configured authority declines the skeptical review.")
+    approve.add_argument("--review-result-file", help="Required with --continue-repair; exact skeptical review result evidence.")
+    approve.add_argument("--continuation-batch-file", help="Required with --continue-repair; exact bounded repair batch proposal.")
     context = sub.add_parser("context"); context.add_argument("--launch")
     hook = sub.add_parser("hook"); hook.add_argument("--harness", choices=("claude", "codex"), required=True)
     hook_config = sub.add_parser("hook-config"); hook_config.add_argument("--harness", choices=("claude", "codex"), required=True)
@@ -1578,7 +2032,14 @@ def parser():
 
 
 def resolve(snapshot, role, slot):
-    choice = snapshot["roles"][role]
+    if role in POLICY_REVIEW_ROLES:
+        policy = snapshot.get("review_policy")
+        require(isinstance(policy, dict),
+                f"{snapshot['profile']} has no adopted review policy. Run review-policy-migrate {snapshot['profile']} and review the saved-choice mapping first.")
+        key = "complex_initial" if role == "complex_initial_review" else "skeptical_proposal"
+        choice = policy[key]
+    else:
+        choice = snapshot["roles"][role]
     if role.endswith("_review"):
         if slot is None:
             require(len(choice) == 1, "Select reviewer --slot 1 or 2; each is a separate launch.")
@@ -2668,6 +3129,11 @@ def execute(args):
                 require(args.profile in config["profiles"], "Unknown profile; create it with profile-put first.")
                 config["active"] = args.profile
             elif command == "model-set":
+                if args.exclude_orchestrator:
+                    require(args.orchestrators == "future-only",
+                            "Notification exclusions require --orchestrators future-only.")
+                    require(set(args.exclude_orchestrator) <= set(app.state("orchestrators", {})),
+                            "Every notification exclusion must name an enrolled orchestrator.")
                 require(args.family and not any(c.isspace() for c in args.family), "Model family must be a nonempty token.")
                 require((args.harness == "opencode") == bool(args.provider_id),
                         "Pass --provider-id for OpenCode models only.")
@@ -2690,6 +3156,41 @@ def execute(args):
                 write(app.config_path, config)
             if not changed:
                 return {"changed": False, "active": after, "saved": True}
+        elif command == "review-policy-migrate":
+            require(args.profile in config["profiles"], "Unknown profile.")
+            profile = config["profiles"][args.profile]
+            if "review_policy" in profile:
+                require(not args.apply, "This profile already has a review policy; preserve it and edit through profile-put if a reviewed change is needed.")
+                policy = copy.deepcopy(profile["review_policy"])
+                return {"profile": args.profile, "applied": False, "already_configured": True,
+                        "review_policy": policy, "policy_sha256": digest(policy)}
+            proposed = suggested_review_policy(args.profile, profile)
+            policy_sha256 = digest(proposed)
+            if not args.apply:
+                return {"profile": args.profile, "applied": False, "already_configured": False,
+                        "review_policy": proposed, "policy_sha256": policy_sha256,
+                        "instruction": (f"Review this exact saved-choice mapping, then apply with --apply "
+                                        f"--policy-sha256 {policy_sha256}. Active profile changes also need "
+                                        "--orchestrators future-only, ask, or handoff.")}
+            require(args.policy_sha256 == policy_sha256,
+                    "Saved profile choices changed or the preview digest does not match; preview the migration again.")
+            original = copy.deepcopy(config)
+            before = selection(config) if config["active"] else None
+            profile["review_policy"] = proposed
+            validate(config)
+            after = selection(config) if config["active"] else None
+            changed = after != before
+            if changed:
+                require(args.orchestrators,
+                        "Active review choices change. Review the migration preview and pass --orchestrators future-only, ask, or handoff.")
+                config["activation"] = uuid.uuid4().hex
+                after = selection(config)
+            if config != original:
+                write(app.config_path, config)
+            if not changed:
+                return {"profile": args.profile, "applied": True, "changed": True,
+                        "active_selection_changed": False, "review_policy": proposed,
+                        "policy_sha256": policy_sha256}
         elif command == "notify":
             after = selection(config)
             notice = app.state("notification", {})
@@ -2730,15 +3231,18 @@ def execute(args):
             plan = review_scope(config, args.cwd, args.base, read(args.facts))
             active = selection(config)
             plan.update(selection=active["selection"], selection_snapshot=active, id=uuid.uuid4().hex)
-            has_cycle_context = bool(args.target or args.cycle_key or args.previous_cycle)
-            light_standard = ("standard_review_policy" in active and plan["role"] == "standard_review")
-            if light_standard:
+            plan = apply_review_purpose(app, config, args, plan)
+            has_cycle_options = bool(args.cycle_key or args.previous_cycle)
+            light_cycle = ("standard_review_policy" in active and
+                           plan["role"] in ("standard_review", "complex_initial_review") and
+                           plan.get("purpose") in ("initial", "later"))
+            if light_cycle:
                 require(args.target and args.cycle_key,
-                        "claude-codex-light standard reviews require --target and --cycle-key.")
+                        "claude-codex-light initial and later reviews require --target and --cycle-key.")
                 plan = make_light_review_plan(app, config, args, plan)
             else:
-                require(not has_cycle_context,
-                        "Target cycle options apply only to standard reviews under claude-codex-light.")
+                require(not has_cycle_options,
+                        "Review-cycle keys apply only to standard reviews under claude-codex-light.")
                 app.save_state(f"reviews/{plan['id']}", plan)
             return review_output(app, config, plan, full=args.full)
         elif command == "review-inspect":
@@ -2747,17 +3251,143 @@ def execute(args):
             return review_output(app, config, plan, full=args.full, saved_snapshot=True)
         elif command == "approve-review":
             plan = app.state(f"reviews/{safe_id(args.plan)}", None)
-            require(plan and plan["role"] == "advanced_review", "Advanced review plan required.")
+            require(isinstance(plan, dict), "Unknown or malformed review plan.")
             authority = configured_authority(config)
             require(args.authorization.strip(), "Record the configured authority's explicit authorization; do not infer permission.")
-            approval = {"id": uuid.uuid4().hex, "scope": plan["scope"], "selection": plan["selection"],
-                        "authority": authority, "authorization": args.authorization, "at": now(),
-                        "role": "standard_review" if args.standard_instead else "advanced_review"}
+            if args.continue_repair:
+                require(plan.get("purpose") == "skeptical_proposal" and not args.standard_instead
+                        and not args.decline_skeptical and args.route is None,
+                        "--continue-repair applies only as a distinct decision for a skeptical proposal plan.")
+                require(args.continuation_batch_file,
+                        "A bounded repair continuation needs --continuation-batch-file with the exact approved batch.")
+                batch = bounded_document(args.continuation_batch_file, "continuation batch")
+                skeptical, status = approval_decision(app, plan, "skeptical_review")
+                declined, decline_status = approval_decision(app, plan, "skeptical_review_declined")
+                routed, route_status = approval_decision(app, plan, "review_route")
+                require(status == "available" and decline_status == "available",
+                        "Approval records are unreadable; resolve them before recording continuation authority.")
+                require(route_status == "available" and not routed,
+                        "A revert or defer route is already recorded; create a fresh plan for a changed user decision.")
+                launches, launch_status = policy_review_launches(app, plan)
+                require(launch_status == "available",
+                        "Review launch records are unreadable; inspect them before recording continuation authority.")
+                unresolved = [item for item in launches
+                              if item.get("status") != "exited" or type(item.get("exit_code")) is not int]
+                require(not unresolved,
+                        "A skeptical review launch is active or uncertain; inspect it before any continuation decision.")
+                if skeptical:
+                    result = bounded_document(args.review_result_file, "skeptical review result")
+                    latest = launches[-1] if launches else None
+                    require(latest and latest.get("slot") == 1 and latest.get("exit_code") == 0,
+                            "Continuation after review requires the exact skeptical reviewer launch to exit successfully.")
+                    skeptical_id = skeptical["id"]
+                    result_sha256 = result["sha256"]
+                    launch_id = latest["id"]
+                else:
+                    require(declined and not launches and not args.review_result_file,
+                            "Continuation needs either a completed approved skeptical review or a recorded human-authority decline with no model launch.")
+                    skeptical_id = declined["id"]
+                    result_sha256 = None
+                    launch_id = None
+                approval = {"id": uuid.uuid4().hex, "scope": plan["scope"], "selection": plan["selection"],
+                            "authority": authority, "authorization": args.authorization, "at": now(),
+                            "role": "repair_continuation", "decision": "repair_continuation",
+                            "plan_id": plan["id"], "purpose": plan["purpose"],
+                            "proposal_sha256": plan["proposal_sha256"],
+                            "skeptical_approval_id": skeptical_id,
+                            "skeptical_launch_id": launch_id,
+                            "review_result_sha256": result_sha256,
+                            "continuation_batch_sha256": batch["sha256"]}
+            elif args.decline_skeptical:
+                require(plan.get("purpose") == "skeptical_proposal" and not args.standard_instead
+                        and args.route is None and not args.review_result_file
+                        and not args.continuation_batch_file,
+                        "Record a skeptical-review decline by itself; follow it with a separate bounded continuation, revert, or defer decision.")
+                launches, launch_status = policy_review_launches(app, plan)
+                require(launch_status == "available" and not launches,
+                        "A skeptical review launch already exists or is uncertain; inspect its recorded outcome before choosing another route.")
+                approved_review, approval_status = approval_decision(app, plan, "skeptical_review")
+                require(approval_status == "available" and not approved_review,
+                        "A skeptical review approval already exists; do not record a conflicting decline.")
+                approval = {"id": uuid.uuid4().hex, "scope": plan["scope"], "selection": plan["selection"],
+                            "authority": authority, "authorization": args.authorization, "at": now(),
+                            "role": "skeptical_review_declined", "decision": "skeptical_review_declined",
+                            "plan_id": plan["id"], "purpose": plan["purpose"],
+                            "proposal_sha256": plan["proposal_sha256"]}
+            elif args.route:
+                require(plan.get("purpose") == "skeptical_proposal" and not args.standard_instead
+                        and not args.decline_skeptical and not args.continue_repair
+                        and not args.review_result_file and not args.continuation_batch_file,
+                        "--route applies only as a separate post-decline decision for a skeptical proposal plan.")
+                declined, decline_status = approval_decision(app, plan, "skeptical_review_declined")
+                approved_review, approval_status = approval_decision(app, plan, "skeptical_review")
+                launches, launch_status = policy_review_launches(app, plan)
+                require(decline_status == "available" and declined
+                        and approval_status == "available" and not approved_review
+                        and launch_status == "available" and not launches,
+                        "A revert or defer route requires a prior skeptical-review decline with no model launch.")
+                approval = {"id": uuid.uuid4().hex, "scope": plan["scope"], "selection": plan["selection"],
+                            "authority": authority, "authorization": args.authorization, "at": now(),
+                            "role": "skeptical_review_route", "decision": "review_route", "route": args.route,
+                            "plan_id": plan["id"], "purpose": plan["purpose"],
+                            "proposal_sha256": plan["proposal_sha256"]}
+            elif plan.get("purpose") == "skeptical_proposal":
+                require(not args.standard_instead and args.route is None
+                        and not args.review_result_file and not args.continuation_batch_file,
+                        "A skeptical review launch approval cannot also approve repair continuation or a fallback role.")
+                declined, decline_status = approval_decision(app, plan, "skeptical_review_declined")
+                require(decline_status == "available" and not declined,
+                        "A skeptical review decline already exists; do not record a conflicting approval.")
+                approval = {"id": uuid.uuid4().hex, "scope": plan["scope"], "selection": plan["selection"],
+                            "authority": authority, "authorization": args.authorization, "at": now(),
+                            "role": "skeptical_review", "decision": "skeptical_review",
+                            "plan_id": plan["id"], "purpose": plan["purpose"],
+                            "proposal_sha256": plan["proposal_sha256"]}
+            else:
+                require(plan.get("role") == "advanced_review" and not args.decline_skeptical
+                        and args.route is None and not args.continue_repair
+                        and not args.review_result_file and not args.continuation_batch_file,
+                        "Advanced review plan required; initial policy review does not use per-plan approval.")
+                approval = {"id": uuid.uuid4().hex, "scope": plan["scope"], "selection": plan["selection"],
+                            "authority": authority, "authorization": args.authorization, "at": now(),
+                            "role": "standard_review" if args.standard_instead else "advanced_review"}
             app.save_state(f"approvals/{approval['id']}", approval)
             return approval
         elif command == "resolve":
             active = selection(config)
             has_context = bool(args.review_target or args.review_cycle or args.review_plan)
+            if args.role == "standard_review" and not has_context and "review_policy" in active:
+                print(
+                    "Starting the first review of a PR? Run model-preferences review-plan --purpose initial "
+                    "against the candidate and its target base, then use the panel the plan selects.",
+                    file=sys.stderr,
+                )
+            if args.role in POLICY_REVIEW_ROLES:
+                require(args.review_plan,
+                        "Configured-purpose reviewer resolution requires its exact --review-plan.")
+                plan = saved_review_plan(app, args.review_plan)
+                require(plan.get("role") == args.role and plan.get("selection") == active["selection"],
+                        "Review plan purpose or profile selection changed; create a fresh plan.")
+                require(args.review_target == plan.get("review_target"),
+                        "Reviewer resolution must name the plan's exact PR target, including when no target is bound.")
+                freshness = review_freshness(config, plan)
+                require(freshness["status"] == "current",
+                        "Review scope, profile, or proposal is stale or unknown; inspect and create a fresh plan.")
+                if args.role == "complex_initial_review" and active["profile"] == LIGHT_PROFILE:
+                    require(args.review_target and args.review_cycle,
+                            "claude-codex-light complex initial resolution requires its exact --review-target and --review-cycle.")
+                    target, cycle, plan, slot, choice = cycle_review_context(app, config, args)
+                    return {**choice, "selection_kind": "cycle", "review_target": target["id"],
+                            "review_cycle": cycle["id"], "review_plan": plan["id"],
+                            "review_purpose": plan["purpose"], "slot": slot["number"]}
+                require(not args.review_cycle,
+                        "Configured-purpose reviews outside a light initial cycle do not use a review-cycle ordinal.")
+                choice = resolve(active, args.role, args.slot)
+                return {**choice, "selection_kind": "review_plan", "review_plan": plan["id"],
+                        "review_purpose": plan["purpose"], "review_target": plan.get("review_target"),
+                        "review_scope": plan["scope"], "proposal_sha256": plan.get("proposal_sha256"),
+                        "approval_required": args.role == "skeptical_review",
+                        "approval_status": review_guidance(app, config, plan)["approval_status"]}
             if args.role == "standard_review" and "standard_review_policy" in active:
                 if has_context:
                     require(args.review_target and args.review_cycle and args.review_plan,
@@ -2773,6 +3403,17 @@ def execute(args):
                         "role": args.role, "selection_kind": "configured_candidates",
                         "configured_candidates": active["roles"]["standard_review"],
                         "contextual_cycle": None}
+            if args.role == "standard_review" and args.review_plan:
+                plan = saved_review_plan(app, args.review_plan)
+                require(plan.get("role") == "standard_review" and plan.get("selection") == active["selection"],
+                        "Standard reviewer resolution needs a current standard-review plan for the active selection.")
+                require(args.review_target == plan.get("review_target") and not args.review_cycle,
+                        "Standard reviewer resolution must name the plan's exact target and no unsupported cycle.")
+                require(review_freshness(config, plan)["status"] == "current",
+                        "Review scope or profile selection is stale or unknown; create a fresh plan.")
+                return {**resolve(active, args.role, args.slot), "selection_kind": "review_plan",
+                        "review_plan": plan["id"], "review_target": plan.get("review_target"),
+                        "review_purpose": plan.get("purpose"), "review_scope": plan["scope"]}
             require(not has_context, "Review target context applies only to standard reviews under claude-codex-light.")
             return resolve(active, args.role, args.slot)
         elif command == "context":
@@ -2824,6 +3465,10 @@ def execute(args):
             if "standard_review_policy" in active:
                 text += (" The standard-review choices above are configured candidates. A contextual review uses only the slot "
                          "saved for its target, cycle, and exact plan.")
+            if "review_policy" in active:
+                text += (" Initial complex reviews use the profile's saved complex_initial panel without a per-PR approval. "
+                         "A skeptical proposal review needs a matching explicit approval for that plan, scope, selection, "
+                         "and proposal. That approval does not authorize a repair batch; record a separate bounded decision.")
             if binding:
                 launch = app.state(f"launches/{safe_id(binding['launch'])}", None)
                 require(launch, "Running task choice is missing.")
@@ -2841,7 +3486,8 @@ def execute(args):
                     "--receipt-file requires --context-injector and --owner-worktree.")
             active = selection(config)
             cwd = Path(args.cwd).resolve(); require(cwd.is_dir(), "Task directory is missing.")
-            has_cycle_context = bool(args.review_target or args.review_cycle)
+            policy_review_role = args.role in POLICY_REVIEW_ROLES
+            light_complex_cycle = (args.role == "complex_initial_review" and active["profile"] == LIGHT_PROFILE)
             review_cycle = None
             target = cycle = review_slot = None
             saved_plan = (app.state(f"reviews/{safe_id(args.review_plan)}", None)
@@ -2857,9 +3503,23 @@ def execute(args):
                 args.slot = review_slot["number"]
                 review_cycle = {"target_id": target["id"], "cycle_id": cycle["id"],
                                 "plan_id": plan["id"], "slot": review_slot["number"]}
+            elif light_complex_cycle:
+                require(args.review_target and args.review_cycle and args.review_plan,
+                        "claude-codex-light complex initial dispatch requires --review-target, --review-cycle, and --review-plan.")
+                target, cycle, plan, review_slot, choice = cycle_review_context(app, config, args, cwd)
+                args.slot = review_slot["number"]
+                review_cycle = {"target_id": target["id"], "cycle_id": cycle["id"],
+                                "plan_id": plan["id"], "slot": review_slot["number"]}
+            elif policy_review_role:
+                require(not args.review_cycle,
+                        "Configured-purpose reviews use the target on their saved plan and do not join light review cycles.")
+                choice = resolve(active, args.role, args.slot)
+                if args.slot is None:
+                    args.slot = 1
             else:
-                require(not has_cycle_context and not args.retry_failed,
-                        "Review target context and --retry-failed apply only to standard reviews under claude-codex-light.")
+                require(not args.review_cycle and not args.retry_failed
+                        and (not args.review_target or args.review_plan),
+                        "Review target context and review-cycle context apply only to standard_review plans under claude-codex-light; retry applies only to supported saved review plans.")
                 choice = resolve(active, args.role, args.slot)
             require(args.role != "orchestrator" or choice["harness"] == "opencode",
                     "Fresh successor orchestration remains outside Model Preferences handoff authority.")
@@ -2869,8 +3529,13 @@ def execute(args):
             except UnicodeError as exc:
                 raise PreferenceError("Task brief must be UTF-8.") from exc
             require(0 < len(task_bytes) <= 16384 and prompt.strip(), "Task brief must be 1 to 16384 bytes of nonempty UTF-8.")
+            proposal = None
+            if args.role == "skeptical_review":
+                proposal = bounded_document(args.proposal_file, "proposal")
             validate_review(app, config, args, choice, cwd)
             task_digest = hashlib.sha256(task_bytes).hexdigest()
+            if proposal is not None:
+                task_digest = digest({"task_sha256": task_digest, "proposal_sha256": proposal["sha256"]})
             if review_cycle:
                 existing = reconcile_review_launch(app, target, cycle, review_slot,
                                                    review_cycle["plan_id"], task_digest)
@@ -2885,6 +3550,27 @@ def execute(args):
                 else:
                     require(not args.retry_failed,
                             "--retry-failed requires an existing known nonzero launch for this exact slot.")
+            elif policy_review_role:
+                plan = saved_review_plan(app, args.review_plan)
+                policy_launches, launch_status = policy_review_launches(app, plan)
+                require(launch_status == "available",
+                        "Review launch records are unreadable; inspect local launch state before dispatch.")
+                slot_launches = [item for item in policy_launches if item.get("slot") == args.slot]
+                if slot_launches:
+                    existing = slot_launches[-1]
+                    require(existing.get("task_digest") == task_digest,
+                            "This exact review-plan slot already has a different task or proposal; create a fresh plan.")
+                    if existing.get("status") != "exited" or type(existing.get("exit_code")) is not int:
+                        raise PreferenceError(f"Review launch {existing['id']} is active or uncertain; inspect it before retrying.")
+                    if existing["exit_code"] == 0 or not args.retry_failed:
+                        return {"launch": existing["id"], "status": existing["status"],
+                                "exit_code": existing["exit_code"], "reused": True,
+                                "review_purpose": plan["purpose"], "slot": args.slot}
+                    require(existing["exit_code"] != 0,
+                            "--retry-failed requires this exact slot's latest launch to have a known nonzero exit.")
+                else:
+                    require(not args.retry_failed,
+                            "--retry-failed requires an existing known nonzero launch for this exact plan slot.")
             if choice["harness"] == "opencode":
                 opencode_task = task_bytes
             else:
@@ -2896,7 +3582,10 @@ def execute(args):
                             "--context-injector, --owner-worktree or --receipt-file, putting required context in --task-file "
                             "and retaining applicable review/permission flags. "
                             "Guide: apps/model-preferences/README.md#pattern-buffer-support")
-                prompt = reviewer_guidance.compose_reviewer_prompt(args.role, prompt)
+                review_context = ("Exact continuation proposal under review:\n\n" + proposal["text"]
+                                  if proposal is not None else None)
+                prompt = reviewer_guidance.compose_reviewer_prompt(args.role, prompt,
+                                                                    context_text=review_context)
                 prompt = DELEGATION + " Use the current researcher role for authorized research. Verify its findings.\n\n" + prompt
                 argv = argv_for(choice, prompt, cwd)
                 launch_id = uuid.uuid4().hex
@@ -2916,6 +3605,13 @@ def execute(args):
                 launch = {"id": launch_id, "choice": choice, "cwd": str(cwd), "created_at": now(),
                           "context_injector": adapter, "slot": args.slot,
                           "task_digest": task_digest, "status": "starting"}
+                if policy_review_role:
+                    launch["review_plan_binding"] = {
+                        "plan_id": plan["id"], "purpose": plan["purpose"], "scope": plan["scope"],
+                        "selection": plan["selection"], "role": plan["role"], "slot": args.slot,
+                        "review_target": plan.get("review_target"),
+                        "proposal_sha256": plan.get("proposal_sha256"),
+                    }
                 if choice["harness"] == "codex":
                     launch["recovery_provenance"] = {
                         "version": 1,
@@ -2938,8 +3634,14 @@ def execute(args):
             raise PreferenceError("Unsupported command.")
     if command == "dispatch" and choice["harness"] == "opencode":
         return dispatch_opencode(app, args, config, choice, cwd, opencode_task)
-    if command in ("activate", "model-set", "profile-put", "authority-set", "notify"):
-        notice = app.notify(after, args.orchestrators, retry=command == "notify")
+    if command in ("activate", "model-set", "profile-put", "authority-set", "review-policy-migrate", "notify"):
+        notice = app.notify(after, args.orchestrators, retry=command == "notify",
+                            exclusions=getattr(args, "exclude_orchestrator", ()))
+        if command == "review-policy-migrate":
+            return {"profile": args.profile, "applied": True, "changed": True,
+                    "active_selection_changed": True, "review_policy": proposed,
+                    "policy_sha256": policy_sha256, "active": after,
+                    "notification": notice}
         return {"changed": command != "notify", "active": after, "notification": notice}
     print(json.dumps({"launch": launch["id"], "choice": choice}), file=sys.stderr, flush=True)
     try:
@@ -2990,6 +3692,53 @@ def validate_review(app, config, args, choice, cwd):
     current = review_scope(config, cwd, plan["base"], plan["facts"])
     require(current["scope"] == plan["scope"] and plan["selection"] == choice["selection"],
             "Review scope/profile changed; create a fresh plan.")
+    if plan.get("role") != choice["role"]:
+        standard_decision = (app.state(f"approvals/{safe_id(args.approval)}", None)
+                             if plan.get("role") == "advanced_review"
+                             and choice["role"] == "standard_review" and getattr(args, "approval", None)
+                             else None)
+        require(standard_decision and standard_decision.get("scope") == plan.get("scope")
+                and standard_decision.get("selection") == plan.get("selection")
+                and standard_decision.get("role") == "standard_review",
+                "Requested reviewer purpose needs explicit permission; approval does not cover this scope unless it is the exact standard-instead decision.")
+    if plan.get("review_target"):
+        require(getattr(args, "review_target", None) == plan["review_target"],
+                "Dispatch must name the review plan's exact PR target.")
+        target = load_target(app, plan["review_target"])
+        require(repository_identity(cwd) == target["repository"] == plan.get("review_repository"),
+                "Review worktree or target repository changed; create a fresh plan.")
+    elif getattr(args, "review_target", None):
+        raise PreferenceError("Review target does not match the saved plan.")
+    if choice["role"] == "skeptical_review":
+        require(plan.get("purpose") == "skeptical_proposal"
+                and plan.get("classification") in ("straightforward", "complex")
+                and plan.get("proposal_sha256"),
+                "Skeptical review needs a purpose-bound proposal plan.")
+        proposal = bounded_document(getattr(args, "proposal_file", None), "proposal")
+        require(proposal["path"] == plan.get("proposal_path")
+                and proposal["sha256"] == plan["proposal_sha256"],
+                "Proposal bytes changed after review planning; create a fresh plan and approval.")
+        approval = bound_policy_approval(app, plan, getattr(args, "approval", None), "skeptical_review")
+        require(approval.get("role") == "skeptical_review"
+                and approval.get("authority") == configured_authority(config),
+                "Only the configured authority's matching skeptical-review approval can launch this reviewer.")
+        return
+    if choice["role"] == "complex_initial_review":
+        require(plan.get("purpose") == "initial" and plan.get("classification") == "complex"
+                and isinstance(plan.get("policy_choices"), list),
+                "Configured complex reviewers require an initial complex review plan.")
+        active = selection(config)
+        if active["profile"] == LIGHT_PROFILE:
+            require(args.review_target and args.review_cycle,
+                    "claude-codex-light complex initial dispatch requires its exact target cycle.")
+            target, cycle, bound_plan, slot, expected = cycle_review_context(app, config, args, cwd)
+            require(bound_plan["id"] == plan["id"] and slot["number"] == getattr(args, "slot", None),
+                    "Complex initial reviewer does not match the saved light target cycle slot.")
+        else:
+            expected = resolve(active, choice["role"], getattr(args, "slot", None))
+        require(choice == expected,
+                "Reviewer does not match the active profile's saved initial-complex policy.")
+        return
     if plan["role"] == "advanced_review":
         authority = configured_authority(config)
         require(args.approval, f"Advanced review was requested. Record explicit permission from the configured authority ({authority}) or choose standard reviewers first.")
@@ -2999,6 +3748,8 @@ def validate_review(app, config, args, choice, cwd):
     else:
         require(choice["role"] == "standard_review", "Create an advanced review plan before asking for advanced reviewers.")
         if "standard_review_policy" in config["profiles"][choice["profile"]]:
+            require(args.review_target and args.review_cycle,
+                    "claude-codex-light standard reviews require their exact target and cycle.")
             target, cycle, bound_plan, slot, contextual_choice = cycle_review_context(app, config, args, cwd)
             require(bound_plan["id"] == plan["id"] and contextual_choice == choice
                     and getattr(args, "slot", None) == slot["number"],
@@ -3009,9 +3760,8 @@ def validate_review(app, config, args, choice, cwd):
                              if item["plan_id"] == plan["id"] and item["launch_id"] == launch_id), None)
                 require(link, "Codex resume launch is not a member of this exact review cycle slot.")
                 launch_for_link(app, target, cycle, slot, link)
-        else:
-            require(not (getattr(args, "review_target", None) or getattr(args, "review_cycle", None)),
-                    "Review target context applies only to claude-codex-light.")
+        elif getattr(args, "review_cycle", None):
+            raise PreferenceError("Review-cycle context applies only to claude-codex-light standard review plans.")
 
 
 def bind_native(app, launch_id, session):
@@ -3766,6 +4516,7 @@ def resume_launch(app, args):
                 require(launch["status"] == "exited", "Original launch has not exited; nothing resumed.")
             choice = launch["choice"]
             membership = launch.get("review_cycle")
+            plan_binding = launch.get("review_plan_binding")
             if membership:
                 require(args.review_target == membership["target_id"]
                         and args.review_cycle == membership["cycle_id"]
@@ -3773,9 +4524,15 @@ def resume_launch(app, args):
                         "Codex resume must name the launch's original review target, cycle, and plan.")
                 args.slot = membership["slot"]
                 args.review_launch_id = launch_id
+            elif isinstance(plan_binding, dict):
+                require(args.review_plan == plan_binding.get("plan_id")
+                        and args.review_target == plan_binding.get("review_target")
+                        and not args.review_cycle,
+                        "Codex resume must name the launch's original review plan and target.")
+                args.slot = plan_binding.get("slot")
             else:
                 require(not args.review_target and not args.review_cycle,
-                        "This launch has no review-cycle membership.")
+                        "This launch has no review-target membership.")
             active = selection(config)
             require(choice["selection"] == active["selection"], "Current profile instructions conflict with this launch; use a fresh dispatch or coordinate the profile first.")
             require(resolve(active, choice["role"], launch.get("slot")) == choice, "Recorded role choice changed; nothing resumed.")
@@ -3795,6 +4552,15 @@ def resume_launch(app, args):
                        "previous": previous.get("id") if previous else None}
             if membership:
                 attempt["review_cycle"] = membership
+            if plan_binding:
+                attempt["review_plan_binding"] = plan_binding
+            resume_brief = brief.decode()
+            review_context = None
+            if choice["role"] == "skeptical_review":
+                proposal = bounded_document(args.proposal_file, "proposal")
+                review_context = "Exact continuation proposal under review:\n\n" + proposal["text"]
+                attempt["task_digest"] = digest({"task_sha256": attempt["task_digest"],
+                                                  "proposal_sha256": proposal["sha256"]})
             if choice["profile"] in ("Codex-Qwen", "Qwen-only") and choice["role"].endswith("_review"):
                 attempt["review_authorization_sha256"] = hashlib.sha256(args.review_authorization.encode()).hexdigest()
             app.save_state(f"continuations/{session}", attempt)
@@ -3820,7 +4586,8 @@ def resume_launch(app, args):
                         "Interrupted launch changed before native continuation; inspect before retrying.")
                 recovery_observation = launch_recovery_observation(app, latest)
                 require_recovered_launch_ready(latest, recovery_observation)
-            prompt = reviewer_guidance.compose_reviewer_prompt(choice["role"], brief.decode())
+            prompt = reviewer_guidance.compose_reviewer_prompt(choice["role"], resume_brief,
+                                                                context_text=review_context)
             prompt = DELEGATION + " Use the current researcher role for authorized research.\n\n" + prompt
             env = dict(os.environ, STARFLEET_MODEL_LAUNCH=launch_id)
             env.pop("STARFLEET_CONTEXT_DISPATCH", None)
