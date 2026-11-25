@@ -124,6 +124,7 @@ Reasoning effort is also called thought size or thought budget size.
 The report does not contain thinking tokens or remaining context.
 Missing or unsupported evidence stays unknown and is never inferred from saved settings or model self-report.
 Claude observations store only allowlisted fields in private local state, one record per exact session, and an unknown read creates no state.
+Claude capture uses Pattern Buffer's installed checkpoint-enabled status line independently of checkpoint enrollment.
 Codex reads the exact session's native `turn_context` record after validating its `session_meta` identity.
 It validates identity from the file header and reads at most the most recent 8 MiB, so long transcripts remain usable.
 A Codex transcript window containing records for more than one session identity reports unknown.

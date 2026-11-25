@@ -258,6 +258,7 @@ The command prints one JSON observation with the model, reasoning effort, eviden
 Reasoning effort is also called thought size or thought budget size.
 The command does not report thinking tokens or remaining context.
 Claude reports only `model.id` and `effort.level` values observed in the exact session's statusline payload.
+Claude capture uses Pattern Buffer's installed checkpoint-enabled status line independently of checkpoint enrollment.
 Claude stores those allowlisted values in private local state, one file per exact session, and does not retain the raw payload.
 Codex reports the latest timestamped `turn_context.payload.model` and `turn_context.payload.effort` after `session_meta.payload.id` matches the requested UUID.
 It validates the file header and reads at most the most recent 8 MiB rather than rejecting a long transcript.

@@ -12,6 +12,7 @@ import tempfile
 import unittest
 
 import pattern_buffer_session_effort as effort
+import pattern_buffer_sessions as sessions
 
 
 SCRIPT = Path(__file__).with_name("pattern_buffer.py")
@@ -170,10 +171,39 @@ class SessionEffortTests(unittest.TestCase):
                                      "--transcript", str(transcript))
                 self.assertEqual(report["effort"], level)
         state = self.root / "claude-state"
-        effort.observe_claude_statusline({"session_id": SESSION, "model": {"id": "claude-fixture"},
+        effort.observe_claude_statusline(sessions, {"session_id": SESSION, "model": {"id": "claude-fixture"},
                                          "effort": {"level": "xhigh"}}, state_dir=state)
         self.assertEqual(self.report("--harness", "claude", "--session", SESSION,
                                      "--state-dir", str(state))["effort"], "xhigh")
+
+    def test_installed_claude_statusline_and_effort_launcher(self):
+        runtime = self.root / "runtime"
+        settings = self.root / "claude.json"
+        state_home = self.root / "state-home"
+        env = {**os.environ, "XDG_STATE_HOME": str(state_home), "PYTHONPATH": ""}
+        bin_dir = self.root / "bin"
+        self.cli("install", "--harness", "claude", "--settings", str(settings),
+                 "--runtime-dir", str(runtime), "--bin-dir", str(bin_dir), env=env)
+        cmd = [str(bin_dir / "pattern-buffer"), "session-effort", "--harness", "claude",
+               "--session", SESSION]
+
+        def installed_report():
+            result = subprocess.run(cmd, cwd=self.root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        self.assertEqual(installed_report()["state"], "unknown")
+        self.assertFalse(state_home.exists())
+        statusline = json.loads(settings.read_text())["statusLine"]["command"]
+        payload = {"session_id": SESSION, "model": {"id": "claude-pilot-fixture"},
+                   "effort": {"level": "max"}, "context_window": {"used_percentage": 11}}
+        result = subprocess.run(statusline, shell=True, cwd=self.root, env=env,
+                                input=json.dumps(payload), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Context: 11%\n")
+        report = installed_report()
+        self.assertEqual((report["model"], report["effort"], report["source"]),
+                         ("claude-pilot-fixture", "max", "claude_statusline"))
 
     def test_opencode_installer_packages_the_common_effort_command(self):
         runtime = self.root / "installed"

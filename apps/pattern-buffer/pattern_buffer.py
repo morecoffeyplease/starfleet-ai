@@ -3213,7 +3213,7 @@ def statusline(delegate_json):
         except (OSError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError):
             pass
         try:
-            auxiliary("session_effort").observe_claude_statusline(payload)
+            auxiliary("session_effort").observe_claude_statusline(auxiliary("sessions"), payload)
         except Exception:
             pass
     delegate = json.loads(delegate_json)
@@ -3618,7 +3618,7 @@ def main():
             if args.harness == "codex" and args.state_dir:
                 raise ValueError("--state-dir applies only to Claude")
             report = auxiliary("session_effort").read_session_effort(
-                args.harness, args.session, transcript=args.transcript,
+                auxiliary("sessions"), args.harness, args.session, transcript=args.transcript,
                 state_dir=args.state_dir, codex_home=args.codex_home)
             print(json.dumps(report, indent=2, ensure_ascii=False))
             return 0

@@ -8,8 +8,6 @@ import re
 import stat
 import uuid
 
-from pattern_buffer_sessions import _atomic_write, _check_path, _read_file
-
 
 MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
 MAX_METADATA_BYTES = 256 * 1024
@@ -92,7 +90,7 @@ def _state_directory(state_dir=None):
     return base
 
 
-def observe_claude_statusline(payload, state_dir=None):
+def observe_claude_statusline(sessions, payload, state_dir=None):
     if not isinstance(payload, dict):
         return False
     session = _session_id(payload.get("session_id"))
@@ -115,17 +113,17 @@ def observe_claude_statusline(payload, state_dir=None):
         "observed_at": _format_timestamp(datetime.datetime.now(datetime.timezone.utc)),
     }
     path = directory / f"claude-{session}.json"
-    _atomic_write(path, json.dumps(record, separators=(",", ":")).encode("utf-8"))
+    sessions._atomic_write(path, json.dumps(record, separators=(",", ":")).encode("utf-8"))
     return True
 
 
-def _read_claude(session, state_dir=None, now=None):
+def _read_claude(sessions, session, state_dir=None, now=None):
     directory = _state_directory(state_dir)
     if directory is None:
         return _report("claude", session, now=now)
     path = directory / f"claude-{session}.json"
     try:
-        raw = _read_file(path, 16 * 1024, missing_ok=True)
+        raw = sessions._read_file(path, 16 * 1024, missing_ok=True)
         if raw is None:
             return _report("claude", session, now=now)
         data = json.loads(raw)
@@ -207,8 +205,8 @@ def _discover_transcript(codex_home, session):
     return matches[0] if matches else None
 
 
-def _transcript_window(path, session):
-    _check_path(path)
+def _transcript_window(sessions, path, session):
+    sessions._check_path(path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags)
     try:
@@ -247,7 +245,7 @@ def _transcript_window(path, session):
         os.close(descriptor)
 
 
-def _read_codex(session, transcript=None, codex_home=None, now=None):
+def _read_codex(sessions, session, transcript=None, codex_home=None, now=None):
     if transcript is None:
         home = codex_home or os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
         path = _discover_transcript(home, session)
@@ -258,7 +256,7 @@ def _read_codex(session, transcript=None, codex_home=None, now=None):
     if ".." in path.parts:
         return _report("codex", session, now=now)
     try:
-        text = _transcript_window(path, session)
+        text = _transcript_window(sessions, path, session)
         if text is None:
             return _report("codex", session, now=now)
         latest = None
@@ -296,7 +294,7 @@ def _read_codex(session, transcript=None, codex_home=None, now=None):
         return _report("codex", session, now=now)
 
 
-def read_session_effort(harness, session, *, transcript=None, state_dir=None, codex_home=None, now=None):
+def read_session_effort(sessions, harness, session, *, transcript=None, state_dir=None, codex_home=None, now=None):
     if harness not in _EFFORTS:
         raise ValueError("harness must be claude or codex")
     canonical = _session_id(session)
@@ -305,7 +303,7 @@ def read_session_effort(harness, session, *, transcript=None, state_dir=None, co
     if harness == "claude":
         if transcript is not None or codex_home is not None:
             raise ValueError("Codex transcript options do not apply to Claude")
-        return _read_claude(canonical, state_dir, now)
+        return _read_claude(sessions, canonical, state_dir, now)
     if state_dir is not None:
         raise ValueError("Claude state options do not apply to Codex")
-    return _read_codex(canonical, transcript, codex_home, now)
+    return _read_codex(sessions, canonical, transcript, codex_home, now)
