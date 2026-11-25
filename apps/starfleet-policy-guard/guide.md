@@ -520,7 +520,7 @@ An older installed runtime may still require the former owner.
 In that case, use `lane.py` from a current Starfleet source checkout for the same preview and apply commands.
 The default command prints a plan with the seat, attachment path, recorded repository and branch, pull request records, missing-checkout evidence, and preimage hashes.
 Review that output, then apply only with `--apply --plan-sha256 REVIEWED_PLAN_SHA256`.
-For a live worktree with the recorded Git identity, use the existing owner-bound `uninstall` workflow from that checkout.
+For a live worktree with the recorded Git identity, use the [live registration workflow](#retire-a-live-attachment-registration) or run the existing owner-bound `uninstall` workflow from that checkout.
 Changing the Git remote leaves the worktree identity intact.
 It refuses a checkout that still has the recorded worktree identity but is on a different branch.
 For that case, restore the recorded branch and run `uninstall` from the checkout.
@@ -651,6 +651,28 @@ python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID recover --rollback
 The receipt proves only the local file changes.
 It does not prove that a running native host refreshed its hook configuration or stopped invoking a cached hook.
 Use real receiving evidence or a supported owner reload at a safe boundary to confirm native refresh, and do not force a restart.
+
+## Retire a live attachment registration
+
+Use `retire-attachment --live-registration` when the recorded permanent-seat checkout still exists.
+Any local operator can review and apply the plan.
+Coordinate an idle point for that checkout with any active writer before you apply.
+The plan checks the exact Git worktree, repository, branch, and current head.
+If any bound record or checkout evidence changes, review a fresh plan.
+
+```sh
+python3 /path/to/current/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/finished-feature --live-registration
+python3 /path/to/current/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/finished-feature --live-registration --apply --plan-sha256 REVIEWED_PLAN_SHA256
+python3 /path/to/current/lane.py --seat-id SEAT_ID status
+```
+
+Check that the exact attachment reports `retired` and shows its preserved PR records.
+The operation writes only the local registration and receipt.
+Shared hooks and the seat adapter remain installed for other attachments.
+If the seat is now drained, use [the drained-seat retirement workflow](#retire-a-drained-durable-seat) to detach its exact hooks and adapter.
+Use the existing owner-bound `uninstall` workflow for legacy per-worktree installations, whose registrations and hook ownership do not use the permanent-seat transaction.
 
 ## Inspect, hand off, and recover
 

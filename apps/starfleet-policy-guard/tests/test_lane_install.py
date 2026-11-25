@@ -4574,6 +4574,83 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertEqual(len(json.loads(status.stdout)['retired_attachments']), 1)
 
+    def test_live_attachment_retirement_preserves_shared_hook_and_pr_history(self):
+        owner, owner_env = self.native_owner_fixture()
+        settings_path = owner / '.claude/settings.local.json'
+        settings_path.chmod(0o600)
+        original_settings = settings_path.read_bytes()
+        source = self.source_checkout('live-attachment-retirement')
+        first = self.add_native_seat_attachment(source, owner, self.repo, owner_env)
+        checkout = self.base / 'live product checkout'
+        second = self.add_native_seat_attachment(source, owner, checkout, owner_env, 'feature/live')
+        seat_id = second['seat_id']
+        self.assertEqual(first['seat_id'], seat_id)
+        runtime = Path(second['seat_runtime_path'])
+        seat_path = lane_runtime.session_store.seat_dir(seat_id) / 'seat.json'
+        attachments = {Path(row['root']): row for row in lane_runtime.session_store.all_checkouts(seat_id)}
+        target = attachments[checkout]
+        state_path = Path(target['checkout_dir']) / 'state.json'
+        state_before = self.seed_attachment_pr_history(seat_id, target['checkout_id'], state_path)
+        seat_before = json.loads(seat_path.read_text())
+        sibling_path = Path(attachments[self.repo]['checkout_dir']) / 'state.json'
+        adapter = Path(seat_before['adapter'])
+        self.assertEqual(str(settings_path), seat_before['settings']['path'])
+        retained = {path: path.read_bytes() for path in (sibling_path, seat_path, adapter, settings_path)}
+        other_session = dict(owner_env, CLAUDE_CODE_SESSION_ID='claude-other-session')
+
+        old = self.call_source(runtime, '--cwd', checkout, 'uninstall', env=other_session, ok=False)
+        self.assertEqual(old.returncode, 2)
+        self.assertIn('belongs to another native session', old.stderr)
+        git_head = self.git('-C', str(checkout), 'rev-parse', 'HEAD').stdout.strip()
+        product_status = self.git('-C', str(checkout), 'status', '--porcelain').stdout
+        preview = self.call_seat_retirement(runtime, seat_id, checkout, '--live-registration',
+                                            env=other_session)
+        plan = json.loads(preview.stdout)
+        self.assertEqual(plan['checkout_evidence']['state'], 'live')
+        self.assertEqual(plan['checkout_evidence']['observed']['head'], git_head)
+        self.assertEqual(json.loads(state_path.read_text()), state_before)
+        apply_args = ('--live-registration', '--apply', '--plan-sha256', plan['plan_sha256'])
+
+        self.git('-C', str(checkout), 'commit', '--allow-empty', '-m', 'fixture head change')
+        stale = self.call_seat_retirement(runtime, seat_id, checkout, *apply_args,
+                                          env=other_session, ok=False)
+        self.assertEqual(stale.returncode, 2)
+        self.assertIn('preimage changed', stale.stderr)
+        self.assertEqual(json.loads(state_path.read_text()), state_before)
+
+        new_head = self.git('-C', str(checkout), 'rev-parse', 'HEAD').stdout.strip()
+        fresh = json.loads(self.call_seat_retirement(runtime, seat_id, checkout, '--live-registration',
+                                                     env=other_session).stdout)
+        result = self.call_seat_retirement(runtime, seat_id, checkout, '--live-registration',
+                                           '--apply', '--plan-sha256', fresh['plan_sha256'],
+                                           env=other_session)
+        self.assertTrue(json.loads(result.stdout)['history_preserved'])
+        state_after = json.loads(state_path.read_text())
+        self.assertEqual(state_after['phase'], 'removed')
+        self.assertEqual(state_after['retirement_receipt']['checkout_evidence']['state'], 'live')
+        self.assertEqual(state_after['pr_bindings'], state_before['pr_bindings'])
+        self.assertEqual(state_after['history'], state_before['history'])
+        for path, preimage in retained.items():
+            self.assertEqual(path.read_bytes(), preimage)
+        self.assertEqual(self.git('-C', str(checkout), 'status', '--porcelain').stdout, product_status)
+        self.assertEqual(self.git('-C', str(checkout), 'rev-parse', 'HEAD').stdout.strip(), new_head)
+
+        sibling_plan = json.loads(self.call_seat_retirement(
+            runtime, seat_id, self.repo, '--live-registration', env=other_session).stdout)
+        self.call_seat_retirement(runtime, seat_id, self.repo, '--live-registration',
+                                  '--apply', '--plan-sha256', sibling_plan['plan_sha256'],
+                                  env=other_session)
+        self.assertTrue(adapter.exists())
+        self.assertEqual(settings_path.read_bytes(), retained[settings_path])
+        physical_plan = json.loads(self.call_seat_retire(
+            runtime, seat_id, seat_before['owner'], other_session).stdout)
+        self.call_seat_retire(runtime, seat_id, seat_before['owner'], other_session,
+                              '--apply', '--plan-sha256', physical_plan['plan_sha256'])
+        self.assertFalse(adapter.exists())
+        self.assertEqual(json.loads(settings_path.read_bytes()), json.loads(original_settings))
+        self.assertEqual(json.loads(state_path.read_text()), state_after)
+        self.assertEqual(json.loads(seat_path.read_text())['prs'], seat_before['prs'])
+
     def test_missing_attachment_retirement_leaves_an_unrelated_replacement_untouched(self):
         owner, owner_env = self.native_owner_fixture()
         source = self.source_checkout('issue49-unrelated-replacement', marker_file='lane_scope.py')
