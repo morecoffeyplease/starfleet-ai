@@ -63,6 +63,8 @@ Ask before changing product behavior or scope.
 Reconcile checkout, heads, active work, evidence and holds; re-pull before editing and coordinate tracker ownership.
 Update only changed facts in this lane's sections.
 2. Consider temporary worktrees for ready independent work, respecting dependencies, ownership and resource limits.
+3. Before starting or resuming a work slice or dispatching a fix round, use `gh` to check recent merges into its base and new open drafts.
+Coordinate material overlaps with their owners.
 
 **PR openings and accepted repair batches**
 - Before opening or starting an accepted batch, read Published guidance attestations in `python3 /path/to/installed/lane.py guide --print`.
