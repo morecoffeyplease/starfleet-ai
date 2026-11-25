@@ -97,6 +97,14 @@ The command reads CMUX's current native caller and the local Hailing enrollment 
 It requires `CMUX_AGENT_LAUNCH_KIND` and exactly one matching native session hint to agree with CMUX and Hailing, so a delegated child uses its parent's supplied flags instead of asking `owner-args` to infer the parent's identity.
 An exact configured binding does not prove that a future completion message is queued, prompted, received or read.
 
+On CMUX 0.65.2 build 113, anonymous Feed telemetry can appear beside the named Codex session in `cmux current`.
+Warp-drive requires a complete pane inventory with zero omitted agent rows.
+The older anonymous row must match the PID-only digest produced by CMUX, and the saved session must match the named caller.
+The local process start and CMUX controlling-terminal lookup must also match the saved process, pane, and workspace.
+The normal caller-session and Hailing enrollment checks still apply.
+When an ambiguity remains, inspect `cmux current --json --limit 200` and `cmux sessions list --agent codex --surface SURFACE_UUID --all --json`.
+Use the exact native session when the evidence agrees, and route any unresolved discrepancy to the maintainer with the CMUX version and the two row types.
+
 For OpenCode, pass its exact native `ses_` session ID, including letter case, and the current CMUX surface UUID.
 Warp-drive does not convert OpenCode session IDs to UUIDs or borrow an identity from another agent.
 The source CLI accepts OpenCode reservation ownership, but an installed older Warp-drive runtime does not gain that support until separately updated.

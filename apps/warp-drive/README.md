@@ -105,6 +105,8 @@ Independent requests and batches may run concurrently across checkouts when thei
 Use your own observed harness, session and surface by default; use a parent's stable, exact enrolled recipient only when that parent explicitly delegates it for this request.
 Naming a delegated parent identity records that request's owner and completion recipient, and any later ownership handoff still requires an explicit `warp-drive transfer`.
 Use `warp-drive owner-args` in the current native terminal to print its verified tuple for an existing delegated brief; see the [agent guide](guide.md#verify-owner-arguments-for-a-delegated-request).
+If CMUX shows an older anonymous Codex Feed record on the same pane, `owner-args` can still identify the native session when the exact PID, process start, pane, and workspace all corroborate that the record belongs to that process.
+[Inspect this specific ambiguity in the agent guide](guide.md#verify-owner-arguments-for-a-delegated-request).
 
 Run the sending scheduler explicitly in a dedicated native CMUX terminal with `warp-drive scheduler --send`.
 Its `CMUX_SURFACE_ID` must identify that terminal and differ from enrolled recipient surfaces.
