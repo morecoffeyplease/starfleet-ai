@@ -81,6 +81,10 @@ pattern-buffer --cwd /absolute/worktree enrollment-release --harness codex --ses
 ```
 
 The named replacement then adopts from its own native session.
+Run `enrollment-status` and `enrollment-adopt` separately, naming your exact harness and session.
+The hooks permit these recovery operations when the successor has a pending binding, including when its own checkpoint was already set up.
+Adoption must match the pending enrollment ID, assigned role and safe release.
+It leaves outstanding required-read and checkpoint recovery receipts to their existing workflows.
 It receives a new session-named context file and retains the same durable enrollment ID and historical predecessor identity.
 The old binding remains retired and cannot receive the successor's mission or rearm its reminders.
 

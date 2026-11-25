@@ -563,57 +563,12 @@ class MonitorTests(unittest.TestCase):
 
     def test_prompt_uses_owned_installed_launcher_only_for_matching_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
-            home = Path(temporary) / "home with spaces"
+            home = Path(temporary).resolve() / "home with spaces"
             runtime_root = home / ".local/share/starfleet-ai/hailing-frequencies"
-            staging = Path(temporary) / "staging"
-            staging.mkdir()
-            staged_script = staging / "hailing_frequencies.py"
-            staged_service = staging / "service.py"
-            staged_temporal = staging / "temporal_beacon.py"
-            staged_guide = staging / "guide.md"
-            staged_agent_notify = staging / "agent-notify"
-            staged_agent_notify_guide = staging / "agent-notify-guide.md"
-            staged_discord_cleanup = staging / "discord_cleanup.py"
-            staged_discord_cleanup_guide = staging / "discord-cleanup.md"
-            staged_opencode_adapter = staging / "opencode_adapter.py"
-            staged_script.write_bytes(b"immutable runtime script")
-            staged_service.write_bytes(b"immutable runtime service")
-            source_app = Path(__file__).resolve().parents[1]
-            staged_temporal.write_bytes((source_app / "temporal_beacon.py").read_bytes())
-            staged_guide.write_bytes((source_app / "guide.md").read_bytes())
-            staged_agent_notify.write_bytes((source_app / "agent-notify").read_bytes())
-            staged_agent_notify_guide.write_bytes((source_app / "agent-notify-guide.md").read_bytes())
-            staged_discord_cleanup.write_bytes((source_app / "discord_cleanup.py").read_bytes())
-            staged_discord_cleanup_guide.write_bytes((source_app / "discord-cleanup.md").read_bytes())
-            staged_opencode_adapter.write_bytes(
-                (source_app.parent / "opencode-adapter" / "opencode_adapter.py").read_bytes())
-            skill_source = source_app / "skills/temporal-beacon/SKILL.md"
-            agent_notify_skill_source = source_app / "skills/agent-notify/SKILL.md"
-            sources = {"hailing_frequencies.py": staged_script.read_bytes(), "service.py": staged_service.read_bytes(),
-                       "temporal_beacon.py": staged_temporal.read_bytes(), "guide.md": staged_guide.read_bytes(),
-                       "agent-notify": staged_agent_notify.read_bytes(),
-                       "agent-notify-guide.md": staged_agent_notify_guide.read_bytes(),
-                       "discord_cleanup.py": staged_discord_cleanup.read_bytes(),
-                       "discord-cleanup.md": staged_discord_cleanup_guide.read_bytes(),
-                       "opencode_adapter.py": staged_opencode_adapter.read_bytes(),
-                       "skills/temporal-beacon/SKILL.md": skill_source.read_bytes(),
-                       "skills/agent-notify/SKILL.md": agent_notify_skill_source.read_bytes()}
-            digest = hashlib.sha256(b"".join(name.encode() + b"\0" + content
-                                              for name, content in sources.items())).hexdigest()
-            runtime = runtime_root / digest
-            runtime.mkdir(parents=True)
+            installation = install.install(runtime_root, home / ".local/bin")
+            runtime = Path(installation["runtime"])
             script = runtime / "hailing_frequencies.py"
-            service_path = runtime / "service.py"
-            for name, content in sources.items():
-                target = runtime / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(content)
-            hf.atomic_json(runtime / "installation.json", {"sha256": digest, "python": sys.executable})
-            launcher = home / ".local/bin/hailing-frequencies"
-            launcher.parent.mkdir(parents=True)
-            launcher.write_text("#!/bin/sh\n" + hf.INSTALL_MARKER + "\nexec " + shlex.quote(sys.executable) + " " +
-                                shlex.quote(str(script.resolve())) + ' "$@"\n')
-            launcher.chmod(0o755)
+            launcher = Path(installation["command"])
             default_state = home / ".local/state/starfleet-ai/hailing-frequencies"
             app = hf.Monitor(default_state, self.host)
             message_id = uid()
@@ -986,6 +941,77 @@ class BindingTests(unittest.TestCase):
 
     def save(self):
         Path(self.temp.name, self.t["harness"] + "-hook-sessions.json").write_text(json.dumps(self.store))
+
+    def prepare_replacement(self, harness="claude"):
+        self.t["harness"] = harness
+        successor = {**self.t, "session": uid(), "started_at": 10}
+        persisted = dict(version=1, targets=[self.t, target("other")], coordinator=None,
+                         remind_after=5, escalate_after=10, cooldown=5, interval=5)
+        directory = Path(self.temp.name)
+        hf.atomic_json(directory / "config.json", persisted)
+        self.store["sessions"] = {successor["session"]: dict(
+            surfaceId=successor["surface"], workspaceId=successor["workspace"],
+            agentLifecycle="running", startedAt=10)}
+        self.store["activeSessionsBySurface"][self.t["surface"]]["sessionId"] = successor["session"]
+        self.save()
+        self.current["items"][0]["agents"] = [
+            dict(session_id=self.t["session"], kind=harness, state="ended"),
+            dict(session_id=successor["session"], kind=harness, state="working")]
+        args = hf.parser().parse_args([
+            "--state-dir", str(directory), "replace", "--from-session", self.t["session"],
+            "--surface", successor["surface"], "--session", successor["session"],
+            "--harness", harness, "--label", successor["label"]])
+        for patcher in (patch.dict("os.environ", {"CMUX_SURFACE_ID": successor["surface"],
+                                                  "CMUX_WORKSPACE_ID": successor["workspace"],
+                                                  "CMUX_AGENT_LAUNCH_KIND": harness,
+                                                  "CLAUDE_CODE_SESSION_ID": successor["session"],
+                                                  "CODEX_THREAD_ID": successor["session"]}),
+                        patch("replacement_custody.Path.home", return_value=directory)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.cmux.messages = lambda target: []
+        return hf.Monitor(directory, self.cmux, clock=lambda: 20), args, persisted
+
+    def test_same_surface_replacement_preserves_history_and_retry_cutoff(self):
+        app, args, original = self.prepare_replacement("codex")
+        with closing(app.database()) as db, db:
+            db.execute("INSERT INTO acknowledgements VALUES (?,?,?,?)", (self.t["session"], uid(), 1, "inbox"))
+        with patch.object(hf, "Cmux", return_value=self.cmux), patch.object(hf, "Monitor", return_value=app):
+            receipt = hf.main(["--state-dir", str(app.directory), "replace", "--from-session", args.from_session,
+                               "--surface", args.surface, "--session", args.session, "--harness", args.harness,
+                               "--label", args.label])
+        self.assertEqual(receipt["replaced"], self.t["session"])
+        self.assertEqual(receipt["enrolled"]["cutoff"], 20)
+        self.assertEqual(app.config()["targets"], [receipt["enrolled"], original["targets"][1]])
+        app.clock = lambda: 30
+        with app.locked():
+            self.assertEqual(app.replace_enrollment(app.config(), args), receipt)
+        with closing(app.database()) as db:
+            self.assertEqual(db.execute("SELECT session FROM acknowledgements").fetchall(), [(self.t["session"],)])
+
+    def test_replacement_refusals_leave_enrollments_unchanged(self):
+        app, args, original = self.prepare_replacement()
+        agents = self.current["items"][0]["agents"]
+        predecessor = agents[0]
+        for state in ("idle", "working", "unknown"):
+            with self.subTest(state=state):
+                predecessor["state"] = state
+                with self.assertRaisesRegex(ValueError, "predecessor ended"):
+                    app.replace_enrollment(app.config(), args)
+        agents.pop(0)
+        with self.assertRaisesRegex(ValueError, "activity is unavailable"):
+            app.replace_enrollment(app.config(), args)
+        predecessor["state"] = "ended"
+        agents.append(predecessor)
+        with patch.dict("os.environ", {"CMUX_SURFACE_ID": uid()}):
+            with self.assertRaisesRegex(ValueError, "exact successor CMUX surface"):
+                app.replace_enrollment(app.config(), args)
+        with self.assertRaisesRegex(ValueError, "Coordinator enrollment"):
+            app.replace_enrollment({**app.config(), "coordinator": self.t["session"]}, args)
+        self.cmux.messages = lambda target: [message(target, at=5)]
+        with self.assertRaisesRegex(ValueError, "unread native CMUX messages"):
+            app.replace_enrollment(app.config(), args)
+        self.assertEqual(app.config(), original)
 
     def test_exact_current_binding_and_single_agent_aware_submit(self):
         self.cmux.submit(self.t, "Monitor\nRead queue")

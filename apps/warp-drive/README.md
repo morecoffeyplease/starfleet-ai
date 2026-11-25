@@ -57,6 +57,7 @@ Legacy generic `pressure` samples remain unknown and block new work until a fres
 During warning, Warp-drive allows up to the configured number of reserved heavy claims and at most one reserved light claim.
 The default heavy limit is one, and the light limit is always one.
 Warp-drive counts every reserved row, including unstarted claims and uncertain claims with inactive leases.
+After the current owner or configured operator verifies the exact workload has stopped, explicit reconciliation can release its capacity while preserving the unknown exit result and launch history.
 The two classes have separate limits, so one heavy and one light claim can coexist under the default setting.
 The scheduler still requires fresh host samples and CPU headroom for every grant.
 Use `warp-drive config warning-heavy-limit 0 --actor OPERATOR_ID` to block all new heavy claims during warning.
@@ -104,6 +105,8 @@ Independent requests and batches may run concurrently across checkouts when thei
 Use your own observed harness, session and surface by default; use a parent's stable, exact enrolled recipient only when that parent explicitly delegates it for this request.
 Naming a delegated parent identity records that request's owner and completion recipient, and any later ownership handoff still requires an explicit `warp-drive transfer`.
 Use `warp-drive owner-args` in the current native terminal to print its verified tuple for an existing delegated brief; see the [agent guide](guide.md#verify-owner-arguments-for-a-delegated-request).
+If CMUX shows an older anonymous Codex Feed record on the same pane, `owner-args` can still identify the native session when the exact PID, process start, pane, and workspace all corroborate that the record belongs to that process.
+[Inspect this specific ambiguity in the agent guide](guide.md#verify-owner-arguments-for-a-delegated-request).
 
 Run the sending scheduler explicitly in a dedicated native CMUX terminal with `warp-drive scheduler --send`.
 Its `CMUX_SURFACE_ID` must identify that terminal and differ from enrolled recipient surfaces.
@@ -154,6 +157,10 @@ The turn context shows current round, each ready worktree's manual order and ser
 The snapshot is not a FIFO rank, reservation promise or ETA, and a later sample or scheduler pass may change it.
 Status and doctor list completed request IDs whose owners lack an exact Hailing route and show the supported enrollment or owner-authorized transfer action.
 Pending completion events remain durable for the existing sending scheduler to retry after route recovery.
+For an outgoing session with an uncertain launch, [verify the exact workload stopped and reconcile the reservation](guide.md#completion-and-exceptional-outcomes) before treating the capacity claim as settled.
+An inactive lease alone does not establish that the workload stopped.
+A verified stop can finish the reservation while preserving its unknown exit result.
+Use explicit transfer to route a pending completion for that same reservation to the accepted enrolled successor before retiring the outgoing session.
 
 For exceptional incidents, the same `scheduler --send` process may queue one native CMUX inbox message to the exact enrolled `warp-drive-engineer` Hailing target.
 Each scheduler pass attempts at most one completion and one engineer incident message, so recovered backlogs drain at the sampling cadence.

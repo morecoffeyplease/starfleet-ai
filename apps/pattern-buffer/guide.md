@@ -311,6 +311,9 @@ Keep the separate checkpoint for current implementation state.
 Use `status --harness HARNESS --session SESSION_UUID` to inspect the selected file; missing or invalid required files emit a blocking stop-and-notify alarm instead of borrowing another mission.
 Use `enrollment-release` and `enrollment-adopt` for an explicitly authorized successor, preserving exact identity and outgoing timer cancellation.
 If a required binding is missing, invalid or inactive, pause product work and inspect `enrollment-status --harness HARNESS --session SESSION_UUID`.
+A named pending successor can run its exact `enrollment-status` and `enrollment-adopt` as separate commands even while required reads or checkpoint recovery are pending.
+Adoption must match the safely released enrollment, exact native session and assigned role.
+After adoption, finish any required reads and checkpoint recovery before ordinary tools or product work.
 Only already-authorized supported recovery is allowed: the named pending successor may adopt the reviewed handoff, finish its fresh checkpoint setup and validate; an active owner may restore an already-approved source with `session-enroll --reviewed-update --evidence REFERENCE`.
 Do not resume product work until validation succeeds; notify the context owner through the configured contact workflow for unexpected state, missing authority or reviewed inputs, or failed recovery.
 Read the [session enrollment and reliability guide](docs/session-enrollments.md) for commands, authority boundaries and failure recovery.

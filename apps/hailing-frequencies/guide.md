@@ -5,6 +5,11 @@ Use the machine's existing `~/.local/bin/hailing-frequencies` launcher and defau
 Do not create a second state directory or start a duplicate `supervise` worker.
 Use `hailing-frequencies status` to inspect saved enrollment and `hailing-frequencies health` for recent scans with complete target coverage.
 If health reports incomplete coverage, inspect `status` for targets whose inboxes could not be read.
+Run `starfleet doctor --json` from your exact session to check whether a fresh worker scan covers your own route.
+An unrelated missing target can leave the fleet warning in place while your session has intended delivery.
+If your intended delivery is blocked, check your exact target row and send scope in `status`.
+A fresh scan is required after upgrading the worker.
+Confirm actual delivery separately with the exact message or timer receipt.
 Neither establishes permission to start another worker; if worker availability is unclear, ask the existing owner or operator instead.
 
 The default Hailing Frequencies install includes the `agent-notify` Discord conversation command and its skill.
@@ -19,6 +24,15 @@ Use `temporal-beacon set --after-idle 50m --message 'Refresh the checkpoint befo
 Activity postpones delivery, and receipt completes the timer; do not rearm it from its own wake.
 Unknown activity, human-input holds and replaced sessions prevent submission.
 Run `temporal-beacon doctor` before relying on delivery and read [the timer guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md) for details.
+
+## Claude Code weekly quota alerts
+
+From your exact enrolled Claude or Codex session, use `temporal-beacon quota-watch --message 'Review the new Claude weekly quota reading.'` to wake on changes in the local weekly allowance.
+Add `--at-or-below 3` for one alert per reset at 3% remaining or less.
+Use `temporal-beacon quota-status` to check the source and alert state, and `temporal-beacon quota-stop` to end the watch.
+The existing Hailing worker needs send coverage for your session and a fresh Claude Code status-line cache.
+Receive a quota alert with the command in its wake and apply only the operator's approved continuation.
+See [quota watch setup](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/hailing-frequencies/temporal-beacon.md#watch-claude-code-weekly-quota).
 
 ## Identify the exact session
 
@@ -46,6 +60,21 @@ A coordinator may help enroll another session only with explicit operator author
 If the session is already enrolled unchanged, keep its existing cutoff and receipts.
 After enrollment, run `hailing-frequencies status` to confirm that the exact session is listed.
 Enrollment confirms saved configuration only; it does not prove a reminder reached or was read by the agent.
+
+### Replace an ended session on your pane
+
+For Claude or Codex on the same CMUX pane and workspace, use the exact enrolled predecessor from `hailing-frequencies status` and the exact current identity from CMUX.
+
+```sh
+hailing-frequencies replace --harness claude --surface YOUR_SURFACE_UUID --session YOUR_SESSION_UUID --from-session ENROLLED_PREDECESSOR_UUID --label YOUR_LABEL
+```
+
+Select your actual harness and run this from the successor.
+CMUX must positively identify the predecessor as ended and the successor as the current owner.
+The replacement starts a fresh cutoff and preserves the predecessor's history.
+Active timers, unresolved native inbox messages, open or unresolved Discord Watch conversations, and coordinator registrations require an explicit handoff.
+Use the explicit handoff for nonstandard Discord Watch state locations.
+Confirm the new registration with `hailing-frequencies status` and check `warp-drive owner-args` from the successor when using Warp.
 
 ### OpenCode self-enrollment
 
@@ -79,7 +108,8 @@ The opt-in never bypasses missing or mismatched identities, dialogs, disabled re
 1. Read the private handoff packet and confirm the exact outgoing session, the threads you are authorized to receive, and any retained obligations.
    From the incoming session, run `hailing-frequencies status` and follow [exact-session enrollment](#enroll-only-your-own-session) if needed.
    Reuse a matching enrollment without changing its cutoff or receipts.
-   If the outgoing binding is still on the same surface and enrollment refuses, keep that binding and use a separate authorized incoming surface.
+   If the outgoing binding is still on the same surface, use the [self-service replacement](#replace-an-ended-session-on-your-pane) only after its custody checks pass.
+   If obligations still need transfer, keep the outgoing binding and use a separate authorized incoming surface.
 2. Run `discord-watch status` to check the recorded owner and pending work for each named thread.
    From the exact enrolled incoming session, transfer each authorized thread and verify the resulting owner.
 
