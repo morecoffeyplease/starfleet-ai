@@ -2614,6 +2614,7 @@ def test_owner_args_anonymous_codex_feed(temp):
         "current": {"truncated": False, "owner_availability": {"agent_sessions": "available"}, "items": [{
             "placement": {"kind": "local"}, "lifecycle": "running", "freshness": {"state": "current"},
             "projections": [{"workspace_id": workspace, "panel_id": surface}], "agents": agents,
+            "omitted": {"agents": 0},
         }]},
         "sessions": {"total_matches": 1, "sessions": [record]},
         "rpc": target,
@@ -2671,6 +2672,9 @@ print(fixture["process_start"])
         check(result.returncode == 2 and not result.stdout and not state.exists(),
               f"owner-args returned an identity for contradictory evidence: {replacements!r}")
 
+    item = snapshots["current"]["items"][0]
+    refuses(item, {"omitted": {}})
+    refuses(item, {"omitted": {"agents": 1}})
     refuses(anonymous, {"session_id": uuid_text()})
     refuses(anonymous, {"session_id": "fallback-0000000000000000"})
     refuses(anonymous, {"last_activity_at": named["last_activity_at"]})

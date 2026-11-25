@@ -1539,9 +1539,12 @@ def owner_process_start(pid):
     return None
 
 
-def corroborate_anonymous_codex_feed(active, workspace, surface):
+def corroborate_anonymous_codex_feed(active, workspace, surface, omitted):
     if len(active) != 2 or any(row.get("kind") != "codex" or row.get("has_hook_lifecycle_state") is not True
                                for row in active):
+        return active
+    omitted_agents = omitted.get("agents") if isinstance(omitted, dict) else None
+    if type(omitted_agents) is not int or omitted_agents != 0:
         return active
     anonymous = [row for row in active if isinstance(identifier := row.get("session_id"), str)
                  and re.fullmatch(r"fallback-[0-9a-f]{16}", identifier)]
@@ -1639,7 +1642,7 @@ def discover_native_owner():
     require(isinstance(agents, list), "CMUX caller surface has no agent inventory; retry when it is available.")
     active = [agent for agent in agents
               if isinstance(agent, dict) and agent.get("state") != "ended"]
-    active = corroborate_anonymous_codex_feed(active, workspace, surface)
+    active = corroborate_anonymous_codex_feed(active, workspace, surface, item.get("omitted"))
     require(len(active) == 1 and active[0].get("state") in ("working", "idle", "needs_input"),
             "CMUX caller needs one unambiguous active native owner. Run from the intended native agent terminal and retry.")
     harness = active[0].get("kind")

@@ -98,7 +98,8 @@ It requires `CMUX_AGENT_LAUNCH_KIND` and exactly one matching native session hin
 An exact configured binding does not prove that a future completion message is queued, prompted, received or read.
 
 On CMUX 0.65.2 build 113, anonymous Feed telemetry can appear beside the named Codex session in `cmux current`.
-Warp-drive accepts that specific pair when the older anonymous row matches the PID-only digest produced by CMUX and the saved session matches the named caller.
+Warp-drive requires a complete pane inventory with zero omitted agent rows.
+The older anonymous row must match the PID-only digest produced by CMUX, and the saved session must match the named caller.
 The local process start and CMUX controlling-terminal lookup must also match the saved process, pane, and workspace.
 The normal caller-session and Hailing enrollment checks still apply.
 When an ambiguity remains, inspect `cmux current --json --limit 200` and `cmux sessions list --agent codex --surface SURFACE_UUID --all --json`.
