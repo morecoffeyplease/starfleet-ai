@@ -170,7 +170,7 @@ python3 apps/discord-watch/install.py
 discord-watch guide --print
 ```
 
-The installer stages Discord Watch, the custody adoption module, Temporal Beacon, the pinned dependency, this README, the guide, and the Hailing Frequencies source dependency into an immutable content-addressed runtime.
+The installer stages Discord Watch, the custody adoption module, Temporal Beacon and its quota alert dependency, the pinned dependency, this README, the guide, and the Hailing Frequencies source dependency into an immutable content-addressed runtime.
 It verifies the wheel hash, vendored import location, package version, and runtime integrity record before replacing the launcher.
 The installed guide can print before initialization, enrollment, Discord credentials, or a Git checkout.
 Uninstalling the launcher preserves the runtime and local state.

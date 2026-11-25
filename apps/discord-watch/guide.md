@@ -34,7 +34,7 @@ discord-watch guide --print
 ```
 
 The Discord Watch installer creates the `discord-watch` launcher and an immutable runtime under `~/.local/share/starfleet-ai/discord-watch/`.
-It packages the maintained guide, README, source, pinned Gateway dependency, custody adoption module, Temporal Beacon source, and a source copy of Hailing Frequencies' guarded CMUX binding.
+It packages the maintained guide, README, source, pinned Gateway dependency, custody adoption module, Temporal Beacon and its quota alert dependency, and a source copy of Hailing Frequencies' guarded CMUX binding.
 Installation does not initialize state, register a thread, start a worker, or alter harness or CMUX settings.
 If either launcher is already installed, run its guide and continue with the setup below.
 To install into a different location, pass `--runtime-root PATH` and `--bin-dir PATH` to `install.py`.

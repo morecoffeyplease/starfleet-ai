@@ -194,16 +194,20 @@ def install(runtime_root=None, bin_dir=None, uninstall=False, provisioner=None):
     source_dir = Path(__file__).resolve().parent
     hailing_source = source_dir.parent / "hailing-frequencies" / "hailing_frequencies.py"
     temporal_source = source_dir.parent / "hailing-frequencies" / "temporal_beacon.py"
+    quota_alert_source = temporal_source.with_name("quota_alert.py")
     opencode_adapter_source = source_dir.parent / "opencode-adapter" / "opencode_adapter.py"
     if not hailing_source.is_file():
         raise ValueError("Hailing Frequencies source dependency is unavailable")
     if not temporal_source.is_file() or temporal_source.is_symlink():
         raise ValueError("Temporal Beacon source dependency is unavailable")
+    if not quota_alert_source.is_file() or quota_alert_source.is_symlink():
+        raise ValueError("Temporal Beacon quota alert source dependency is unavailable")
     if not opencode_adapter_source.is_file() or opencode_adapter_source.is_symlink():
         raise ValueError("OpenCode session adapter source dependency is unavailable")
     sources = {name: (source_dir / name).read_bytes() for name in SOURCE_NAMES}
     sources["hailing_frequencies.py"] = hailing_source.read_bytes()
     sources["temporal_beacon.py"] = temporal_source.read_bytes()
+    sources["quota_alert.py"] = quota_alert_source.read_bytes()
     sources["opencode_adapter.py"] = opencode_adapter_source.read_bytes()
     from generate_dependency_lock import render
     if sources["requirements.lock"].decode("utf-8") != render(source_dir / "dependency-manifest.json"):

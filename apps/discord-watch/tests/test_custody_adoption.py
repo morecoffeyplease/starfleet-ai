@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -266,6 +267,17 @@ class CustodyAdoptionTests(unittest.TestCase):
         integrity = json.loads((runtime / "runtime-integrity.json").read_text())
         self.assertIn("custody_adoption.py", integrity["files"])
         self.assertIn("temporal_beacon.py", integrity["files"])
+        self.assertIn("quota_alert.py", integrity["files"])
+        missing_state = root / "unconfigured"
+        preview = subprocess.run(
+            [result["command"], "--hailing-state", str(missing_state),
+             "custody-adoption", "preview", "--operation-id", OPERATION,
+             "--approval-reference", "synthetic-install-check", "--thread", THREAD],
+            capture_output=True, text=True, cwd=root, env={**os.environ, "PYTHONPATH": ""},
+        )
+        self.assertEqual(preview.returncode, 1, preview.stderr)
+        self.assertIn("Hailing Frequencies config", json.loads(preview.stderr)["error"])
+        self.assertFalse(missing_state.exists())
 
     def test_partial_apply_holds_and_resumes_same_operation_without_replaying_uncertain_work(self):
         preview, prepared, accepted = self._prepare_and_accept()
