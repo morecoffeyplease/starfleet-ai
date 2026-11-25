@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+from datetime import datetime, timedelta, timezone
 import fcntl
 import getpass
 import hashlib
@@ -1517,6 +1518,81 @@ def cmux_json(args, action):
     return value
 
 
+def cmux_utc_time(value):
+    if isinstance(value, str) and value.endswith("Z"):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            pass
+    return None
+
+
+def owner_process_start(pid):
+    try:
+        observed = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                  env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+                                  capture_output=True, text=True, timeout=2)
+        if observed.returncode == 0:
+            return datetime.strptime(observed.stdout.strip(), "%a %b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def corroborate_anonymous_codex_feed(active, workspace, surface):
+    if len(active) != 2 or any(row.get("kind") != "codex" or row.get("has_hook_lifecycle_state") is not True
+                               for row in active):
+        return active
+    anonymous = [row for row in active if isinstance(identifier := row.get("session_id"), str)
+                 and re.fullmatch(r"fallback-[0-9a-f]{16}", identifier)]
+    if len(anonymous) != 1 or anonymous[0].get("state") not in ("working", "idle"):
+        return active
+    native = next(row for row in active if row is not anonymous[0])
+    session = canonical_session("codex", native.get("session_id"))
+    feed_activity = cmux_utc_time(anonymous[0].get("last_activity_at"))
+    native_activity = cmux_utc_time(native.get("last_activity_at"))
+    if feed_activity is None or native_activity is None or feed_activity >= native_activity:
+        return active
+
+    saved = cmux_json(["sessions", "list", "--agent", "codex", "--surface", surface, "--all"], "sessions list")
+    records = saved.get("sessions")
+    count = saved.get("total_matches")
+    if type(count) is not int or count != 1 or not isinstance(records, list) or len(records) != 1:
+        return active
+    record = records[0]
+    if (not isinstance(record, dict) or record.get("agent") != "codex" or
+            canonical_session("codex", record.get("session_id")) != session or
+            canonical_uuid(record.get("workspace_id"), "CMUX saved workspace") != workspace or
+            canonical_uuid(record.get("surface_id"), "CMUX saved surface") != surface):
+        return active
+    pid = record.get("pid")
+    if type(pid) is not int or pid <= 0 or record.get("stored_pid_exists") is not True:
+        return active
+
+    # CMUX 0.65.2 build 113, stableFallbackFeedSessionId in CLI/cmux.swift.
+    seed = f"source=codex\npid={pid}".encode()
+    if anonymous[0]["session_id"] != "fallback-" + hashlib.sha256(seed).hexdigest()[:16]:
+        return active
+    process_start = owner_process_start(pid)
+    saved_start = cmux_utc_time(record.get("started_at"))
+    saved_activity = cmux_utc_time(record.get("updated_at"))
+    if process_start is None or saved_start is None or saved_activity is None:
+        return active
+    # ps reports whole seconds. A timestamp within that second cannot establish ordering.
+    if not process_start + timedelta(seconds=1) <= saved_start <= feed_activity < saved_activity:
+        return active
+    params = json_text({"pid": pid, "pid_resolution": "controlling_tty"})
+    route = cmux_json(["rpc", "agent.resolve_delivery_target", params], "process delivery target")
+    routed_pid = route.get("pid")
+    if (route.get("source") != "pid" or route.get("pid_resolution") != "controlling_tty" or
+            type(routed_pid) is not int or routed_pid != pid or
+            canonical_uuid(route.get("workspace_id"), "CMUX process workspace") != workspace or
+            canonical_uuid(route.get("surface_id"), "CMUX process surface") != surface or
+            owner_process_start(pid) != process_start):
+        return active
+    return [native]
+
+
 def discover_native_owner():
     caller_packet = cmux_json(["--id-format", "uuids", "identify"], "identify")
     caller = caller_packet.get("caller")
@@ -1563,6 +1639,7 @@ def discover_native_owner():
     require(isinstance(agents, list), "CMUX caller surface has no agent inventory; retry when it is available.")
     active = [agent for agent in agents
               if isinstance(agent, dict) and agent.get("state") != "ended"]
+    active = corroborate_anonymous_codex_feed(active, workspace, surface)
     require(len(active) == 1 and active[0].get("state") in ("working", "idle", "needs_input"),
             "CMUX caller needs one unambiguous active native owner. Run from the intended native agent terminal and retry.")
     harness = active[0].get("kind")
