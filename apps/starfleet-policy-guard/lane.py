@@ -2243,8 +2243,8 @@ def retirement_checkout_evidence(checkout, state):
                      observed_common_gitdir == checkout.get('common_gitdir'))
     if same_worktree and observed_branch != recorded_branch:
         raise ValueError('The recorded checkout exists on another branch; restore its recorded branch and run uninstall from that checkout. Missing-checkout retirement does not apply to a live worktree on another branch')
-    if same_worktree and observed_repository == checkout.get('repository'):
-        raise ValueError('The recorded checkout is live and matches its recorded repository and branch; run uninstall from that checkout')
+    if same_worktree:
+        raise ValueError('The recorded checkout is live; run uninstall from that checkout')
     return {'state': 'not-recorded-worktree', 'reason': 'recorded path no longer identifies its recorded repository worktree',
             'path_exists': True, 'path_is_symlink': False, 'recorded_branch': recorded_branch,
             'observed': observed}
@@ -2254,7 +2254,8 @@ def build_retire_attachment_plan(identifier, checkout_value):
     seat = session_store.load_seat(identifier)
     if not seat:
         raise ValueError('Permanent Policy Guard seat registry is missing; preserve history and use recover --inspect')
-    lane_scope.check_owner({'lane_owner': seat['owner']})
+    if not valid_historical_seat_owner(seat):
+        raise ValueError('The recorded historical seat owner is malformed; preserve it and inspect status')
     ensure_retirement_lifecycle_clear(seat)
     checkout_value = Path(checkout_value)
     if not checkout_value.is_absolute():
@@ -6353,7 +6354,7 @@ def build_parser():
     p = sub.add_parser('unpin', help='Remove a local PR retention pin')
     p.add_argument('--pr-url',required=True)
     p = sub.add_parser('retire-attachment', help='Retire a missing Policy Guard checkout with a reviewed plan hash',
-                       description='Plan or apply history-preserving retirement of one missing Policy Guard attachment.',
+                       description='Any local operator can plan or apply retirement of one missing attachment while preserving its history.',
                        formatter_class=argparse.RawDescriptionHelpFormatter,
                        epilog='Example:\n  lane.py --seat-id SEAT_ID retire-attachment --checkout /worktrees/temporary-feature\n  lane.py --seat-id SEAT_ID retire-attachment --checkout /worktrees/temporary-feature --apply --plan-sha256 REVIEWED_PLAN_SHA256')
     p.add_argument('--checkout', type=Path, required=True,

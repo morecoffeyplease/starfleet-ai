@@ -154,10 +154,13 @@ See [the printable guide](guide.md#retire-a-drained-durable-seat) for the exact 
 
 ## Retire a missing attachment
 
-An exact seat owner can retire a recorded attachment when its checkout path is gone or now belongs to a different Git repository or worktree.
-The command refuses a live matching checkout and directs the owner to run `uninstall` from that checkout.
-It also refuses a recorded worktree that exists on another branch, and refuses while an install, migration, handoff, or upgrade recovery is pending.
-It changes only the Policy Guard attachment record, preserves pull request records and their counts, and records the owner, time, and missing-checkout evidence.
+Any local operator can retire a recorded attachment when its checkout path is gone or now identifies another worktree.
+Use the recorded seat ID and absolute checkout path to review and apply the exact plan.
+Use a current source checkout's `lane.py` if an older installed runtime still asks for the former owner.
+For a live worktree with the recorded Git identity, use the existing owner-bound `uninstall` workflow from that checkout on its recorded branch.
+A pending install, migration, handoff, or upgrade still requires recovery first.
+Retirement preserves the seat's owner, existing hooks, and PR records and counts.
+The receipt records the historical owner, time, and missing-checkout evidence.
 
 For example, review the plan for a deleted temporary checkout, then apply only its exact hash:
 

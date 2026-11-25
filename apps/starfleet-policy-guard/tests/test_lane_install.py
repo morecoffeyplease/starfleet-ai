@@ -4488,7 +4488,7 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), state_before)
         self.assertEqual(seat_path.read_bytes(), seat_before)
 
-    def test_missing_only_attachment_works_by_seat_id_and_refuses_wrong_owner_and_stale_plan(self):
+    def test_missing_only_attachment_accepts_local_operator_and_refuses_stale_plan(self):
         owner, owner_env = self.native_owner_fixture()
         source = self.source_checkout('issue49-only-attachment', marker_file='lane_scope.py')
         checkout = self.base / 'only disposable product worktree'
@@ -4497,6 +4497,14 @@ class LaneInstallTest(unittest.TestCase):
         attachment = lane_runtime.session_store.all_checkouts(seat_id)[0]
         state_path = Path(attachment['checkout_dir']) / 'state.json'
         original_state_bytes = state_path.read_bytes()
+        runtime = Path(attached['seat_runtime_path'])
+        other_session = dict(owner_env, CLAUDE_CODE_SESSION_ID='claude-other-session')
+        self.git('-C', str(checkout), 'remote', 'rename', 'origin', 'upstream')
+        live = self.call_seat_retirement(runtime, seat_id, checkout, env=other_session, ok=False)
+        self.assertEqual(live.returncode, 2)
+        self.assertIn('checkout is live', live.stderr)
+        self.assertEqual(state_path.read_bytes(), original_state_bytes)
+
         removed = subprocess.run(['git', '-C', str(self.repo), 'worktree', 'remove', '--force', str(checkout)],
                                   capture_output=True, text=True, env=owner_env)
         self.assertEqual(removed.returncode, 0, removed.stderr)
@@ -4504,10 +4512,8 @@ class LaneInstallTest(unittest.TestCase):
                                         capture_output=True, text=True, env=owner_env)
         self.assertEqual(branch_removed.returncode, 0, branch_removed.stderr)
 
-        wrong_owner = dict(owner_env, CLAUDE_CODE_SESSION_ID='claude-other-session')
-        denied = self.call_seat_retirement(source, seat_id, checkout, env=wrong_owner, cwd=self.base, ok=False)
-        self.assertEqual(denied.returncode, 2)
-        self.assertIn('belongs to another native session', denied.stderr)
+        preview = self.call_seat_retirement(runtime, seat_id, checkout, env=other_session)
+        self.assertEqual(json.loads(preview.stdout)['checkout_evidence']['state'], 'missing')
         self.assertEqual(state_path.read_bytes(), original_state_bytes)
 
         seat_before = lane_runtime.session_store.load_seat(seat_id)
@@ -4516,7 +4522,7 @@ class LaneInstallTest(unittest.TestCase):
             pending = copy.deepcopy(seat_before)
             pending[field] = {'fixture': 'pending'}
             lane_runtime.session_store.save_seat(pending)
-            refused = self.call_seat_retirement(source, seat_id, checkout, env=owner_env, cwd=self.base, ok=False)
+            refused = self.call_seat_retirement(runtime, seat_id, checkout, env=other_session, ok=False)
             self.assertEqual(refused.returncode, 2)
             self.assertIn('recover --inspect', refused.stderr)
             self.assertEqual(state_path.read_bytes(), original_state_bytes)
@@ -4524,7 +4530,7 @@ class LaneInstallTest(unittest.TestCase):
 
         upgrade_journal = lane_runtime.session_store.seat_dir(seat_id) / lane_runtime.UPGRADE_JOURNAL
         upgrade_journal.write_text('{}\n')
-        upgrade_refused = self.call_seat_retirement(source, seat_id, checkout, env=owner_env, cwd=self.base, ok=False)
+        upgrade_refused = self.call_seat_retirement(runtime, seat_id, checkout, env=other_session, ok=False)
         self.assertEqual(upgrade_refused.returncode, 2)
         self.assertIn('recover --inspect', upgrade_refused.stderr)
         self.assertIn('upgrade-recover --rollback', upgrade_refused.stderr)
@@ -4533,28 +4539,38 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), original_state_bytes)
         upgrade_journal.unlink()
 
-        planned = self.call_seat_retirement(source, seat_id, checkout, env=owner_env, cwd=self.base)
+        planned = self.call_seat_retirement(runtime, seat_id, checkout, env=other_session)
         self.assertEqual(planned.returncode, 0, planned.stderr)
         plan = json.loads(planned.stdout)
         stale_state = json.loads(state_path.read_text())
         stale_state['fixture_preimage_drift'] = True
         state_path.write_text(json.dumps(stale_state, indent=2) + '\n')
         drift_bytes = state_path.read_bytes()
-        stale = self.call_seat_retirement(source, seat_id, checkout, '--apply', '--plan-sha256',
-                                          plan['plan_sha256'], env=owner_env, cwd=self.base, ok=False)
+        stale = self.call_seat_retirement(runtime, seat_id, checkout, '--apply', '--plan-sha256',
+                                          plan['plan_sha256'], env=other_session, ok=False)
         self.assertEqual(stale.returncode, 2)
         self.assertIn('preimage changed', stale.stderr)
         self.assertEqual(state_path.read_bytes(), drift_bytes)
 
-        fresh = json.loads(self.call_seat_retirement(source, seat_id, checkout,
-                                                      env=owner_env, cwd=self.base).stdout)
-        applied = self.call_seat_retirement(source, seat_id, checkout, '--apply', '--plan-sha256',
-                                            fresh['plan_sha256'], env=owner_env, cwd=self.base)
+        fresh = json.loads(self.call_seat_retirement(runtime, seat_id, checkout,
+                                                      env=other_session).stdout)
+        shell_env = {key: value for key, value in other_session.items()
+                     if key not in ('CMUX_AGENT_LAUNCH_KIND', 'CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID')}
+        manifest_before = seat_path.read_bytes()
+        adapter = Path(seat_before['adapter'])
+        adapter_before = adapter.read_bytes()
+        settings_before = self.settings.read_bytes()
+        applied = self.call_seat_retirement(runtime, seat_id, checkout, '--apply', '--plan-sha256',
+                                            fresh['plan_sha256'], env=shell_env)
         self.assertEqual(applied.returncode, 0, applied.stderr)
         retired = json.loads(state_path.read_text())
         self.assertEqual(retired['phase'], 'removed')
         self.assertTrue(retired['retirement_receipt']['checkout_evidence']['reason'])
-        status = self.call_source(source, '--seat-id', seat_id, 'status', env=owner_env)
+        self.assertEqual(retired['retirement_receipt']['owner'], seat_before['owner'])
+        self.assertEqual(seat_path.read_bytes(), manifest_before)
+        self.assertEqual(adapter.read_bytes(), adapter_before)
+        self.assertEqual(self.settings.read_bytes(), settings_before)
+        status = self.call_source(runtime, '--seat-id', seat_id, 'status', env=shell_env)
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertEqual(len(json.loads(status.stdout)['retired_attachments']), 1)
 
