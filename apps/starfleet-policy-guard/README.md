@@ -35,6 +35,7 @@ Other repositories retain their selected publication policy.
 Under that policy, the current owner can publish a successor-validation attestation that links the inherited publication and reconciles current evidence.
 Successor validation requires the current owner's clean report with successful canonical verification and the current required-read receipts.
 The [published guidance attestation guide](guide.md#published-guidance-attestations) documents packet fields, exact-comment validation, handoff ancestry, recovery, the `--enable` adoption command and source/runtime upgrade requirements.
+Before recommending or dispatching a repair, use the [triage guidance](guide.md#triage-findings) to decide which findings belong in the batch.
 New repair-batch publications require a structured assessment of the existing attempts, deciding evidence, dispositions, applicable rules and any required approval evidence.
 After a reviewed source upgrade, an existing repair publication remains usable only while its packet and rendered body still match the exact current publication reference.
 The legacy compatibility path cannot render or start-check a new repair batch without the assessment.
