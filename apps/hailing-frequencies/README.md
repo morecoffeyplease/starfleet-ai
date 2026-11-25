@@ -20,6 +20,9 @@ Set up a [Claude Code weekly quota watch](temporal-beacon.md#watch-claude-code-w
 The Hailing installer also installs the `agent-notify` Discord conversation command, its [setup guide](agent-notify-guide.md), and its [agent skill](skills/agent-notify/SKILL.md).
 Print its setup instructions with `agent-notify guide --print` before creating Discord configuration or a worker.
 Agent Notify keeps its existing private configuration and thread routing state, and registers posts with the existing Discord Watch worker when available.
+Use `--title` for the topic.
+Agent Notify adds the worktree short name and pings the configured user on every new thread, including FYI.
+Use `agent-notify reply THREAD_ID --ping` to ask for action in an existing thread and a plain reply for a silent update.
 `agent-notify doctor --starfleet-json` inspects private file permissions and credential presence locally without sourcing the shell configuration, calling Discord, or writing its cache.
 The local check cannot verify a live Discord webhook, token, account, or forum tags, so intended delivery remains unknown.
 A separate `discord-cleanup` command previews and deletes selected archived, Closed threads from the configured Agent Notify forum.
