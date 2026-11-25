@@ -276,8 +276,23 @@ class CustodyAdoptionTests(unittest.TestCase):
             capture_output=True, text=True, cwd=root, env={**os.environ, "PYTHONPATH": ""},
         )
         self.assertEqual(preview.returncode, 1, preview.stderr)
-        self.assertIn("Hailing Frequencies config", json.loads(preview.stderr)["error"])
+        self.assertIn(str(missing_state / "config.json"), json.loads(preview.stderr)["error"])
         self.assertFalse(missing_state.exists())
+
+    def test_exact_owner_can_receive_an_adopted_frozen_group(self):
+        with contextlib.closing(self.app.database()) as db, db:
+            db.execute("UPDATE threads SET catchup_before=NULL,catchup_max=NULL WHERE thread_id=?", (THREAD,))
+        preview, _, _ = self._prepare_and_accept()
+        adoption.run(self.app, self._namespace("apply", plan_digest=preview["plan_digest"]))
+
+        output = io.StringIO()
+        receipt = self.app.receive(THREAD, output=output, group_id=1)
+        self.assertEqual(receipt["received"], ["152"])
+        self.assertIn("uncertain fixture body", output.getvalue())
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertEqual(db.execute("SELECT status FROM delivery_groups WHERE id=1").fetchone(), ("received",))
+            self.assertEqual(db.execute("SELECT state,target_owner_generation FROM delivery_group_attempts "
+                                        "WHERE group_id=1").fetchall(), [("uncertain", 1)])
 
     def test_partial_apply_holds_and_resumes_same_operation_without_replaying_uncertain_work(self):
         preview, prepared, accepted = self._prepare_and_accept()

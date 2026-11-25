@@ -2360,8 +2360,8 @@ class Watch:
                 latest = self._identity_owner(session_hint=session_hint)
                 require(latest == current, "Owner changed during reply output; no replies were acknowledged")
                 now = self.clock()
-                owner_json = json.dumps(current, separators=(",", ":"))
                 with db:
+                    db.execute("BEGIN IMMEDIATE")
                     latest_thread = self._thread(db, thread_id, require_open=False)
                     require(latest_thread["owner"] == current,
                             "Owner changed during reply output; no replies were acknowledged")
@@ -2380,9 +2380,8 @@ class Watch:
                     for row in rows:
                         updated = db.execute(
                             "UPDATE messages SET state='received',received_at=?,last_error_json=NULL "
-                            "WHERE thread_id=? AND message_id=? AND state!='received' AND EXISTS ("
-                            "SELECT 1 FROM threads WHERE thread_id=? AND owner_json=?)",
-                            (now, thread_id, row[0], thread_id, owner_json))
+                            "WHERE thread_id=? AND message_id=? AND state!='received'",
+                            (now, thread_id, row[0]))
                         require(updated.rowcount == 1,
                                 "Reply or ownership changed during output; no replies were acknowledged")
                     if selected_group:
