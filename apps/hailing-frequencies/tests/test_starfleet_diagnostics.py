@@ -43,12 +43,17 @@ class StarfleetDiagnosticTests(unittest.TestCase):
             "remind_after": 300, "escalate_after": 900, "cooldown": 600, "interval": 5,
         })
 
+    def scan_target(self):
+        keys = ("harness", "session", "surface", "workspace", "started_at")
+        return {**{key: self.target[key] for key in keys},
+                "inbox_status": "complete", "sending_enabled": True}
+
     def test_hailing_and_temporal_use_fresh_read_only_heartbeat_evidence(self):
         now = time.time()
         hf.atomic_json(self.state / "last-scan.json", {
             "completed_at": now, "at": now, "mode": "send", "sending_sessions": None,
             "coverage_complete": True, "target_errors": [],
-            "targets": [{"session": self.target["session"], "sending_enabled": True}],
+            "targets": [self.scan_target()],
         })
         hf.atomic_json(self.state / "timer-last-scan.json", {"at": now, "timers": []})
         before = snapshot(self.state)
@@ -63,6 +68,56 @@ class StarfleetDiagnosticTests(unittest.TestCase):
         self.assertEqual(snapshot(self.state), before)
         self.assertFalse((self.state / "monitor.lock").exists())
         self.assertFalse((self.state / "receipts.sqlite3").exists())
+
+    def test_fresh_partial_scan_preserves_exact_send_coverage(self):
+        now = time.time()
+        row = self.scan_target()
+        missing_session = "44444444-4444-4444-8444-444444444444"
+        report = {
+            "completed_at": now, "at": now, "mode": "send", "sending_sessions": None,
+            "coverage_complete": False,
+            "target_errors": [{"session": missing_session, "stage": "initial_scan"}],
+            "targets": [row, {"session": missing_session, "inbox_status": "incomplete"}],
+        }
+        hf.atomic_json(self.state / "last-scan.json", report)
+        hf.atomic_json(self.state / "timer-last-scan.json", {"at": now, "timers": []})
+        app = hf.Monitor(self.state)
+        before = snapshot(self.state)
+        for diagnose in (hf.hailing_diagnostic_report, hf.temporal_diagnostic_report):
+            with self.subTest(diagnose=diagnose.__name__):
+                checks = diagnose(app, self.caller)["checks"]
+                self.assertEqual(checks["worker"], "ready")
+                self.assertEqual(checks["intended_delivery"], "ready")
+                self.assertEqual(checks["observed_delivery"], "unknown")
+        self.assertEqual(snapshot(self.state), before)
+        for change in (
+            {"targets": [{"session": row["session"], "sending_enabled": True}]},
+            {"targets": [{**row, "inbox_status": "incomplete"}]},
+            {"targets": [{**row, "started_at": row["started_at"] - 5}]},
+            {"targets": [{**row, "hold": "Human draft"}]},
+            {"targets": [{**row, "sending_enabled": False}]},
+            {"targets": [row, row]},
+            {"target_errors": [{"session": row["session"]}]},
+            {"sending_sessions": []},
+            {"mode": "observe"},
+        ):
+            with self.subTest(change=change):
+                hf.atomic_json(self.state / "last-scan.json", {**report, **change})
+                for diagnose in (hf.hailing_diagnostic_report, hf.temporal_diagnostic_report):
+                    checks = diagnose(app, self.caller)["checks"]
+                    self.assertEqual(checks["worker"], "ready")
+                    self.assertEqual(checks["intended_delivery"], "blocked")
+
+        for name, value in (
+            ("last-scan.json", {**report, "completed_at": now - 121}),
+            ("last-error.json", {"at": now + 1, "error": "Inbox scan saturated"}),
+        ):
+            with self.subTest(name=name):
+                hf.atomic_json(self.state / "last-scan.json", report)
+                hf.atomic_json(self.state / name, value)
+                checks = hf.hailing_diagnostic_report(app, self.caller)["checks"]
+                self.assertEqual(checks["worker"], "blocked")
+                self.assertEqual(checks["intended_delivery"], "unknown")
 
     def test_hailing_cli_missing_state_does_not_create_files_or_locks(self):
         state = self.root / "absent"

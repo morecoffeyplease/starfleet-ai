@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import contextlib
 from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
@@ -121,6 +122,23 @@ class TemporalBeaconTests(unittest.TestCase):
         self.clock.value += 7200
         self.beacon.tick()
         self.assertEqual(len(self.host.sent), 1)
+
+    def test_timer_creation_holds_if_enrollment_changes_before_lock(self):
+        lock = self.beacon.locked
+
+        @contextlib.contextmanager
+        def changed_enrollment():
+            config = self.app.config()
+            config["targets"] = []
+            hf.atomic_json(self.root / "config.json", config)
+            with lock():
+                yield
+
+        with patch.object(self.beacon, "locked", changed_enrollment):
+            with self.assertRaisesRegex(ValueError, "owner enrollment changed"):
+                self.set_timer(after="1m")
+        with contextlib.closing(self.beacon.database()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM timers").fetchone()[0], 0)
 
     def test_activity_reader_matches_exact_session_and_rejects_incomplete_snapshot(self):
         current = {"truncated": False, "owner_availability": {"agent_sessions": "available"}, "items": [
@@ -619,6 +637,214 @@ class TemporalBeaconTests(unittest.TestCase):
                              ["timer"]["status"], "active")
             self.assertEqual(self.set_timer(after="30s")["timer"]["status"], "active")
 
+    def publish_quota(self, remaining, reset_at, *, observed_at=None):
+        self.beacon.quota_cache = self.root / "rate-limits.json"
+        payload = {"ts": self.clock.value if observed_at is None else observed_at,
+                   "rate_limits": {"seven_day": {"used_percentage": 100 - remaining,
+                                                "resets_at": reset_at}}}
+        hf.atomic_json(self.beacon.quota_cache, payload)
+        return self.beacon.quota_cache
+
+    def watch_quota(self, threshold=None):
+        with patch.dict("os.environ", self.env):
+            return self.beacon.quota_watch("Save the checkpoint", threshold=threshold)
+
+    def receive_quota(self, timer_id):
+        output = io.StringIO()
+        with patch.dict("os.environ", self.env):
+            self.beacon.receive(self.beacon.owner()[1], output, timer_id)
+        return json.loads(output.getvalue())
+
+    def test_quota_cli_setup_status_receive_and_stop(self):
+        reset = self.clock.value + 3600
+        cache = self.publish_quota(2, reset, observed_at=self.clock.value - 181)
+        cli = ["--state-dir", str(self.root), "temporal"]
+        with patch.object(hf, "Cmux", return_value=self.host), \
+             patch.object(tb, "TemporalBeacon", return_value=self.beacon), \
+             patch.dict("os.environ", self.env):
+            self.assertIsNone(hf.main([*cli, "quota-status"])["watch"])
+            self.assertFalse((self.root / "receipts.sqlite3").exists())
+            watch = hf.main([*cli, "quota-watch", "--at-or-below", "3", "--message", "Save checkpoints"])
+            self.assertEqual(watch["watch"]["threshold"], 3)
+            self.assertFalse(hf.main([*cli, "quota-status"])["sample"]["available"])
+            self.beacon.tick()
+            self.assertEqual(self.host.sent, [])
+
+            self.publish_quota(2, reset)
+            before = cache.read_bytes()
+            event = self.beacon.tick()["timers"][0]
+            self.assertIn("temporal receive --timer-id " + event["timer_id"], self.host.sent[0][1])
+            output = io.StringIO()
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                hf.main([*cli, "receive", "--timer-id", event["timer_id"]])
+            self.assertEqual(json.loads(output.getvalue())["quota_observation"]["remaining_percent"], 2)
+            self.assertTrue(hf.main([*cli, "quota-stop"])["stopped"])
+            self.assertEqual(cache.read_bytes(), before)
+
+    def test_quota_change_watch_baselines_and_coalesces_while_awaiting_receipt(self):
+        reset = self.clock.value + 3600
+        cache = self.publish_quota(12, reset)
+        self.watch_quota()
+        self.assertTrue(self.watch_quota()["idempotent"])
+        self.beacon.tick()
+        self.clock.value += 1
+        self.publish_quota(12, reset)
+        self.beacon.tick()
+        self.assertEqual(self.host.sent, [])
+
+        self.clock.value += 1
+        self.publish_quota(11, reset)
+        update = self.beacon.tick()["timers"][0]
+        self.assertEqual(update["status"], "submitted")
+        self.assertEqual(self.host.sent[0][0]["session"], self.target["session"])
+        self.clock.value += 1
+        self.publish_quota(10, reset)
+        self.clock.value += 1
+        self.publish_quota(9, reset)
+        before = cache.read_bytes()
+        self.beacon.tick()
+        self.assertEqual(len(self.host.sent), 1)
+
+        receipt = self.receive_quota(update["timer_id"])
+        self.assertEqual(receipt["quota_observation"]["remaining_percent"], 11)
+        self.assertIn("Save the checkpoint", receipt["continuation"])
+        self.assertFalse(receipt["receipt_means_task_completed"])
+
+        next_update = self.beacon.tick()["timers"][0]
+        self.assertEqual(next_update["status"], "submitted")
+        self.assertEqual(self.receive_quota(next_update["timer_id"])["quota_observation"]["remaining_percent"], 9)
+        self.assertEqual(cache.read_bytes(), before)
+
+        self.clock.value = reset + 1
+        new_reset = reset + 7 * 86400
+        self.publish_quota(9, new_reset)
+        event = self.beacon.tick()["timers"][0]
+        self.assertEqual(self.receive_quota(event["timer_id"])["quota_observation"]["resets_at"], new_reset)
+
+    def test_quota_threshold_holds_deduplicates_and_rearms_next_week_after_restart(self):
+        reset = self.clock.value + 3600
+        cache = self.publish_quota(3, reset)
+        self.watch_quota(3)
+        self.host.hold = "Human draft"
+        held = self.beacon.tick()["timers"][0]
+        self.assertEqual(held["status"], "held")
+        self.assertEqual(self.host.sent, [])
+
+        self.beacon = tb.TemporalBeacon(self.app, self.clock)
+        self.beacon.quota_cache = cache
+        self.clock.value += 181
+        self.host.hold = None
+        sent = self.beacon.tick()["timers"][0]
+        self.assertEqual(sent["occurrence_id"], held["occurrence_id"])
+        receipt = self.receive_quota(sent["timer_id"])
+        self.assertEqual(receipt["quota_observation"]["resets_at"], reset)
+        self.assertEqual(receipt["quota_observation"]["remaining_percent"], 3)
+
+        with patch.dict("os.environ", self.env):
+            self.assertTrue(self.beacon.quota_stop()["stopped"])
+        self.assertFalse(self.watch_quota(3)["idempotent"])
+        self.publish_quota(2, reset)
+        self.beacon.tick()
+        self.assertEqual(len(self.host.sent), 1)
+
+        self.clock.value = reset + 1
+        new_reset = reset + 7 * 86400
+        self.publish_quota(40, new_reset)
+        self.beacon.tick()
+        self.assertEqual(len(self.host.sent), 1)
+        self.clock.value += 1
+        self.publish_quota(2.5, new_reset)
+        latest = self.beacon.tick()["timers"][0]
+        self.assertEqual(latest["status"], "submitted")
+        self.assertEqual(self.receive_quota(latest["timer_id"])["quota_observation"]["resets_at"], new_reset)
+
+    def test_quota_uncertain_send_is_not_replayed_or_discarded_on_stop(self):
+        reset = self.clock.value + 3600
+        cache = self.publish_quota(2, reset)
+        self.watch_quota(3)
+        self.beacon.tick(send=False)
+        self.beacon.tick(only_sessions=[uid()])
+        self.assertEqual(self.host.sent, [])
+
+        self.host.failure = TimeoutError("unknown paste outcome")
+        event = self.beacon.tick(only_sessions=[self.target["session"]])["timers"][0]
+        self.assertEqual(event["status"], "uncertain")
+        self.host.failure = None
+        self.beacon = tb.TemporalBeacon(self.app, self.clock)
+        self.beacon.quota_cache = cache
+        self.clock.value += 1
+        self.publish_quota(1, reset)
+        self.beacon.tick()
+        self.assertEqual(self.status(event["timer_id"]), ("active", ["uncertain"]))
+        self.assertEqual(len(self.host.sent), 1)
+        with patch.dict("os.environ", self.env):
+            self.assertTrue(self.beacon.quota_stop()["stopped"])
+        self.assertEqual(self.receive_quota(event["timer_id"])["quota_observation"]["remaining_percent"], 2)
+        self.beacon.tick()
+        self.assertEqual(len(self.host.sent), 1)
+
+    def test_quota_watch_does_not_enqueue_for_a_confirmed_ended_owner(self):
+        self.publish_quota(2, self.clock.value + 3600)
+        self.watch_quota(3)
+        self.activity(state="ended")
+        self.assertEqual(self.beacon.tick()["timers"], [])
+        self.assertEqual(self.host.sent, [])
+        with patch.dict("os.environ", self.env):
+            self.assertIsNone(self.beacon.quota_status()["timer"])
+
+    def test_quota_stop_cancels_unsent_held_alert_and_owner_status_is_exact(self):
+        reset = self.clock.value + 3600
+        self.publish_quota(3, reset)
+        self.watch_quota(3)
+        with patch.dict("os.environ", {**self.env, "CMUX_SURFACE_ID": uid()}), self.assertRaises(ValueError):
+            self.beacon.quota_status()
+        with patch.dict("os.environ", self.env):
+            status = self.beacon.quota_status()
+        self.assertEqual(status["watch"]["threshold"], 3)
+        self.assertEqual(status["sample"]["remaining_percent"], 3)
+        self.host.hold = "Human draft"
+        event = self.beacon.tick()["timers"][0]
+        self.assertEqual(event["status"], "held")
+        self.host.hold = None
+        with patch.dict("os.environ", self.env):
+            self.assertTrue(self.beacon.quota_stop()["pending_canceled"])
+        self.assertEqual(self.status(event["timer_id"]), ("canceled", ["canceled"]))
+        self.beacon.tick()
+        self.assertEqual(self.host.sent, [])
+
+    def test_quota_cache_unavailable_for_stale_malformed_or_unsafe_inputs(self):
+        import quota_alert
+
+        now = self.clock.value
+        reset = now + 3600
+        cache = self.publish_quota(2.5, reset, observed_at=now - 180)
+        self.assertEqual(quota_alert.read_cache(cache, now), {
+            "available": True, "observed_at": now - 180, "resets_at": reset, "remaining_percent": 2.5,
+        })
+        self.assertFalse(quota_alert.read_cache(cache, now + 1)["available"])
+        self.publish_quota(2.5, reset, observed_at=now + 1)
+        self.assertFalse(quota_alert.read_cache(cache, now)["available"])
+        self.publish_quota(2.5, now)
+        self.assertFalse(quota_alert.read_cache(cache, now)["available"])
+
+        for sample in (b"{broken", b" " * 65536, b'{"ts": true}', b'{"ts": 1800000000, "rate_limits": null}'):
+            with self.subTest(sample=sample[:30]):
+                cache.write_bytes(sample)
+                self.assertFalse(quota_alert.read_cache(cache, now)["available"])
+
+        self.publish_quota(2.5, reset)
+        cache.chmod(0o666)
+        self.assertFalse(quota_alert.read_cache(cache, now)["available"])
+        cache.chmod(0o644)
+        self.assertTrue(quota_alert.read_cache(cache, now)["available"])
+        symlink = cache.with_name("symlink.json")
+        symlink.symlink_to(cache)
+        self.assertFalse(quota_alert.read_cache(symlink, now)["available"])
+        pipe = cache.with_name("quota-pipe")
+        os.mkfifo(pipe)
+        self.assertFalse(quota_alert.read_cache(pipe, now)["available"])
+        self.assertFalse(quota_alert.read_cache(cache.with_name("missing.json"), now)["available"])
+
     def test_installer_publishes_three_owned_commands_and_immutable_skills(self):
         import install
         app_dir = Path(__file__).resolve().parents[1]
@@ -632,7 +858,8 @@ class TemporalBeaconTests(unittest.TestCase):
             hailing = Path(result["command"])
             temporal = Path(result["temporal_beacon_command"])
             agent_notify = Path(result["agent_notify_command"])
-            self.assertIn("usage:", subprocess.check_output([str(temporal), "--help"], text=True))
+            self.assertIn("quota-watch", subprocess.check_output([str(temporal), "--help"], text=True))
+            self.assertTrue((Path(result["runtime"]) / "quota_alert.py").is_file())
             self.assertEqual(Path(result["skill"]).read_bytes(), beacon_skill.read_bytes())
             self.assertEqual(Path(result["skill"]).stat().st_mode & 0o222, 0)
             self.assertEqual(Path(result["agent_notify_skill"]).read_bytes(), agent_notify_skill.read_bytes())

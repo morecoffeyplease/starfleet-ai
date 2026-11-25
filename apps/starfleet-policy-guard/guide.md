@@ -517,16 +517,23 @@ Neither path intercepts arbitrary shell scripts, other applications, or commands
 ## Retire a missing attachment
 
 Use `retire-attachment` when a recorded checkout path no longer exists or no longer identifies the recorded repository worktree.
-The command requires the exact recorded native owner and the absolute checkout path from the seat record.
-It can run from any surviving attachment, or with global `--seat-id SEAT_ID` when no product checkout is available.
+Any local operator can run this command without the recorded owner's session.
+Select one seat with global `--seat-id SEAT_ID` or use a surviving attachment.
+Pass the absolute checkout path shown in the seat record.
+An older installed runtime may still require the former owner.
+In that case, use `lane.py` from a current Starfleet source checkout for the same preview and apply commands.
 The default command prints a plan with the seat, attachment path, recorded repository and branch, pull request records, missing-checkout evidence, and preimage hashes.
 Review that output, then apply only with `--apply --plan-sha256 REVIEWED_PLAN_SHA256`.
-The command refuses a live matching worktree and says to run `uninstall` from it.
+For a live worktree with the recorded Git identity, use the [live registration workflow](#retire-a-live-attachment-registration) or run the existing owner-bound `uninstall` workflow from that checkout.
+Changing the Git remote leaves the worktree identity intact.
 It refuses a checkout that still has the recorded worktree identity but is on a different branch.
 For that case, restore the recorded branch and run `uninstall` from the checkout.
 It refuses while a seat install, migration, handoff, or upgrade is incomplete and names the applicable recovery command.
 It never creates, deletes, or modifies a product checkout, branch, or repository metadata.
-The command marks the checkout removed, writes a receipt with owner, time, and evidence, and preserves the attachment state, report history, pull request bindings, and counts.
+A successful apply reports `retired: true` and `history_preserved: true`.
+The receipt records the historical seat owner, retirement time, and checkout evidence.
+The report history, PR bindings, and counts remain available.
+A transfer of live work or seat ownership still uses its existing handoff workflow.
 `status` and `coverage --summary` from a surviving attachment show retired checkout paths and the preserved pull request records.
 
 For example, a temporary checkout and its branch can both be deleted while another attachment remains live:
@@ -587,7 +594,7 @@ An owner match, remote URL, host label, or repository name cannot substitute for
 Every active source attachment must exist and match its recorded worktree; review and apply the existing `retire-attachment` plan for each missing active attachment first.
 If another seat already owns the replacement root, its exact ID must be supplied with `--release-anchor-seat`.
 The destination seat must have no pending transition, an intact runtime and adapter pin, intact owned hooks, and only attachment rows already marked removed.
-An absent active destination attachment still blocks release until its owner retires it through `retire-attachment`.
+An absent active destination attachment still blocks release until an operator retires it through `retire-attachment`.
 The transaction removes the destination seat's exact owned hook groups, adds the source seat's current groups when that harness manages hooks, upgrades the source seat, and leaves the released seat's runtime pin and history intact.
 The two seat IDs are never merged, and removed attachment state bytes are not rewritten.
 The normal upgrade receipt policy applies: prior receipts are archived and each active attachment needs a fresh report before covered actions can pass.
@@ -649,6 +656,28 @@ The receipt proves only the local file changes.
 It does not prove that a running native host refreshed its hook configuration or stopped invoking a cached hook.
 Use real receiving evidence or a supported owner reload at a safe boundary to confirm native refresh, and do not force a restart.
 
+## Retire a live attachment registration
+
+Use `retire-attachment --live-registration` when the recorded permanent-seat checkout still exists.
+Any local operator can review and apply the plan.
+Coordinate an idle point for that checkout with any active writer before you apply.
+The plan checks the exact Git worktree, repository, branch, and current head.
+If any bound record or checkout evidence changes, review a fresh plan.
+
+```sh
+python3 /path/to/current/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/finished-feature --live-registration
+python3 /path/to/current/lane.py --seat-id SEAT_ID retire-attachment \
+  --checkout /worktrees/finished-feature --live-registration --apply --plan-sha256 REVIEWED_PLAN_SHA256
+python3 /path/to/current/lane.py --seat-id SEAT_ID status
+```
+
+Check that the exact attachment reports `retired` and shows its preserved PR records.
+The operation writes only the local registration and receipt.
+Shared hooks and the seat adapter remain installed for other attachments.
+If the seat is now drained, use [the drained-seat retirement workflow](#retire-a-drained-durable-seat) to detach its exact hooks and adapter.
+Use the existing owner-bound `uninstall` workflow for legacy per-worktree installations, whose registrations and hook ownership do not use the permanent-seat transaction.
+
 ## Inspect, hand off, and recover
 
 Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status` to inspect a permanent seat even when product checkouts are unavailable.
@@ -659,6 +688,7 @@ Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID registrations`
 Run `coverage --summary` or `status` from an attached checkout to inspect local configuration and observations.
 Configured hooks and adapters are not proof that the native runtime loaded or used them.
 For a seat handoff, the outgoing owner prepares the exact seat ID, every active and retired attachment, covered PRs, pending work, and any missing worktree in the existing checkpoint.
+Retire missing attachments through the reviewed `retire-attachment` plan before handoff if they block it.
 Record the authorized release to the exact incoming owner in the existing checkpoint, with the outgoing owner recording it when available.
 If the outgoing owner is unavailable, resolve the scope through the applicable existing authority process and hold the dependent handoff until that disposition is recorded.
 The incoming owner records acceptance of that same scope before the rebind.

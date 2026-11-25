@@ -2585,6 +2585,112 @@ def request_object(key, owner, path, command):
             "repo": str(path), "command": command}
 
 
+def test_owner_args_anonymous_codex_feed(temp):
+    root = temp / "anonymous-owner"
+    root.mkdir()
+    state = root / "unused-state"
+    hailing = root / "hailing"
+    hailing.mkdir()
+    workspace, surface, session = uuid_text(), uuid_text(), uuid_text()
+    owner = {"harness": "codex", "session": session, "surface": surface}
+    (hailing / "config.json").write_text(json.dumps({"version": 1, "targets": [{
+        **owner, "workspace": workspace, "started_at": 1.0, "cutoff": 0.0,
+        "label": "anonymous-feed-fixture",
+    }], "remind_after": 60, "escalate_after": 120, "cooldown": 30, "interval": 10}))
+    pid = 4242
+    anonymous_id = "fallback-" + hashlib.sha256(f"source=codex\npid={pid}".encode()).hexdigest()[:16]
+    named = {"kind": "codex", "session_id": session.lower(), "state": "idle",
+             "has_hook_lifecycle_state": True, "last_activity_at": "2026-11-25T06:29:35Z"}
+    anonymous = {"kind": "codex", "session_id": anonymous_id, "state": "working",
+                 "has_hook_lifecycle_state": True, "last_activity_at": "2026-11-25T03:09:11Z"}
+    agents = [named, anonymous]
+    record = {"agent": "codex", "session_id": session.lower(), "pid": pid, "stored_pid_exists": True,
+              "surface_id": surface, "workspace_id": workspace,
+              "started_at": "2026-11-24T22:12:56.089Z", "updated_at": "2026-11-25T06:29:35.279Z"}
+    target = {"source": "pid", "pid_resolution": "controlling_tty", "pid": pid,
+              "surface_id": surface, "workspace_id": workspace}
+    snapshots = {
+        "identify": {"caller": {"surface_type": "terminal", "workspace_id": workspace, "surface_id": surface}},
+        "current": {"truncated": False, "owner_availability": {"agent_sessions": "available"}, "items": [{
+            "placement": {"kind": "local"}, "lifecycle": "running", "freshness": {"state": "current"},
+            "projections": [{"workspace_id": workspace, "panel_id": surface}], "agents": agents,
+            "omitted": {"agents": 0},
+        }]},
+        "sessions": {"total_matches": 1, "sessions": [record]},
+        "rpc": target,
+        "process_start": "Tue Nov 24 22:00:19 2026",
+    }
+    fixture_path = root / "fixtures.json"
+    cmux = root / "cmux"
+    cmux.write_text("""#!/usr/bin/env python3
+import json, os, sys
+fixture = json.load(open(os.environ["CMUX_FIXTURE"]))
+args = sys.argv[1:]
+if args[:3] == ["--json", "--id-format", "uuids"] and args[3:] == ["identify"]:
+    command = "identify"
+elif args == ["--json", "current", "--limit", "200"]:
+    command = "current"
+elif args == ["--json", "sessions", "list", "--agent", "codex", "--surface",
+              fixture["identify"]["caller"]["surface_id"], "--all"]:
+    command = "sessions"
+elif args[:3] == ["--json", "rpc", "agent.resolve_delivery_target"] and len(args) == 4 and json.loads(args[3]) == {
+    "pid": fixture["sessions"]["sessions"][0]["pid"], "pid_resolution": "controlling_tty",
+}:
+    command = "rpc"
+else:
+    sys.exit(89)
+print(json.dumps(fixture[command]))
+""", encoding="utf-8")
+    cmux.chmod(0o755)
+    ps = root / "ps"
+    ps.write_text("""#!/usr/bin/env python3
+import json, os, sys
+fixture = json.load(open(os.environ["CMUX_FIXTURE"]))
+if sys.argv[1:] != ["-p", str(fixture["sessions"]["sessions"][0]["pid"]), "-o", "lstart="]:
+    sys.exit(89)
+assert os.environ["LC_ALL"] == "C" and os.environ["TZ"] == "UTC"
+print(fixture["process_start"])
+""", encoding="utf-8")
+    ps.chmod(0o755)
+    env = {"WARP_DRIVE_CMUX": str(cmux), "WARP_DRIVE_HAILING_STATE": str(hailing),
+           "CMUX_FIXTURE": str(fixture_path), "PATH": str(root) + os.pathsep + os.environ["PATH"],
+           "CMUX_AGENT_LAUNCH_KIND": "codex", "CODEX_THREAD_ID": session.lower(),
+           "CLAUDE_CODE_SESSION_ID": "", "OPENCODE_SESSION_ID": ""}
+
+    def run(ok=True):
+        fixture_path.write_text(json.dumps(snapshots), encoding="utf-8")
+        return run_cli(state, "owner-args", "--format", "json", ok=ok, env=env)
+
+    check(parse_json(run())["owner"] == owner and not state.exists(),
+          "owner-args did not recognize a corroborated same-process anonymous Feed row")
+
+    def refuses(changes, replacements):
+        original = {key: changes[key] for key in replacements}
+        changes.update(replacements)
+        result = run(ok=False)
+        changes.update(original)
+        check(result.returncode == 2 and not result.stdout and not state.exists(),
+              f"owner-args returned an identity for contradictory evidence: {replacements!r}")
+
+    item = snapshots["current"]["items"][0]
+    refuses(item, {"omitted": {}})
+    refuses(item, {"omitted": {"agents": 1}})
+    refuses(anonymous, {"session_id": uuid_text()})
+    refuses(anonymous, {"session_id": "fallback-0000000000000000"})
+    refuses(anonymous, {"last_activity_at": named["last_activity_at"]})
+    refuses(record, {"session_id": uuid_text()})
+    refuses(record, {"stored_pid_exists": False})
+    refuses(record, {"pid": pid + 1})
+    refuses(target, {"source": "surface"})
+    refuses(target, {"surface_id": uuid_text()})
+    refuses(target, {"workspace_id": uuid_text()})
+    refuses(snapshots, {"process_start": "Tue Nov 24 23:00:00 2026"})
+    refuses(snapshots, {"process_start": "Wed Nov 25 03:11:00 2026"})
+    refuses(snapshots, {"process_start": "unavailable"})
+    refuses(snapshots, {"sessions": {"total_matches": 1, "sessions": []}})
+    refuses(snapshots, {"rpc": {}})
+
+
 def test_owner_args_cli(temp):
     state = temp / "owner-args-state"
     hailing_dir = temp / "owner-args-hailing"
@@ -3393,7 +3499,8 @@ def test_helper_diagnostics_cli(temp):
           uncertain_status["evidence"]["lease_active"] is False and
           uncertain_status["evidence"]["outcome"] == "unknown" and
           uncertain_status["recovery_command"] is None and
-          "reconcile only after confirming" in uncertain_status["next_action"],
+          "--outcome unknown --stopped-generation" in uncertain_status["next_action"] and
+          "An inactive lease alone cannot establish a stop" in uncertain_inspect["next_action"],
           "stale post-launch helper was not kept uncertain with no replay command")
     with contextlib.closing(warp_drive.connect(state)) as db:
         with warp_drive.immediate_transaction(db):
@@ -3563,6 +3670,11 @@ def test_stopped_unknown_release(temp):
         check(command[3] == owner["surface"] and "exit result is unknown" in command[4],
               "stopped-workload wake did not preserve the exact owner and the unknown result")
         inspected = parse_json(run_cli(state, "inspect", request))
+        diagnostic = inspected["reservation"]["helper_diagnostic"]
+        check(diagnostic["classification"] == "finished" and
+              "preserve the unknown exit result" in diagnostic["next_action"] and
+              "accepted enrolled successor" in diagnostic["next_action"],
+              "finished unknown claim omitted retirement guidance")
         releases = [event for event in inspected["events"] if event["kind"] == "stopped_workload_released"]
         check(len(releases) == 1 and releases[0]["data"]["actor"] == operator
               and sum(event["kind"] == "launch_intent" for event in inspected["events"]) == 1,
@@ -4190,6 +4302,7 @@ def main():
             test_scheduler_refreshes_policy_version(temp)
             test_explicit_cpu_estimates(temp)
             test_owner_args_cli(temp)
+            test_owner_args_anonymous_codex_feed(temp)
             test_new_recipient_enrollment_guard(temp)
             test_missed_turn_ordering(temp)
             test_scheduler_startup_pacing_and_escape_limit(temp)

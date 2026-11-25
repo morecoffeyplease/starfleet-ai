@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,15 @@ MAX_COMMAND_OUTPUT = 2 * 1024 * 1024
 MAX_INPUT_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 5
 TOOL_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")
+RESOURCE_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}\Z")
+COMMIT_ID = re.compile(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\Z")
+HANDOFF_ACTIONS = ("checkout_acceptance", "outgoing_retirement")
+RESOURCE_COMMANDS = {
+    "warp-drive": ("warp-drive", "inspect"),
+    "temporal-beacon": ("temporal-beacon", "inspect"),
+    "discord-watch": ("discord-watch", "managed"),
+}
+RESOURCE_STATES = ("active", "pending", "settled", "unknown")
 
 
 @dataclass(frozen=True)
@@ -411,6 +421,98 @@ def preflight_report(context_files=(), guidance_files=(), skipped_tools=(), envi
     return build_report(checks, caller)
 
 
+def evidence_reference(value):
+    if isinstance(value, str) and value.strip() and len(value) <= 512 and value.isprintable():
+        return value
+    raise ValueError("Handoff evidence references must be nonempty printable text of at most 512 characters")
+
+
+def handoff_resource(value):
+    if not isinstance(value, dict):
+        raise ValueError("Each handoff resource must be an object")
+    tool, identifier, state = value.get("tool"), value.get("id"), value.get("state", "unknown")
+    if (not isinstance(tool, str) or not TOOL_NAME.fullmatch(tool) or
+            not isinstance(identifier, str) or not RESOURCE_ID.fullmatch(identifier) or
+            state not in RESOURCE_STATES):
+        raise ValueError("Each resource needs an exact tool and ID and a supported state")
+    affects = value.get("affects")
+    if (not isinstance(affects, list) or any(action not in HANDOFF_ACTIONS for action in affects) or
+            len(set(affects)) != len(affects)):
+        raise ValueError("Each resource needs an affects list of distinct supported handoff actions")
+    evidence = value.get("evidence")
+    if state != "unknown" or not affects or evidence is not None:
+        evidence = evidence_reference(evidence)
+    if state == "settled" and affects:
+        raise ValueError("A settled resource cannot have remaining dependencies")
+    command = RESOURCE_COMMANDS.get(tool)
+    return {
+        "tool": tool,
+        "id": identifier,
+        "state": state,
+        "affects": affects,
+        "evidence": evidence,
+        "historical_unknown": state == "unknown" and not affects,
+        "inspect_command": shlex.join((*command, identifier)) if command else None,
+    }
+
+
+def handoff_status(resources, action, otherwise):
+    outstanding = [r for r in resources if action in r["affects"]]
+    if any(r["state"] in ("active", "pending") for r in outstanding):
+        return "blocked"
+    if outstanding:
+        return "unknown"
+    return otherwise
+
+
+def handoff_report(path):
+    try:
+        file = Path(path).expanduser()
+        if not file.is_file():
+            raise ValueError("Use an existing regular file for --handoff-file")
+        data = read_input_bytes(file)
+        if len(data) > MAX_INPUT_BYTES:
+            raise ValueError("Handoff input exceeds the read limit")
+        record = json.loads(data)
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("Could not read a valid handoff JSON file") from exc
+    if not isinstance(record, dict):
+        raise ValueError("Handoff input must be a JSON object")
+    checkout, rows = record.get("checkout", {}), record.get("resources", [])
+    complete = record.get("resources_complete", False)
+    if not isinstance(checkout, dict) or not isinstance(rows, list) or type(complete) is not bool:
+        raise ValueError("Handoff checkout, resources, or inventory completeness has the wrong type")
+    worktree, head = checkout.get("worktree"), checkout.get("head")
+    acceptance, evidence = checkout.get("acceptance", "unknown"), checkout.get("evidence")
+    if worktree is not None and (not isinstance(worktree, str) or not worktree.isprintable() or
+                                 not Path(worktree).is_absolute()):
+        raise ValueError("Use an absolute checkout worktree path")
+    if head is not None and (not isinstance(head, str) or not COMMIT_ID.fullmatch(head)):
+        raise ValueError("Use the full checkout commit ID")
+    if acceptance not in ("accepted", "pending", "unknown"):
+        raise ValueError("Use accepted, pending, or unknown checkout acceptance")
+    if acceptance == "accepted" and (worktree is None or head is None or evidence is None):
+        raise ValueError("Accepted checkout evidence needs the exact worktree, full head, and receipt reference")
+    if evidence is not None:
+        evidence = evidence_reference(evidence)
+    resources = [handoff_resource(row) for row in rows]
+    if len({(row["tool"], row["id"]) for row in resources}) != len(resources):
+        raise ValueError("Handoff resources must have distinct tool and ID pairs")
+    recorded = "recorded_accepted" if acceptance == "accepted" else acceptance
+    checkout_status = handoff_status(resources, "checkout_acceptance", recorded)
+    retirement = handoff_status(resources, "outgoing_retirement",
+                                "review" if complete and checkout_status == "recorded_accepted" else "unknown")
+    return {
+        "source": "explicit_owner_record",
+        "resources_complete": complete,
+        "checkout_acceptance": {"status": checkout_status, "recorded": acceptance,
+                                "worktree": worktree, "head": head, "evidence": evidence},
+        "outgoing_retirement": {"status": retirement,
+                                "next_step": "Verify remaining obligations and the exact outgoing session's exit through the handoff guide."},
+        "resources": resources,
+    }
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="replicator",
@@ -424,6 +526,7 @@ def build_parser():
     preflight.add_argument("--guidance-file", action="append", default=[], metavar="PATH")
     preflight.add_argument("--skip-tool", action="append", default=[], metavar="NAME")
     preflight.add_argument("--json", action="store_true", help="print the report as JSON")
+    preflight.add_argument("--handoff-file", metavar="PATH", help="include advisory owner-supplied handoff evidence")
     return parser
 
 
@@ -438,6 +541,28 @@ def print_human_report(report):
         print(f"{check['name']}: {check['status']}")
         print(f"  Source: {check['source']}")
         print(f"  Next step: {check['next_step']}")
+    if "handoff" in report:
+        handoff = report["handoff"]
+        checkout = handoff["checkout_acceptance"]
+        retirement = handoff["outgoing_retirement"]
+        print()
+        print("Handoff record supplied by the owner")
+        print(f"  Checkout acceptance: {checkout['status'].replace('_', ' ')}")
+        if checkout["worktree"] is not None and checkout["head"] is not None:
+            print(f"  Checkout: {checkout['worktree']} at {checkout['head']}")
+        if checkout["evidence"]:
+            print(f"  Evidence: {checkout['evidence']}")
+        print(f"  Outgoing retirement: {retirement['status']}")
+        print(f"  Next step: {retirement['next_step']}")
+        for resource in handoff["resources"]:
+            affects = ", ".join(action.replace("_", " ") for action in resource["affects"])
+            state = "historical (outcome unknown)" if resource["historical_unknown"] else resource["state"]
+            print(f"  - {resource['tool']} {resource['id']}: {state}")
+            print(f"    Remaining dependencies: {affects or 'none recorded'}")
+            if resource["evidence"]:
+                print(f"    Evidence: {resource['evidence']}")
+            if resource["inspect_command"]:
+                print(f"    Inspect: {resource['inspect_command']}")
 
 
 def main(argv=None):
@@ -449,6 +574,8 @@ def main(argv=None):
     if args.command == "preflight":
         try:
             report = preflight_report(args.context_file, args.guidance_file, args.skip_tool)
+            if args.handoff_file:
+                report["handoff"] = handoff_report(args.handoff_file)
         except ValueError as exc:
             parser.error(str(exc))
         if args.json:
