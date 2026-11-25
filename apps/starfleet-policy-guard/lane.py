@@ -2204,7 +2204,7 @@ def checkout_pr_records(seat, checkout_id, state):
     return rows
 
 
-def retirement_checkout_evidence(checkout, state):
+def retirement_checkout_evidence(checkout, state, *, live_registration=False):
     checkout_path = Path(checkout['root'])
     recorded_branch = state.get('branch')
     if not checkout_path.exists() and not checkout_path.is_symlink():
@@ -2243,18 +2243,26 @@ def retirement_checkout_evidence(checkout, state):
                      observed_common_gitdir == checkout.get('common_gitdir'))
     if same_worktree and observed_branch != recorded_branch:
         raise ValueError('The recorded checkout exists on another branch; restore its recorded branch and run uninstall from that checkout. Missing-checkout retirement does not apply to a live worktree on another branch')
-    if same_worktree and observed_repository == checkout.get('repository'):
-        raise ValueError('The recorded checkout is live and matches its recorded repository and branch; run uninstall from that checkout')
+    if same_worktree:
+        if not live_registration:
+            raise ValueError('The recorded checkout is live; run uninstall from that checkout or explicitly review --live-registration')
+        if observed_repository != checkout.get('repository'):
+            raise ValueError('The recorded checkout repository changed; inspect it before retiring its live registration')
+        observed['head'] = delivery.value(checkout_path, 'rev-parse', '--verify', 'HEAD^{commit}')
+        return {'state': 'live', 'reason': 'recorded worktree, repository, and branch match',
+                'path_exists': True, 'path_is_symlink': False, 'recorded_branch': recorded_branch,
+                'observed': observed}
     return {'state': 'not-recorded-worktree', 'reason': 'recorded path no longer identifies its recorded repository worktree',
             'path_exists': True, 'path_is_symlink': False, 'recorded_branch': recorded_branch,
             'observed': observed}
 
 
-def build_retire_attachment_plan(identifier, checkout_value):
+def build_retire_attachment_plan(identifier, checkout_value, *, live_registration=False):
     seat = session_store.load_seat(identifier)
     if not seat:
         raise ValueError('Permanent Policy Guard seat registry is missing; preserve history and use recover --inspect')
-    lane_scope.check_owner({'lane_owner': seat['owner']})
+    if not valid_historical_seat_owner(seat):
+        raise ValueError('The recorded historical seat owner is malformed; preserve it and inspect status')
     ensure_retirement_lifecycle_clear(seat)
     checkout_value = Path(checkout_value)
     if not checkout_value.is_absolute():
@@ -2280,7 +2288,9 @@ def build_retire_attachment_plan(identifier, checkout_value):
                 'history_preserved': True}
     if state.get('phase') != 'active':
         raise ValueError('The recorded attachment is not active; preserve its state and use recover --inspect')
-    evidence = retirement_checkout_evidence(item, state)
+    evidence = retirement_checkout_evidence(item, state, live_registration=live_registration)
+    if live_registration and evidence['state'] != 'live':
+        raise ValueError('--live-registration requires the exact recorded worktree; inspect without it if the worktree is missing')
     pr_records = checkout_pr_records(seat, item['checkout_id'], state)
     seat_path = session_store.seat_dir(identifier) / 'seat.json'
     review = {'protocol': RETIREMENT_PROTOCOL, 'seat_id': identifier,
@@ -2308,7 +2318,8 @@ def retire_attachment(args):
     if args.apply:
         if not args.plan_sha256:
             raise ValueError('retire-attachment --apply requires --plan-sha256 from a reviewed retire-attachment plan')
-        review = build_retire_attachment_plan(identifier, args.checkout)
+        review = build_retire_attachment_plan(identifier, args.checkout,
+                                              live_registration=args.live_registration)
         if review.get('already_retired'):
             return {'retired': True, 'already_retired': True, 'history_preserved': True,
                     'seat_id': identifier, 'attachment': review['attachment'],
@@ -2316,7 +2327,8 @@ def retire_attachment(args):
         if args.plan_sha256 != review['plan_sha256']:
             raise ValueError('Retirement plan or a bound preimage changed; inspect a fresh retire-attachment plan')
         with session_store.locked_seat(identifier):
-            current = build_retire_attachment_plan(identifier, args.checkout)
+            current = build_retire_attachment_plan(identifier, args.checkout,
+                                                   live_registration=args.live_registration)
             if current.get('already_retired'):
                 return {'retired': True, 'already_retired': True, 'history_preserved': True,
                         'seat_id': identifier, 'attachment': current['attachment'],
@@ -2349,7 +2361,8 @@ def retire_attachment(args):
                 'retirement_receipt': receipt, 'plan_sha256': current['plan_sha256']}
     if args.plan_sha256:
         raise ValueError('Use --apply with --plan-sha256 to apply a reviewed retirement plan')
-    return build_retire_attachment_plan(identifier, args.checkout)
+    return build_retire_attachment_plan(identifier, args.checkout,
+                                        live_registration=args.live_registration)
 
 
 def seat_retirement_attachment_summary(identifier, seat):
@@ -4314,7 +4327,8 @@ def seat_retirement_status(seat, checkout_rows, anchor, actual, adapter_status,
                        'Resolve the anchor, runtime, adapter, settings, or lifecycle state before reviewing retire-seat.')
     else:
         state = 'attachments-active-or-uncertain'
-        next_action = 'Remove live attachments through uninstall, and retire only missing recorded attachments through retire-attachment before reviewing seat retirement.'
+        next_action = ('Review an exact retire-attachment plan for each registration before reviewing seat retirement. '
+                       'Use --live-registration to select a present recorded worktree explicitly.')
     return {'state': state, 'active_or_uncertain_attachments': sum(phase != 'removed' for phase in phases),
             'retired_attachments': sum(phase == 'removed' for phase in phases),
             'retained_hook_condition': ('retained-active' if seat.get('hooks_installed') and
@@ -6352,12 +6366,14 @@ def build_parser():
     p.add_argument('--pr-url',required=True)
     p = sub.add_parser('unpin', help='Remove a local PR retention pin')
     p.add_argument('--pr-url',required=True)
-    p = sub.add_parser('retire-attachment', help='Retire a missing Policy Guard checkout with a reviewed plan hash',
-                       description='Plan or apply history-preserving retirement of one missing Policy Guard attachment.',
+    p = sub.add_parser('retire-attachment', help='Retire one Policy Guard attachment with a reviewed plan hash',
+                       description='Any local operator can plan or apply retirement of one permanent-seat attachment while preserving its history.',
                        formatter_class=argparse.RawDescriptionHelpFormatter,
                        epilog='Example:\n  lane.py --seat-id SEAT_ID retire-attachment --checkout /worktrees/temporary-feature\n  lane.py --seat-id SEAT_ID retire-attachment --checkout /worktrees/temporary-feature --apply --plan-sha256 REVIEWED_PLAN_SHA256')
     p.add_argument('--checkout', type=Path, required=True,
                    help='Absolute recorded checkout path to inspect; the command never writes to this path')
+    p.add_argument('--live-registration', action='store_true',
+                   help='Explicitly retire the registration for a present recorded worktree, preserving shared hooks and adapters')
     p.add_argument('--apply', action='store_true', help='Apply only the exact plan named by --plan-sha256')
     p.add_argument('--plan-sha256', help='Exact hash from a reviewed retire-attachment plan')
     p = sub.add_parser('retire-seat', help='Retire one exact drained durable seat after existing authorization',
