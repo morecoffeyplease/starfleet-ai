@@ -128,6 +128,7 @@ Claude capture uses Pattern Buffer's installed checkpoint-enabled status line in
 Codex reads the exact session's native `turn_context` record after validating its `session_meta` identity.
 It validates identity from the file header and reads at most the most recent 8 MiB, so long transcripts remain usable.
 A Codex transcript window containing records for more than one session identity reports unknown.
+Forked Codex rollouts report unknown because the bounded reading cannot distinguish all inherited turns.
 Claude reports the session-selected level; Codex reports the observed turn, which can include a turn-specific override.
 A report describes the recorded observation, not a guarantee about a later turn.
 Use `--transcript PATH` to read one Codex transcript directly, or let the command look under `CODEX_HOME/sessions` for an exact UUID match.

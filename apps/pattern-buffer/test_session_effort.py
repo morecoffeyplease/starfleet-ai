@@ -161,6 +161,24 @@ class SessionEffortTests(unittest.TestCase):
         self.assertEqual(self.report("--harness", "codex", "--session", SESSION,
                                      "--transcript", str(transcript))["state"], "unknown")
 
+    def test_bounded_forked_rollout_does_not_report_a_copied_parent_turn(self):
+        transcript = self.root / "fork.jsonl"
+        with transcript.open("w") as handle:
+            print(json.dumps({"type": "session_meta", "payload": {
+                "id": SESSION, "forked_from_id": OTHER_SESSION}}), file=handle)
+            print(json.dumps({"type": "session_meta", "payload": {
+                "id": OTHER_SESSION}}), file=handle)
+            padding = json.dumps({"type": "event_msg", "payload": "x" * (512 * 1024)})
+            for _ in range(17):
+                print(padding, file=handle)
+            print(json.dumps({"type": "turn_context", "timestamp": "2026-11-15T00:00:00Z",
+                              "payload": {"model": "copied-parent", "effort": "high"}}), file=handle)
+        self.assertGreater(transcript.stat().st_size, effort.MAX_TRANSCRIPT_BYTES)
+        report = self.report("--harness", "codex", "--session", SESSION, "--transcript", str(transcript))
+        self.assertEqual(report["state"], "unknown")
+        self.assertIsNone(report["model"])
+        self.assertIsNone(report["effort"])
+
     def test_supported_observed_effort_levels_are_preserved(self):
         stamp = self.timestamp(datetime.datetime.now(datetime.timezone.utc))
         for level in ("none", "minimal", "xhigh", "max", "ultra"):

@@ -222,6 +222,10 @@ def _transcript_window(sessions, path, session):
                 or not isinstance(metadata.get("payload"), dict)
                 or _session_id(metadata["payload"].get("id")) != session):
             return None
+        # Forked histories can contain parent turns after their identity record
+        # has fallen outside this bounded read window.
+        if metadata["payload"].get("forked_from_id") is not None:
+            return None
         offset = max(0, before.st_size - MAX_TRANSCRIPT_BYTES)
         os.lseek(descriptor, offset, os.SEEK_SET)
         remaining = before.st_size - offset

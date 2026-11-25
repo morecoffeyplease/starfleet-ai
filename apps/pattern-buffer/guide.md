@@ -259,6 +259,7 @@ Claude captures allowlisted model and effort fields from its installed checkpoin
 Codex validates the exact native session and observes its latest recorded turn, including any recorded override, in a bounded 8 MiB window.
 Use `--transcript PATH` for an explicit Codex transcript or allow exact UUID discovery under `CODEX_HOME/sessions`.
 Incomplete, unsupported or ambiguous native evidence returns unknown.
+Forked Codex rollouts report unknown because the bounded reading cannot distinguish all inherited turns.
 The observation provides no estimate of thinking tokens or remaining context and no guarantee about the next turn.
 If the reading is unavailable, follow [Replicator's other evidence options](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/replicator/guide.md#verify-model-and-reasoning-effort).
 
