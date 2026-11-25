@@ -83,6 +83,9 @@ Compose to a private path, then use the reviewed `session-enroll --reviewed-upda
 Use assign for a persistent worktree role or session-enroll for an exact native session that needs a private standing file.
 Session enrollment replaces the worktree context for that exact identity and fails closed when required context is missing or invalid.
 Use the [session enrollment guide](docs/session-enrollments.md) for replacement handoffs, identity checks, trust limits and recovery.
+The exact pending successor can inspect its binding with `enrollment-status` and run `enrollment-adopt` while standing context is pending, including when an existing checkpoint or required reads already hold ordinary tools.
+The hook admits this one recovery operation only when it matches the explicit safe release.
+After adoption, any outstanding read and checkpoint gates still apply.
 Use the [checkpoint guide](docs/checkpoints.md) for opt-in short-lived recovery notes, pressure reminders and Hailing Frequencies idle receipts.
 For enrolled Claude and Codex sessions, the standard recovery hook also gates ordinary tools until the latest published checkpoint is delivered in complete framed parts after an observed compaction.
 A checkpoint is a current-state snapshot and does not replace standing context, task authorization or the authoritative tracker.

@@ -167,6 +167,9 @@ Starfleet AI is licensed under the [MIT License](LICENSE).
 
 ## Check Claude Code weekly usage
 
+To wake an enrolled Claude or Codex session when Claude's weekly allowance changes or reaches a threshold, set up a [Claude Code weekly quota watch](apps/hailing-frequencies/temporal-beacon.md#watch-claude-code-weekly-quota).
+The existing Hailing Frequencies worker reads the local Claude Code status-line cache and uses guarded Temporal Beacon delivery.
+
 If the local Claude Code status line writes `~/.claude/cache/rate-limits.json`, read it with `cat ~/.claude/cache/rate-limits.json`.
 This optional cache is written by local status-line configuration, such as `~/.claude/statusline-command.sh`; installing Starfleet does not create it.
 Before using the percentage, compare its `ts` epoch seconds with the current time from `date +%s`.

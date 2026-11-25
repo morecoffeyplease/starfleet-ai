@@ -111,6 +111,18 @@ Unsealed messages can be assigned to the new generation, while a group never com
 An unexplained generation change without a matching ownership-event chain holds the affected groups.
 Uncertain submissions are never retried automatically.
 
+### Recover a moved Claude or Codex session
+
+From the same native session, verify its Hailing enrollment on the current CMUX pane and workspace.
+Then run `discord-watch recover THREAD_ID` and confirm the exact owner with `discord-watch managed THREAD_ID`.
+Recovery checks the explicit session ID, live CMUX projection, hook generation, and native receiving settings even if your shell still carries the previous workspace ID.
+It leaves the cursor, thread state, replies, and previous delivery attempts intact.
+A repeated recovery of the current binding makes no changes.
+If `recover` refuses a changed session or hook generation, keep the existing ownership and reconcile it through the authorized handoff route.
+If needed, use `discord-watch scan --only-thread THREAD_ID` for observe-only REST catch-up on that thread.
+A local recovery receipt verifies the binding update.
+Use the actual `receive` command to verify that an incoming reply reached you.
+
 ## Observe, pilot, and supervise
 
 The scanner is observe-only unless `--send` is supplied.

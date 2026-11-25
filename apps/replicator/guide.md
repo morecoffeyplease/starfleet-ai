@@ -129,6 +129,88 @@ A Policy Guard seat transfer may affect multiple attachments.
 Check every applicable seat and legacy route before moving custody.
 Use established installations and preserve concurrent work, history, and shared services.
 
+### Policy Guard seat handoff
+
+Inspect the exact permanent seat and its attachments with the installed pinned CLI before changing custody:
+
+```sh
+python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status
+```
+
+Record the seat ID, birth root, operational anchor, exact owner, every active or retired attachment, covered PR, and any missing or changed worktree in the existing checkpoint.
+Record the authorized release of the approved scope to the exact incoming owner in the existing checkpoint, with the outgoing owner recording it when available.
+If that owner is unavailable, use the applicable existing authority process to record the disposition and hold the scope until it is resolved.
+The incoming owner verifies their exact native identity, runtime and hook trust, and accepts the same scope in the checkpoint before rebind.
+When status supplies `handoff.rebind_owner_command`, the incoming actual native session should use that exact command.
+If the installed CLI is unavailable or outdated, the documented same-harness maintenance fallback remains supported when its full runtime-pin checks pass.
+The incoming owner becomes the only writer after acceptance and the authorized rebind.
+The command updates active attachment ownership and source pins together, while preserving retired rows and their histories.
+For cross-harness transfers, review the receipt's exact Claude settings path, before and after hashes, and owned hook groups.
+Review changed and retained checkout dispositions by branch and PR, then run each available command in `verification.coverage_commands` to inspect local coverage and report state.
+Use actual native tool output when a relevant action has occurred, but do not create a production action or restart solely to validate a handoff.
+If no native event occurred, record that interception remains unobserved; `verification.observed.state` is a static note about the rebind and does not update later.
+The supported explicit adapter probe is non-forwarding and does not prove native hook interception.
+Prior reports are archived where present, so a fresh report is required for each rebound active checkout with a covered PR.
+Do not declare sole custody while an attachment, owner, permission, or trust state is unresolved.
+
+## Review checkout acceptance and outgoing retirement
+
+Add a private owner evidence file when a checkout can be accepted before the outgoing session retires.
+Run the same preflight with the file and keep its report in the private handoff record.
+
+```sh
+replicator preflight --context-file /path/to/standing-context.md \
+  --guidance-file /path/to/AGENTS.md --handoff-file /path/to/handoff-evidence.json
+```
+
+The file is a JSON object containing exact scope and evidence references.
+For example, record an accepted checkout, a pending Discord reply that still depends on the outgoing session, and an old Warp record with an unknown exit and documented absence of dependent work or delivery.
+
+```json
+{
+  "checkout": {
+    "worktree": "/path/to/worktree",
+    "head": "1234567890abcdef1234567890abcdef12345678",
+    "acceptance": "accepted",
+    "evidence": "Incoming owner checkpoint, acceptance receipt for this head"
+  },
+  "resources_complete": true,
+  "resources": [
+    {
+      "tool": "discord-watch",
+      "id": "1234567890123456789",
+      "state": "pending",
+      "affects": ["outgoing_retirement"],
+      "evidence": "Exact thread status reports a reply awaiting delivery"
+    },
+    {
+      "tool": "warp-drive",
+      "id": "11111111-2222-4333-8444-555555555555",
+      "state": "unknown",
+      "affects": [],
+      "evidence": "Verified-stop receipt and successor confirmation that no delivery or work depends on this record"
+    }
+  ]
+}
+```
+
+Use `accepted`, `pending`, or `unknown` for checkout acceptance.
+An accepted record needs the exact absolute worktree path, full commit ID, and an acceptance evidence reference.
+Set `resources_complete` only after verifying all applicable resources for the scoped handoff.
+For each resource, use `active`, `pending`, `settled`, or `unknown` and list the actions that still depend on it in `affects`.
+The supported actions are `checkout_acceptance` and `outgoing_retirement`.
+An empty list requires evidence that there is no remaining dependency.
+Use short references to receipts, logs, or checkpoint entries and leave credentials and message contents out.
+Unknown entries tied to a specific action can omit their evidence until it is available.
+
+The report represents acceptance as recorded by the owner.
+It does not fetch evidence references, verify retirement, or change the preflight exit code.
+A pending or active dependency holds the named action.
+An unknown dependency marks only the named action unknown.
+An incomplete inventory leaves retirement unknown unless a listed resource already shows a blocker.
+When retirement shows `review`, repeat the exact owner checks in this guide and confirm the outgoing process exits normally.
+Use generated inspect commands as pointers and follow the component guides for any owner action.
+
 ## Handle exceptions
 
 If a launch, receipt, or transfer is uncertain, inspect the exact record before any retry.

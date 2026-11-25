@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+from datetime import datetime, timedelta, timezone
 import fcntl
 import getpass
 import hashlib
@@ -1517,6 +1518,84 @@ def cmux_json(args, action):
     return value
 
 
+def cmux_utc_time(value):
+    if isinstance(value, str) and value.endswith("Z"):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            pass
+    return None
+
+
+def owner_process_start(pid):
+    try:
+        observed = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                  env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+                                  capture_output=True, text=True, timeout=2)
+        if observed.returncode == 0:
+            return datetime.strptime(observed.stdout.strip(), "%a %b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def corroborate_anonymous_codex_feed(active, workspace, surface, omitted):
+    if len(active) != 2 or any(row.get("kind") != "codex" or row.get("has_hook_lifecycle_state") is not True
+                               for row in active):
+        return active
+    omitted_agents = omitted.get("agents") if isinstance(omitted, dict) else None
+    if type(omitted_agents) is not int or omitted_agents != 0:
+        return active
+    anonymous = [row for row in active if isinstance(identifier := row.get("session_id"), str)
+                 and re.fullmatch(r"fallback-[0-9a-f]{16}", identifier)]
+    if len(anonymous) != 1 or anonymous[0].get("state") not in ("working", "idle"):
+        return active
+    native = next(row for row in active if row is not anonymous[0])
+    session = canonical_session("codex", native.get("session_id"))
+    feed_activity = cmux_utc_time(anonymous[0].get("last_activity_at"))
+    native_activity = cmux_utc_time(native.get("last_activity_at"))
+    if feed_activity is None or native_activity is None or feed_activity >= native_activity:
+        return active
+
+    saved = cmux_json(["sessions", "list", "--agent", "codex", "--surface", surface, "--all"], "sessions list")
+    records = saved.get("sessions")
+    count = saved.get("total_matches")
+    if type(count) is not int or count != 1 or not isinstance(records, list) or len(records) != 1:
+        return active
+    record = records[0]
+    if (not isinstance(record, dict) or record.get("agent") != "codex" or
+            canonical_session("codex", record.get("session_id")) != session or
+            canonical_uuid(record.get("workspace_id"), "CMUX saved workspace") != workspace or
+            canonical_uuid(record.get("surface_id"), "CMUX saved surface") != surface):
+        return active
+    pid = record.get("pid")
+    if type(pid) is not int or pid <= 0 or record.get("stored_pid_exists") is not True:
+        return active
+
+    # CMUX 0.65.2 build 113, stableFallbackFeedSessionId in CLI/cmux.swift.
+    seed = f"source=codex\npid={pid}".encode()
+    if anonymous[0]["session_id"] != "fallback-" + hashlib.sha256(seed).hexdigest()[:16]:
+        return active
+    process_start = owner_process_start(pid)
+    saved_start = cmux_utc_time(record.get("started_at"))
+    saved_activity = cmux_utc_time(record.get("updated_at"))
+    if process_start is None or saved_start is None or saved_activity is None:
+        return active
+    # ps reports whole seconds. A timestamp within that second cannot establish ordering.
+    if not process_start + timedelta(seconds=1) <= saved_start <= feed_activity < saved_activity:
+        return active
+    params = json_text({"pid": pid, "pid_resolution": "controlling_tty"})
+    route = cmux_json(["rpc", "agent.resolve_delivery_target", params], "process delivery target")
+    routed_pid = route.get("pid")
+    if (route.get("source") != "pid" or route.get("pid_resolution") != "controlling_tty" or
+            type(routed_pid) is not int or routed_pid != pid or
+            canonical_uuid(route.get("workspace_id"), "CMUX process workspace") != workspace or
+            canonical_uuid(route.get("surface_id"), "CMUX process surface") != surface or
+            owner_process_start(pid) != process_start):
+        return active
+    return [native]
+
+
 def discover_native_owner():
     caller_packet = cmux_json(["--id-format", "uuids", "identify"], "identify")
     caller = caller_packet.get("caller")
@@ -1563,6 +1642,7 @@ def discover_native_owner():
     require(isinstance(agents, list), "CMUX caller surface has no agent inventory; retry when it is available.")
     active = [agent for agent in agents
               if isinstance(agent, dict) and agent.get("state") != "ended"]
+    active = corroborate_anonymous_codex_feed(active, workspace, surface, item.get("omitted"))
     require(len(active) == 1 and active[0].get("state") in ("working", "idle", "needs_input"),
             "CMUX caller needs one unambiguous active native owner. Run from the intended native agent terminal and retry.")
     harness = active[0].get("kind")
@@ -1634,6 +1714,10 @@ def deliver_completion_wake(db, state_dir, row, target, cmux, sender_surface):
     body = (f"Warp-drive completion {event_key}: reservation {request_id} finished "
             f"with outcome {row['outcome']} and exit code {row['exit_code']}. "
             f"Inspect it with: warp-drive --state-dir {shlex.quote(str(state_dir))} inspect {request_id}")
+    if row["outcome"] == "unknown":
+        body = (f"Warp-drive completion {event_key}: reservation {request_id} released capacity "
+                "after the workload was verified stopped. The exit result is unknown. "
+                f"Inspect it with: warp-drive --state-dir {shlex.quote(str(state_dir))} inspect {request_id}")
     with immediate_transaction(db):
         current = current_request(db, request_id)
         if current["state"] != "finished" or current["wake_status"] not in (None, "pending", "unavailable"):
@@ -2075,7 +2159,12 @@ def helper_diagnostic(row, attachment_evidence, state_dir, hailing_snapshot, at=
     recovery_command = None
     if state == "finished":
         classification = "finished"
-        next_action = f"The command finished with recorded outcome {row.get('outcome') or 'unknown'}; inspect its result."
+        if row.get("outcome") == "unknown":
+            next_action = ("Inspect the stop evidence and preserve the unknown exit result. "
+                           "If the owner is retiring and delivery is still pending, transfer the same reservation "
+                           "to the accepted enrolled successor.")
+        else:
+            next_action = f"The command finished with recorded outcome {row.get('outcome') or 'unknown'}; inspect its result."
     elif state == "cancelled":
         classification = "cancelled"
         next_action = "This reservation was cancelled. Inspect its recorded event history."
@@ -2088,7 +2177,10 @@ def helper_diagnostic(row, attachment_evidence, state_dir, hailing_snapshot, at=
             next_action = "The launch intent, active lease, and fresh helper heartbeat indicate current command handling. Continue observing with inspect; do not attach or replay."
         elif state == "reserved":
             classification = "uncertain_after_launch"
-            next_action = "The launch intent exists but the helper or lease is no longer current. Inspect and obtain owner evidence; reconcile only after confirming the outcome. Do not attach or replay."
+            next_action = ("Inspect the exact workload and obtain owner evidence. "
+                           "If the workload and its descendants have stopped, reconcile with "
+                           "--outcome unknown --stopped-generation and record the stop evidence. "
+                           "An inactive lease alone cannot establish a stop. Keep the request for inspection without replaying it.")
         else:
             classification = "unknown_after_launch"
             next_action = "A launch intent exists in an unexpected reservation state. Inspect and obtain owner evidence; do not attach or replay."
@@ -2474,6 +2566,9 @@ def build_parser():
     reconcile.add_argument("--outcome", choices=("unknown", "succeeded", "failed"), required=True)
     reconcile.add_argument("--evidence", required=True)
     reconcile.add_argument("--exit-code", type=int)
+    reconcile.add_argument("--stopped-generation", type=int,
+                           help="release an unknown reservation after verifying its exact workload stopped")
+    reconcile.add_argument("--actor", help="configured operator or delegate for a verified stop")
     return parser
 
 
@@ -2599,28 +2694,48 @@ def _main(argv, product_umask):
             print(json.dumps(value, indent=2, default=str))
         elif args.command_name == "reconcile":
             owner = owner_from_args(args)
+            stopped = args.stopped_generation is not None
+            require(args.actor is None or stopped, "--actor requires --stopped-generation")
+            if stopped:
+                require(args.outcome == "unknown" and args.exit_code is None and args.evidence.strip(),
+                        "Stopped-workload reconciliation requires unknown outcome and stop evidence, with no exit code")
             with immediate_transaction(db):
                 row = current_request(db, args.request_id)
-                require(owner_matches(row, owner), "Only the current owner may reconcile this reservation")
+                require(owner_matches(row, owner), "Only the current owner may reconcile this reservation"
+                        if args.actor is None else "The recorded owner changed; inspect the reservation again")
+                if args.actor is not None:
+                    resolve_actor(db, args.actor)
                 require(row["state"] == "reserved" and row["launch_intent_at"] is not None,
                         "Only a launched reservation can be reconciled")
-                if args.outcome == "unknown":
+                if stopped:
+                    require(row["helper_generation"] == args.stopped_generation,
+                            "Helper generation changed; inspect the workload again")
+                    require(row["outcome"] == "unknown" and not row["lease_active"] and
+                            row["heartbeat_at"] is not None and now() - row["heartbeat_at"] > HELPER_STALE_SECONDS and
+                            row["exit_code"] is None and row["ended_at"] is None,
+                            "Stopped-workload reconciliation requires an expired unknown claim without an exit receipt")
+                    db.execute("""UPDATE reservations SET state='finished',wake_status='pending',wake_detail=NULL
+                        WHERE id=?""", (row["id"],))
+                elif args.outcome == "unknown":
                     db.execute("UPDATE reservations SET outcome='unknown',lease_active=0 WHERE id=?",
                                (row["id"],))
                 else:
                     db.execute("UPDATE reservations SET state='finished',outcome=?,exit_code=?,ended_at=?,lease_active=0,wake_status='pending' WHERE id=?",
                                (args.outcome, args.exit_code, now(), row["id"]))
-                event(db, "owner_reconciled", row["id"], outcome=args.outcome,
+                event(db, "stopped_workload_released" if stopped else "owner_reconciled",
+                      row["id"], outcome=args.outcome,
                       exit_code=args.exit_code, evidence=args.evidence,
+                      **({"helper_generation": args.stopped_generation, "actor": args.actor} if stopped else {}),
                       **child_accounting_unavailable(
                           "owner reconciliation has no helper-observed wait4 sample"))
-                if args.outcome != "unknown":
+                finished = stopped or args.outcome != "unknown"
+                if finished:
                     resolve_incident(db, f"command-uncertain:{row['id']}")
                     resolve_incident(db, f"runtime-overdue:{row['id']}")
             print(json.dumps({"request_id": row["id"], "outcome": args.outcome,
-                              "state": "finished" if args.outcome != "unknown" else "reserved",
+                              "state": "finished" if finished else "reserved",
                               "evidence_recorded": True,
-                              "wake_status": "pending" if args.outcome != "unknown" else None}, indent=2))
+                              "wake_status": "pending" if finished else None}, indent=2))
         elif args.command_name == "cancel":
             with immediate_transaction(db):
                 row = current_request(db, args.request_id)

@@ -2488,6 +2488,8 @@ def recovery_pretool_gate(ci, root, gitdir, harness, payload):
     required_reads = ci.auxiliary("required_reads")
     parsed, command = _parse_hook_cli(ci, root, harness, session, payload)
     read_part = (parsed.part if parsed is not None and parsed.command == "checkpoint-read" else None)
+    if required_reads.allowed_pending_adoption(ci, root, gitdir, harness, session, parsed):
+        return None
     if parsed is not None:
         if parsed.command == "checkpoint-status":
             return None

@@ -142,12 +142,25 @@ python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
   --release-anchor-seat DESTINATION_SEAT_ID --plan-sha256 REVIEWED_PLAN_SHA256
 ```
 
+## Retire a drained durable seat
+
+Use `retire-seat` after every recorded attachment is removed and an existing explicit authorization names the local cleanup.
+The read-only plan binds the historical seat owner separately from the actual native operator, plus the anchor, immutable runtime pin, captured `gh`, adapter, exact hooks, settings hashes and attachment receipts.
+The required authorization reference is recorded but not authenticated, and the historical owner and attachment history remain unchanged.
+Apply only the reviewed `--plan-sha256`; the operation removes only this seat's adapter and exact managed hook groups, releases its operational anchor and preserves PR history.
+An interrupted operation can be inspected and rolled back through `recover --inspect` and `recover --rollback` from the native operator that began it.
+The receipt proves local file changes only and does not prove that a running native host refreshed or stopped invoking a cached hook.
+See [the printable guide](guide.md#retire-a-drained-durable-seat) for the exact command sequence and limits.
+
 ## Retire a missing attachment
 
-An exact seat owner can retire a recorded attachment when its checkout path is gone or now belongs to a different Git repository or worktree.
-The command refuses a live matching checkout and directs the owner to run `uninstall` from that checkout.
-It also refuses a recorded worktree that exists on another branch, and refuses while an install, migration, handoff, or upgrade recovery is pending.
-It changes only the Policy Guard attachment record, preserves pull request records and their counts, and records the owner, time, and missing-checkout evidence.
+Any local operator can retire a recorded attachment when its checkout path is gone or now identifies another worktree.
+Use the recorded seat ID and absolute checkout path to review and apply the exact plan.
+Use a current source checkout's `lane.py` if an older installed runtime still asks for the former owner.
+For a live worktree with the recorded Git identity, use the [live registration workflow](#retire-a-live-attachment-registration) or run the existing owner-bound `uninstall` workflow from that checkout.
+A pending install, migration, handoff, or upgrade still requires recovery first.
+Retirement preserves the seat's owner, existing hooks, and PR records and counts.
+The receipt records the historical owner, time, and missing-checkout evidence.
 
 For example, review the plan for a deleted temporary checkout, then apply only its exact hash:
 
@@ -162,3 +175,12 @@ python3 /path/to/clean/starfleet-ai/apps/starfleet-policy-guard/lane.py \
 
 If the recorded checkout still exists on another branch, restore its recorded branch and run `uninstall` from it instead of retiring it.
 Use the [Policy Guard guide](guide.md#retire-a-missing-attachment) for the full plan, apply, upgrade, and recovery workflow.
+
+## Retire a live attachment registration
+
+Use `retire-attachment --live-registration` to remove one exact permanent-seat registration from a checkout that still exists.
+The reviewed plan binds the checkout's Git identity, recorded branch, and current head.
+Apply only that plan's hash with the same exact seat ID, checkout path, and live-registration flag.
+The operation preserves the checkout, the seat owner, shared hooks and adapter, and PR history.
+Use the reviewed `retire-seat` workflow for physical hook and adapter cleanup after all attachments are retired.
+See [the printable guide](guide.md#retire-a-live-attachment-registration) for the command sequence.

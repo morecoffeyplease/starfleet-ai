@@ -1783,8 +1783,26 @@ class DiscordWatchTests(unittest.TestCase):
                     watch.validate_registered_owner(owner, readiness_policy=hf.DISCORD_REPLY_READINESS)
                 settings[setting] = True
 
+            # A native restart moved the pane while the shell kept its old workspace.
+            owner_config["targets"] = [target(SESSION_A, SURFACE_B, WORKSPACE_B)]
+            config_path.write_text(json.dumps(owner_config), encoding="utf-8")
+            hook_record.update(surfaceId=SURFACE_B, workspaceId=WORKSPACE_B)
+            hook_path.write_text(json.dumps({"sessions": {SESSION_A: hook_record}}), encoding="utf-8")
+            os.environ["CMUX_SURFACE_ID"] = SURFACE_B
+            projection["panel_id"] = SURFACE_B
+            with self.assertRaisesRegex(ValueError, "Workspace changed"):
+                watch.recover(THREAD)
+            projection["workspace_id"] = WORKSPACE_B
+            with self.assertRaisesRegex(ValueError, "belongs to another exact session"):
+                watch.managed(THREAD)
+            self.assertTrue(watch.recover(THREAD)["recovered"])
+            self.assertFalse(watch.recover(THREAD)["recovered"])
+            self.assertTrue(watch.managed(THREAD)["managed"])
+            self.assertTrue(watch.register(THREAD)["already_registered"])
+            self.assertEqual(len(paste_calls), 1)
+
             output = io.StringIO()
-            receipt = watch.receive(THREAD, output=output)
+            receipt = watch.receive(THREAD, output=output, group_id=1)
             self.assertEqual(receipt["received"], ["101"])
             self.assertIn("reply survives unknown terminal input", output.getvalue())
             with contextlib.closing(watch.database(create=False)) as db:
@@ -2602,6 +2620,25 @@ class DiscordWatchTests(unittest.TestCase):
         managed = self.app.managed(THREAD)
         self.assertEqual(managed["owner_session"], SESSION_B)
         self.assertFalse(managed["open"])
+
+    def test_recover_requires_the_same_harness_session_and_generation(self):
+        self.register()
+        self.targets = [target(SESSION_B, SURFACE_B, WORKSPACE_B)]
+        self._write_hailing()
+        os.environ.update(CODEX_THREAD_ID=SESSION_B, CMUX_SURFACE_ID=SURFACE_B)
+        with self.assertRaisesRegex(ValueError, "exact native session"):
+            self.app.recover(THREAD)
+        os.environ["CODEX_THREAD_ID"] = SESSION_A
+        self.targets = [target(SESSION_A, SURFACE_B, WORKSPACE_B, started_at=1235.5)]
+        self._write_hailing()
+        with self.assertRaisesRegex(ValueError, "Session generation changed"):
+            self.app.recover(THREAD)
+        os.environ.pop("CODEX_THREAD_ID")
+        with self.assertRaisesRegex(ValueError, "requires the exact native"):
+            self.app.recover(THREAD)
+        with contextlib.closing(self.app.database(create=False)) as db:
+            self.assertEqual(db.execute("SELECT owner_generation FROM threads").fetchone(), (1,))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM ownership_events").fetchone(), (0,))
 
     def test_closed_transfer_preserves_uncertain_submission_and_exact_generation(self):
         self.register()
