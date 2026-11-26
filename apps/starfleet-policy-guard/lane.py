@@ -207,24 +207,25 @@ def runtime_source_versions(runtime, harness):
     return {name: runtime['files'][name] for name in names}
 
 
-def permanent_handoff_source_versions(seat, harness):
+def pinned_rebind_command(identifier, runtime_cli, owner):
+    return shlex.join([sys.executable, str(runtime_cli), '--seat-id', identifier,
+                       'rebind-owner', '--from-harness', owner['harness'],
+                       '--from-session', owner['session_id'], '--confirm-handoff'])
+
+
+def require_pinned_handoff_source(runtime, identifier, previous, incoming_harness):
     try:
-        incoming = source_versions(harness)
-    except OSError:
-        raise ValueError('Incoming delivery adapter source is missing or unavailable; no owner handoff was recorded') from None
-    runtime = seat.get('runtime') if isinstance(seat, dict) else None
-    if (not isinstance(runtime, dict) or not isinstance(runtime.get('version'), str) or
-            not isinstance(runtime.get('path'), str) or not Path(runtime['path']).is_absolute() or
-            not isinstance(runtime.get('files'), dict)):
-        raise ValueError('Permanent seat runtime metadata is malformed; preserve it and inspect status')
-    try:
-        verified = session_store.recorded_runtime_plan(APP, runtime['files'])
+        executing = session_store.recorded_runtime_plan(APP, runtime['files'])
     except (OSError, TypeError, ValueError):
-        raise ValueError('Permanent seat runtime is changed or unavailable; preserve it and inspect status') from None
-    if (verified['version'] != runtime['version'] or verified['path'] != runtime['path'] or
-            any(runtime['files'].get(name) != digest for name, digest in incoming.items())):
-        raise ValueError('Incoming delivery adapter source differs from the permanent seat runtime; no owner handoff was recorded')
-    return incoming
+        executing = None
+    if executing and all(executing[key] == runtime[key] for key in ('version', 'path', 'files')):
+        return
+    message = 'The executing Policy Guard CLI differs from the verified seat runtime.'
+    if incoming_harness == 'opencode':
+        raise ValueError(message + ' Use prime_directive_manage from the incoming native session with the '
+                         'recorded OpenCode plugin at ' + str(Path(runtime['path']) / 'opencode-plugin'))
+    command = pinned_rebind_command(identifier, Path(runtime['path']) / 'lane.py', previous)
+    raise ValueError(message + ' Run the recorded handoff command from the incoming native session. ' + command)
 
 
 def source_revision(runtime=None):
@@ -962,9 +963,7 @@ def rebind_owner(args):
                 raise ValueError('A previous owner handoff is incomplete; use recover --rollback before another transfer')
             checkout_rows = session_store.all_checkouts(identifier)
             runtime = permanent_handoff_runtime(seat)
-            same_harness = previous['harness'] == identity['harness']
-            outgoing_versions = (runtime_source_versions(runtime, previous['harness']) if same_harness
-                                 else source_versions(previous['harness']))
+            outgoing_versions = runtime_source_versions(runtime, previous['harness'])
             for item in checkout_rows:
                 state = item.get('state')
                 if state is not None and not isinstance(state,dict):
@@ -985,8 +984,9 @@ def rebind_owner(args):
                     raise ValueError('Permanent seat and checkout owners differ; preserve history and inspect status')
                 if state.get('source_versions') != outgoing_versions:
                     raise ValueError('Pinned delivery adapter source changed; restore the reviewed source')
-            incoming_versions = (runtime_source_versions(runtime, identity['harness']) if same_harness
-                                 else permanent_handoff_source_versions(seat, identity['harness']))
+            incoming_versions = runtime_source_versions(runtime, identity['harness'])
+            if previous['harness'] != identity['harness']:
+                require_pinned_handoff_source(runtime, identifier, previous, identity['harness'])
             changed_attachments=[]
             retained_attachments=[]
             path_state_by_checkout={}
@@ -4708,9 +4708,7 @@ def seat_status(identifier):
                         not all_checkouts_removed and
                         complete_runtime_pin and adapter_status.get('state') == 'intact' and
                         rebind_route_ready(recorded_owner, actual, runtime, checkout_rows))
-    rebind_command = (shlex.join([sys.executable, str(runtime_cli), '--seat-id', identifier,
-                                  'rebind-owner', '--from-harness', recorded_owner['harness'],
-                                  '--from-session', recorded_owner['session_id'], '--confirm-handoff'])
+    rebind_command = (pinned_rebind_command(identifier, runtime_cli, recorded_owner)
                       if can_offer_rebind else None)
     settings_info = seat.get('settings') if isinstance(seat.get('settings'), dict) else {}
     prospective_settings_path = (str(Path(anchor['root'])/'.claude/settings.local.json')

@@ -4310,6 +4310,62 @@ class LaneInstallTest(unittest.TestCase):
         self.assertEqual(value['verification']['coverage_commands'][0]['root'], str(self.repo.resolve()))
         self.assertEqual(json.loads(active_state_path.read_text())['lane_owner']['harness'], 'codex')
 
+    def test_cross_harness_rebind_reports_recorded_runtime_and_distinguishes_stale_active_pin(self):
+        fixture = self.prepare_seat_with_retired_attachment('cross-harness-runtime-hint')
+        seat_id = fixture['seat_id']
+        runtime = fixture['runtime']
+        wrong_source = self.source_checkout('cross-harness-wrong-cli', marker_file='lane_scope.py')
+        outgoing_session = fixture['owner_env']['CLAUDE_CODE_SESSION_ID']
+        incoming_env = dict(self.env, CMUX_AGENT_LAUNCH_KIND='codex',
+                            CODEX_THREAD_ID='codex-cross-harness-incoming')
+        incoming_env.pop('CLAUDE_CODE_SESSION_ID', None)
+        seat_path = lane_runtime.session_store.seat_dir(seat_id) / 'seat.json'
+        seat_before = json.loads(seat_path.read_bytes())
+        state_path = lane_runtime.directory(self.repo) / 'state.json'
+        settings_path = fixture['owner'] / '.claude/settings.local.json'
+        adapter = Path(seat_before['adapter'])
+        retained_path = fixture['retired_state_path']
+        before = {path: path.read_bytes() for path in (seat_path, state_path, settings_path,
+                                                       adapter, retained_path)}
+
+        status = self.call_source(wrong_source, '--seat-id', seat_id, 'status', env=incoming_env)
+        command = json.loads(status.stdout)['handoff']['rebind_owner_command']
+        self.assertEqual(shlex.split(command), [sys.executable, str(runtime / 'lane.py'),
+                         '--seat-id', seat_id, 'rebind-owner', '--from-harness', 'claude',
+                         '--from-session', outgoing_session, '--confirm-handoff'])
+        wrong_cli = self.call_seat_rebind(wrong_source, seat_id, 'claude', outgoing_session,
+                                          incoming_env, ok=False)
+        self.assertEqual(wrong_cli.returncode, 2)
+        self.assertIn('executing Policy Guard CLI differs from the verified seat runtime', wrong_cli.stderr)
+        self.assertIn(command, wrong_cli.stderr)
+        for path, raw in before.items():
+            self.assertEqual(path.read_bytes(), raw)
+
+        stale_active = json.loads(before[state_path])
+        stale_active['source_versions']['lane.py'] = '0' * 64
+        changed = json.dumps(stale_active, indent=2).encode() + b'\n'
+        state_path.write_bytes(changed)
+        stale = self.call_seat_rebind(wrong_source, seat_id, 'claude', outgoing_session,
+                                      incoming_env, ok=False)
+        self.assertEqual(stale.returncode, 2)
+        self.assertIn('Pinned delivery adapter source changed', stale.stderr)
+        self.assertNotIn(command, stale.stderr)
+        self.assertEqual(state_path.read_bytes(), changed)
+        for path in (seat_path, settings_path, adapter, retained_path):
+            self.assertEqual(path.read_bytes(), before[path])
+        state_path.write_bytes(before[state_path])
+
+        applied = subprocess.run(shlex.split(command), cwd=self.repo, env=incoming_env,
+                                 capture_output=True, text=True)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(applied.stdout)
+        self.assertTrue(receipt['rebound'])
+        self.assertTrue(receipt['settings_receipt']['changed'])
+        self.assertEqual(json.loads(settings_path.read_text())['permissions'], self.original['permissions'])
+        self.assertEqual(retained_path.read_bytes(), before[retained_path])
+        self.assertEqual(adapter.read_bytes(), before[adapter])
+        self.assertEqual(json.loads(seat_path.read_bytes())['runtime'], seat_before['runtime'])
+
     def test_rebind_owner_accepts_matching_retired_source_pin_control(self):
         fixture = self.prepare_seat_with_retired_attachment('issue60-matching-retired')
         incoming_env = dict(fixture['owner_env'], CLAUDE_CODE_SESSION_ID='claude-incoming-matching')

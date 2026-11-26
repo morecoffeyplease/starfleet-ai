@@ -141,17 +141,20 @@ Use established installations and preserve concurrent work, history, and shared 
 
 ### Policy Guard seat handoff
 
-Inspect the exact permanent seat and its attachments with the installed pinned CLI before changing custody:
+Inspect the exact permanent seat and its attachments from a current Policy Guard source checkout before changing custody:
 
 ```sh
-python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status
+python3 /path/to/current/starfleet-ai/apps/starfleet-policy-guard/lane.py --seat-id SEAT_ID status
 ```
+
+Use the seat's current `runtime_cli` even if the checkout's delivery rules still name an older runtime path.
 
 Record the seat ID, birth root, operational anchor, exact owner, every active or retired attachment, covered PR, and any missing or changed worktree in the existing checkpoint.
 Record the authorized release of the approved scope to the exact incoming owner in the existing checkpoint, with the outgoing owner recording it when available.
 If that owner is unavailable, use the applicable existing authority process to record the disposition and hold the scope until it is resolved.
 The incoming owner verifies their exact native identity, runtime and hook trust, and accepts the same scope in the checkpoint before rebind.
-When status supplies `handoff.rebind_owner_command`, the incoming actual native session should use that exact command.
+An incoming Claude or Codex session uses the exact `handoff.rebind_owner_command` from current seat status when present.
+For OpenCode, use the native management tool from the seat's recorded runtime as described in the [Policy Guard guide](https://github.com/morecoffeyplease/starfleet-ai/blob/main/apps/starfleet-policy-guard/guide.md#inspect-hand-off-and-recover).
 If the installed CLI is unavailable or outdated, the documented same-harness maintenance fallback remains supported when its full runtime-pin checks pass.
 The incoming owner becomes the only writer after acceptance and the authorized rebind.
 The command updates active attachment ownership and source pins together, while preserving retired rows and their histories.

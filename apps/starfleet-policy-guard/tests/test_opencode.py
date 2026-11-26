@@ -338,9 +338,10 @@ class OpenCodeTest(unittest.TestCase):
                 handoff = self.bridge(event, ['--cwd', self.f.repo, 'rebind-owner', '--from-harness', 'codex',
                     '--from-session', 'codex-fixture-thread', '--confirm-handoff'], ok=False)
                 self.assertEqual(handoff.returncode, 2)
-                expected_error = ('Incoming delivery adapter source is missing' if mode == 'missing' else
-                                  'Permanent seat runtime is changed')
-                self.assertIn(expected_error, handoff.stderr)
+                runtime = json.loads(before_seat)['runtime']
+                self.assertIn('executing Policy Guard CLI differs from the verified seat runtime', handoff.stderr)
+                self.assertIn('Use prime_directive_manage from the incoming native session', handoff.stderr)
+                self.assertIn(str(Path(runtime['path']) / 'opencode-plugin'), handoff.stderr)
                 self.assertEqual(state_path.read_bytes(), before_state)
                 self.assertEqual(seat_path.read_bytes(), before_seat)
                 self.assertNotIn('handoff_journal', json.loads(seat_path.read_text()))
