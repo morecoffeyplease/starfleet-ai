@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -40,6 +41,78 @@ class ReplicatorCliTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_installed_retirement_preview_preserves_snapshots_and_exact_generation(self):
+        installation = self.install_copy()
+        shutil.rmtree(self.source)
+        snapshot = self.root / "snapshots"
+        snapshot.mkdir()
+        base = {"harness": "codex", "surface": "old-pane", "workspace": "workspace", "started_at": 10}
+        bindings = {session: dict(base, session=session) for session in (
+            "hold", "recover", "review", "stale", "old-scan", "open-post", "warp-gap", "warp-conflict", "current",
+        )}
+        hailing = {
+            "config": {"targets": list(bindings.values())},
+            "health": {"stale_after": 120},
+            "last_scan": {
+                "completed_at": time.time(),
+                "target_errors": [{"session": session, "stage": "initial_scan", "error": "Error: not_found:"}
+                                  for session in bindings if session != "current"],
+                "targets": [dict(binding, inbox_status="complete" if session == "current" else "incomplete",
+                                 started_at=9 if session == "old-scan" else 10)
+                            for session, binding in bindings.items()],
+            },
+        }
+        cmux = {
+            "truncated": False,
+            "owner_availability": {"agent_sessions": "available"},
+            "items": [{
+                "lifecycle": "running", "placement": {"kind": "local"},
+                "projections": [{"panel_id": "new-pane", "workspace_id": "workspace"}],
+                "agents": [{"kind": "codex", "session_id": "recover", "state": "idle"}],
+            }],
+        }
+        discord = {"threads": [
+            {"thread": "1", "owner": bindings["hold"], "open": False, "queue": {"pending": 2}},
+            {"thread": "2", "owner": bindings["open-post"], "open": True, "queue": {}},
+        ]}
+        warp = {
+            "reservations": [],
+            "completion_route_gaps": [
+                {"owner": bindings["warp-gap"], "request_ids": ["job"]},
+                {"owner": dict(bindings["warp-conflict"], harness="claude"), "request_ids": ["disputed"]},
+            ],
+        }
+        evidence = {"retirements": [
+            {"binding": dict(bindings[session], started_at=9 if session == "stale" else 10),
+             "exit_evidence": "exit receipt", "obligations_evidence": "checked owner obligations"}
+            for session in ("hold", "review", "stale", "open-post", "warp-gap", "warp-conflict")
+        ]}
+        for name, value in (("hailing", hailing), ("cmux", cmux), ("discord", discord),
+                            ("warp", warp), ("evidence", evidence)):
+            (snapshot / f"{name}.json").write_text(json.dumps(value), encoding="utf-8")
+        command = [installation["command"], "retirement-preview", "--snapshot-dir", str(snapshot),
+                   "--retirement-evidence", str(snapshot / "evidence.json"), "--json"]
+        before = self.tree_snapshot()
+        result = self.run_process(command)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        rows = {row["binding"]["session"]: row for row in json.loads(result.stdout)["registrations"]}
+        self.assertEqual({session: row["disposition"] for session, row in rows.items()}, {
+            "HOLD": "hold", "RECOVER": "recover", "REVIEW": "review_retirement",
+            "STALE": "hold", "OPEN-POST": "review_retirement", "WARP-GAP": "hold", "WARP-CONFLICT": "hold",
+        })
+        self.assertEqual(rows["HOLD"]["discord_pending"], [{"thread": "1", "pending": 2}])
+        self.assertEqual(rows["RECOVER"]["current_panel"], {"panel_id": "new-pane", "workspace_id": "workspace"})
+        self.assertEqual(rows["WARP-GAP"]["warp_route_gaps"], ["job"])
+        self.assertEqual(rows["WARP-CONFLICT"]["warp_route_gaps"], [])
+        self.assertEqual(rows["WARP-CONFLICT"]["warp_identity_conflicts"], ["disputed"])
+        self.assertEqual(self.tree_snapshot(), before)
+
+        cmux["truncated"] = True
+        (snapshot / "cmux.json").write_text(json.dumps(cmux), encoding="utf-8")
+        result = self.run_process(command)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"complete CMUX agent snapshot", result.stderr)
 
     def run_process(self, command, cwd=None):
         return subprocess.run(
