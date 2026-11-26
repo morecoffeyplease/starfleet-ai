@@ -4,6 +4,7 @@
 import argparse
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 
 STATUSES = ("ready", "blocked", "unknown", "skipped")
@@ -513,6 +515,125 @@ def handoff_report(path):
     }
 
 
+def snapshot_json(path):
+    try:
+        if not path.is_file():
+            raise ValueError(f"Snapshot must be a regular file: {path.name}")
+        data = read_input_bytes(path)
+        if len(data) > MAX_INPUT_BYTES:
+            raise ValueError(f"Snapshot exceeds the read limit: {path.name}")
+        result = json.loads(data)
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"Could not read snapshot: {path.name}") from exc
+    if not isinstance(result, dict):
+        raise ValueError(f"Snapshot must contain a JSON object: {path.name}")
+    return result
+
+
+def owner_key(row, session_field="session", harness_field="harness"):
+    session, harness = row.get(session_field), row.get(harness_field)
+    if not isinstance(session, str) or not RESOURCE_ID.fullmatch(session):
+        return None
+    if harness not in ("claude", "codex", "opencode"):
+        return None
+    return harness, session if harness == "opencode" else session.upper()
+
+
+def binding_key(row):
+    owner = owner_key(row)
+    panel, workspace, generation = (row.get(field) for field in ("surface", "workspace", "started_at"))
+    if (owner is None or any(not isinstance(v, str) or not RESOURCE_ID.fullmatch(v) for v in (panel, workspace))
+            or type(generation) not in (int, float) or not math.isfinite(generation) or generation <= 0):
+        return None
+    return (*owner, panel.upper(), workspace.upper(), generation)
+
+
+def retirement_preview(directory, evidence_path=None):
+    hailing, cmux, discord, warp = [
+        snapshot_json(directory / name) for name in ("hailing.json", "cmux.json", "discord.json", "warp.json")
+    ]
+    scan = hailing["last_scan"]
+    age = time.time() - scan["completed_at"]
+    threshold = hailing["health"]["stale_after"]
+    if (not math.isfinite(age) or not math.isfinite(threshold) or not 0 <= age <= threshold):
+        raise ValueError("Capture a fresh Hailing scan before previewing retirement")
+    if cmux["truncated"] is not False or cmux["owner_availability"]["agent_sessions"] != "available":
+        raise ValueError("Capture a complete CMUX agent snapshot before previewing retirement")
+
+    missing = {row["session"].upper() for row in scan["target_errors"]
+               if row.get("stage") == "initial_scan" and "not_found:" in row["error"]}
+    incomplete = {key for row in scan["targets"] if row["inbox_status"] == "incomplete"
+                  and (key := binding_key(row)) is not None and key[1].upper() in missing}
+    evidence = {}
+    if evidence_path:
+        for row in snapshot_json(evidence_path)["retirements"]:
+            key = binding_key(row["binding"])
+            if key is None or key in evidence:
+                raise ValueError("Retirement evidence requires distinct exact bindings and generations")
+            evidence[key] = {
+                "exit": evidence_reference(row["exit_evidence"]),
+                "obligations": evidence_reference(row["obligations_evidence"]),
+            }
+
+    rows = []
+    for target in hailing["config"]["targets"]:
+        key = binding_key(target)
+        if key not in incomplete:
+            continue
+        owner = key[:2]
+        live = [(item, agent) for item in cmux["items"] for agent in item["agents"]
+                if owner_key(agent, "session_id", "kind") == owner]
+        replies = [{"thread": thread["thread"], "pending": thread["queue"].get("pending", 0)}
+                   for thread in discord["threads"]
+                   if owner_key(thread["owner"]) == owner and thread["queue"].get("pending", 0) > 0]
+        jobs = [job["id"] for job in warp["reservations"]
+                if owner_key(job, "owner_session", "owner_harness") == owner
+                and job["state"] in ("waiting", "reserved")]
+        gaps = [request for gap in warp["completion_route_gaps"] if owner_key(gap["owner"]) == owner
+                for request in gap["request_ids"]]
+        conflicts = []
+        for gap in warp["completion_route_gaps"]:
+            gap_owner = owner_key(gap["owner"])
+            if (gap_owner is not None and gap_owner[0] != owner[0] and gap_owner[1] == owner[1]
+                    and gap["owner"].get("surface", "").upper() == key[2]):
+                conflicts.extend(gap["request_ids"])
+        reasons = []
+        if replies:
+            reasons.append("Discord replies are pending")
+        if jobs:
+            reasons.append("Warp has a waiting or reserved request")
+        if gaps:
+            reasons.append("Warp has terminal completions without an exact route")
+        if conflicts:
+            reasons.append("Warp has terminal completions for the same session and surface under another harness")
+
+        disposition = "hold"
+        current_panel = None
+        if live:
+            reasons.append("CMUX still projects the exact session")
+            if len(live) == 1:
+                item, agent = live[0]
+                projections = item["projections"]
+                if (item["placement"]["kind"] == "local" and item["lifecycle"] == "running"
+                        and agent["state"] in ACTIVE_CMUX_STATES and len(projections) == 1
+                        and projections[0].get("panel_id") and projections[0].get("workspace_id")):
+                    disposition = "recover"
+                    current_panel = {field: projections[0][field] for field in ("panel_id", "workspace_id")}
+        elif not reasons and key in evidence:
+            disposition = "review_retirement"
+            reasons.append("Explicit exit and obligation evidence provided for this binding")
+        elif key not in evidence:
+            reasons.append("Exact exit and disposition of timers, inbox and other obligations are unverified")
+
+        rows.append({"binding": dict(zip(("harness", "session", "surface", "workspace", "started_at"), key)),
+                     "label": target.get("label"), "disposition": disposition, "reasons": reasons,
+                     "current_panel": current_panel,
+                     "discord_pending": replies, "warp_requests": jobs, "warp_route_gaps": gaps,
+                     "warp_identity_conflicts": conflicts,
+                     "retirement_evidence": evidence.get(key)})
+    return {"schema_version": 1, "hailing_scan_completed_at": scan["completed_at"], "registrations": rows}
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="replicator",
@@ -527,6 +648,10 @@ def build_parser():
     preflight.add_argument("--skip-tool", action="append", default=[], metavar="NAME")
     preflight.add_argument("--json", action="store_true", help="print the report as JSON")
     preflight.add_argument("--handoff-file", metavar="PATH", help="include advisory owner-supplied handoff evidence")
+    retirement = commands.add_parser("retirement-preview", help="review missing Hailing bindings from private snapshots")
+    retirement.add_argument("--snapshot-dir", type=Path, required=True)
+    retirement.add_argument("--retirement-evidence", type=Path, help="optional exact exit and obligation evidence")
+    retirement.add_argument("--json", action="store_true", help="print exact bindings and evidence as JSON")
     return parser
 
 
@@ -570,6 +695,20 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "guide" and args.print_guide:
         sys.stdout.buffer.write(Path(__file__).with_name("guide.md").read_bytes())
+        return 0
+    if args.command == "retirement-preview":
+        try:
+            report = retirement_preview(args.snapshot_dir, args.retirement_evidence)
+        except (KeyError, TypeError, AttributeError, ValueError, OverflowError) as exc:
+            parser.error(f"Invalid or incomplete retirement inputs ({exc})")
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            for row in report["registrations"]:
+                print(f"{row['binding']['session']} {row['disposition']}")
+                for reason in row["reasons"]:
+                    print(f"  {reason}")
+            print(f"Missing registrations reviewed: {len(report['registrations'])}")
         return 0
     if args.command == "preflight":
         try:

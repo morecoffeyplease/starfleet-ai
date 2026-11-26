@@ -66,6 +66,16 @@ Replicator reads the explicit file alongside its existing live CMUX and Git chec
 It does not fetch the referenced records, run component commands, or establish receipt, custody, or a safe exit.
 The optional advisory report does not change the existing preflight exit codes.
 
+## Preview missing Hailing registrations
+
+Use `replicator retirement-preview --snapshot-dir PATH` during a handoff or a review of older registrations.
+The [retirement preview guide](guide.md#preview-missing-hailing-registrations) shows how to collect the four private snapshots and supply exact retirement evidence.
+Add `--json` for bindings, reasons, and exact pending Discord and Warp records.
+The preview reads only the supplied files, works outside a checkout, and leaves services and snapshots untouched.
+It lists bindings missing from a fresh Hailing scan and distinguishes a live session to recover, an unresolved record to hold, and a record ready for retirement review.
+Open Discord posts with no pending replies do not hold the review.
+The preview cannot verify a process exit, establish the absence of another owner's timer, or remove an enrollment.
+
 ## Install the local launcher
 
 Run the source installer only when you want the `replicator` command in your local command directory:

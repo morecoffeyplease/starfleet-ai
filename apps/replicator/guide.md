@@ -28,6 +28,7 @@ and transfer steps.
    The incoming owner's timestamped acceptance of your release is the handoff point and makes the successor the sole writer for that scope.
 3. Settle any obligations you still own, then deregister your own exact binding from each service that still lists you.
    Keep any binding needed for a retained job, pending reply, or timer occurrence until that obligation is resolved.
+   If your Hailing registration reports a missing surface, use the [retirement preview](#preview-missing-hailing-registrations) to distinguish recovery from retirement review.
    Confirm the remaining dispositions in the checkpoint and exit normally after verified acceptance and cleanup.
 
 ### Open a successor when needed
@@ -219,6 +220,45 @@ An unknown dependency marks only the named action unknown.
 An incomplete inventory leaves retirement unknown unless a listed resource already shows a blocker.
 When retirement shows `review`, repeat the exact owner checks in this guide and confirm the outgoing process exits normally.
 Use generated inspect commands as pointers and follow the component guides for any owner action.
+
+## Preview missing Hailing registrations
+
+Collect fresh local status snapshots in a private directory outside the checkout.
+Capture them together and rerun the captures if a binding or work assignment changes.
+The status commands require the corresponding installed tools and existing state.
+The preview itself requires only the files and runs without CMUX or credentials.
+
+```sh
+umask 077
+snapshot_dir=$(mktemp -d)
+hailing-frequencies status |
+  jq '{config: {targets: .config.targets}, health: {stale_after: .health.stale_after},
+       last_scan: (.last_scan | {completed_at, targets, target_errors})}' > "$snapshot_dir/hailing.json"
+cmux current --json --limit 200 |
+  jq '{truncated, owner_availability, items: [.items[] | {lifecycle, placement, projections, agents}]}' > "$snapshot_dir/cmux.json"
+discord-watch status |
+  jq '{threads: [.threads[] | {thread, owner, queue}]}' > "$snapshot_dir/discord.json"
+warp-drive status |
+  jq '{reservations: [.reservations[] | {id, owner_harness, owner_session, state}],
+       completion_route_gaps}' > "$snapshot_dir/warp.json"
+replicator retirement-preview --snapshot-dir "$snapshot_dir" --json
+```
+
+Use `recover` to locate an exact live session and follow the Hailing guide for its current binding.
+Use `hold` when pending replies, waiting or reserved Warp requests, terminal completion route gaps, or missing evidence still need review.
+A Warp completion that names the same session and surface under another harness is an identity conflict that also holds retirement.
+An open Discord post without pending replies is not a dependency.
+Use `review_retirement` for an explicit exact exit and obligations record with no detected live session or conflicting dependency.
+Recheck the current binding and follow the component owner's supported commands before any change.
+
+Pass `--retirement-evidence PATH` only after recording affirmative end evidence and checking the authorized scope for active jobs, timers, quota watches, unsettled occurrences, native inbox messages, and any other obligations.
+Temporal Beacon's exact-owner commands do not establish another session's timer state.
+Use a verified handoff record for that ownership evidence, or leave the disposition held.
+The JSON input is an object with a `retirements` array.
+Each entry has a `binding` copied exactly from the preview, an `exit_evidence` reference, and an `obligations_evidence` reference.
+The preview matches the harness, session, surface, workspace, and generation.
+These references are operator-supplied assertions.
+Keep the report and evidence private and remove temporary captures when the review is recorded.
 
 ## Handle exceptions
 
