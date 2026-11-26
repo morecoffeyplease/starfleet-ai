@@ -680,7 +680,8 @@ Use the existing owner-bound `uninstall` workflow for legacy per-worktree instal
 
 ## Inspect, hand off, and recover
 
-Run `python3 /path/to/installed/runtime/lane.py --seat-id SEAT_ID status` to inspect a permanent seat even when product checkouts are unavailable.
+Run `python3 /path/to/current/starfleet-ai/apps/starfleet-policy-guard/lane.py --seat-id SEAT_ID status` to inspect a permanent seat even when product checkouts are unavailable.
+Use the seat's current `runtime_cli` even if the checkout's delivery rules still name an older runtime path.
 Status reports the immutable birth root separately from the active operational anchor, the pinned runtime CLI, recorded or prospective Claude settings path, and each checkout's active, missing, changed, or retired worktree state.
 When run from an unbound permanent root, `permanent_seat_hint` identifies a unique registered seat only when its active root and recorded Gitdir match exactly.
 The accompanying `setup_guidance` still describes the current product checkout attachment, so do not create another seat when the hint says the permanent seat is already registered.
@@ -692,7 +693,8 @@ Retire missing attachments through the reviewed `retire-attachment` plan before 
 Record the authorized release to the exact incoming owner in the existing checkpoint, with the outgoing owner recording it when available.
 If the outgoing owner is unavailable, resolve the scope through the applicable existing authority process and hold the dependent handoff until that disposition is recorded.
 The incoming owner records acceptance of that same scope before the rebind.
-When `handoff.rebind_owner_command` is present, the current incoming native session should use that exact command.
+For an incoming Claude or Codex session, use the exact `handoff.rebind_owner_command` from current seat status when present.
+For an incoming OpenCode session, use the [native handoff workflow](#opencode-225-prototype-server-plugin) with the plugin in the recorded runtime.
 If the installed CLI is unavailable or outdated, the documented same-harness maintenance fallback below remains supported when its full runtime-pin checks pass.
 Run a rebind only after the authorized scope transfer is recorded and the incoming owner has accepted it.
 The status command is read-only and does not supply transfer authority or establish a new owner.
@@ -717,7 +719,9 @@ python3 /path/to/current/starfleet-ai/apps/starfleet-policy-guard/lane.py \
 That path verifies the seat-recorded immutable runtime path, version, complete file manifest and hashes before checking active attachment pins.
 It preserves the installed runtime pin, adapter and hook targets, and leaves removed attachment records unchanged.
 It does not upgrade or repair the seat runtime; changed or missing runtime files fail closed for recovery.
-Cross-harness handoffs still require the executing source to match the complete seat-recorded runtime.
+Cross-harness handoffs require the executing source to match the complete seat-recorded runtime.
+If the CLI reports a runtime mismatch, inspect current seat status and use the recorded handoff command from the incoming native session.
+A stale active attachment fingerprint is a separate refusal that requires inspecting the recorded attachment and pin.
 `--from-harness` and `--from-session` identify the exact outgoing owner; the incoming harness and session are detected from the current native runtime.
 Handoff preserves history and requires a fresh report from the incoming owner.
 For a cross-harness handoff, the transaction adds or removes only the seat-owned Claude hook pair as needed and preserves unrelated settings.

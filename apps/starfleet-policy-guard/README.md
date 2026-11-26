@@ -78,6 +78,9 @@ python3 /path/to/installed/runtime/lane.py --cwd /product/worktree coverage --su
 
 ## Rebind an existing seat from a source checkout
 
+After recording the authorized handoff and acceptance, run `lane.py --seat-id SEAT_ID status` from a current source checkout in the incoming native session.
+For Claude or Codex, use the exact `handoff.rebind_owner_command` when present.
+The seat's `runtime_cli` is current even if checkout delivery rules still name an old path.
 After an authorized same-harness transfer, a current source checkout can run the `rebind-owner` CLI when the installed CLI entrypoint is unavailable or outdated, provided the seat-recorded runtime remains present and intact.
 The command verifies the seat-recorded immutable runtime path, version, complete file manifest and hashes before checking active attachment pins.
 It preserves the installed runtime pin, adapter and hook targets, and leaves removed attachment records unchanged.
