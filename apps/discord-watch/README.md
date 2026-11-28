@@ -131,6 +131,11 @@ Use `custody-adoption` for a changed hook generation in the same native session,
 If recovery reports a per-thread REST catch-up hold, run `discord-watch scan --only-thread THREAD_ID` to reconcile that thread without submitting a wake.
 Confirm delivery by receiving an actual reply.
 
+Discord Watch stores the selected delivery transport in each thread's exact owner snapshot.
+After changing a Codex session's Hailing Frequencies transport, run `discord-watch recover THREAD_ID` for each thread owned by that session and verify with `discord-watch managed THREAD_ID`.
+Until recovery updates the saved snapshot, Discord Watch holds new wakes for that thread because the saved and current owner bindings differ.
+Recovery preserves queued replies and prior attempts; uncertain and awaiting-receipt groups are never submitted again automatically.
+
 `custody-adoption` assigns selected existing threads and timers to a new hook generation of the same native session and workspace.
 The default route keeps the same pane.
 For a Claude or Codex session resumed in a different pane, explicitly name the retired pane with `--from-surface` in both preview and prepare.

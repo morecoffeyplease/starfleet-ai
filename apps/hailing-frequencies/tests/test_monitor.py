@@ -910,6 +910,58 @@ class AttentionOnceTests(unittest.TestCase):
         self.assertEqual(second["outcome"], "submitted")
         self.assertEqual(len(self.host.sent), 2)
 
+    def test_codex_native_queue_records_admission_and_never_replays_uncertain_send(self):
+        self.lane.update(harness="codex", delivery_transport=hf.CODEX_QUEUE_TRANSPORT)
+        self.config["targets"] = [self.lane]
+        hf.atomic_json(self.directory / "config.json", self.config)
+        current = {"truncated": False, "owner_availability": {"agent_sessions": "available"}, "items": [{
+            "placement": {"kind": "local"},
+            "projections": [{"panel_id": self.lane["surface"], "workspace_id": self.lane["workspace"]}],
+            "agents": [{"session_id": self.lane["session"], "kind": "codex", "state": "idle"}]}]}
+        guard = {"surface_id": self.lane["surface"], "workspace_id": self.lane["workspace"],
+                 "state": "draft", "agent": True, "terminal": True, "blocks_typing": False,
+                 "waiting_on_human": False, "lifecycle": "idle"}
+        settings = {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
+        hook = {"sessions": {self.lane["session"]: {"surfaceId": self.lane["surface"],
+                "workspaceId": self.lane["workspace"], "agentLifecycle": "idle",
+                "startedAt": self.lane["started_at"]}}}
+        (self.directory / "codex-hook-sessions.json").write_text(json.dumps(hook), encoding="utf-8")
+        cmux = hf.Cmux(hook_directory=self.directory)
+
+        def command(*args):
+            if args[0] == "current":
+                return current
+            return {"surface.input_state": guard, "agent.message.settings": settings}[args[1]]
+
+        cmux.command = command
+        self.host = cmux
+        self.app = hf.Monitor(self.directory, cmux, clock=lambda: self.now)
+        queue_calls = []
+
+        def run(args, **_kwargs):
+            if args == ["codex", "queue", "--help"]:
+                return subprocess.CompletedProcess(args, 0,
+                    "Usage: codex queue --thread UUID --message TEXT", "")
+            queue_calls.append(args)
+            thread = uid() if "uncertain event" in args[-1] else self.lane["session"]
+            return subprocess.CompletedProcess(args, 0,
+                f"Queued message {uid()} for thread {thread}.", "")
+
+        with patch.object(hf.subprocess, "run", side_effect=run):
+            accepted = self.cli(body=b"accepted event", event_key="accepted-event")
+            self.assertEqual((accepted["outcome"], accepted["attempted"]), ("submitted", True))
+            self.assertIn("queue admission", accepted["detail"])
+            self.assertIn("receipt is unconfirmed", accepted["detail"])
+            self.assertEqual(self.cli(body=b"accepted event", event_key="accepted-event"), accepted)
+
+            uncertain = self.cli(body=b"uncertain event", event_key="uncertain-event")
+            self.assertEqual((uncertain["outcome"], uncertain["attempted"]), ("uncertain", True))
+            self.assertEqual(self.cli(body=b"uncertain event", event_key="uncertain-event"), uncertain)
+
+        self.assertEqual(len(queue_calls), 2)
+        self.assertEqual(self.intent("accepted-event")[1:3], ("submitted", 1))
+        self.assertEqual(self.intent("uncertain-event")[1:3], ("uncertain", 1))
+
 
 class BindingTests(unittest.TestCase):
     def setUp(self):
@@ -1099,6 +1151,103 @@ class BindingTests(unittest.TestCase):
         self.current["items"][0]["agents"][0]["state"] = "ended"
         with self.assertRaisesRegex(ValueError, "ended"):
             self.cmux.binding(self.t)
+
+    def test_codex_native_queue_preserves_known_draft_and_holds_unknown_input(self):
+        self.t.update(harness="codex", delivery_transport=hf.CODEX_QUEUE_TRANSPORT)
+        self.current["items"][0]["agents"][0]["kind"] = "codex"
+        self.guard["state"] = "draft"
+        self.save()
+        message_id = uid()
+        queue_calls = []
+
+        def run(args, **_kwargs):
+            if args == ["codex", "queue", "--help"]:
+                return subprocess.CompletedProcess(args, 0,
+                    "Usage: codex queue --thread UUID --message TEXT", "")
+            queue_calls.append(args)
+            return subprocess.CompletedProcess(args, 0,
+                f"Queued message {message_id} for thread {self.t['session']}.", "")
+
+        started = []
+        with patch.object(hf.subprocess, "run", side_effect=run):
+            result = self.cmux.submit(self.t, "one native event",
+                                      on_transport_start=lambda: started.append(True))
+            self.assertEqual(result, {"submitted": True, "transport": "codex_queue", "admission": "confirmed",
+                                      "message_id": message_id, "thread_id": self.t["session"]})
+            self.assertEqual(started, [True])
+            self.assertEqual(queue_calls, [["codex", "queue", "--thread", self.t["session"],
+                                            "--message", "one native event"]])
+            for change in ({"state": "unknown"}, {"waiting_on_human": True},
+                           {"blocks_typing": True}, {"lifecycle": "unknown"}):
+                original = dict(self.guard)
+                self.guard.update(change)
+                started.clear()
+                with self.assertRaises(hf.DeliveryHoldError):
+                    self.cmux.submit(self.t, "must stay pending",
+                                     on_transport_start=lambda: started.append(True))
+                self.guard = original
+        self.assertFalse(started)
+        self.assertEqual(len(queue_calls), 1)
+        self.assertFalse(any(args[0] == "paste" for args in self.calls))
+
+    def test_codex_native_queue_rejects_acceptance_for_another_thread(self):
+        self.t.update(harness="codex", delivery_transport=hf.CODEX_QUEUE_TRANSPORT)
+        self.current["items"][0]["agents"][0]["kind"] = "codex"
+        self.save()
+        started = []
+
+        def run(args, **_kwargs):
+            if args == ["codex", "queue", "--help"]:
+                return subprocess.CompletedProcess(args, 0,
+                    "Usage: codex queue --thread UUID --message TEXT", "")
+            return subprocess.CompletedProcess(args, 0,
+                f"Queued message {uid()} for thread {uid()}.", "")
+
+        with patch.object(hf.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(ValueError, "different thread"):
+                self.cmux.submit(self.t, "one native event",
+                                 on_transport_start=lambda: started.append(True))
+        self.assertEqual(started, [True])
+        self.assertFalse(any(args[0] == "paste" for args in self.calls))
+
+    def test_transport_opt_in_and_rollback_preserve_durable_state(self):
+        self.t["harness"] = "codex"
+        self.current["items"][0]["agents"][0]["kind"] = "codex"
+        self.save()
+        app = hf.Monitor(self.temp.name, self.cmux, clock=lambda: 20)
+        config = {"version": 1, "targets": [self.t], "coordinator": None,
+                  "remind_after": 5, "escalate_after": 10, "cooldown": 5, "interval": 5}
+        env = {"CMUX_AGENT_LAUNCH_KIND": "codex", "CODEX_THREAD_ID": self.t["session"],
+               "CMUX_SURFACE_ID": self.t["surface"], "CMUX_WORKSPACE_ID": self.t["workspace"]}
+
+        def run(args, **_kwargs):
+            self.assertEqual(args, ["codex", "queue", "--help"])
+            return subprocess.CompletedProcess(args, 0,
+                "Usage: codex queue --thread UUID --message TEXT", "")
+
+        with patch.dict("os.environ", env), patch.object(hf.subprocess, "run", side_effect=run):
+            enabled = app.set_delivery_transport(config, self.t["session"], "codex_queue")
+            self.assertEqual(enabled["delivery_transport"], "codex_queue")
+            self.assertTrue(enabled["pending_events_preserved"])
+            self.assertTrue(enabled["receipts_preserved"])
+            self.assertEqual(app.config()["targets"][0]["delivery_transport"], "codex_queue")
+            disabled = app.set_delivery_transport(config, self.t["session"], "cmux")
+        self.assertEqual(disabled["previous_transport"], "codex_queue")
+        self.assertEqual(app.config()["targets"][0], self.t)
+
+    def test_transport_opt_in_requires_exact_live_caller_binding(self):
+        self.t["harness"] = "codex"
+        self.current["items"][0]["agents"][0]["kind"] = "codex"
+        self.save()
+        app = hf.Monitor(self.temp.name, self.cmux, clock=lambda: 20)
+        config = {"version": 1, "targets": [self.t], "coordinator": None,
+                  "remind_after": 5, "escalate_after": 10, "cooldown": 5, "interval": 5}
+        wrong = {"CMUX_AGENT_LAUNCH_KIND": "codex", "CODEX_THREAD_ID": uid(),
+                 "CMUX_SURFACE_ID": self.t["surface"], "CMUX_WORKSPACE_ID": self.t["workspace"]}
+        with patch.dict("os.environ", wrong):
+            with self.assertRaisesRegex(ValueError, "does not match the enrolled target"):
+                app.set_delivery_transport(config, self.t["session"], "codex_queue")
+        self.assertNotIn("delivery_transport", config["targets"][0])
 
     def test_stop_prevents_starting_another_host_operation(self):
         cmux = hf.Cmux()

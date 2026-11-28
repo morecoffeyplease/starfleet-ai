@@ -910,6 +910,8 @@ class Watch:
                      "worktree_directory", "parent_task_id")
         require(all(key in target for key in keys), "Hailing Frequencies owner binding is incomplete")
         snapshot = {key: target[key] for key in keys}
+        if target.get("delivery_transport", "cmux") != "cmux":
+            snapshot["delivery_transport"] = target["delivery_transport"]
         if target.get("harness") == "opencode":
             snapshot["delivery_policy"] = hf.opencode_delivery_policy(target)
         return snapshot
