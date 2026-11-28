@@ -31,8 +31,12 @@ INBOX_OUTPUT_LIMIT = 64 * 1024
 ATTENTION_MESSAGE_LIMIT = 4 * 1024
 ACTIVE_LIFECYCLES = ("running", "idle", "backgroundWorkPending")
 NATIVE_PROMPT_READINESS = "native_prompt"
+NATIVE_QUEUE_READINESS = "native_queue"
 DISCORD_REPLY_READINESS = "discord_reply"
-CMUX_READINESS_POLICIES = frozenset((NATIVE_PROMPT_READINESS, DISCORD_REPLY_READINESS))
+CMUX_READINESS_POLICIES = frozenset((NATIVE_PROMPT_READINESS, NATIVE_QUEUE_READINESS,
+                                    DISCORD_REPLY_READINESS))
+CODEX_QUEUE_TRANSPORT = "codex_queue"
+SUPPORTED_DELIVERY_TRANSPORTS = frozenset(("cmux", CODEX_QUEUE_TRANSPORT))
 INSTALL_MARKER = "# starfleet-hailing-frequencies:v1"
 RUNTIME_SOURCE_NAMES = ("hailing_frequencies.py", "service.py", "temporal_beacon.py",
                         "quota_alert.py", "replacement_custody.py", "guide.md",
@@ -314,6 +318,54 @@ class Cmux:
     def rpc(self, method, **params):
         return self.command("rpc", method, json.dumps(params))
 
+    @staticmethod
+    def readiness_policy_for(target, requested=None):
+        transport = target.get("delivery_transport", "cmux")
+        if requested is None:
+            return NATIVE_QUEUE_READINESS if transport == CODEX_QUEUE_TRANSPORT else NATIVE_PROMPT_READINESS
+        if requested == DISCORD_REPLY_READINESS and transport == CODEX_QUEUE_TRANSPORT:
+            return NATIVE_QUEUE_READINESS
+        return requested
+
+    @staticmethod
+    def codex_queue_available(executable="codex"):
+        """Confirm the installed Codex CLI advertises the exact native queue command."""
+        try:
+            result = subprocess.run([executable, "queue", "--help"], capture_output=True,
+                                    text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            raise ValueError("Codex native queue command is unavailable") from None
+        require(result.returncode == 0 and "Usage: codex queue" in result.stdout and
+                "--thread" in result.stdout and "--message" in result.stdout,
+                "Installed Codex CLI does not advertise the supported native queue command")
+        return True
+
+    @staticmethod
+    def codex_queue(target, text, executable="codex"):
+        """Queue an exact Codex thread message and require exact-thread admission evidence."""
+        require(target.get("harness") == "codex", "Codex native queue requires a Codex target")
+        try:
+            result = subprocess.run([executable, "queue", "--thread", target["session"],
+                                     "--message", text], capture_output=True,
+                                    text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            raise ValueError("Codex native queue outcome is uncertain") from None
+        if result.returncode != 0:
+            raise ValueError("Codex native queue outcome is uncertain")
+        match = re.fullmatch(
+            r"Queued message ([0-9a-fA-F-]{36}) for thread ([0-9a-fA-F-]{36})\.",
+            result.stdout.strip())
+        require(match is not None, "Codex native queue acceptance was not confirmed; delivery is uncertain")
+        try:
+            message_id = identity(match.group(1))
+            thread_id = identity(match.group(2))
+        except ValueError:
+            raise ValueError("Codex native queue acceptance was not confirmed; delivery is uncertain") from None
+        require(thread_id == target["session"],
+                "Codex native queue confirmed a different thread; delivery is uncertain")
+        return {"submitted": True, "transport": CODEX_QUEUE_TRANSPORT, "admission": "confirmed",
+                "message_id": message_id, "thread_id": thread_id}
+
     def messages(self, target):
         # Omitting state requests the full inbox, including native read records
         # needed to correlate exact replies. Never change native read state.
@@ -341,8 +393,9 @@ class Cmux:
         require(len(matches) == 1, "Exact session activity is unavailable or ambiguous")
         return {"state": matches[0].get("state"), "last_activity_at": matches[0].get("last_activity_at")}
 
-    def binding(self, target, *, readiness_policy=NATIVE_PROMPT_READINESS):
+    def binding(self, target, *, readiness_policy=None):
         """Validate the live owner and selected native input-readiness policy."""
+        readiness_policy = self.readiness_policy_for(target, readiness_policy)
         require(readiness_policy in CMUX_READINESS_POLICIES, "Unknown CMUX readiness policy")
         if target.get("harness") == "opencode":
             require(readiness_policy == NATIVE_PROMPT_READINESS,
@@ -350,6 +403,10 @@ class Cmux:
             opencode_binding(target)
             self._opencode_native_binding(target)
             return True
+        if readiness_policy == NATIVE_QUEUE_READINESS:
+            require(target.get("delivery_transport") == CODEX_QUEUE_TRANSPORT and
+                    target.get("harness") == "codex",
+                    "Native queue readiness is only available for an opted-in Codex target")
         if readiness_policy == DISCORD_REPLY_READINESS:
             require(target.get("harness") in ("claude", "codex"),
                     "Discord reply readiness is only available for Claude and Codex")
@@ -382,17 +439,21 @@ class Cmux:
         started = record.get("startedAt")
         require(isinstance(started, (int, float)) and math.isfinite(started), "Missing session start evidence")
         require(started == target["started_at"], "Session generation changed")
-        if readiness_policy == NATIVE_PROMPT_READINESS:
+        if readiness_policy in (NATIVE_PROMPT_READINESS, NATIVE_QUEUE_READINESS):
             guard = self.rpc("surface.input_state", surface_id=target["surface"])
+            allowed_states = (("empty", "draft") if readiness_policy == NATIVE_QUEUE_READINESS
+                              else ("empty",))
             require(guard.get("surface_id", "").upper() == target["surface"] and
                     guard.get("workspace_id", "").upper() == target["workspace"], "Input owner changed")
             require(guard.get("agent") is True and guard.get("terminal") is True and
-                    guard.get("state") == "empty" and guard.get("blocks_typing") is False and
+                    guard.get("state") in allowed_states and guard.get("blocks_typing") is False and
                     guard.get("waiting_on_human") is False and guard.get("lifecycle") in ACTIVE_LIFECYCLES,
                     "Human draft, approval, unknown input state or inactive session")
         settings = self.rpc("agent.message.settings", target=target["surface"])
         require(all(settings.get(k) is True for k in ("messages_enabled", "receiving", "workspace_receiving")),
                 "Native messaging is disabled")
+        if readiness_policy == NATIVE_QUEUE_READINESS:
+            self.codex_queue_available()
         return True
 
     def enrollment_binding(self, target):
@@ -509,8 +570,8 @@ class Cmux:
                 "Native messaging is disabled")
         return True
 
-    def submit(self, target, text, on_transport_start=None, *,
-               readiness_policy=NATIVE_PROMPT_READINESS):
+    def submit(self, target, text, on_transport_start=None, *, readiness_policy=None):
+        readiness_policy = self.readiness_policy_for(target, readiness_policy)
         if target.get("harness") == "opencode":
             require(readiness_policy == NATIVE_PROMPT_READINESS,
                     "Discord reply readiness is only available for Claude and Codex")
@@ -522,6 +583,14 @@ class Cmux:
             if on_transport_start is not None:
                 on_transport_start()
             return opencode_prompt(target, password, text)
+        if target.get("delivery_transport", "cmux") == CODEX_QUEUE_TRANSPORT:
+            try:
+                self.binding(target, readiness_policy=readiness_policy)
+            except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                raise DeliveryHoldError(str(exc)) from exc
+            if on_transport_start is not None:
+                on_transport_start()
+            return self.codex_queue(target, text)
         # One host paste/submit operation, never a force flag or separate Escape/Ctrl-C.
         # A multiline Claude paste selects the host's agent-aware submit key.
         try:
@@ -591,10 +660,17 @@ class Monitor:
                 require(identity(target[key]) == target[key], "Use canonical UUIDs")
             require(session_identity(target["session"], harness) == target["session"],
                     "Session identity does not match its exact harness")
+            transport = target.get("delivery_transport", "cmux")
+            require(transport in SUPPORTED_DELIVERY_TRANSPORTS,
+                    "Unsupported native delivery transport")
+            require(transport != CODEX_QUEUE_TRANSPORT or harness == "codex",
+                    "Codex native queue transport requires a Codex target")
             for key in ("cutoff", "started_at"):
                 require(type(target[key]) in (int, float) and math.isfinite(target[key]) and target[key] >= 0,
                         f"Invalid {key}")
             if harness == "opencode":
+                require("delivery_transport" not in target,
+                        "Native delivery transport is not configurable for OpenCode targets")
                 require(all(isinstance(target.get(key), str) and target[key] for key in
                             ("api_url", "password_file", "session_directory", "worktree_directory",
                              "parent_task_id")), "OpenCode target binding is incomplete")
@@ -919,11 +995,16 @@ class Monitor:
                 outcome = "uncertain"
                 detail = ("OpenCode API response was not confirmed; delivery is uncertain"
                           if target["harness"] == "opencode" else
+                          "Codex native queue outcome was not confirmed; delivery is uncertain"
+                          if target.get("delivery_transport") == CODEX_QUEUE_TRANSPORT else
                           "CMUX submit was not confirmed; delivery is uncertain")
             else:
                 if target["harness"] == "opencode":
                     outcome, detail, attempted = "submitted", (
                         "OpenCode API confirmed exact user-message admission; model receipt is unconfirmed"), True
+                elif target.get("delivery_transport") == CODEX_QUEUE_TRANSPORT:
+                    outcome, detail, attempted = "submitted", (
+                        "Codex CLI confirmed queue admission for the exact thread; native receipt is unconfirmed"), True
                 else:
                     outcome, detail, attempted = "submitted", "CMUX confirmed submit", True
             with db:
@@ -959,6 +1040,47 @@ class Monitor:
         require(target is not None, "Session is not enrolled")
         require(surface == target["surface"], "CMUX_SURFACE_ID does not match the enrolled surface")
         return target
+
+    def set_delivery_transport(self, config, session_id, transport):
+        session = session_identity(session_id)
+        target = next((item for item in config["targets"] if item["session"] == session), None)
+        require(target is not None, "Session is not enrolled")
+        require(target["harness"] in ("claude", "codex"),
+                "Native delivery transport is supported only for Claude and Codex")
+        require(transport in SUPPORTED_DELIVERY_TRANSPORTS, "Unsupported native delivery transport")
+        require(transport != CODEX_QUEUE_TRANSPORT or target["harness"] == "codex",
+                "Codex native queue transport requires a Codex target")
+        require(not self.custody_adoption_hold("hailing_session", session),
+                "Session is held by an explicit custody adoption")
+
+        expected_kind = "claude" if target["harness"] == "claude" else "codex"
+        allowed_kinds = ("claude", "claudeteams") if expected_kind == "claude" else (expected_kind,)
+        launch_kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "").strip().casefold()
+        require(launch_kind in allowed_kinds, "Run transport change from the exact native harness")
+        session_env = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID"}[target["harness"]]
+        require(os.environ.get(session_env), "Run transport change from the exact enrolled session")
+        require(session_identity(os.environ[session_env], target["harness"]) == session,
+                "Caller session does not match the enrolled target")
+        require(os.environ.get("CMUX_SURFACE_ID") and
+                identity(os.environ["CMUX_SURFACE_ID"]) == target["surface"],
+                "Run transport change from the exact enrolled CMUX surface")
+        require(os.environ.get("CMUX_WORKSPACE_ID") and
+                identity(os.environ["CMUX_WORKSPACE_ID"]) == target["workspace"],
+                "Run transport change from the exact enrolled CMUX workspace")
+
+        self.cmux.binding(target, readiness_policy=NATIVE_PROMPT_READINESS)
+        if transport == CODEX_QUEUE_TRANSPORT:
+            self.cmux.codex_queue_available()
+        previous = target.get("delivery_transport", "cmux")
+        if transport == "cmux":
+            target.pop("delivery_transport", None)
+        else:
+            target["delivery_transport"] = transport
+        self.config(config)
+        atomic_json(self.directory / "config.json", config)
+        return {"session": session, "previous_transport": previous,
+                "delivery_transport": transport, "changed": previous != transport,
+                "pending_events_preserved": True, "receipts_preserved": True}
 
     def select_inbox_messages(self, target, message_ids, rows):
         by_id = {}
@@ -1700,6 +1822,9 @@ def parser():
     replace.add_argument("--session", required=True)
     replace.add_argument("--harness", choices=("claude", "codex"), required=True)
     replace.add_argument("--label", required=True)
+    transport = sub.add_parser("transport", help="Opt one exact enrolled session into a native delivery path or disable it")
+    transport.add_argument("--session", required=True)
+    transport.add_argument("--use", choices=sorted(SUPPORTED_DELIVERY_TRANSPORTS), required=True)
     opencode_enroll = sub.add_parser("opencode-enroll",
                                      help="Self-enroll one exact OpenCode session from a private binding manifest")
     opencode_enroll.add_argument("--manifest", type=Path, required=True)
@@ -1912,6 +2037,8 @@ def main(argv=None):
                                          for mid in args.message]}
         if args.command == "replace":
             return app.replace_enrollment(config, args)
+        if args.command == "transport":
+            return app.set_delivery_transport(config, args.session, args.use)
         if args.command == "enroll":
             target = app.native_enrollment_target(args)
             surface, session = target["surface"], target["session"]

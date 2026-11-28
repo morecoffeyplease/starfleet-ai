@@ -70,6 +70,29 @@ If the session is already enrolled unchanged, keep its existing cutoff and recei
 After enrollment, run `hailing-frequencies status` to confirm that the exact session is listed.
 Enrollment confirms saved configuration only; it does not prove a reminder reached or was read by the agent.
 
+## Opt one Codex session into native queued attention
+
+The default delivery path remains CMUX paste.
+From the exact enrolled Codex session, use the observed `CODEX_THREAD_ID` to opt in that one target:
+
+```sh
+hailing-frequencies transport --session CODEX_THREAD_UUID --use codex_queue
+```
+
+The route change requires the exact CMUX surface, workspace, session generation, an empty composer, enabled native receiving, and a Codex CLI that advertises `codex queue --thread UUID --message TEXT`.
+Only that target changes; this option is unavailable for Claude or OpenCode.
+After opt-in, Hailing Frequencies reminders, Temporal Beacon timers, and Pattern Buffer `attention-once` events for this target use the exact-thread Codex queue.
+The queue can preserve a known composer draft, but unknown input state, approvals, permission prompts, human-input holds, and identity or generation mismatches still stop delivery.
+An exact-thread queue confirmation means the CLI accepted the message; it does not prove receipt or action by the agent.
+Uncertain submissions are not replayed automatically.
+
+Discord Watch keeps an exact transport snapshot for each thread, so it holds new wakes until you run `discord-watch recover THREAD_ID` for each registered thread owned by this session and verify with `discord-watch managed THREAD_ID`.
+After recovery, Discord Watch wakes for those threads use the selected transport.
+To restore CMUX paste, run `hailing-frequencies transport --session CODEX_THREAD_UUID --use cmux` from the same exact session while the composer is empty.
+The route change preserves pending work and receipts.
+After the rollback route change, run `discord-watch recover THREAD_ID` for each registered thread owned by this session, then verify with `discord-watch managed THREAD_ID`.
+Recovery preserves queued replies and prior attempts; uncertain and awaiting-receipt groups are never submitted again automatically.
+
 ### Replace an ended session on your pane
 
 For Claude or Codex on the same CMUX pane and workspace, use the exact enrolled predecessor from `hailing-frequencies status` and the exact current identity from CMUX.

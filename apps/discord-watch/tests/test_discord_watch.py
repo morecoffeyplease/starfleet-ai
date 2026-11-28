@@ -1692,8 +1692,16 @@ class DiscordWatchTests(unittest.TestCase):
         settings = {"messages_enabled": True, "receiving": True, "workspace_receiving": True}
         cmux_calls = []
         paste_calls = []
+        codex_queue_calls = []
 
         def run_cmux(args, **_kwargs):
+            if args and args[0] == "codex":
+                if args[1:3] == ["queue", "--help"]:
+                    return subprocess.CompletedProcess(args, 0,
+                        "Usage: codex queue --thread UUID --message TEXT", "")
+                codex_queue_calls.append(args)
+                return subprocess.CompletedProcess(args, 0,
+                    f"Queued message 33333333-3333-4333-8333-333333333333 for thread {SESSION_A}.", "")
             cmux_calls.append(args)
             if args[2] == "current":
                 response = current
@@ -1808,10 +1816,41 @@ class DiscordWatchTests(unittest.TestCase):
             with contextlib.closing(watch.database(create=False)) as db:
                 self.assertEqual(db.execute("SELECT state FROM messages WHERE thread_id=? AND message_id=?",
                                             (THREAD, "101")).fetchone()[0], "received")
+            input_reads_after_first_receive = sum(
+                len(args) > 3 and args[2] == "rpc" and args[3] == "surface.input_state"
+                for args in cmux_calls)
+            self.assertEqual(input_reads_after_first_receive, input_reads_before_reply)
+
+            owner_config["targets"][0]["delivery_transport"] = "codex_queue"
+            config_path.write_text(json.dumps(owner_config), encoding="utf-8")
+            input_state.update(surface_id=SURFACE_B, workspace_id=WORKSPACE_B,
+                               state="empty", lifecycle="idle")
+            self.assertTrue(watch.recover(THREAD)["recovered"])
+            owner = watch.current_owner(readiness_policy=hf.DISCORD_REPLY_READINESS)
+            self.assertEqual(owner["delivery_transport"], "codex_queue")
+            api.rows.append(message("102", content="native queue reply stays pending until receipt"))
+            watch.scan()
+            now[0] += dw.GROUP_QUIET_SECONDS + dw.ROUTINE_REST_INTERVAL
+            input_state.update(state="draft", lifecycle="idle")
+            native_result = watch.scan(send=True)
+            self.assertEqual(native_result["threads"][0]["wake"]["state"], "awaiting_receipt")
+            self.assertEqual(len(paste_calls), 1)
+            self.assertEqual(len(codex_queue_calls), 1)
+            self.assertEqual(codex_queue_calls[0][0:5], ["codex", "queue", "--thread", SESSION_A,
+                                                          "--message"])
+            self.assertIn("receive --thread 100 --group 2", codex_queue_calls[0][-1])
+            self.assertNotIn("native queue reply stays pending until receipt", codex_queue_calls[0][-1])
+            native_output = io.StringIO()
+            native_receipt = watch.receive(THREAD, output=native_output, group_id=2)
+            self.assertEqual(native_receipt["received"], ["102"])
+            self.assertIn("native queue reply stays pending until receipt", native_output.getvalue())
+            with contextlib.closing(watch.database(create=False)) as db:
+                self.assertEqual(db.execute("SELECT state FROM messages WHERE thread_id=? AND message_id=?",
+                                            (THREAD, "102")).fetchone()[0], "received")
             input_reads_after_receive = sum(
                 len(args) > 3 and args[2] == "rpc" and args[3] == "surface.input_state"
                 for args in cmux_calls)
-            self.assertEqual(input_reads_after_receive, input_reads_before_reply)
+            self.assertGreater(input_reads_after_receive, input_reads_after_first_receive)
 
     def test_opencode_session_self_registers_exact_owner_without_state_migration(self):
         opencode_session = "ses_DiscordWatchFixture"
@@ -1896,6 +1935,10 @@ class DiscordWatchTests(unittest.TestCase):
         for harness in ("claude", "codex"):
             snapshot = self.app.binding_snapshot(target(harness=harness, delivery_policy="api_sidechannel"))
             self.assertNotIn("delivery_policy", snapshot)
+        default_codex = self.app.binding_snapshot(target())
+        self.assertNotIn("delivery_transport", default_codex)
+        queued_codex = self.app.binding_snapshot(target(delivery_transport="codex_queue"))
+        self.assertEqual(queued_codex["delivery_transport"], "codex_queue")
 
     def _prepare_busy_opencode(self):
         session = "ses_DiscordWatchReceipt"

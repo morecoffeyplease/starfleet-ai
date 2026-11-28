@@ -53,8 +53,9 @@ discord-watch doctor
 Use `--harness codex` and the exact `CODEX_THREAD_ID` for a Codex recipient.
 OpenCode registration, `managed`, `close`, and `receive` verify the exact Hailing Frequencies owner identity without checking composer readiness.
 Claude and Codex owner commands and Discord reply wakes check the exact live surface, session, workspace, hook generation, and all three native receiving settings.
-They do not read `surface.input_state`, so draft and unknown composer or prompt lifecycle states do not hold a Discord reply wake or the exact owner's `receive` command.
-Ordinary Hailing Frequencies prompts keep the strict empty-composer and no-human-input guard.
+On the default CMUX route, Discord reply wakes and exact-owner `receive` commands do not read `surface.input_state`, so draft and unknown composer states do not hold them.
+An explicitly opted-in Codex native queue route also checks `surface.input_state` and accepts only known `empty` or `draft` states with no blocking or human-input obligation.
+Default Hailing Frequencies CMUX prompts require an empty composer; the exact-session Codex queue opt-in described in the Hailing Frequencies guide permits a known draft while preserving other holds.
 The default `native_empty_composer` policy requires an explicitly empty composer with no human-input obligation.
 For OpenCode only, an explicitly selected `api_sidechannel` policy may also accept `draft` or `unknown` classifications when there is no blocking input or human-input obligation and all other native, API, lifecycle, receiving, and owner guards pass.
 The command must run in the recipient's own CMUX session with its normal `CMUX_AGENT_LAUNCH_KIND`, session ID, and `CMUX_SURFACE_ID` environment.
@@ -110,6 +111,11 @@ An explicit transfer preserves frozen group membership and lets the authorized n
 Unsealed messages can be assigned to the new generation, while a group never combines messages from different generations.
 An unexplained generation change without a matching ownership-event chain holds the affected groups.
 Uncertain submissions are never retried automatically.
+
+Discord Watch stores the selected delivery transport in each thread's exact owner snapshot.
+After changing a Codex session's Hailing Frequencies transport, run `discord-watch recover THREAD_ID` for each thread owned by that session, then confirm it with `discord-watch managed THREAD_ID`.
+Until recovery updates the thread snapshot, Discord Watch holds new wakes for that thread because the saved and current owner bindings differ.
+Recovery preserves queued replies and prior attempts; uncertain and awaiting-receipt groups are never submitted again automatically.
 
 ### Recover a moved Claude or Codex session
 

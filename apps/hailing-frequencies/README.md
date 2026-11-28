@@ -131,6 +131,27 @@ Enrollment normally covers only messages created after enrollment.
 Use `--include-existing` to include an enrolled session's existing backlog; messages older than that session's recorded start are always excluded.
 Re-enrollment of an unchanged identity preserves its original cutoff and receipts.
 
+### Opt one Codex session into native queued attention
+
+The default delivery path remains CMUX paste for every enrolled session.
+From the exact enrolled Codex session, opt that one target into the installed Codex CLI's native queue:
+
+```sh
+hailing-frequencies transport --session CODEX_THREAD_UUID --use codex_queue
+```
+
+The command requires the exact current CMUX surface, workspace, session generation, enabled native receiving, an explicitly empty composer, and a Codex CLI that advertises `codex queue --thread UUID --message TEXT`.
+Only that enrolled Codex target changes; Claude and OpenCode targets cannot use this transport.
+After opt-in, Hailing Frequencies reminders, Temporal Beacon timers, and `attention-once` use the native Codex queue for this session.
+Known `empty` or `draft` composer states can receive a queued attention request, while `unknown`, permission, approval, human-input, missing-owner, and changed-generation states remain held.
+The Codex CLI's exact-thread queue confirmation is admission evidence only; it does not prove that Codex received, read, or acted on the message.
+The durable event receipt still prevents an uncertain queue result from being replayed automatically.
+
+To return this exact session to CMUX paste, use `hailing-frequencies transport --session CODEX_THREAD_UUID --use cmux` from the same enrolled Codex session while the composer is empty.
+This changes only the selected target and preserves Hailing receipts and pending timer records.
+For each Discord Watch thread registered to this Codex session, run `discord-watch recover THREAD_ID` from that same session after changing the route so its owner snapshot uses the current transport.
+Recovery preserves queued replies and prior attempts; uncertain and awaiting-receipt groups are never submitted again automatically.
+
 ### Replace your ended session on the same pane
 
 From the current Claude or Codex session on the same CMUX pane, run:
