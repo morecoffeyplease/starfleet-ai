@@ -25,6 +25,7 @@ import temporal_beacon as tb
 SESSION = "11111111-1111-4111-8111-111111111111".upper()
 SURFACE = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".upper()
 WORKSPACE = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".upper()
+NEW_SURFACE = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".upper()
 THREAD = "100"
 OPERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -163,16 +164,16 @@ class CustodyAdoptionTests(unittest.TestCase):
         defaults = {"adoption_action": action, "operation_id": OPERATION,
                     "thread": [THREAD], "timer_id": [self.due_timer, self.uncertain_timer],
                     "approval_reference": "private-fixture-approval-reference",
-                    "plan_digest": None}
+                    "plan_digest": None, "from_surface": None}
         defaults.update(values)
         return type("Args", (), defaults)()
 
     def _preview(self):
         return adoption.run(self.app, self._namespace("preview"))
 
-    def _prepare_and_accept(self):
-        preview = self._preview()
-        prepared = adoption.run(self.app, self._namespace("prepare", plan_digest=preview["plan_digest"]))
+    def _prepare_and_accept(self, **scope):
+        preview = adoption.run(self.app, self._namespace("preview", **scope))
+        prepared = adoption.run(self.app, self._namespace("prepare", plan_digest=preview["plan_digest"], **scope))
         accepted = adoption.run(self.app, self._namespace("accept", plan_digest=preview["plan_digest"]))
         return preview, prepared, accepted
 
@@ -294,8 +295,71 @@ class CustodyAdoptionTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT state,target_owner_generation FROM delivery_group_attempts "
                                         "WHERE group_id=1").fetchall(), [("uncertain", 1)])
 
+    def _move_to_new_pane(self):
+        self.current["surface"] = NEW_SURFACE
+        os.environ["CMUX_SURFACE_ID"] = NEW_SURFACE
+        hook = self.hailing / "codex-hook-sessions.json"
+        store = json.loads(hook.read_text())
+        store["sessions"][SESSION]["surfaceId"] = NEW_SURFACE
+        hf.atomic_json(hook, store)
+        item = {"placement": {"kind": "local"}, "freshness": {"state": "current"},
+                "agents": [{"kind": "codex", "session_id": SESSION, "state": "idle"}],
+                "projections": [{"panel_id": NEW_SURFACE, "workspace_id": WORKSPACE}]}
+        self.cmux.command = mock.Mock(return_value={
+            "truncated": False, "owner_availability": {"agent_sessions": "available"}, "items": [item]})
+        self.cmux.rpc = mock.Mock(side_effect=ValueError("Error: not_found: Surface not found"))
+
+    def test_retired_pane_requires_an_explicit_old_surface_and_native_absence(self):
+        self._move_to_new_pane()
+        state = self.hailing / "config.json"
+        old_config = state.read_bytes()
+        with self.assertRaisesRegex(ValueError, "no unique Hailing Frequencies registration"):
+            self._preview()
+        preview_args = self._namespace("preview", from_surface=SURFACE)
+        self.cmux.rpc.side_effect = None
+        with self.assertRaisesRegex(ValueError, "old pane still exists"):
+            adoption.run(self.app, preview_args)
+        self.cmux.rpc.side_effect = ValueError("socket gone")
+        with self.assertRaisesRegex(ValueError, "could not verify"):
+            adoption.run(self.app, preview_args)
+        self.assertEqual(state.read_bytes(), old_config)
+
+    def test_retired_pane_refuses_an_ambiguous_live_owner_and_unsafe_input(self):
+        self._move_to_new_pane()
+        preview_args = self._namespace("preview", from_surface=SURFACE)
+        self.cmux.command.return_value["items"] *= 2
+        with self.assertRaisesRegex(ValueError, "competing live owner"):
+            adoption.run(self.app, preview_args)
+        with mock.patch.object(self.cmux, "binding", side_effect=ValueError("unknown input state")):
+            with self.assertRaisesRegex(ValueError, "unknown input state"):
+                adoption.run(self.app, preview_args)
+
+    def test_retired_pane_refuses_an_occupied_destination(self):
+        self._move_to_new_pane()
+        config_path = self.hailing / "config.json"
+        config = json.loads(config_path.read_text())
+        config["targets"].append({**self.current, "session": str(uuid.uuid4()).upper()})
+        hf.atomic_json(config_path, config)
+        with self.assertRaisesRegex(ValueError, "receiving pane already has"):
+            adoption.run(self.app, self._namespace("preview", from_surface=SURFACE))
+
+    def test_retired_pane_rechecks_retirement_after_owner_acceptance(self):
+        self._move_to_new_pane()
+        preview, _, _ = self._prepare_and_accept(from_surface=SURFACE)
+        self.cmux.rpc.side_effect = None
+        with self.assertRaisesRegex(ValueError, "old pane still exists"):
+            adoption.run(self.app, self._namespace("apply", plan_digest=preview["plan_digest"]))
+        self.assertEqual(json.loads((self.hailing / "config.json").read_text())["targets"], [self.old])
+
     def test_partial_apply_holds_and_resumes_same_operation_without_replaying_uncertain_work(self):
-        preview, prepared, accepted = self._prepare_and_accept()
+        self._assert_partial_apply()
+
+    def test_retired_pane_partial_apply_resumes_without_replaying_uncertain_work(self):
+        self._move_to_new_pane()
+        self._assert_partial_apply(from_surface=SURFACE)
+
+    def _assert_partial_apply(self, **scope):
+        preview, prepared, accepted = self._prepare_and_accept(**scope)
         self.assertEqual(prepared["state"], "prepared")
         self.assertEqual(accepted["state"], "accepted")
         with mock.patch.object(adoption, "_apply_discord", side_effect=RuntimeError("fixture interruption")):
@@ -341,7 +405,8 @@ class CustodyAdoptionTests(unittest.TestCase):
             self.assertEqual(rows, [("pending", 0), ("uncertain", 2)])
             events = db.execute("SELECT event_type,continuity,from_worktree,to_worktree "
                                 "FROM ownership_events WHERE thread_id=?", (THREAD,)).fetchall()
-            self.assertEqual(events, [("custody_adoption", "not_established",
+            event_type = "custody_adoption_retired_pane" if scope else "custody_adoption"
+            self.assertEqual(events, [(event_type, "not_established",
                                        "not_recorded_by_hf_or_dw", str(self.worktree))])
             self.assertIsNone(self.app._custody_adoption_hold(db, THREAD))
             wake = self.app._wake_one(db, thread, self.now)
@@ -357,6 +422,9 @@ class CustodyAdoptionTests(unittest.TestCase):
                                         (self.uncertain_timer,)).fetchone()[0], "uncertain")
             hailing_target = json.loads((self.hailing / "config.json").read_text())["targets"][0]
             self.assertEqual(hailing_target["started_at"], 200.0)
+            self.assertEqual(hailing_target["surface"], self.current["surface"])
+            selected = db.execute("SELECT surface,owner_key FROM timers WHERE id=?", (self.due_timer,)).fetchone()
+            self.assertEqual(selected, (self.current["surface"], beacon.owner_key(self.current, str(self.worktree))))
             self.assertEqual(hailing_target["cutoff"], 80.0)
 
 

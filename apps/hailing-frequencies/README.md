@@ -150,6 +150,8 @@ Check saved enrollment with `hailing-frequencies status`, and run `warp-drive ow
 If a required check fails, keep the existing registration and follow the [explicit handoff](guide.md#receive-an-authorized-handoff).
 
 An explicit current-generation custody adoption is a separate operation exposed by Discord Watch for an operator-approved, enumerated set of existing obligations.
+For an exact Claude or Codex session that resumed on another pane in the same workspace, use the adoption command's explicit `--from-surface` mode after the original pane is retired.
+The adopted enrollment retains its cutoff and uses only the verified current pane and generation.
 It records an old-to-current assignment without claiming historical process continuity, and keeps the original cutoff and private receipt history.
 The current native owner must accept the exact immutable plan through the existing exact CMUX binding.
 Its approval reference is a cooperative audit note, not authenticated proof.

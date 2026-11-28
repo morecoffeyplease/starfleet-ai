@@ -219,6 +219,7 @@ Inspect uncertain delivery before deciding how to recover.
 
 An operator-approved adoption can assign an enumerated existing timer to the verified current generation when the old native generation is unavailable.
 The operation is implemented by `discord-watch custody-adoption` and is documented in the [Discord Watch guide](../discord-watch/guide.md#explicit-current-generation-custody-adoption).
+If the exact Claude or Codex session resumed on a new pane in the same workspace, the explicit retired-pane mode retains selected timer IDs and still requires the original canonical worktree.
 It records distinct old and current identities and never claims historical process continuity.
 The current exact owner must independently accept the immutable plan through the existing native binding guard.
 An active partial adoption holds only its selected timers, including timers that become due while held.
