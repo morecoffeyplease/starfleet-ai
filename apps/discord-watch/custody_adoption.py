@@ -78,7 +78,34 @@ def _owner_digest(target):
     return _digest(target)
 
 
-def _hook_current(app, old_target):
+def _verify_retired_pane(cmux, old_surface, target):
+    try:
+        cmux.rpc("surface.input_state", surface_id=old_surface)
+    except ValueError as error:
+        require(str(error) == "Error: not_found: Surface not found",
+                "CMUX could not verify the retired pane's absence")
+    else:
+        raise ValueError("The named old pane still exists")
+
+    current = cmux.command("current", "--limit", "200")
+    require(not current.get("truncated", True)
+            and current.get("owner_availability", {}).get("agent_sessions") == "available",
+            "Complete CMUX session inventory is required for retired-pane adoption")
+    locations = [
+        (hf.identity(projection["panel_id"]), hf.identity(projection["workspace_id"]),
+         item.get("freshness", {}).get("state"))
+        for item in current["items"] if item.get("placement", {}).get("kind") == "local"
+        for agent in item["agents"]
+        if agent.get("kind") == target["harness"]
+        and (agent.get("session_id") or "").upper() == target["session"]
+        and agent.get("state") != "ended"
+        for projection in item["projections"]
+    ]
+    require(locations == [(target["surface"], target["workspace"], "current")],
+            "CMUX reports a missing, stale or competing live owner")
+
+
+def _hook_current(app, old_target, from_surface=None):
     harness = app._launch_kind()
     require(harness == old_target["harness"], "Current harness differs from the registered owner")
     env_key = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
@@ -90,10 +117,13 @@ def _hook_current(app, old_target):
     workspace_raw = os.environ.get("CMUX_WORKSPACE_ID")
     require(surface_raw and workspace_raw, "Current surface and workspace identities are required")
     surface, workspace = hf.identity(surface_raw), hf.identity(workspace_raw)
-    require((harness, session, surface, workspace) ==
+    require((harness, session, from_surface or surface, workspace) ==
             (old_target["harness"], old_target["session"], old_target["surface"],
              old_target["workspace"]),
             "Current caller is outside the exact registered harness/session/surface/workspace")
+    if from_surface is not None:
+        require(harness in ("claude", "codex") and from_surface != surface,
+                "Retired-pane adoption requires the same Claude or Codex session on a different pane")
     cmux = app.cmux_factory()
     hook_path = cmux.hook_directory / f"{harness}-hook-sessions.json"
     _private_file(hook_path, "native hook store")
@@ -125,7 +155,7 @@ def _hook_current(app, old_target):
     except (OSError, RuntimeError):
         raise ValueError("Current canonical worktree is unavailable") from None
     target = dict(old_target)
-    target["started_at"] = started_at
+    target.update(surface=surface, started_at=started_at)
     target = app.binding_snapshot(target)
     if harness == "opencode":
         cmux.owner_identity_binding(target)
@@ -133,12 +163,14 @@ def _hook_current(app, old_target):
                 "Current OpenCode worktree differs from its exact enrolled binding")
     else:
         cmux.binding(target)
+    if from_surface is not None:
+        _verify_retired_pane(cmux, from_surface, target)
     temporal_beacon.TemporalBeacon(hf.Monitor(app.hailing_state, cmux=cmux))._verify_expected_worktree(
         target, worktree)
     return target, worktree
 
 
-def _find_target(app):
+def _find_target(app, from_surface=None):
     config_path = app.hailing_state / "config.json"
     _private_file(config_path, "Hailing Frequencies config")
     try:
@@ -158,11 +190,15 @@ def _find_target(app):
     workspace = hf.identity(os.environ.get("CMUX_WORKSPACE_ID", ""))
     matches = [target for target in config["targets"]
                if (target["harness"], target["session"], target["surface"], target["workspace"]) ==
-               (harness, session, surface, workspace)]
+               (harness, session, from_surface or surface, workspace)]
     require(len(matches) == 1, "The exact current workspace has no unique Hailing Frequencies registration")
     hailing_target = dict(matches[0])
+    if from_surface is not None:
+        require(not any(target["surface"] == surface and target != hailing_target
+                        for target in config["targets"]),
+                "The receiving pane already has a different Hailing Frequencies registration")
     old_target = app.binding_snapshot(hailing_target)
-    current_target, worktree = _hook_current(app, old_target)
+    current_target, worktree = _hook_current(app, old_target, from_surface)
     require(current_target["started_at"] != old_target["started_at"],
             "A custody adoption requires a changed native generation")
     return config_path, config_bytes, config, hailing_target, old_target, current_target, worktree
@@ -237,8 +273,9 @@ def _timer_preserved_digest(snapshot):
     return _digest(value)
 
 
-def _build_plan(app, operation_id, thread_ids, timer_ids, approval_reference):
-    config_path, config_bytes, config, hailing_target, old_target, current_target, worktree = _find_target(app)
+def _build_plan(app, operation_id, thread_ids, timer_ids, approval_reference, from_surface=None):
+    config_path, config_bytes, config, hailing_target, old_target, current_target, worktree = _find_target(
+        app, from_surface)
     hailing_db_path = app.hailing_state / "receipts.sqlite3"
     watch_db_path = app.directory / "discord-watch.sqlite3"
     require(hailing_db_path.is_file() and not hailing_db_path.is_symlink(),
@@ -259,7 +296,8 @@ def _build_plan(app, operation_id, thread_ids, timer_ids, approval_reference):
     new_hailing_target = None
     for index, target in enumerate(new_config["targets"]):
         if target.get("session") == old_target["session"] and target.get("harness") == old_target["harness"]:
-            new_config["targets"][index]["started_at"] = current_target["started_at"]
+            new_config["targets"][index].update(surface=current_target["surface"],
+                                                started_at=current_target["started_at"])
             new_hailing_target = dict(new_config["targets"][index])
             break
     require(new_hailing_target is not None, "Hailing Frequencies target disappeared while planning")
@@ -349,6 +387,7 @@ def _build_plan(app, operation_id, thread_ids, timer_ids, approval_reference):
             "operation": "explicit_current_generation_custody_adoption",
             "continuity": "not_established",
             "approval_reference": approval_reference,
+            **({"from_surface": from_surface} if from_surface is not None else {}),
             "old_owner": old_target, "current_owner": current_target,
             "old_owner_tuple": _target_tuple(old_target, old_worktree),
             "current_owner_tuple": _target_tuple(current_target, worktree),
@@ -406,7 +445,7 @@ def _check_digest(expected, supplied):
 
 
 def _owner_acceptance(app, plan):
-    current_target, worktree = _hook_current(app, plan["old_owner"])
+    current_target, worktree = _hook_current(app, plan["old_owner"], plan.get("from_surface"))
     require(current_target == plan["current_owner"] and worktree == plan["current_owner_tuple"]["worktree"],
             "Current receiving owner differs from the immutable adoption plan")
     return {"owner": current_target, "worktree": worktree,
@@ -602,7 +641,8 @@ def _apply_hailing(app, plan, digest, accepted_owner):
                 "Hailing Frequencies owner changed after the adoption plan")
         for target in config["targets"]:
             if target.get("session") == plan["old_owner"]["session"] and target.get("harness") == plan["old_owner"]["harness"]:
-                target["started_at"] = plan["current_owner"]["started_at"]
+                target.update(surface=plan["current_owner"]["surface"],
+                              started_at=plan["current_owner"]["started_at"])
                 break
         rendered = (json.dumps(config, indent=2) + "\n").encode("utf-8")
         require(_file_digest(rendered) == plan["hailing"]["config_after_digest"],
@@ -648,15 +688,16 @@ def _apply_discord(app, plan, digest, resource, accepted_owner):
     _assert_accepted_owner(app, plan, accepted_owner)
     with contextlib.closing(app.database(create=False)) as db:
         db.execute("BEGIN IMMEDIATE")
+        event_type = "custody_adoption_retired_pane" if "from_surface" in plan else "custody_adoption"
         existing = db.execute("SELECT operation_id,plan_digest,old_owner_digest,new_owner_digest,"
-                              "before_digest,after_preserved_digest FROM ownership_events "
+                              "before_digest,after_preserved_digest,event_type FROM ownership_events "
                               "WHERE operation_id=? AND thread_id=?",
                               (plan["operation_id"], resource["thread_id"])).fetchone()
         current = _dw_snapshot(db, resource["thread_id"])
         thread = current["thread"]
         expected_new_generation = resource["old_generation"] + 1
         if existing:
-            require(_event_matches(existing, plan, resource, "discord_thread"),
+            require(_event_matches(existing, plan, resource, "discord_thread") and existing[6] == event_type,
                     "Discord Watch adoption event conflicts with the accepted plan")
             require(json.loads(thread["owner_json"]) == plan["current_owner"] and
                     thread["owner_generation"] == expected_new_generation and
@@ -683,10 +724,10 @@ def _apply_discord(app, plan, digest, resource, accepted_owner):
             db.execute("INSERT INTO ownership_events(thread_id,from_session,to_session,at,owner_generation,"
                        "event_type,operation_id,plan_digest,from_owner_json,to_owner_json,old_owner_digest,"
                        "new_owner_digest,before_digest,after_preserved_digest,from_worktree,to_worktree,continuity) "
-                       "VALUES(?,?,?,?,?,'custody_adoption',?,?,?,?,?,?,?,?,?,?,?)",
+                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (resource["thread_id"], plan["old_owner"]["session"],
                         plan["current_owner"]["session"], time.time(), new_generation,
-                        plan["operation_id"], digest, old_json, new_json,
+                        event_type, plan["operation_id"], digest, old_json, new_json,
                         resource["old_owner_digest"], resource["new_owner_digest"],
                         resource["before_digest"], resource["after_preserved_digest"],
                         plan["old_owner_tuple"]["worktree"], plan["current_owner_tuple"]["worktree"],
@@ -761,7 +802,7 @@ def _apply_operation(app, operation_id, plan_digest):
             candidate = _build_plan(app, operation_id,
                                     [row["thread_id"] for row in plan["discord_threads"]],
                                     [row["timer_id"] for row in plan["temporal_timers"]],
-                                    plan["approval_reference"])
+                                    plan["approval_reference"], plan.get("from_surface"))
             require(_digest(candidate) == digest,
                     "Selected state changed after acceptance; adoption was not started")
         _ensure_operation_holds(app, plan, digest)
@@ -771,7 +812,7 @@ def _apply_operation(app, operation_id, plan_digest):
                 candidate = _build_plan(app, operation_id,
                                         [row["thread_id"] for row in plan["discord_threads"]],
                                         [row["timer_id"] for row in plan["temporal_timers"]],
-                                        plan["approval_reference"])
+                                        plan["approval_reference"], plan.get("from_surface"))
                 require(_digest(candidate) == digest,
                         "Selected state changed before the first adoption commit")
             _apply_hailing(app, plan, digest, accepted_owner)
@@ -817,7 +858,8 @@ def run(app, args):
     if args.adoption_action == "preview":
         operation_id, threads, timers, reference = _normalize_inputs(
             args.operation_id, args.thread, args.timer_id, args.approval_reference)
-        plan = _build_plan(app, operation_id, threads, timers, reference)
+        from_surface = hf.identity(args.from_surface) if args.from_surface is not None else None
+        plan = _build_plan(app, operation_id, threads, timers, reference, from_surface)
         digest = _digest(plan)
         return {"operation_id": operation_id, "plan_digest": digest,
                 "state": "preview_only", "continuity": "not_established",
@@ -841,7 +883,8 @@ def run(app, args):
         operation_id, threads, timers, reference = _normalize_inputs(
             args.operation_id, args.thread, args.timer_id, args.approval_reference)
         require(args.plan_digest, "Exact preview plan digest is required")
-        plan = _build_plan(app, operation_id, threads, timers, reference)
+        from_surface = hf.identity(args.from_surface) if args.from_surface is not None else None
+        plan = _build_plan(app, operation_id, threads, timers, reference, from_surface)
         digest = _digest(plan)
         _check_digest(digest, args.plan_digest)
         _record_operation(app, plan, digest, reference)

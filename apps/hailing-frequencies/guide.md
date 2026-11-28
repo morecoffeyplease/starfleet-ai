@@ -19,7 +19,8 @@ Agent Notify uses the existing Discord Watch installation and worker when presen
 
 ## Recover after a hook generation change
 
-When the same native session and pane have a new hook start, preserve the existing enrollment and any outstanding receipts.
+When your native session has a new hook start, preserve the existing enrollment and any outstanding receipts.
+If the same Claude or Codex session resumed on another pane in the same workspace, the custody guide explains when to name the retired pane with `--from-surface`.
 If an operator approves adoption of specific retained Discord Watch threads or Temporal Beacon timers, follow `discord-watch guide --print` under **Explicit current-generation custody adoption**.
 Use its exact preview, prepare, accept and apply commands from the owning session.
 The plan preserves the original Hailing cutoff and receipt history and identifies the selected obligations.

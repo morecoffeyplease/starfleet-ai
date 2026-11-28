@@ -1519,7 +1519,7 @@ class Watch:
              after_preserved_digest, from_worktree, to_worktree, continuity) = event
             if generation != expected_generation or from_session != previous:
                 return False
-            if event_type == "custody_adoption":
+            if event_type in ("custody_adoption", "custody_adoption_retired_pane"):
                 try:
                     from_owner = json.loads(from_owner_json)
                     to_owner = json.loads(to_owner_json)
@@ -1558,11 +1558,14 @@ class Watch:
                     return False
                 if (_sha256_owner(from_owner) != old_owner_digest or
                         _sha256_owner(to_owner) != new_owner_digest or
-                        (from_owner["harness"], from_owner["session"], from_owner["surface"],
-                         from_owner["workspace"]) !=
-                        (to_owner["harness"], to_owner["session"], to_owner["surface"],
-                         to_owner["workspace"]) or
+                        (from_owner["harness"], from_owner["session"], from_owner["workspace"]) !=
+                        (to_owner["harness"], to_owner["session"], to_owner["workspace"]) or
                         from_owner["started_at"] == to_owner["started_at"]):
+                    return False
+                moved_pane = from_owner["surface"] != to_owner["surface"]
+                if moved_pane != (event_type == "custody_adoption_retired_pane"):
+                    return False
+                if moved_pane and old_harness not in ("claude", "codex"):
                     return False
                 if generation - 1 in exact_owners and exact_owners[generation - 1] != from_owner:
                     return False
@@ -3210,6 +3213,7 @@ def parser():
         child.add_argument("--operation-id", required=True)
         child.add_argument("--thread", action="append", default=[])
         child.add_argument("--timer-id", action="append", default=[])
+        child.add_argument("--from-surface", help="Review the exact retired pane in the caller's workspace")
         child.add_argument("--approval-reference", required=True,
                            help="Cooperative audit reference; this is not authenticated proof")
         if action == "prepare":

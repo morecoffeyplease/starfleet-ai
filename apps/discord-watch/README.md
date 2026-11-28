@@ -131,7 +131,10 @@ Use `custody-adoption` for a changed hook generation in the same native session,
 If recovery reports a per-thread REST catch-up hold, run `discord-watch scan --only-thread THREAD_ID` to reconcile that thread without submitting a wake.
 Confirm delivery by receiving an actual reply.
 
-`custody-adoption` assigns selected existing threads and timers to a new hook generation of the same native session, pane, and workspace.
+`custody-adoption` assigns selected existing threads and timers to a new hook generation of the same native session and workspace.
+The default route keeps the same pane.
+For a Claude or Codex session resumed in a different pane, explicitly name the retired pane with `--from-surface` in both preview and prepare.
+Adoption verifies native absence of the old pane, one live location for the exact owner, the same workspace, and the existing receiving and input readiness guards.
 It preserves the old and current generation identities, records continuity as unestablished, and requires a private approval-reference audit note plus independent acceptance by the current exact native owner.
 The approval reference is cooperative evidence and is not authenticated proof.
 Preview is read-only and omits reply bodies, attachment URLs, and continuation text.

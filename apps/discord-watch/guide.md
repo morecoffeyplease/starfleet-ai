@@ -143,6 +143,13 @@ discord-watch custody-adoption preview --operation-id OPERATION_UUID \
   --approval-reference APPROVAL_REFERENCE --thread THREAD_ID --timer-id TIMER_UUID
 ```
 
+If the same Claude or Codex session resumed on a different pane in the same workspace, add `--from-surface RETIRED_PANE_UUID` to both preview and prepare.
+Use the pane UUID in the saved enrollment.
+The former pane must be absent from CMUX, even if it contains only a shell.
+The destination must be the only current native location for this exact session and must pass the usual input and receiving checks.
+The plan binds both panes and generations to the digest, and accept and apply recheck the retired pane and exact destination.
+A different workspace or another enrollment on the destination is a hold.
+
 The preview reads state and the current exact native binding without creating locks, writing state, polling Discord, or sending input.
 It prints only owner tuples, resource IDs, state summaries, and digests, never reply bodies, attachment URLs, or timer continuation text.
 Review the `continuity: not_established` limitation and preservation summaries before preparing the immutable plan.
