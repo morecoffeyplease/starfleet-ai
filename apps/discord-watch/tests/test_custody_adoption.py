@@ -64,10 +64,12 @@ class CustodyAdoptionTests(unittest.TestCase):
         self.now = time.time()
         self.old = {"harness": "codex", "session": SESSION, "surface": SURFACE,
                     "workspace": WORKSPACE, "started_at": 100.0,
-                    "cutoff": 80.0, "label": "fixture-owner"}
+                    "cutoff": 80.0, "label": "fixture-owner",
+                    "delivery_transport": "codex_queue"}
         self.current = {"harness": "codex", "session": SESSION, "surface": SURFACE,
                         "workspace": WORKSPACE, "started_at": 200.0,
-                        "cutoff": 80.0, "label": "fixture-owner"}
+                        "cutoff": 80.0, "label": "fixture-owner",
+                        "delivery_transport": "codex_queue"}
         hook = {"sessions": {SESSION: {"surfaceId": SURFACE, "workspaceId": WORKSPACE,
                                        "startedAt": 200.0, "cwd": str(self.worktree),
                                        "agentLifecycle": "idle"}}}
@@ -397,6 +399,7 @@ class CustodyAdoptionTests(unittest.TestCase):
         with contextlib.closing(self.app.database(create=False)) as db:
             thread = self.app._thread(db, THREAD)
             self.assertEqual(thread["owner"], self.app.binding_snapshot(self.current))
+            self.assertEqual(thread["owner"]["delivery_transport"], "codex_queue")
             self.assertEqual(thread["owner_generation"], 2)
             self.assertTrue(self.app._generation_chain_valid(db, thread, 1,
                             json.loads(db.execute("SELECT owner_json FROM delivery_groups WHERE id=1").fetchone()[0])))
@@ -423,6 +426,7 @@ class CustodyAdoptionTests(unittest.TestCase):
             hailing_target = json.loads((self.hailing / "config.json").read_text())["targets"][0]
             self.assertEqual(hailing_target["started_at"], 200.0)
             self.assertEqual(hailing_target["surface"], self.current["surface"])
+            self.assertEqual(hailing_target["delivery_transport"], "codex_queue")
             selected = db.execute("SELECT surface,owner_key FROM timers WHERE id=?", (self.due_timer,)).fetchone()
             self.assertEqual(selected, (self.current["surface"], beacon.owner_key(self.current, str(self.worktree))))
             self.assertEqual(hailing_target["cutoff"], 80.0)
